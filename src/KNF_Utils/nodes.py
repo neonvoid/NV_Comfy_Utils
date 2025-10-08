@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple
 import time
 from datetime import datetime
+import cv2
 
 class KNF_Organizer:
     def __init__(self):
@@ -75,6 +76,10 @@ class GeminiVideoCaptioner:
                 "prompt_text": ("STRING", {"multiline": True, "default": "Describe this video in detail."}),
                 "api_key": ("STRING", {"default": ""}),
                 "model": (["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.5-pro"], {"default": "gemini-2.5-pro"}),
+                "fps": ("FLOAT", {"default": 30.0, "min": 1.0, "max": 120.0, "step": 0.1}),
+            },
+            "optional": {
+                "video_tensor": ("IMAGE",)
             }
         }
 
@@ -148,20 +153,72 @@ class GeminiVideoCaptioner:
         }
         return mime_types.get(extension, 'video/mp4')
 
-    def caption_video(self, video_file, prompt_text, api_key, model):
+    def tensor_to_video(self, video_tensor, fps=30):
+        """Convert video tensor to temporary video file."""
+        try:
+            # Handle both 4D (frames, height, width, channels) and 5D (batch, frames, height, width, channels) tensors
+            if len(video_tensor.shape) == 4:
+                # 4D tensor: (frames, height, width, channels)
+                video_array = video_tensor.cpu().numpy()
+            elif len(video_tensor.shape) == 5:
+                # 5D tensor: (batch, frames, height, width, channels)
+                video_array = video_tensor[0].cpu().numpy()  # Remove batch dimension
+            else:
+                raise ValueError(f"Expected 4D tensor (frames, height, width, channels) or 5D tensor (batch, frames, height, width, channels), got {video_tensor.shape}")
+            
+            # Ensure values are in [0, 255] range
+            if video_array.max() <= 1.0:
+                video_array = (video_array * 255).astype(np.uint8)
+            else:
+                video_array = video_array.astype(np.uint8)
+            
+            # Create temporary video file
+            temp_dir = folder_paths.get_temp_directory()
+            temp_video_path = os.path.join(temp_dir, f"temp_video_{int(time.time())}.mp4")
+            
+            # Use OpenCV to write video
+            height, width = video_array.shape[1:3]
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter(temp_video_path, fourcc, fps, (width, height))
+            
+            for frame in video_array:
+                # Convert RGB to BGR for OpenCV
+                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                out.write(frame_bgr)
+            
+            out.release()
+            return temp_video_path
+            
+        except Exception as e:
+            print(f"Error converting tensor to video: {e}")
+            return None
+
+    def caption_video(self, video_file=None, prompt_text="Describe this video in detail.", api_key="", model="gemini-2.5-pro", fps=30.0, video_tensor=None):
         """Main function to caption video using Gemini API."""
-        if not video_file or not api_key:
-            return ("Error: Video file path and API key are required",)
+        if not api_key:
+            return ("Error: API key is required",)
         
-        # Construct full path for ComfyUI video file
-        if not os.path.isabs(video_file):
-            input_dir = folder_paths.get_input_directory()
-            video_path = os.path.join(input_dir, video_file)
+        video_path = None
+        
+        # Handle video tensor input (from node link)
+        if video_tensor is not None:
+            print(f"Processing video tensor input at {fps} FPS...")
+            video_path = self.tensor_to_video(video_tensor, fps)
+            if video_path is None:
+                return ("Error: Failed to convert video tensor to file",)
+        # Handle video file input
+        elif video_file:
+            # Construct full path for ComfyUI video file
+            if not os.path.isabs(video_file):
+                input_dir = folder_paths.get_input_directory()
+                video_path = os.path.join(input_dir, video_file)
+            else:
+                video_path = video_file
+            
+            if not os.path.exists(video_path):
+                return (f"Error: Video file not found: {video_path}",)
         else:
-            video_path = video_file
-        
-        if not os.path.exists(video_path):
-            return (f"Error: Video file not found: {video_path}",)
+            return ("Error: Either video file or video tensor must be provided",)
         
         try:
             # Get video metadata
@@ -205,6 +262,13 @@ class GeminiVideoCaptioner:
                     candidate = result['candidates'][0]
                     if 'content' in candidate and 'parts' in candidate['content']:
                         caption = candidate['content']['parts'][0]['text']
+                        # Clean up temporary video file if it was created from tensor
+                        if video_tensor is not None and os.path.exists(video_path):
+                            try:
+                                os.remove(video_path)
+                                print(f"Cleaned up temporary video file: {video_path}")
+                            except Exception as cleanup_error:
+                                print(f"Warning: Could not clean up temporary file {video_path}: {cleanup_error}")
                         return (caption.strip(),)
                     else:
                         return ("Error: No content in API response",)
@@ -214,6 +278,13 @@ class GeminiVideoCaptioner:
                 return (f"API error: {response.status_code} - {response.text}",)
                 
         except Exception as e:
+            # Clean up temporary video file if it was created from tensor
+            if video_tensor is not None and video_path and os.path.exists(video_path):
+                try:
+                    os.remove(video_path)
+                    print(f"Cleaned up temporary video file after error: {video_path}")
+                except Exception as cleanup_error:
+                    print(f"Warning: Could not clean up temporary file {video_path}: {cleanup_error}")
             return (f"Exception: {str(e)}",)
 
 
