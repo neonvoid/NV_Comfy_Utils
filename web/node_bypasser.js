@@ -95,6 +95,34 @@ class NodeBypasser extends LGraphNode {
             } else {
                 console.log("[NodeBypasser] List button or onClick not found:", this.listNodesButton);
             }
+            
+            if (this.bypassButton && this.bypassButton.onClick) {
+                console.log("[NodeBypasser] Adding onClick to bypass button");
+                const originalBypassOnClick = this.bypassButton.onClick;
+                this.bypassButton.onClick = (options) => {
+                    console.log("[NodeBypasser] Bypass button onClick triggered!");
+                    this.bypassNodesByName(true);
+                    if (originalBypassOnClick) {
+                        originalBypassOnClick.call(this.bypassButton, options);
+                    }
+                };
+            } else {
+                console.log("[NodeBypasser] Bypass button or onClick not found:", this.bypassButton);
+            }
+            
+            if (this.enableButton && this.enableButton.onClick) {
+                console.log("[NodeBypasser] Adding onClick to enable button");
+                const originalEnableOnClick = this.enableButton.onClick;
+                this.enableButton.onClick = (options) => {
+                    console.log("[NodeBypasser] Enable button onClick triggered!");
+                    this.bypassNodesByName(false);
+                    if (originalEnableOnClick) {
+                        originalEnableOnClick.call(this.enableButton, options);
+                    }
+                };
+            } else {
+                console.log("[NodeBypasser] Enable button or onClick not found:", this.enableButton);
+            }
         }, 1000);
         
         this.onConstructed();
@@ -184,7 +212,11 @@ class NodeBypasser extends LGraphNode {
     // Bypass nodes by name
     bypassNodesByName(bypass) {
         try {
+            console.log("[NodeBypasser] bypassNodesByName called with bypass=", bypass);
+            
             const nodeNamesText = this.nodeNamesInput.value;
+            console.log("[NodeBypasser] Node names text:", nodeNamesText);
+            
             if (!nodeNamesText || nodeNamesText.trim() === "" || nodeNamesText.includes("Enter node names")) {
                 this.resultWidget.value = "Please enter node names to bypass";
                 return;
