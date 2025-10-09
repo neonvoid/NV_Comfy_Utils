@@ -23,6 +23,7 @@ class NodeBypasser extends LGraphNode {
         // Add a button to list all nodes
         this.listNodesButton = ComfyWidgets["BOOLEAN"](this, "list_nodes", ["BOOLEAN", { default: false }], app).widget;
         this.listNodesButton.name = "List All Nodes";
+        console.log("[NodeBypasser] Created listNodesButton:", this.listNodesButton);
         
         // Add a text input for node names to bypass
         this.nodeNamesInput = ComfyWidgets["STRING"](this, "node_names", ["STRING", { 
@@ -77,6 +78,24 @@ class NodeBypasser extends LGraphNode {
             }
         };
         
+        // Add backup onClick handlers for debugging
+        setTimeout(() => {
+            console.log("[NodeBypasser] Setting up backup onClick handlers...");
+            
+            if (this.listNodesButton && this.listNodesButton.onClick) {
+                console.log("[NodeBypasser] Adding onClick to list button");
+                const originalOnClick = this.listNodesButton.onClick;
+                this.listNodesButton.onClick = (options) => {
+                    console.log("[NodeBypasser] List button onClick triggered!");
+                    this.listAllNodes();
+                    if (originalOnClick) {
+                        originalOnClick.call(this.listNodesButton, options);
+                    }
+                };
+            } else {
+                console.log("[NodeBypasser] List button or onClick not found:", this.listNodesButton);
+            }
+        }, 1000);
         
         this.onConstructed();
     }
@@ -85,6 +104,8 @@ class NodeBypasser extends LGraphNode {
         this.__constructed__ = true;
         // Ensure size is set after construction
         this.size = [250, 250];
+        console.log("[NodeBypasser] Node constructed, widgets:", this.widgets.length);
+        console.log("[NodeBypasser] Widget names:", this.widgets.map(w => w.name));
     }
     
     computeSize() {
