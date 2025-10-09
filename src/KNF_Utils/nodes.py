@@ -58,7 +58,6 @@ class KNF_Organizer:
             black_image = torch.zeros((1, 512, 512, 3), dtype=torch.float32)
             return (black_image, firstframeOriginal, firstFrameRestyled, videoPrompt)
 
-
     CATEGORY = "Example"
 
 class GeminiVideoCaptioner:
@@ -288,13 +287,13 @@ class GeminiVideoCaptioner:
             return (f"Exception: {str(e)}",)
 
 
-# Register the nodes
+# Register the nodes (NodeBypasser is frontend-only, no Python registration needed)
 NODE_CLASS_MAPPINGS = {
     "KNF_Organizer": KNF_Organizer,
-    "GeminiVideoCaptioner": GeminiVideoCaptioner
+    "GeminiVideoCaptioner": GeminiVideoCaptioner,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "KNF_Organizer": "KNF_Organizer",
-    "GeminiVideoCaptioner": "Gemini Video Captioner"
+    "GeminiVideoCaptioner": "Gemini Video Captioner",
 }
