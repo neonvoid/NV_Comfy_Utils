@@ -214,14 +214,19 @@ NodeBypasser.category = "KNF_Utils";
 NodeBypasser.description = "Bypass nodes by name";
 
 // Register the extension
+console.log("[NodeBypasser] Extension loading...");
 app.registerExtension({
     name: "NV_Comfy_Utils.NodeBypasser",
     registerCustomNodes() {
+        console.log("[NodeBypasser] Registering custom nodes...");
         LiteGraph.registerNodeType(NodeBypasser.type, NodeBypasser);
+        console.log("[NodeBypasser] Node type registered:", NodeBypasser.type);
     },
     loadedGraphNode(node) {
         if (node.type == "NodeBypasser") {
+            console.log("[NodeBypasser] Node loaded in graph:", node.id);
             node._tempWidth = node.size[0];
         }
     },
 });
+console.log("[NodeBypasser] Extension registered");
