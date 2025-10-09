@@ -53,6 +53,7 @@ class NodeBypasser extends LGraphNode {
             
             // Handle list nodes button
             if (widget === this.listNodesButton && value === true) {
+                console.log("[NodeBypasser] List nodes button clicked!");
                 this.listAllNodes();
                 setTimeout(() => {
                     this.listNodesButton.value = false;
@@ -96,13 +97,19 @@ class NodeBypasser extends LGraphNode {
     
     listAllNodes() {
         try {
+            console.log("[NodeBypasser] listAllNodes() called");
+            
             const graph = app.graph;
+            console.log("[NodeBypasser] Graph:", graph);
             if (!graph) {
                 this.resultWidget.value = "Error: No graph found";
                 return;
             }
             
             const nodes = graph._nodes;
+            console.log("[NodeBypasser] Nodes:", nodes);
+            console.log("[NodeBypasser] Number of nodes:", nodes ? nodes.length : "undefined");
+            
             if (!nodes) {
                 this.resultWidget.value = "Error: No nodes found in graph";
                 return;
@@ -117,8 +124,11 @@ class NodeBypasser extends LGraphNode {
                 const nodeTitle = node.title || 'No title';
                 const nodeMode = node.mode || 0;
                 
+                console.log(`[NodeBypasser] Processing node: ${nodeId} - ${nodeType} - ${nodeTitle}`);
+                
                 // Skip the bypasser node itself
                 if (node === this) {
+                    console.log("[NodeBypasser] Skipping self node");
                     continue;
                 }
                 
@@ -133,6 +143,8 @@ class NodeBypasser extends LGraphNode {
                 nodeDetails.push(`Node ${nodeId}: ${nodeType} - ${nodeTitle} (${modeText})`);
             }
             
+            console.log("[NodeBypasser] Node details:", nodeDetails);
+            
             if (nodeDetails.length === 0) {
                 this.resultWidget.value = "No other nodes found in graph";
                 return;
@@ -140,6 +152,7 @@ class NodeBypasser extends LGraphNode {
             
             const result = `Found ${nodeDetails.length} nodes in graph:\n\n${nodeDetails.join('\n')}`;
             this.resultWidget.value = result;
+            console.log("[NodeBypasser] Result set:", result);
             
         } catch (error) {
             console.error('[NodeBypasser] Error listing nodes:', error);
