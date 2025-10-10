@@ -27,7 +27,7 @@ class NodeBypasser extends LGraphNode {
         
         // Add a text input for node names to bypass
         this.nodeNamesInput = ComfyWidgets["STRING"](this, "node_names", ["STRING", { 
-            default: "Enter node names separated by commas (e.g., LoadImage, LoadVideo)",
+            default: "Enter node names separated by commas (e.g., LoadImage, LoadVideo, singlePass*, !extension)",
             multiline: true
         }], app).widget;
         this.nodeNamesInput.name = "Node Names to Bypass";
@@ -235,25 +235,39 @@ class NodeBypasser extends LGraphNode {
             let processedCount = 0;
             const results = [];
             const notFound = [];
+            const errors = [];
             
             for (const nodeName of nodeNames) {
-                // Find nodes that match the name (case-insensitive)
-                const matchingNodes = nodes.filter(node => 
-                    node !== this && // Don't include the bypasser node itself
-                    (node.type.toLowerCase().includes(nodeName.toLowerCase()) ||
-                     (node.title && node.title.toLowerCase().includes(nodeName.toLowerCase())))
-                );
-                
-                if (matchingNodes.length === 0) {
-                    notFound.push(nodeName);
-                    continue;
-                }
-                
-                for (const targetNode of matchingNodes) {
-                    const newMode = bypass ? MODE_BYPASS : MODE_ALWAYS;
-                    targetNode.mode = newMode;
-                    processedCount++;
-                    results.push(`Node ${targetNode.id}: ${targetNode.type}`);
+                try {
+                    let matchingNodes = [];
+                    
+                    // Check if it's a regex pattern (contains * or ! or other regex chars)
+                    if (this.isRegexPattern(nodeName)) {
+                        console.log("[NodeBypasser] Processing regex pattern:", nodeName);
+                        matchingNodes = this.findNodesByRegex(nodeName, nodes);
+                    } else {
+                        // Use simple string matching for non-regex patterns
+                        matchingNodes = nodes.filter(node => 
+                            node !== this && // Don't include the bypasser node itself
+                            (node.type.toLowerCase().includes(nodeName.toLowerCase()) ||
+                             (node.title && node.title.toLowerCase().includes(nodeName.toLowerCase())))
+                        );
+                    }
+                    
+                    if (matchingNodes.length === 0) {
+                        notFound.push(nodeName);
+                        continue;
+                    }
+                    
+                    for (const targetNode of matchingNodes) {
+                        const newMode = bypass ? MODE_BYPASS : MODE_ALWAYS;
+                        targetNode.mode = newMode;
+                        processedCount++;
+                        results.push(`Node ${targetNode.id}: ${targetNode.type}`);
+                    }
+                } catch (error) {
+                    console.error(`[NodeBypasser] Error processing pattern "${nodeName}":`, error);
+                    errors.push(`${nodeName}: ${error.message}`);
                 }
             }
             
@@ -262,12 +276,75 @@ class NodeBypasser extends LGraphNode {
             if (notFound.length > 0) {
                 resultText += `\n\nNot found: ${notFound.join(', ')}`;
             }
+            if (errors.length > 0) {
+                resultText += `\n\nErrors: ${errors.join(', ')}`;
+            }
             
             this.resultWidget.value = resultText;
             
         } catch (error) {
             console.error('[NodeBypasser] Error bypassing nodes:', error);
             this.resultWidget.value = `Error: ${error.message}`;
+        }
+    }
+    
+    // Check if a pattern contains regex-like characters
+    isRegexPattern(pattern) {
+        // Check for common regex indicators
+        return pattern.includes('*') || 
+               pattern.includes('!') || 
+               pattern.includes('^') || 
+               pattern.includes('$') || 
+               pattern.includes('[') || 
+               pattern.includes(']') || 
+               pattern.includes('(') || 
+               pattern.includes(')') ||
+               pattern.includes('+') ||
+               pattern.includes('?') ||
+               pattern.includes('|');
+    }
+    
+    // Find nodes using regex patterns
+    findNodesByRegex(pattern, nodes) {
+        try {
+            let regexPattern = pattern;
+            let isExclusion = false;
+            
+            // Handle exclusion patterns (starting with !)
+            if (pattern.startsWith('!')) {
+                isExclusion = true;
+                regexPattern = pattern.substring(1);
+            }
+            
+            // Convert wildcard patterns to regex
+            // * becomes .* (match any characters)
+            // ? becomes . (match single character)
+            regexPattern = regexPattern
+                .replace(/\*/g, '.*')
+                .replace(/\?/g, '.');
+            
+            // Create case-insensitive regex
+            const regex = new RegExp(regexPattern, 'i');
+            
+            console.log(`[NodeBypasser] Converted pattern "${pattern}" to regex: /${regexPattern}/i`);
+            
+            const matchingNodes = nodes.filter(node => {
+                if (node === this) return false; // Don't include the bypasser node itself
+                
+                const typeMatch = regex.test(node.type);
+                const titleMatch = node.title ? regex.test(node.title) : false;
+                const matches = typeMatch || titleMatch;
+                
+                // For exclusion patterns, return the opposite
+                return isExclusion ? !matches : matches;
+            });
+            
+            console.log(`[NodeBypasser] Found ${matchingNodes.length} nodes matching pattern "${pattern}"`);
+            return matchingNodes;
+            
+        } catch (error) {
+            console.error(`[NodeBypasser] Regex error for pattern "${pattern}":`, error);
+            throw new Error(`Invalid regex pattern: ${error.message}`);
         }
     }
         

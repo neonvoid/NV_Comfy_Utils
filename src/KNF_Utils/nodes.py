@@ -287,13 +287,18 @@ class GeminiVideoCaptioner:
             return (f"Exception: {str(e)}",)
 
 
+# Import the video path loader
+from .smart_video_loader import AutomateVideoPathLoader
+
 # Register the nodes (NodeBypasser is frontend-only, no Python registration needed)
 NODE_CLASS_MAPPINGS = {
     "KNF_Organizer": KNF_Organizer,
     "GeminiVideoCaptioner": GeminiVideoCaptioner,
+    "AutomateVideoPathLoader": AutomateVideoPathLoader,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "KNF_Organizer": "KNF_Organizer",
     "GeminiVideoCaptioner": "Gemini Video Captioner",
+    "AutomateVideoPathLoader": "Automate Video Path Loader",
 }
