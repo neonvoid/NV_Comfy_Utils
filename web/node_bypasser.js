@@ -9,7 +9,7 @@ class NodeBypasser extends LGraphNode {
     constructor(title = "Node Bypasser") {
         super(title);
         this.comfyClass = "NodeBypasser";
-        this.isVirtualNode = false;
+        this.isVirtualNode = true;  // Mark as virtual to avoid execution errors
         this.removed = false;
         this.configuring = false;
         this._tempWidth = 0;
