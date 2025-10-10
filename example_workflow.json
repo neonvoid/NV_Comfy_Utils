@@ -1,0 +1,83 @@
+{
+  "last_node_id": 3,
+  "last_link_id": 2,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "LoadImage",
+      "pos": [100, 100],
+      "size": {"0": 315, "1": 314},
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [1],
+          "shape": 3,
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "example_image.png",
+        "image"
+      ]
+    },
+    {
+      "id": 2,
+      "type": "CustomVideoSaver",
+      "pos": [500, 100],
+      "size": {"0": 315, "1": 400},
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video_tensor",
+          "type": "IMAGE",
+          "link": 1
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CustomVideoSaver"
+      },
+      "widgets_values": [
+        "my_video",
+        "C:\\Videos\\MyProject",
+        "mp4",
+        30.0,
+        18,
+        true,
+        "",
+        null,
+        null
+      ]
+    },
+    {
+      "id": 3,
+      "type": "Note",
+      "pos": [100, 500],
+      "size": {"0": 200, "1": 100},
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "properties": {
+        "Node name for S&R": "Note"
+      },
+      "widgets_values": [
+        "Example Workflow:\n\n1. Load an image\n2. Connect to Custom Video Saver\n3. Set custom directory\n4. Run workflow\n\nNote: This is just an example. In practice, you would connect a video tensor (multiple frames) to the Custom Video Saver."
+      ]
+    }
+  ],
+  "links": [
+    [1, 1, 0, 2, 0, "IMAGE"]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {},
+  "version": 0.4
+}

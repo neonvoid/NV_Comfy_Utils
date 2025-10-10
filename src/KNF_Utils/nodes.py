@@ -287,6 +287,370 @@ class GeminiVideoCaptioner:
             return (f"Exception: {str(e)}",)
 
 
+class CustomVideoSaver:
+    """
+    Custom video saver that allows saving videos to a user-specified directory.
+    Similar to ComfyUI's native video saving but with custom directory selection.
+    """
+    
+    def __init__(self):
+        self.type = "output"
+        self.output_dir = folder_paths.get_output_directory()
+        self._check_codec_support()
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video_tensor": ("IMAGE",),
+                "filename_prefix": ("STRING", {"default": "ComfyUI_video"}),
+                "custom_directory": ("STRING", {"default": ""}),  # Empty = use default output
+                "video_format": (["mp4", "avi", "mov", "mkv", "webm", "wmv"], {"default": "mp4"}),
+                "fps": ("FLOAT", {"default": 30.0, "min": 1.0, "max": 120.0, "step": 0.1}),
+                "quality": ("INT", {"default": 18, "min": 0, "max": 51, "step": 1}),  # FFmpeg CRF quality
+                "preserve_colors": ("BOOLEAN", {"default": True}),  # Enable color preservation mode
+            },
+            "optional": {
+                "subfolder": ("STRING", {"default": ""}),
+                "prompt": ("PROMPT",),
+                "extra_pnginfo": ("EXTRA_PNGINFO",),
+            }
+        }
+    
+    RETURN_TYPES = ("STRING", "STRING", "STRING")
+    RETURN_NAMES = ("video_path", "filename", "info")
+    FUNCTION = "save_video"
+    CATEGORY = "KNF_Utils/Video"
+    OUTPUT_NODE = True
+    
+    def save_video(self, video_tensor, filename_prefix="ComfyUI_video", custom_directory="", 
+                   video_format="mp4", fps=30.0, quality=18, preserve_colors=True, subfolder="", prompt=None, extra_pnginfo=None):
+        """
+        Save video tensor to specified directory with custom naming and color preservation.
+        
+        Args:
+            video_tensor: Video tensor (batch, frames, height, width, channels)
+            filename_prefix: Base name for the video file
+            custom_directory: Custom directory path (empty = use default output)
+            video_format: Video format extension
+            fps: Frames per second
+            quality: FFmpeg CRF quality (0=lossless, 18=high, 23=medium, 51=lowest)
+            preserve_colors: Enable color preservation mode (recommended: True)
+            subfolder: Subfolder within the output directory
+            prompt: Optional prompt information
+            extra_pnginfo: Optional extra PNG info
+            
+        Returns:
+            Tuple of (full_path, filename, info_string)
+        """
+        try:
+            # Determine output directory
+            if custom_directory and custom_directory.strip():
+                # Use custom directory if provided
+                if os.path.isabs(custom_directory):
+                    # Absolute path
+                    if not os.path.exists(custom_directory):
+                        os.makedirs(custom_directory, exist_ok=True)
+                    output_dir = custom_directory
+                else:
+                    # Relative path from ComfyUI root
+                    comfy_root = os.path.dirname(folder_paths.get_output_directory())
+                    output_dir = os.path.join(comfy_root, custom_directory)
+                    if not os.path.exists(output_dir):
+                        os.makedirs(output_dir, exist_ok=True)
+            else:
+                # Use default ComfyUI output directory
+                output_dir = self.output_dir
+            
+            # Add subfolder if specified
+            if subfolder and subfolder.strip():
+                output_dir = os.path.join(output_dir, subfolder)
+                if not os.path.exists(output_dir):
+                    os.makedirs(output_dir, exist_ok=True)
+            
+            # Generate filename with counter (similar to ComfyUI's pattern)
+            full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(
+                filename_prefix, output_dir, video_tensor.shape[2], video_tensor.shape[1]
+            )
+            
+            # Create final filename with video extension
+            video_filename = f"{filename}_{counter:05}.{video_format}"
+            video_path = os.path.join(full_output_folder, video_filename)
+            
+            # Convert tensor to video with color preservation
+            success = self._tensor_to_video_file(video_tensor, video_path, fps, quality, video_format, preserve_colors)
+            
+            if not success:
+                return ("", "", f"Error: Failed to save video to {video_path}")
+            
+            # Create info string
+            color_mode = "Color Preserved" if preserve_colors else "Standard"
+            info = f"Video saved: {video_filename} | FPS: {fps} | Quality: {quality} | Format: {video_format.upper()} | {color_mode}"
+            if custom_directory:
+                info += f" | Custom dir: {custom_directory}"
+            
+            return (video_path, video_filename, info)
+            
+        except Exception as e:
+            error_msg = f"Error saving video: {str(e)}"
+            print(f"[CustomVideoSaver] {error_msg}")
+            return ("", "", error_msg)
+    
+    def _tensor_to_video_file(self, video_tensor, output_path, fps, quality, video_format, preserve_colors=True):
+        """
+        Convert video tensor to video file using OpenCV with color data preservation.
+        
+        Args:
+            video_tensor: Video tensor (batch, frames, height, width, channels)
+            output_path: Output file path
+            fps: Frames per second
+            quality: Video quality (for codec-specific settings)
+            video_format: Video format extension
+            preserve_colors: Enable color preservation mode
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            # Handle tensor dimensions
+            if len(video_tensor.shape) == 5:
+                # (batch, frames, height, width, channels) - remove batch dimension
+                video_array = video_tensor[0].cpu().numpy()
+            elif len(video_tensor.shape) == 4:
+                # (frames, height, width, channels)
+                video_array = video_tensor.cpu().numpy()
+            else:
+                print(f"[CustomVideoSaver] Unexpected tensor shape: {video_tensor.shape}")
+                return False
+            
+            # Preserve original data type and range for maximum color fidelity
+            original_dtype = video_array.dtype
+            original_min = video_array.min()
+            original_max = video_array.max()
+            
+            print(f"[CustomVideoSaver] Original data: dtype={original_dtype}, range=[{original_min:.6f}, {original_max:.6f}]")
+            
+            # Color preservation mode: use high-precision conversion
+            if preserve_colors:
+                # Use high-precision conversion to preserve color accuracy
+                if original_dtype == np.float32 or original_dtype == np.float64:
+                    if original_max <= 1.0:
+                        # Normalized float data [0,1] -> [0,255] with high precision
+                        video_array = np.clip(video_array * 255.0, 0, 255)
+                        # Use round() for more accurate conversion than direct casting
+                        video_array = np.round(video_array).astype(np.uint8)
+                    else:
+                        # Float data in [0,255] range - preserve as much precision as possible
+                        video_array = np.clip(video_array, 0, 255)
+                        video_array = np.round(video_array).astype(np.uint8)
+                elif original_dtype == np.uint8:
+                    # Already in correct format - no conversion needed
+                    video_array = video_array.astype(np.uint8)
+                elif original_dtype in [np.uint16, np.int16]:
+                    # 16-bit data - scale down to 8-bit while preserving color information
+                    if original_max > 255:
+                        video_array = np.clip(video_array / 256.0, 0, 255).astype(np.uint8)
+                    else:
+                        video_array = np.clip(video_array, 0, 255).astype(np.uint8)
+                else:
+                    # Other integer types - convert with clipping
+                    video_array = np.clip(video_array, 0, 255).astype(np.uint8)
+            else:
+                # Standard conversion mode (faster but less precise)
+                if original_dtype == np.float32 or original_dtype == np.float64:
+                    if original_max <= 1.0:
+                        video_array = np.clip(video_array * 255.0, 0, 255).astype(np.uint8)
+                    else:
+                        video_array = np.clip(video_array, 0, 255).astype(np.uint8)
+                else:
+                    video_array = np.clip(video_array, 0, 255).astype(np.uint8)
+            
+            # Get video dimensions
+            num_frames, height, width, channels = video_array.shape
+            
+            print(f"[CustomVideoSaver] Processing {num_frames} frames of {width}x{height} with {channels} channels")
+            
+            # Set up video codec based on format with color preservation settings
+            fourcc = self._get_fourcc(video_format)
+            
+            # Create video writer with color preservation settings
+            out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+            
+            if not out.isOpened():
+                print(f"[CustomVideoSaver] Failed to open video writer for {output_path}")
+                print(f"[CustomVideoSaver] Trying alternative codec...")
+                
+                # Try alternative codec as fallback
+                if video_format.lower() == "mp4":
+                    alternative_fourcc = cv2.VideoWriter_fourcc(*'XVID')
+                    out = cv2.VideoWriter(output_path, alternative_fourcc, fps, (width, height))
+                    if out.isOpened():
+                        print(f"[CustomVideoSaver] Using XVID codec as fallback")
+                    else:
+                        print(f"[CustomVideoSaver] All codecs failed, cannot create video")
+                        return False
+                else:
+                    return False
+            
+            # Write frames with careful color space handling
+            for i, frame in enumerate(video_array):
+                # Ensure frame is contiguous in memory for better performance
+                frame = np.ascontiguousarray(frame)
+                
+                # Validate color data before conversion
+                if preserve_colors:
+                    frame_min, frame_max = frame.min(), frame.max()
+                    if frame_min < 0 or frame_max > 255:
+                        print(f"[CustomVideoSaver] Warning: Frame {i} has values outside [0,255] range: [{frame_min}, {frame_max}]")
+                        frame = np.clip(frame, 0, 255)
+                
+                # Handle different channel configurations with color preservation
+                if channels == 3:
+                    # RGB to BGR conversion for OpenCV (preserves all color data)
+                    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                elif channels == 4:
+                    # RGBA to BGR (drop alpha channel, preserve RGB)
+                    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
+                elif channels == 1:
+                    # Grayscale to BGR (preserve grayscale data)
+                    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+                else:
+                    # Unknown channel count, try to preserve as-is
+                    print(f"[CustomVideoSaver] Warning: Unknown channel count {channels}, using as-is")
+                    frame_bgr = frame
+                
+                # Ensure the frame is in the correct format for the codec
+                if frame_bgr.dtype != np.uint8:
+                    frame_bgr = frame_bgr.astype(np.uint8)
+                
+                # Final validation for color preservation
+                if preserve_colors:
+                    bgr_min, bgr_max = frame_bgr.min(), frame_bgr.max()
+                    if bgr_min < 0 or bgr_max > 255:
+                        print(f"[CustomVideoSaver] Warning: BGR frame {i} has invalid values: [{bgr_min}, {bgr_max}]")
+                        frame_bgr = np.clip(frame_bgr, 0, 255).astype(np.uint8)
+                
+                out.write(frame_bgr)
+            
+            # Release video writer
+            out.release()
+            
+            # Verify file was created and has reasonable size
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                file_size = os.path.getsize(output_path)
+                print(f"[CustomVideoSaver] Successfully saved video: {output_path} ({file_size} bytes)")
+                return True
+            else:
+                print(f"[CustomVideoSaver] Video file was not created or is empty: {output_path}")
+                return False
+                
+        except Exception as e:
+            print(f"[CustomVideoSaver] Error converting tensor to video: {e}")
+            return False
+    
+    def _get_fourcc(self, video_format):
+        """Get OpenCV fourcc codec for video format with robust fallback system."""
+        # Define codec preferences with fallbacks
+        codec_preferences = {
+            "mp4": [
+                ('mp4v', 'MP4V'),  # Most compatible fallback
+                ('XVID', 'XVID'),  # Alternative
+                ('MJPG', 'MJPG'),  # Motion JPEG
+            ],
+            "avi": [
+                ('XVID', 'XVID'),  # Most compatible for AVI
+                ('MJPG', 'MJPG'),  # Motion JPEG
+                ('mp4v', 'MP4V'),  # Alternative
+            ],
+            "mov": [
+                ('mp4v', 'MP4V'),  # Most compatible for MOV
+                ('XVID', 'XVID'),  # Alternative
+                ('MJPG', 'MJPG'),  # Motion JPEG
+            ],
+            "mkv": [
+                ('mp4v', 'MP4V'),  # Most compatible for MKV
+                ('XVID', 'XVID'),  # Alternative
+                ('MJPG', 'MJPG'),  # Motion JPEG
+            ],
+            "webm": [
+                ('VP80', 'VP8'),   # VP8 for WebM
+                ('mp4v', 'MP4V'),  # Fallback
+            ],
+            "wmv": [
+                ('WMV2', 'WMV2'),  # WMV2 for WMV
+                ('mp4v', 'MP4V'),  # Fallback
+            ],
+        }
+        
+        # Get codec preferences for the format
+        preferences = codec_preferences.get(video_format.lower(), [('mp4v', 'MP4V')])
+        
+        # Try each codec in order of preference
+        for codec_name, display_name in preferences:
+            try:
+                fourcc = cv2.VideoWriter_fourcc(*codec_name)
+                # Test if codec works by creating a test writer
+                test_path = f"test_{codec_name}.{video_format}"
+                test_writer = cv2.VideoWriter(test_path, fourcc, 30, (640, 480))
+                
+                if test_writer.isOpened():
+                    test_writer.release()
+                    # Clean up test file if it was created
+                    if os.path.exists(test_path):
+                        os.remove(test_path)
+                    print(f"[CustomVideoSaver] Using {display_name} codec for {video_format.upper()}")
+                    return fourcc
+                else:
+                    print(f"[CustomVideoSaver] {display_name} codec not available, trying next...")
+                    
+            except Exception as e:
+                print(f"[CustomVideoSaver] {display_name} codec test failed: {e}")
+                continue
+        
+        # If all codecs fail, return the first one as last resort
+        print(f"[CustomVideoSaver] All codecs failed, using fallback: {preferences[0][1]}")
+        return cv2.VideoWriter_fourcc(*preferences[0][0])
+    
+    def _check_codec_support(self):
+        """Check available codecs and provide helpful information."""
+        print("[CustomVideoSaver] Checking codec support...")
+        
+        # Test common codecs
+        test_codecs = [
+            ('mp4v', 'MP4V'),
+            ('XVID', 'XVID'),
+            ('MJPG', 'Motion JPEG'),
+            ('H264', 'H.264'),
+        ]
+        
+        available_codecs = []
+        for codec_name, display_name in test_codecs:
+            try:
+                fourcc = cv2.VideoWriter_fourcc(*codec_name)
+                test_writer = cv2.VideoWriter("test_codec.mp4", fourcc, 30, (640, 480))
+                if test_writer.isOpened():
+                    available_codecs.append(display_name)
+                    test_writer.release()
+                    if os.path.exists("test_codec.mp4"):
+                        os.remove("test_codec.mp4")
+            except:
+                pass
+        
+        if available_codecs:
+            print(f"[CustomVideoSaver] Available codecs: {', '.join(available_codecs)}")
+        else:
+            print("[CustomVideoSaver] Warning: No codecs available, video saving may fail")
+            print("[CustomVideoSaver] Consider installing OpenCV with additional codec support")
+        
+        # Check for common codec issues
+        if 'H.264' not in available_codecs and 'MP4V' in available_codecs:
+            print("[CustomVideoSaver] Note: H.264 not available, using MP4V (this is normal)")
+        
+        if not available_codecs:
+            print("[CustomVideoSaver] Error: No video codecs available!")
+            print("[CustomVideoSaver] Please ensure OpenCV is properly installed with video support")
+
+
 # Import the video path loader
 from .smart_video_loader import AutomateVideoPathLoader
 
@@ -295,10 +659,12 @@ NODE_CLASS_MAPPINGS = {
     "KNF_Organizer": KNF_Organizer,
     "GeminiVideoCaptioner": GeminiVideoCaptioner,
     "AutomateVideoPathLoader": AutomateVideoPathLoader,
+    "CustomVideoSaver": CustomVideoSaver,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "KNF_Organizer": "KNF_Organizer",
     "GeminiVideoCaptioner": "Gemini Video Captioner",
     "AutomateVideoPathLoader": "Automate Video Path Loader",
+    "CustomVideoSaver": "Custom Video Saver",
 }
