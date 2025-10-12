@@ -128,6 +128,27 @@ class NodeBypasser extends LGraphNode {
         this.onConstructed();
     }
     
+    // Save widget values when they change
+    serialize() {
+        const data = super.serialize();
+        if (data) {
+            data.widget_values = {
+                node_names: this.nodeNamesInput.value
+            };
+        }
+        return data;
+    }
+    
+    // Load widget values when node is loaded
+    configure(info) {
+        super.configure(info);
+        if (info.widget_values) {
+            if (info.widget_values.node_names !== undefined) {
+                this.nodeNamesInput.value = info.widget_values.node_names;
+            }
+        }
+    }
+    
     onConstructed() {
         this.__constructed__ = true;
         // Ensure size is set after construction
@@ -250,7 +271,11 @@ class NodeBypasser extends LGraphNode {
                         matchingNodes = nodes.filter(node => 
                             node !== this && // Don't include the bypasser node itself
                             (node.type.toLowerCase().includes(nodeName.toLowerCase()) ||
-                             (node.title && node.title.toLowerCase().includes(nodeName.toLowerCase())))
+                             (node.title && node.title.toLowerCase().includes(nodeName.toLowerCase())) ||
+                             (node.properties && node.properties.name && node.properties.name.toLowerCase().includes(nodeName.toLowerCase())) ||
+                             (node.properties && node.properties.variable_name && node.properties.variable_name.toLowerCase().includes(nodeName.toLowerCase())) ||
+                             (node.properties && node.properties.custom_name && node.properties.custom_name.toLowerCase().includes(nodeName.toLowerCase())) ||
+                             (node._stableCustomName && node._stableCustomName.toLowerCase().includes(nodeName.toLowerCase())))
                         );
                     }
                     
@@ -333,7 +358,9 @@ class NodeBypasser extends LGraphNode {
                 
                 const typeMatch = regex.test(node.type);
                 const titleMatch = node.title ? regex.test(node.title) : false;
-                const matches = typeMatch || titleMatch;
+                const customNameMatch = node.properties && node.properties.custom_name ? regex.test(node.properties.custom_name) : false;
+                const stableCustomNameMatch = node._stableCustomName ? regex.test(node._stableCustomName) : false;
+                const matches = typeMatch || titleMatch || customNameMatch || stableCustomNameMatch;
                 
                 // For exclusion patterns, return the opposite
                 return isExclusion ? !matches : matches;

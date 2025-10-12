@@ -74,8 +74,16 @@ A collection of ComfyUI custom nodes including NodeBypasser and Custom Video Sav
 
 #### 5. Execute
 - Run your workflow
-- The video will be saved to your specified location
+- The video will be saved to your specified location with automatic filename incrementing
+- Files are numbered sequentially: `video_00001.mp4`, `video_00002.mp4`, etc.
 - Check the output for the full file path and filename
+
+### ✨ **Automatic Filename Incrementing**
+The Custom Video Saver automatically increments filenames to prevent overwriting:
+- **Sequential Numbering**: Files are saved as `prefix_00001.ext`, `prefix_00002.ext`, etc.
+- **Gap Handling**: If files are deleted, the next available number is used
+- **No Overwriting**: Your videos are always safe from accidental overwrites
+- **Up to 99,999 Files**: Supports large batches with 5-digit counters
 
 ## 📝 Usage Examples
 
@@ -328,6 +336,11 @@ NV_Comfy_Utils/
 - Check the Status area for error messages
 
 ### Custom Video Saver Issues
+
+#### Filename Incrementing
+- **Files being overwritten**: This has been fixed! The Custom Video Saver now automatically increments filenames (e.g., `video_00001.mp4`, `video_00002.mp4`, etc.)
+- **Gap handling**: If files are deleted, the saver will find the next available number (e.g., if `00001.mp4` and `00003.mp4` exist, it will use `00002.mp4`)
+- **Maximum files**: Supports up to 99,999 files per prefix (00001-99999)
 
 #### Video Not Saving
 - Check that the input is a valid video tensor (IMAGE type)

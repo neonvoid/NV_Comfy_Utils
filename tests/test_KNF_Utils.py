@@ -7,6 +7,7 @@ import torch
 import numpy as np
 import tempfile
 import os
+import re
 from src.KNF_Utils.nodes import KNF_Organizer, GeminiVideoCaptioner, CustomVideoSaver
 
 @pytest.fixture
@@ -124,6 +125,39 @@ def test_custom_video_saver_save_to_temp_directory(custom_video_saver_node, samp
         assert "Color Preserved" in info
         assert os.path.exists(video_path)
         assert filename.endswith(".mp4")
+
+def test_custom_video_saver_filename_incrementing(custom_video_saver_node, sample_video_tensor):
+    """Test that the CustomVideoSaver properly increments filenames to avoid overwriting."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        # Save multiple videos with the same filename prefix
+        results = []
+        for i in range(3):
+            result = custom_video_saver_node.save_video(
+                video_tensor=sample_video_tensor,
+                filename_prefix="test_video",
+                custom_directory=temp_dir,
+                video_format="mp4",
+                fps=30.0,
+                quality=18,
+                preserve_colors=True
+            )
+            results.append(result)
+        
+        # Extract filenames
+        filenames = [result[1] for result in results]
+        
+        # Check that all filenames are unique
+        assert len(filenames) == len(set(filenames)), f"Duplicate filenames found: {filenames}"
+        
+        # Check that filenames follow the expected pattern (test_video_00001.mp4, etc.)
+        expected_pattern = r"test_video_\d{5}\.mp4"
+        for filename in filenames:
+            assert re.match(expected_pattern, filename), f"Filename {filename} doesn't match expected pattern"
+        
+        # Check that files actually exist
+        for result in results:
+            video_path, filename, info = result
+            assert os.path.exists(video_path), f"Video file {filename} was not created"
 
 def test_custom_video_saver_fourcc_codes(custom_video_saver_node):
     """Test that the fourcc codec mapping works correctly."""

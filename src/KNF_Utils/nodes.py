@@ -368,14 +368,11 @@ class CustomVideoSaver:
                 if not os.path.exists(output_dir):
                     os.makedirs(output_dir, exist_ok=True)
             
-            # Generate filename with counter (similar to ComfyUI's pattern)
-            full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(
-                filename_prefix, output_dir, video_tensor.shape[2], video_tensor.shape[1]
+            # Generate filename with counter for video files
+            # Use custom implementation to properly handle video file incrementing
+            video_filename, video_path = self._get_unique_video_filename(
+                filename_prefix, output_dir, video_format
             )
-            
-            # Create final filename with video extension
-            video_filename = f"{filename}_{counter:05}.{video_format}"
-            video_path = os.path.join(full_output_folder, video_filename)
             
             # Convert tensor to video with color preservation
             success = self._tensor_to_video_file(video_tensor, video_path, fps, quality, video_format, preserve_colors)
@@ -611,6 +608,46 @@ class CustomVideoSaver:
         print(f"[CustomVideoSaver] All codecs failed, using fallback: {preferences[0][1]}")
         return cv2.VideoWriter_fourcc(*preferences[0][0])
     
+    def _get_unique_video_filename(self, filename_prefix, output_dir, video_format):
+        """
+        Generate a unique video filename with proper incrementing.
+        
+        Args:
+            filename_prefix: Base name for the video file
+            output_dir: Directory where the video will be saved
+            video_format: Video format extension
+            
+        Returns:
+            Tuple of (filename, full_path)
+        """
+        # Ensure the output directory exists
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir, exist_ok=True)
+        
+        # Start with counter 1
+        counter = 1
+        
+        while True:
+            # Generate filename with 5-digit counter (e.g., video_00001.mp4)
+            video_filename = f"{filename_prefix}_{counter:05}.{video_format}"
+            video_path = os.path.join(output_dir, video_filename)
+            
+            # Check if file already exists
+            if not os.path.exists(video_path):
+                return video_filename, video_path
+            
+            # File exists, increment counter and try again
+            counter += 1
+            
+            # Safety check to prevent infinite loop (max 99999 files)
+            if counter > 99999:
+                # Fallback: use timestamp
+                import time
+                timestamp = int(time.time())
+                video_filename = f"{filename_prefix}_{timestamp}.{video_format}"
+                video_path = os.path.join(output_dir, video_filename)
+                return video_filename, video_path
+    
     def _check_codec_support(self):
         """Check available codecs and provide helpful information."""
         print("[CustomVideoSaver] Checking codec support...")
@@ -653,6 +690,34 @@ class CustomVideoSaver:
 
 # Import the video path loader
 from .smart_video_loader import AutomateVideoPathLoader
+
+# Simple Get Variable Node - Python backend
+class GetVariableNode:
+    """
+    Python backend for Get Variable Node - passes through data from Set Variable Node.
+    This is a minimal implementation that just passes data through.
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "dummy": ("*", {"default": None}),
+            }
+        }
+    
+    RETURN_TYPES = ("*",)
+    RETURN_NAMES = ("value",)
+    FUNCTION = "get_variable"
+    CATEGORY = "KNF_Utils/Variables"
+    
+    def get_variable(self, dummy=None):
+        """Pass through the dummy input - the real data comes from the frontend connection."""
+        return (dummy,)
+    
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("inf")
 
 # Register the nodes (NodeBypasser is frontend-only, no Python registration needed)
 NODE_CLASS_MAPPINGS = {
