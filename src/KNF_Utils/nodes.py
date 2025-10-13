@@ -16,6 +16,14 @@ import time
 from datetime import datetime
 import cv2
 
+# Import IO.ANY for proper wildcard type support
+try:
+    from comfy.comfy_types.node_typing import IO
+except ImportError:
+    # Fallback for older ComfyUI versions
+    class IO:
+        ANY = "*"
+
 class KNF_Organizer:
     def __init__(self):
         pass
@@ -702,14 +710,22 @@ class GetVariableNode:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "dummy": ("*", {"default": None}),
+                "dummy": (IO.ANY, {"default": None}),
             }
         }
     
-    RETURN_TYPES = ("*",)
+    RETURN_TYPES = (IO.ANY,)
     RETURN_NAMES = ("value",)
     FUNCTION = "get_variable"
     CATEGORY = "KNF_Utils/Variables"
+    
+    @classmethod
+    def VALIDATE_INPUTS(cls, dummy=None):
+        """
+        Validate inputs - allow any type to pass through.
+        The frontend handles the actual type matching.
+        """
+        return True
     
     def get_variable(self, dummy=None):
         """Pass through the dummy input - the real data comes from the frontend connection."""
@@ -732,18 +748,26 @@ class LazySwitch:
         return {
             "required": {
                 "boolean": ("BOOLEAN", {"default": True}),
-            },
-            "optional": {
-                "on_false": ("*", {"lazy": True}),
-                "on_true": ("*", {"lazy": True}),
+                "on_false": (IO.ANY, {"lazy": True}),
+                "on_true": (IO.ANY, {"lazy": True}),
             },
         }
     
-    RETURN_TYPES = ("*",)
+    RETURN_TYPES = (IO.ANY,)
     RETURN_NAMES = ("output",)
     FUNCTION = "switch"
     CATEGORY = "KNF_Utils/Logic"
     DESCRIPTION = "Lazily evaluates only the input branch corresponding to the boolean value. If true, only on_true is evaluated. If false, only on_false is evaluated."
+    
+    @classmethod
+    def VALIDATE_INPUTS(cls, boolean, on_false=None, on_true=None):
+        """
+        Validate inputs - allow wildcard types to pass through.
+        This is more permissive than the default validation.
+        """
+        # Always return True to bypass strict type checking
+        # The lazy evaluation will handle which input is actually needed
+        return True
     
     def check_lazy_status(self, boolean, on_false=None, on_true=None):
         """
