@@ -748,6 +748,8 @@ class LazySwitch:
         return {
             "required": {
                 "boolean": ("BOOLEAN", {"default": True}),
+            },
+            "optional": {
                 "on_false": (IO.ANY, {"lazy": True}),
                 "on_true": (IO.ANY, {"lazy": True}),
             },
