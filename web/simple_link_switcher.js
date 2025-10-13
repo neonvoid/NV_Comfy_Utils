@@ -44,9 +44,15 @@ class SimpleLinkSwitcher extends LGraphNode {
         this.switchWidget = ComfyWidgets["BOOLEAN"](this, "switch", ["BOOLEAN", { default: false }], app).widget;
         this.switchWidget.name = "Use Input 2";
         
+        // Add boolean input for switch control
+        this.addInput("switch_input", "BOOLEAN");
+        
         // Action button
         this.connectButton = ComfyWidgets["BOOLEAN"](this, "connect", ["BOOLEAN", { default: false }], app).widget;
         this.connectButton.name = "Connect";
+        
+        // Add boolean input for connect trigger
+        this.addInput("trigger_input", "BOOLEAN");
         
         // Status display
         this.statusWidget = ComfyWidgets["STRING"](this, "status", ["STRING", { multiline: true }], app).widget;
@@ -139,6 +145,105 @@ class SimpleLinkSwitcher extends LGraphNode {
         return this.size;
     }
     
+    // Get the effective switch value (from input or widget)
+    getSwitchValue() {
+        // Check if switch_input is connected (input slot 0)
+        if (this.inputs[0] && this.inputs[0].link != null) {
+            const link = this.graph.links[this.inputs[0].link];
+            if (link) {
+                const originNode = this.graph.getNodeById(link.origin_id);
+                if (originNode) {
+                    // Try to get value from widget (works for primitive nodes and most boolean sources)
+                    if (originNode.widgets && originNode.widgets.length > 0) {
+                        // Look for the widget connected to this output
+                        const widget = originNode.widgets.find(w => w.type === "toggle" || w.name === "boolean" || w.name === "value");
+                        if (widget && widget.value !== undefined) {
+                            return widget.value;
+                        }
+                        // Fall back to first widget value
+                        if (originNode.widgets[0].value !== undefined) {
+                            return originNode.widgets[0].value;
+                        }
+                    }
+                    // Try getOutputData as fallback
+                    if (originNode.outputs && originNode.outputs[link.origin_slot]) {
+                        const value = originNode.getOutputData ? originNode.getOutputData(link.origin_slot) : null;
+                        if (value !== undefined && value !== null) {
+                            return value;
+                        }
+                    }
+                }
+            }
+        }
+        // Fall back to widget value
+        return this.switchWidget.value;
+    }
+    
+    // Get the effective trigger value (from input or widget)
+    getTriggerValue() {
+        // Check if trigger_input is connected (input slot 1)
+        if (this.inputs[1] && this.inputs[1].link != null) {
+            const link = this.graph.links[this.inputs[1].link];
+            if (link) {
+                const originNode = this.graph.getNodeById(link.origin_id);
+                if (originNode) {
+                    // Try to get value from widget (works for primitive nodes and most boolean sources)
+                    if (originNode.widgets && originNode.widgets.length > 0) {
+                        const widget = originNode.widgets.find(w => w.type === "toggle" || w.name === "boolean" || w.name === "value");
+                        if (widget && widget.value !== undefined) {
+                            return widget.value;
+                        }
+                        if (originNode.widgets[0].value !== undefined) {
+                            return originNode.widgets[0].value;
+                        }
+                    }
+                    // Try getOutputData as fallback
+                    if (originNode.outputs && originNode.outputs[link.origin_slot]) {
+                        const value = originNode.getOutputData ? originNode.getOutputData(link.origin_slot) : null;
+                        if (value !== undefined && value !== null) {
+                            return value;
+                        }
+                    }
+                }
+            }
+        }
+        // Fall back to widget value
+        return this.connectButton.value;
+    }
+    
+    // Check inputs on every draw (this works for virtual nodes)
+    onDrawBackground(ctx) {
+        this.checkInputs();
+    }
+    
+    // Check the input values and trigger actions
+    checkInputs() {
+        if (!this.graph) return;
+        
+        const triggerValue = this.getTriggerValue();
+        const switchValue = this.getSwitchValue();
+        
+        // Update widget to reflect input value (visual feedback)
+        if (this.inputs[0] && this.inputs[0].link != null) {
+            this.switchWidget.value = switchValue;
+        }
+        
+        // Check if trigger is true and hasn't been processed yet
+        if (triggerValue === true && this._lastTriggerState !== true) {
+            console.log("[SimpleLinkSwitcher] Trigger activated via input!");
+            this.connectNodes();
+        }
+        this._lastTriggerState = triggerValue;
+    }
+    
+    // Also check on connection changes
+    onConnectionsChange(type, index, connected, link_info) {
+        // Small delay to ensure data is available
+        setTimeout(() => {
+            this.checkInputs();
+        }, 50);
+    }
+    
     onSwitchChange(useInput2) {
         const currentInput = useInput2 ? this.input2Widget.value : this.input1Widget.value;
         const inputCount = currentInput.split(',').length;
@@ -209,8 +314,8 @@ class SimpleLinkSwitcher extends LGraphNode {
             
             const nodes = graph._nodes;
             
-            // Get the selected input pattern
-            const useInput2 = this.switchWidget.value;
+            // Get the selected input pattern (using input if connected, otherwise widget)
+            const useInput2 = this.getSwitchValue();
             const inputPattern = useInput2 ? this.input2Widget.value : this.input1Widget.value;
             const targetPattern = this.targetWidget.value;
             

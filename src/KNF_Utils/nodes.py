@@ -719,12 +719,63 @@ class GetVariableNode:
     def IS_CHANGED(cls, **kwargs):
         return float("inf")
 
+
+class LazySwitch:
+    """
+    Lazy Switch Node - Only evaluates the input corresponding to the boolean value.
+    Unlike standard switches, this allows the workflow to run even if only the 
+    relevant input is connected.
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "boolean": ("BOOLEAN", {"default": True}),
+            },
+            "optional": {
+                "on_false": ("*", {"lazy": True}),
+                "on_true": ("*", {"lazy": True}),
+            },
+        }
+    
+    RETURN_TYPES = ("*",)
+    RETURN_NAMES = ("output",)
+    FUNCTION = "switch"
+    CATEGORY = "KNF_Utils/Logic"
+    DESCRIPTION = "Lazily evaluates only the input branch corresponding to the boolean value. If true, only on_true is evaluated. If false, only on_false is evaluated."
+    
+    def check_lazy_status(self, boolean, on_false=None, on_true=None):
+        """
+        This method tells ComfyUI which inputs need to be evaluated.
+        Only the input corresponding to the boolean value will be requested.
+        """
+        if boolean and on_true is None:
+            # Boolean is true but on_true hasn't been evaluated yet
+            return ["on_true"]
+        if not boolean and on_false is None:
+            # Boolean is false but on_false hasn't been evaluated yet
+            return ["on_false"]
+        # If we get here, the required input has been evaluated
+        return []
+    
+    def switch(self, boolean, on_false=None, on_true=None):
+        """
+        Return the value corresponding to the boolean.
+        Only one of on_false or on_true will be evaluated.
+        """
+        if boolean:
+            return (on_true,)
+        else:
+            return (on_false,)
+
 # Register the nodes (NodeBypasser is frontend-only, no Python registration needed)
 NODE_CLASS_MAPPINGS = {
     "KNF_Organizer": KNF_Organizer,
     "GeminiVideoCaptioner": GeminiVideoCaptioner,
     "AutomateVideoPathLoader": AutomateVideoPathLoader,
     "CustomVideoSaver": CustomVideoSaver,
+    "LazySwitch": LazySwitch,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -732,4 +783,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "GeminiVideoCaptioner": "Gemini Video Captioner",
     "AutomateVideoPathLoader": "Automate Video Path Loader",
     "CustomVideoSaver": "Custom Video Saver",
+    "LazySwitch": "Lazy Switch",
 }

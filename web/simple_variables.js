@@ -92,10 +92,52 @@ app.registerExtension({
                     console.log("[SetVariableNode] Updated", getters.length, "getter nodes");
                 };
 
+                // Find all getter nodes that reference this setter
+                this.findGetters = function() {
+                    if (!node.graph) return [];
+                    
+                    const name = this.widgets[0].value;
+                    if (!name || name === '') return [];
+                    
+                    return node.graph._nodes.filter(otherNode => 
+                        otherNode.type === 'GetVariableNode' && 
+                        otherNode.widgets[0].value === name
+                    );
+                };
+
                 // This is a virtual node - frontend handles everything
                 this.isVirtualNode = true;
                 
                 console.log("[SetVariableNode] Created");
+            }
+
+            // Add context menu options for SetVariableNode
+            getExtraMenuOptions(_, options) {
+                // Find all getters that reference this setter
+                const getters = this.findGetters();
+                
+                if (getters && getters.length > 0) {
+                    // Create submenu entries for each getter
+                    let gettersSubmenu = getters.map(getter => ({
+                        content: `${getter.title} (id: ${getter.id})`,
+                        callback: () => {
+                            // Center on the getter node and select it
+                            this.canvas.centerOnNode(getter);
+                            this.canvas.selectNode(getter, false);
+                            this.canvas.setDirty(true, true);
+                        },
+                    }));
+                    
+                    // Add the "Getters" submenu to the context menu
+                    options.unshift({
+                        content: `Getters (${getters.length})`,
+                        has_submenu: true,
+                        submenu: {
+                            title: "GetVariableNodes",
+                            options: gettersSubmenu,
+                        }
+                    });
+                }
             }
         }
 
@@ -200,6 +242,17 @@ app.registerExtension({
                     return null;
                 };
 
+                // Navigate to the setter node
+                this.goToSetter = function() {
+                    const setter = this.findSetter();
+                    if (setter) {
+                        this.canvas.centerOnNode(setter);
+                        this.canvas.selectNode(setter, false);
+                        this.canvas.setDirty(true, true);
+                    } else {
+                        console.warn("[GetVariableNode] No setter found for:", this.widgets[0].value);
+                    }
+                };
 
                 // This is a virtual node - frontend handles everything
                 this.isVirtualNode = true;
@@ -210,6 +263,17 @@ app.registerExtension({
                 };
                 
                 console.log("[GetVariableNode] Created");
+            }
+
+            // Add context menu options for GetVariableNode
+            getExtraMenuOptions(_, options) {
+                // Add "Go to setter" option
+                options.unshift({
+                    content: "Go to setter",
+                    callback: () => {
+                        this.goToSetter();
+                    },
+                });
             }
         }
 

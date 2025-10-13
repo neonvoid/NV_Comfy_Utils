@@ -36,9 +36,15 @@ class NodeBypasser extends LGraphNode {
         this.bypassButton = ComfyWidgets["BOOLEAN"](this, "bypass_nodes", ["BOOLEAN", { default: false }], app).widget;
         this.bypassButton.name = "Bypass Nodes";
         
+        // Add boolean input for bypass trigger
+        this.addInput("bypass_input", "BOOLEAN");
+        
         // Add enable button
         this.enableButton = ComfyWidgets["BOOLEAN"](this, "enable_nodes", ["BOOLEAN", { default: false }], app).widget;
         this.enableButton.name = "Enable Nodes";
+        
+        // Add boolean input for enable trigger
+        this.addInput("enable_input", "BOOLEAN");
         
         // Add a result display widget
         this.resultWidget = ComfyWidgets["STRING"](this, "result", ["STRING", { multiline: true }], app).widget;
@@ -163,6 +169,111 @@ class NodeBypasser extends LGraphNode {
             this.size = [250, 250];
         }
         return this.size;
+    }
+    
+    // Get the effective bypass value (from input or widget)
+    getBypassValue() {
+        // Check if bypass_input is connected (input slot 0)
+        if (this.inputs[0] && this.inputs[0].link != null) {
+            const link = this.graph.links[this.inputs[0].link];
+            if (link) {
+                const originNode = this.graph.getNodeById(link.origin_id);
+                if (originNode) {
+                    // Try to get value from widget (works for primitive nodes and most boolean sources)
+                    if (originNode.widgets && originNode.widgets.length > 0) {
+                        const widget = originNode.widgets.find(w => w.type === "toggle" || w.name === "boolean" || w.name === "value");
+                        if (widget && widget.value !== undefined) {
+                            return widget.value;
+                        }
+                        if (originNode.widgets[0].value !== undefined) {
+                            return originNode.widgets[0].value;
+                        }
+                    }
+                    // Try getOutputData as fallback
+                    if (originNode.outputs && originNode.outputs[link.origin_slot]) {
+                        const value = originNode.getOutputData ? originNode.getOutputData(link.origin_slot) : null;
+                        if (value !== undefined && value !== null) {
+                            return value;
+                        }
+                    }
+                }
+            }
+        }
+        return this.bypassButton.value;
+    }
+    
+    // Get the effective enable value (from input or widget)
+    getEnableValue() {
+        // Check if enable_input is connected (input slot 1)
+        if (this.inputs[1] && this.inputs[1].link != null) {
+            const link = this.graph.links[this.inputs[1].link];
+            if (link) {
+                const originNode = this.graph.getNodeById(link.origin_id);
+                if (originNode) {
+                    // Try to get value from widget (works for primitive nodes and most boolean sources)
+                    if (originNode.widgets && originNode.widgets.length > 0) {
+                        const widget = originNode.widgets.find(w => w.type === "toggle" || w.name === "boolean" || w.name === "value");
+                        if (widget && widget.value !== undefined) {
+                            return widget.value;
+                        }
+                        if (originNode.widgets[0].value !== undefined) {
+                            return originNode.widgets[0].value;
+                        }
+                    }
+                    // Try getOutputData as fallback
+                    if (originNode.outputs && originNode.outputs[link.origin_slot]) {
+                        const value = originNode.getOutputData ? originNode.getOutputData(link.origin_slot) : null;
+                        if (value !== undefined && value !== null) {
+                            return value;
+                        }
+                    }
+                }
+            }
+        }
+        return this.enableButton.value;
+    }
+    
+    // Check inputs on every draw (this works for virtual nodes)
+    onDrawBackground(ctx) {
+        this.checkInputs();
+    }
+    
+    // Check the input values and trigger actions
+    checkInputs() {
+        if (!this.graph) return;
+        
+        const bypassValue = this.getBypassValue();
+        const enableValue = this.getEnableValue();
+        
+        // Update widgets to reflect input values (visual feedback)
+        if (this.inputs[0] && this.inputs[0].link != null) {
+            this.bypassButton.value = bypassValue;
+        }
+        if (this.inputs[1] && this.inputs[1].link != null) {
+            this.enableButton.value = enableValue;
+        }
+        
+        // Check if bypass trigger is true and hasn't been processed yet
+        if (bypassValue === true && this._lastBypassState !== true) {
+            console.log("[NodeBypasser] Bypass activated via input!");
+            this.bypassNodesByName(true);
+        }
+        this._lastBypassState = bypassValue;
+        
+        // Check if enable trigger is true and hasn't been processed yet
+        if (enableValue === true && this._lastEnableState !== true) {
+            console.log("[NodeBypasser] Enable activated via input!");
+            this.bypassNodesByName(false);
+        }
+        this._lastEnableState = enableValue;
+    }
+    
+    // Also check on connection changes
+    onConnectionsChange(type, index, connected, link_info) {
+        // Small delay to ensure data is available
+        setTimeout(() => {
+            this.checkInputs();
+        }, 50);
     }
     
     listAllNodes() {
