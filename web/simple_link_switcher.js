@@ -1,7 +1,7 @@
 import { app } from "../../scripts/app.js";
 import { ComfyWidgets } from "../../scripts/widgets.js";
 
-// Simple Link Switcher - MVP version for switching between two inputs to one target
+// Simple Link Switcher - Switch between arbitrary number of inputs to one target
 class SimpleLinkSwitcher extends LGraphNode {
     constructor(title = "Simple Link Switcher") {
         super(title);
@@ -13,25 +13,25 @@ class SimpleLinkSwitcher extends LGraphNode {
         this.__constructed__ = false;
         this.widgets = this.widgets || [];
         this.properties = this.properties || {};
+        this.inputWidgets = [];
+        this.numInputs = 2; // Default to 2 inputs
         
         console.log("[SimpleLinkSwitcher] Constructor called");
         
         // Initialize size
-        this.size = [300, 200];
+        this.size = [300, 300];
         
-        // Input 1 pattern
-        this.input1Widget = ComfyWidgets["STRING"](this, "input1", ["STRING", { 
-            default: "Input 1 pattern (e.g., LoadImage,PrimitiveInt)",
-            multiline: false
+        // Number of inputs selector
+        this.numInputsWidget = ComfyWidgets["INT"](this, "num_inputs", ["INT", { 
+            default: 2,
+            min: 2,
+            max: 20,
+            step: 1
         }], app).widget;
-        this.input1Widget.name = "Input 1";
+        this.numInputsWidget.name = "Number of Inputs";
         
-        // Input 2 pattern
-        this.input2Widget = ComfyWidgets["STRING"](this, "input2", ["STRING", { 
-            default: "Input 2 pattern (e.g., LoadVideo,PrimitiveFloat)",
-            multiline: false
-        }], app).widget;
-        this.input2Widget.name = "Input 2";
+        // Create initial input widgets
+        this.createInputWidgets(this.numInputs);
         
         // Target pattern
         this.targetWidget = ComfyWidgets["STRING"](this, "target", ["STRING", { 
@@ -40,12 +40,17 @@ class SimpleLinkSwitcher extends LGraphNode {
         }], app).widget;
         this.targetWidget.name = "Target";
         
-        // Switch between inputs
-        this.switchWidget = ComfyWidgets["BOOLEAN"](this, "switch", ["BOOLEAN", { default: false }], app).widget;
-        this.switchWidget.name = "Use Input 2";
+        // Switch between inputs using index
+        this.switchWidget = ComfyWidgets["INT"](this, "switch", ["INT", { 
+            default: 0,
+            min: 0,
+            max: this.numInputs - 1,
+            step: 1
+        }], app).widget;
+        this.switchWidget.name = "Active Input Index";
         
-        // Add boolean input for switch control
-        this.addInput("switch_input", "BOOLEAN");
+        // Add integer input for switch control
+        this.addInput("switch_input", "INT");
         
         // Action button
         this.connectButton = ComfyWidgets["BOOLEAN"](this, "connect", ["BOOLEAN", { default: false }], app).widget;
@@ -65,13 +70,75 @@ class SimpleLinkSwitcher extends LGraphNode {
         this.onConstructed();
     }
     
+    // Create input widgets dynamically
+    createInputWidgets(count) {
+        // Find the position where input widgets should be (after numInputsWidget, before targetWidget)
+        const numInputsWidgetIndex = this.widgets.indexOf(this.numInputsWidget);
+        const insertPosition = numInputsWidgetIndex + 1;
+        
+        // Remove existing input widgets
+        for (let i = this.inputWidgets.length - 1; i >= 0; i--) {
+            const widget = this.inputWidgets[i];
+            const widgetIndex = this.widgets.indexOf(widget);
+            if (widgetIndex !== -1) {
+                this.widgets.splice(widgetIndex, 1);
+            }
+        }
+        this.inputWidgets = [];
+        
+        // Create new input widgets and insert them at the correct position
+        for (let i = 0; i < count; i++) {
+            const widget = ComfyWidgets["STRING"](this, `input${i}`, ["STRING", { 
+                default: `Input ${i} pattern (e.g., LoadImage,PrimitiveInt)`,
+                multiline: false
+            }], app).widget;
+            widget.name = `Input ${i}`;
+            
+            // Remove it from wherever ComfyWidgets added it
+            const autoIndex = this.widgets.indexOf(widget);
+            if (autoIndex !== -1) {
+                this.widgets.splice(autoIndex, 1);
+            }
+            
+            // Insert at the correct position
+            this.widgets.splice(insertPosition + i, 0, widget);
+            this.inputWidgets.push(widget);
+        }
+        
+        this.numInputs = count;
+        
+        // Update switch widget max value
+        if (this.switchWidget) {
+            this.switchWidget.options.max = count - 1;
+            // Clamp current value
+            if (this.switchWidget.value >= count) {
+                this.switchWidget.value = count - 1;
+            }
+        }
+        
+        // Adjust node size
+        this.size[1] = Math.max(300, 150 + count * 35);
+        
+        // Force the node to recompute its size
+        this.setSize(this.computeSize());
+        
+        // Mark the canvas as dirty to trigger a redraw
+        if (this.graph && this.graph.canvas) {
+            this.graph.canvas.setDirty(true, true);
+        }
+    }
+    
     // Save widget values when they change
     serialize() {
         const data = super.serialize();
         if (data) {
+            const inputValues = {};
+            for (let i = 0; i < this.inputWidgets.length; i++) {
+                inputValues[`input${i}`] = this.inputWidgets[i].value;
+            }
             data.widget_values = {
-                input1: this.input1Widget.value,
-                input2: this.input2Widget.value,
+                num_inputs: this.numInputsWidget.value,
+                inputs: inputValues,
                 target: this.targetWidget.value,
                 switch: this.switchWidget.value
             };
@@ -83,12 +150,23 @@ class SimpleLinkSwitcher extends LGraphNode {
     configure(info) {
         super.configure(info);
         if (info.widget_values) {
-            if (info.widget_values.input1 !== undefined) {
-                this.input1Widget.value = info.widget_values.input1;
+            // Restore number of inputs first
+            if (info.widget_values.num_inputs !== undefined) {
+                this.numInputsWidget.value = info.widget_values.num_inputs;
+                this.createInputWidgets(info.widget_values.num_inputs);
             }
-            if (info.widget_values.input2 !== undefined) {
-                this.input2Widget.value = info.widget_values.input2;
+            
+            // Restore input values
+            if (info.widget_values.inputs) {
+                for (let i = 0; i < this.inputWidgets.length; i++) {
+                    const key = `input${i}`;
+                    if (info.widget_values.inputs[key] !== undefined) {
+                        this.inputWidgets[i].value = info.widget_values.inputs[key];
+                    }
+                }
             }
+            
+            // Restore target and switch
             if (info.widget_values.target !== undefined) {
                 this.targetWidget.value = info.widget_values.target;
             }
@@ -103,6 +181,25 @@ class SimpleLinkSwitcher extends LGraphNode {
         this.onWidgetChange = function (widget, value) {
             if (originalOnWidgetChange) {
                 originalOnWidgetChange.apply(this, [widget, value]);
+            }
+            
+            // Handle number of inputs change
+            if (widget === this.numInputsWidget) {
+                const newCount = Math.max(2, Math.min(20, Math.floor(value)));
+                if (newCount !== this.numInputs) {
+                    // Save existing values before recreating widgets
+                    const existingValues = this.inputWidgets.map(w => w.value);
+                    
+                    // Create new widgets
+                    this.createInputWidgets(newCount);
+                    
+                    // Restore values for widgets that still exist
+                    for (let i = 0; i < Math.min(existingValues.length, this.inputWidgets.length); i++) {
+                        this.inputWidgets[i].value = existingValues[i];
+                    }
+                    
+                    console.log("[SimpleLinkSwitcher] Number of inputs changed to:", newCount);
+                }
             }
             
             // Handle switch change
@@ -135,12 +232,15 @@ class SimpleLinkSwitcher extends LGraphNode {
     
     onConstructed() {
         this.__constructed__ = true;
-        this.size = [300, 200];
+        // Don't override size here, let createInputWidgets handle it
+        if (!this.size || this.size.length !== 2) {
+            this.size = [300, Math.max(300, 150 + this.numInputs * 35)];
+        }
     }
     
     computeSize() {
         if (!this.size || this.size.length !== 2) {
-            this.size = [300, 200];
+            this.size = [300, Math.max(300, 150 + this.numInputs * 35)];
         }
         return this.size;
     }
@@ -153,30 +253,30 @@ class SimpleLinkSwitcher extends LGraphNode {
             if (link) {
                 const originNode = this.graph.getNodeById(link.origin_id);
                 if (originNode) {
-                    // Try to get value from widget (works for primitive nodes and most boolean sources)
+                    // Try to get value from widget (works for primitive nodes)
                     if (originNode.widgets && originNode.widgets.length > 0) {
                         // Look for the widget connected to this output
-                        const widget = originNode.widgets.find(w => w.type === "toggle" || w.name === "boolean" || w.name === "value");
+                        const widget = originNode.widgets.find(w => w.type === "number" || w.name === "value");
                         if (widget && widget.value !== undefined) {
-                            return widget.value;
+                            return Math.floor(widget.value);
                         }
                         // Fall back to first widget value
                         if (originNode.widgets[0].value !== undefined) {
-                            return originNode.widgets[0].value;
+                            return Math.floor(originNode.widgets[0].value);
                         }
                     }
                     // Try getOutputData as fallback
                     if (originNode.outputs && originNode.outputs[link.origin_slot]) {
                         const value = originNode.getOutputData ? originNode.getOutputData(link.origin_slot) : null;
                         if (value !== undefined && value !== null) {
-                            return value;
+                            return Math.floor(value);
                         }
                     }
                 }
             }
         }
         // Fall back to widget value
-        return this.switchWidget.value;
+        return Math.floor(this.switchWidget.value);
     }
     
     // Get the effective trigger value (from input or widget)
@@ -244,10 +344,15 @@ class SimpleLinkSwitcher extends LGraphNode {
         }, 50);
     }
     
-    onSwitchChange(useInput2) {
-        const currentInput = useInput2 ? this.input2Widget.value : this.input1Widget.value;
-        const inputCount = currentInput.split(',').length;
-        this.statusWidget.value = `Selected: ${currentInput} (${inputCount} nodes)`;
+    onSwitchChange(inputIndex) {
+        // Clamp the index to valid range
+        inputIndex = Math.max(0, Math.min(this.numInputs - 1, Math.floor(inputIndex)));
+        
+        if (inputIndex < this.inputWidgets.length) {
+            const currentInput = this.inputWidgets[inputIndex].value;
+            const inputCount = currentInput.split(',').length;
+            this.statusWidget.value = `Selected Input ${inputIndex}: ${currentInput} (${inputCount} nodes)`;
+        }
     }
     
     // Find multiple nodes by comma-separated patterns
@@ -314,12 +419,21 @@ class SimpleLinkSwitcher extends LGraphNode {
             
             const nodes = graph._nodes;
             
-            // Get the selected input pattern (using input if connected, otherwise widget)
-            const useInput2 = this.getSwitchValue();
-            const inputPattern = useInput2 ? this.input2Widget.value : this.input1Widget.value;
+            // Get the selected input index (using input if connected, otherwise widget)
+            const inputIndex = this.getSwitchValue();
+            
+            // Clamp to valid range
+            const clampedIndex = Math.max(0, Math.min(this.numInputs - 1, inputIndex));
+            
+            if (clampedIndex >= this.inputWidgets.length) {
+                this.statusWidget.value = `Error: Invalid input index ${inputIndex}`;
+                return;
+            }
+            
+            const inputPattern = this.inputWidgets[clampedIndex].value;
             const targetPattern = this.targetWidget.value;
             
-            console.log("[SimpleLinkSwitcher] Switch state:", useInput2 ? "Input 2" : "Input 1");
+            console.log("[SimpleLinkSwitcher] Selected input index:", clampedIndex);
             console.log("[SimpleLinkSwitcher] Selected input pattern:", inputPattern);
             
             if (!inputPattern || !targetPattern) {
@@ -395,7 +509,7 @@ class SimpleLinkSwitcher extends LGraphNode {
             
             // Update status
             if (successCount > 0) {
-                this.statusWidget.value = `Connected ${successCount} links:\n${connectionResults.join('\n')}`;
+                this.statusWidget.value = `Input ${clampedIndex} connected ${successCount} links:\n${connectionResults.join('\n')}`;
             } else {
                 this.statusWidget.value = `Error: Could not create any connections`;
             }
@@ -545,7 +659,7 @@ class SimpleLinkSwitcher extends LGraphNode {
 SimpleLinkSwitcher.type = "SimpleLinkSwitcher";
 SimpleLinkSwitcher.title = "Simple Link Switcher";
 SimpleLinkSwitcher.category = "KNF_Utils";
-SimpleLinkSwitcher.description = "Switch between two input nodes to one target node";
+SimpleLinkSwitcher.description = "Switch between arbitrary number of input nodes to one target node";
 
 // Make sure the node is searchable
 console.log("[SimpleLinkSwitcher] Node properties set:", {
