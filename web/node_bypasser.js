@@ -20,6 +20,11 @@ class NodeBypasser extends LGraphNode {
         // Initialize size first to prevent the error
         this.size = [250, 250];
         
+        // Add selector ID widget (for mapping to INT input)
+        this.selectorIdWidget = ComfyWidgets["INT"](this, "selector_id", ["INT", { default: 1, min: 1, max: 999, step: 1 }], app).widget;
+        this.selectorIdWidget.name = "Selector ID";
+        console.log("[NodeBypasser] Created selectorIdWidget:", this.selectorIdWidget);
+        
         // Add a button to list all nodes
         this.listNodesButton = ComfyWidgets["BOOLEAN"](this, "list_nodes", ["BOOLEAN", { default: false }], app).widget;
         this.listNodesButton.name = "List All Nodes";
@@ -35,6 +40,9 @@ class NodeBypasser extends LGraphNode {
         // Add bypass button
         this.bypassButton = ComfyWidgets["BOOLEAN"](this, "bypass_nodes", ["BOOLEAN", { default: false }], app).widget;
         this.bypassButton.name = "Bypass Nodes";
+        
+        // Add selector input (connects to INT source)
+        this.addInput("selector", "INT");
         
         // Add boolean input for bypass trigger
         this.addInput("bypass_input", "BOOLEAN");
@@ -139,7 +147,8 @@ class NodeBypasser extends LGraphNode {
         const data = super.serialize();
         if (data) {
             data.widget_values = {
-                node_names: this.nodeNamesInput.value
+                node_names: this.nodeNamesInput.value,
+                selector_id: this.selectorIdWidget.value
             };
         }
         return data;
@@ -151,6 +160,9 @@ class NodeBypasser extends LGraphNode {
         if (info.widget_values) {
             if (info.widget_values.node_names !== undefined) {
                 this.nodeNamesInput.value = info.widget_values.node_names;
+            }
+            if (info.widget_values.selector_id !== undefined) {
+                this.selectorIdWidget.value = info.widget_values.selector_id;
             }
         }
     }
@@ -173,9 +185,9 @@ class NodeBypasser extends LGraphNode {
     
     // Get the effective bypass value (from input or widget)
     getBypassValue() {
-        // Check if bypass_input is connected (input slot 0)
-        if (this.inputs[0] && this.inputs[0].link != null) {
-            const link = this.graph.links[this.inputs[0].link];
+        // Check if bypass_input is connected (input slot 1 - after selector)
+        if (this.inputs[1] && this.inputs[1].link != null) {
+            const link = this.graph.links[this.inputs[1].link];
             if (link) {
                 const originNode = this.graph.getNodeById(link.origin_id);
                 if (originNode) {
@@ -204,9 +216,9 @@ class NodeBypasser extends LGraphNode {
     
     // Get the effective enable value (from input or widget)
     getEnableValue() {
-        // Check if enable_input is connected (input slot 1)
-        if (this.inputs[1] && this.inputs[1].link != null) {
-            const link = this.graph.links[this.inputs[1].link];
+        // Check if enable_input is connected (input slot 2 - after selector and bypass)
+        if (this.inputs[2] && this.inputs[2].link != null) {
+            const link = this.graph.links[this.inputs[2].link];
             if (link) {
                 const originNode = this.graph.getNodeById(link.origin_id);
                 if (originNode) {
@@ -233,6 +245,32 @@ class NodeBypasser extends LGraphNode {
         return this.enableButton.value;
     }
     
+    // Get the selector value (from input or null if not connected)
+    getSelectorValue() {
+        // Find the selector input slot
+        const selectorInputSlot = this.inputs.findIndex(i => i.name === "selector");
+        
+        if (selectorInputSlot >= 0 && this.inputs[selectorInputSlot].link != null) {
+            const link = this.graph.links[this.inputs[selectorInputSlot].link];
+            if (link) {
+                const originNode = this.graph.getNodeById(link.origin_id);
+                if (originNode && originNode.widgets && originNode.widgets.length > 0) {
+                    // Try to find INT/number widget
+                    const widget = originNode.widgets.find(w => 
+                        w.type === "number" || w.name === "value" || w.name === "int"
+                    );
+                    if (widget && widget.value !== undefined) {
+                        return widget.value;
+                    }
+                    // Fallback to first widget
+                    return originNode.widgets[0].value;
+                }
+            }
+        }
+        // No selector connected - return null (allows bypasser to work independently)
+        return null;
+    }
+    
     // Check inputs on every draw (this works for virtual nodes)
     onDrawBackground(ctx) {
         this.checkInputs();
@@ -244,26 +282,50 @@ class NodeBypasser extends LGraphNode {
         
         const bypassValue = this.getBypassValue();
         const enableValue = this.getEnableValue();
+        const selectorValue = this.getSelectorValue();
+        const myId = this.selectorIdWidget.value;
+        
+        // Check if selector matches this bypasser's ID
+        const isSelectorActive = selectorValue !== null && selectorValue === myId;
+        
+        // Update visual indicator based on selector
+        if (isSelectorActive) {
+            this.bgcolor = "#224422"; // Green tint when this bypasser is selected
+        } else if (selectorValue !== null) {
+            this.bgcolor = "#222222"; // Dark gray when selector is active but not matching
+        } else {
+            this.bgcolor = null; // Normal when no selector connected
+        }
         
         // Update widgets to reflect input values (visual feedback)
-        if (this.inputs[0] && this.inputs[0].link != null) {
+        if (this.inputs[1] && this.inputs[1].link != null) {
             this.bypassButton.value = bypassValue;
         }
-        if (this.inputs[1] && this.inputs[1].link != null) {
+        if (this.inputs[2] && this.inputs[2].link != null) {
             this.enableButton.value = enableValue;
         }
         
         // Check if bypass trigger is true and hasn't been processed yet
         if (bypassValue === true && this._lastBypassState !== true) {
-            console.log("[NodeBypasser] Bypass activated via input!");
-            this.bypassNodesByName(true);
+            // Only bypass if selector matches OR no selector connected
+            if (selectorValue === null || isSelectorActive) {
+                console.log(`[NodeBypasser ${myId}] Bypass activated via input!`);
+                this.bypassNodesByName(true);
+            } else {
+                console.log(`[NodeBypasser ${myId}] Bypass ignored - selector mismatch (${selectorValue} != ${myId})`);
+            }
         }
         this._lastBypassState = bypassValue;
         
         // Check if enable trigger is true and hasn't been processed yet
         if (enableValue === true && this._lastEnableState !== true) {
-            console.log("[NodeBypasser] Enable activated via input!");
-            this.bypassNodesByName(false);
+            // Only enable if selector matches OR no selector connected
+            if (selectorValue === null || isSelectorActive) {
+                console.log(`[NodeBypasser ${myId}] Enable activated via input!`);
+                this.bypassNodesByName(false);
+            } else {
+                console.log(`[NodeBypasser ${myId}] Enable ignored - selector mismatch (${selectorValue} != ${myId})`);
+            }
         }
         this._lastEnableState = enableValue;
     }
