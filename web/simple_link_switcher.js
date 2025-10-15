@@ -243,6 +243,22 @@ class SimpleLinkSwitcher extends LGraphNode {
         if (!this.size || this.size.length !== 2) {
             this.size = [300, Math.max(300, 150 + this.numInputs * 35)];
         }
+        
+        // Set up timer to check inputs even when node is off-screen
+        // This ensures inputs are processed regardless of viewport visibility
+        this._inputCheckInterval = setInterval(() => {
+            if (this.graph && !this.removed) {
+                this.checkInputs();
+            }
+        }, 100); // Check every 100ms
+    }
+    
+    onRemoved() {
+        // Clean up interval when node is removed
+        if (this._inputCheckInterval) {
+            clearInterval(this._inputCheckInterval);
+            this._inputCheckInterval = null;
+        }
     }
     
     computeSize() {

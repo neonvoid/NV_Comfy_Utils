@@ -173,6 +173,22 @@ class NodeBypasser extends LGraphNode {
         this.size = [250, 250];
         console.log("[NodeBypasser] Node constructed, widgets:", this.widgets.length);
         console.log("[NodeBypasser] Widget names:", this.widgets.map(w => w.name));
+        
+        // Set up timer to check inputs even when node is off-screen
+        // This ensures inputs are processed regardless of viewport visibility
+        this._inputCheckInterval = setInterval(() => {
+            if (this.graph && !this.removed) {
+                this.checkInputs();
+            }
+        }, 100); // Check every 100ms
+    }
+    
+    onRemoved() {
+        // Clean up interval when node is removed
+        if (this._inputCheckInterval) {
+            clearInterval(this._inputCheckInterval);
+            this._inputCheckInterval = null;
+        }
     }
     
     computeSize() {

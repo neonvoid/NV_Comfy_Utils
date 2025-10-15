@@ -428,6 +428,58 @@ checkInputs() {
 - This allows actions to re-trigger even if action inputs haven't changed
 - Applies to any pattern with multiple control inputs (selector + bypass/enable/trigger)
 
+### **7. Off-Screen Node Input Processing**
+**Problem**: Node doesn't process inputs when scrolled off-screen or in a collapsed workflow area
+
+**Root Cause**: `onDrawBackground()` only runs when the node is actively being drawn/rendered. If the node is:
+- Scrolled outside the visible viewport
+- In a collapsed group
+- On a hidden layer
+Then `onDrawBackground()` won't be called, so `checkInputs()` never runs! ❌
+
+**Solution**: Add a timer-based check that runs regardless of visibility:
+
+```javascript
+onConstructed() {
+    this.__constructed__ = true;
+    this.size = [250, 250];
+    
+    // CRITICAL: Set up timer to check inputs even when node is off-screen
+    // This ensures inputs are processed regardless of viewport visibility
+    this._inputCheckInterval = setInterval(() => {
+        if (this.graph && !this.removed) {
+            this.checkInputs();
+        }
+    }, 100); // Check every 100ms
+}
+
+onRemoved() {
+    // IMPORTANT: Clean up interval when node is removed to prevent memory leaks
+    if (this._inputCheckInterval) {
+        clearInterval(this._inputCheckInterval);
+        this._inputCheckInterval = null;
+    }
+}
+
+// Keep onDrawBackground as well for efficiency when node IS visible
+onDrawBackground(ctx) {
+    this.checkInputs();
+}
+```
+
+**Benefits**:
+- Node processes inputs even when off-screen
+- Works in collapsed groups, hidden layers, etc.
+- Timer (100ms) is frequent enough for responsiveness
+- Combined with `onDrawBackground` for efficiency when visible
+- Proper cleanup prevents memory leaks
+
+**Performance Considerations**:
+- 100ms interval = 10 checks per second (very lightweight)
+- Only runs when `this.graph` exists and node isn't removed
+- More reliable than viewport-dependent methods
+- Worth the tiny performance cost for guaranteed input processing
+
 ## 🔍 **Debugging Techniques**
 
 ### **Console Logging**
