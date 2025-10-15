@@ -185,9 +185,11 @@ class NodeBypasser extends LGraphNode {
     
     // Get the effective bypass value (from input or widget)
     getBypassValue() {
-        // Check if bypass_input is connected (input slot 1 - after selector)
-        if (this.inputs[1] && this.inputs[1].link != null) {
-            const link = this.graph.links[this.inputs[1].link];
+        // Find the bypass_input slot by name
+        const bypassInputSlot = this.inputs.findIndex(i => i.name === "bypass_input");
+        
+        if (bypassInputSlot >= 0 && this.inputs[bypassInputSlot].link != null) {
+            const link = this.graph.links[this.inputs[bypassInputSlot].link];
             if (link) {
                 const originNode = this.graph.getNodeById(link.origin_id);
                 if (originNode) {
@@ -216,9 +218,11 @@ class NodeBypasser extends LGraphNode {
     
     // Get the effective enable value (from input or widget)
     getEnableValue() {
-        // Check if enable_input is connected (input slot 2 - after selector and bypass)
-        if (this.inputs[2] && this.inputs[2].link != null) {
-            const link = this.graph.links[this.inputs[2].link];
+        // Find the enable_input slot by name
+        const enableInputSlot = this.inputs.findIndex(i => i.name === "enable_input");
+        
+        if (enableInputSlot >= 0 && this.inputs[enableInputSlot].link != null) {
+            const link = this.graph.links[this.inputs[enableInputSlot].link];
             if (link) {
                 const originNode = this.graph.getNodeById(link.origin_id);
                 if (originNode) {
