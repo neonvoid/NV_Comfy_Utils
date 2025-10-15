@@ -21,7 +21,7 @@ class NodeBypasser extends LGraphNode {
         this.size = [250, 250];
         
         // Add selector ID widget (for mapping to INT input)
-        this.selectorIdWidget = ComfyWidgets["INT"](this, "selector_id", ["INT", { default: 1, min: 1, max: 999, step: 1 }], app).widget;
+        this.selectorIdWidget = ComfyWidgets["INT"](this, "selector_id", ["INT", { default: 0, min: 0, max: 999, step: 1 }], app).widget;
         this.selectorIdWidget.name = "Selector ID";
         console.log("[NodeBypasser] Created selectorIdWidget:", this.selectorIdWidget);
         
