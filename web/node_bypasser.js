@@ -292,6 +292,15 @@ class NodeBypasser extends LGraphNode {
         // Check if selector matches this bypasser's ID
         const isSelectorActive = selectorValue !== null && selectorValue === myId;
         
+        // Detect if selector has changed - reset state tracking when it does
+        if (selectorValue !== this._lastSelectorValue) {
+            console.log(`[NodeBypasser ${myId}] Selector changed from ${this._lastSelectorValue} to ${selectorValue}`);
+            // Reset state tracking so bypass/enable can trigger again
+            this._lastBypassState = undefined;
+            this._lastEnableState = undefined;
+            this._lastSelectorValue = selectorValue;
+        }
+        
         // Update visual indicator based on selector
         if (isSelectorActive) {
             this.bgcolor = "#224422"; // Green tint when this bypasser is selected
@@ -315,11 +324,14 @@ class NodeBypasser extends LGraphNode {
             if (selectorValue === null || isSelectorActive) {
                 console.log(`[NodeBypasser ${myId}] Bypass activated via input!`);
                 this.bypassNodesByName(true);
+                this._lastBypassState = true;
             } else {
                 console.log(`[NodeBypasser ${myId}] Bypass ignored - selector mismatch (${selectorValue} != ${myId})`);
+                this._lastBypassState = bypassValue; // Still track it to avoid spam
             }
+        } else if (bypassValue === false || bypassValue === null) {
+            this._lastBypassState = bypassValue;
         }
-        this._lastBypassState = bypassValue;
         
         // Check if enable trigger is true and hasn't been processed yet
         if (enableValue === true && this._lastEnableState !== true) {
@@ -327,11 +339,14 @@ class NodeBypasser extends LGraphNode {
             if (selectorValue === null || isSelectorActive) {
                 console.log(`[NodeBypasser ${myId}] Enable activated via input!`);
                 this.bypassNodesByName(false);
+                this._lastEnableState = true;
             } else {
                 console.log(`[NodeBypasser ${myId}] Enable ignored - selector mismatch (${selectorValue} != ${myId})`);
+                this._lastEnableState = enableValue; // Still track it to avoid spam
             }
+        } else if (enableValue === false || enableValue === null) {
+            this._lastEnableState = enableValue;
         }
-        this._lastEnableState = enableValue;
     }
     
     // Also check on connection changes

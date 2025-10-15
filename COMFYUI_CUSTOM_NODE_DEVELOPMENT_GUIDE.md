@@ -209,6 +209,57 @@ node.pos         // Position [x, y]
 node.size        // Size [width, height]
 ```
 
+### **Reading Input Values from Connected Nodes**
+
+When your node has input slots that receive values from other nodes (like primitive boolean or integer nodes), you need to read their values properly:
+
+```javascript
+// CORRECT: Find input by name (robust, cross-machine compatible)
+getInputValue(inputName) {
+    const inputSlot = this.inputs.findIndex(i => i.name === inputName);
+    
+    if (inputSlot >= 0 && this.inputs[inputSlot].link != null) {
+        const link = this.graph.links[this.inputs[inputSlot].link];
+        if (link) {
+            const originNode = this.graph.getNodeById(link.origin_id);
+            if (originNode && originNode.widgets && originNode.widgets.length > 0) {
+                // Try to find the specific widget type
+                const widget = originNode.widgets.find(w => 
+                    w.type === "toggle" || w.type === "number" || 
+                    w.name === "boolean" || w.name === "value" || w.name === "int"
+                );
+                if (widget && widget.value !== undefined) {
+                    return widget.value;
+                }
+                // Fallback to first widget
+                if (originNode.widgets[0].value !== undefined) {
+                    return originNode.widgets[0].value;
+                }
+            }
+        }
+    }
+    return null; // No connection or no value
+}
+
+// Usage example:
+const selectorValue = this.getInputValue("selector");
+const bypassValue = this.getInputValue("bypass_input");
+const enableValue = this.getInputValue("enable_input");
+```
+
+**⚠️ WRONG: Using hardcoded slot indices**
+```javascript
+// DON'T DO THIS - fragile, breaks across machines/versions
+if (this.inputs[0].link != null) { /* ... */ }  // ❌ Hardcoded index
+if (this.inputs[1].link != null) { /* ... */ }  // ❌ Hardcoded index
+```
+
+**Why `findIndex` by name is critical:**
+- Input order can vary across different ComfyUI versions
+- Workflow serialization may reorder inputs
+- Adding/removing inputs changes indices
+- Cross-machine compatibility requires name-based lookup
+
 ### **Node Modes**
 ```javascript
 const MODE_ALWAYS = 0;    // Node executes normally
@@ -328,6 +379,55 @@ import "./custom_node.js";
 **Problem**: onClick handlers not working
 **Solution**: Use setTimeout to ensure widgets are fully initialized
 
+### **6. State Tracking Issues with Selector/Switch Inputs**
+**Problem**: After changing selector/switch input, need to press bypass/enable multiple times for it to take effect
+
+**Root Cause**: State tracking variables (`_lastBypassState`, `_lastTriggerState`) persist across selector changes. When you:
+1. Set `bypass_input = true` with selector `1` → NodeBypasser #1 activates, sets `_lastBypassState = true`
+2. Change selector to `2` → `bypass_input` is still `true` (hasn't changed)
+3. NodeBypasser #2 checks: `bypassValue === true && this._lastBypassState !== true` → **FALSE** (already true)
+4. Action doesn't trigger! ❌
+
+**Solution**: Track selector/switch changes and reset state when they change:
+
+```javascript
+checkInputs() {
+    const bypassValue = this.getBypassValue();
+    const selectorValue = this.getSelectorValue();
+    const myId = this.selectorIdWidget.value;
+    
+    // CRITICAL: Detect selector changes and reset state tracking
+    if (selectorValue !== this._lastSelectorValue) {
+        console.log(`[Node ${myId}] Selector changed from ${this._lastSelectorValue} to ${selectorValue}`);
+        // Reset state tracking so bypass/enable can trigger again
+        this._lastBypassState = undefined;
+        this._lastEnableState = undefined;
+        this._lastSelectorValue = selectorValue;
+    }
+    
+    const isSelectorActive = selectorValue !== null && selectorValue === myId;
+    
+    // Now check if action should trigger
+    if (bypassValue === true && this._lastBypassState !== true) {
+        if (selectorValue === null || isSelectorActive) {
+            console.log(`[Node ${myId}] Bypass activated!`);
+            this.performBypass();
+            this._lastBypassState = true;
+        } else {
+            this._lastBypassState = bypassValue; // Track to avoid spam
+        }
+    } else if (bypassValue === false || bypassValue === null) {
+        this._lastBypassState = bypassValue;
+    }
+}
+```
+
+**Key Points**:
+- Always track the control input (selector/switch) separately
+- Reset dependent state variables when control input changes
+- This allows actions to re-trigger even if action inputs haven't changed
+- Applies to any pattern with multiple control inputs (selector + bypass/enable/trigger)
+
 ## 🔍 **Debugging Techniques**
 
 ### **Console Logging**
@@ -403,6 +503,64 @@ this.onWidgetChange = function (widget, value) {
     }
 };
 ```
+
+### **Selector Pattern for Multiple Nodes**
+
+When you have multiple instances of the same node type and want to control which one is active via a single integer input:
+
+```javascript
+constructor() {
+    super();
+    // Add a selector ID widget (unique identifier for this instance)
+    this.selectorIdWidget = ComfyWidgets["INT"](this, "selector_id", 
+        ["INT", { default: 0, min: 0, max: 999, step: 1 }], app).widget;
+    this.selectorIdWidget.name = "Selector ID";
+    
+    // Add selector input to receive the active ID
+    this.addInput("selector", "INT");
+    
+    // Add your action inputs
+    this.addInput("bypass_input", "BOOLEAN");
+    this.addInput("enable_input", "BOOLEAN");
+}
+
+checkInputs() {
+    // Get the current selector value (which ID is active)
+    const selectorValue = this.getInputValue("selector"); // Use name-based lookup!
+    const myId = this.selectorIdWidget.value;
+    
+    // Check if this node is the active one
+    const isSelectorActive = selectorValue !== null && selectorValue === myId;
+    
+    // Visual feedback
+    if (isSelectorActive) {
+        this.bgcolor = "#224422"; // Green tint for active
+    } else if (selectorValue !== null) {
+        this.bgcolor = "#222222"; // Dark gray for inactive
+    } else {
+        this.bgcolor = null; // Normal when no selector connected
+    }
+    
+    // Only process actions if this node is active OR no selector is connected
+    const bypassValue = this.getInputValue("bypass_input");
+    if (bypassValue === true) {
+        if (selectorValue === null || isSelectorActive) {
+            console.log(`[Node ${myId}] Bypass activated!`);
+            this.performBypass();
+        } else {
+            console.log(`[Node ${myId}] Bypass ignored - selector mismatch`);
+        }
+    }
+}
+```
+
+**Use case**: Have 6 `NodeBypasser` instances with IDs 0-5. Connect a single INT primitive to all their `selector` inputs. Change the INT value to activate different bypassers.
+
+**Benefits**:
+- Clean workflow switching without complex routing
+- Single control point for multiple configurations
+- Visual feedback shows which node is active
+- Graceful degradation when selector is disconnected
 
 ### **Error Handling and User Feedback**
 ```javascript

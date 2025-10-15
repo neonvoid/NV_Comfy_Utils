@@ -339,6 +339,14 @@ class SimpleLinkSwitcher extends LGraphNode {
         const triggerValue = this.getTriggerValue();
         const switchValue = this.getSwitchValue();
         
+        // Detect if switch value has changed - reset trigger state when it does
+        if (switchValue !== this._lastSwitchValue) {
+            console.log(`[SimpleLinkSwitcher] Switch changed from ${this._lastSwitchValue} to ${switchValue}`);
+            // Reset trigger state so connection can trigger again
+            this._lastTriggerState = undefined;
+            this._lastSwitchValue = switchValue;
+        }
+        
         // Update widget to reflect input value (visual feedback)
         if (this.inputs[0] && this.inputs[0].link != null) {
             this.switchWidget.value = switchValue;
@@ -348,8 +356,10 @@ class SimpleLinkSwitcher extends LGraphNode {
         if (triggerValue === true && this._lastTriggerState !== true) {
             console.log("[SimpleLinkSwitcher] Trigger activated via input!");
             this.connectNodes();
+            this._lastTriggerState = true;
+        } else if (triggerValue === false || triggerValue === null) {
+            this._lastTriggerState = triggerValue;
         }
-        this._lastTriggerState = triggerValue;
     }
     
     // Also check on connection changes
