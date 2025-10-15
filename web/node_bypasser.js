@@ -322,6 +322,20 @@ class NodeBypasser extends LGraphNode {
                 }
                 
                 nodeDetails.push(`Node ${nodeId}: ${nodeType} - ${nodeTitle} (${modeText})`);
+                
+                // If this is a subgraph, list internal nodes too
+                if (node.subgraph && node.subgraph._nodes) {
+                    for (const internalNode of node.subgraph._nodes) {
+                        const internalMode = internalNode.mode || 0;
+                        let internalModeText = "Active";
+                        if (internalMode === MODE_BYPASS) {
+                            internalModeText = "Bypassed";
+                        } else if (internalMode === 2) {
+                            internalModeText = "Muted";
+                        }
+                        nodeDetails.push(`  └─ Internal ${internalNode.id}: ${internalNode.type} - ${internalNode.title} (${internalModeText})`);
+                    }
+                }
             }
             
             console.log("[NodeBypasser] Node details:", nodeDetails);
@@ -400,6 +414,16 @@ class NodeBypasser extends LGraphNode {
                         targetNode.mode = newMode;
                         processedCount++;
                         results.push(`Node ${targetNode.id}: ${targetNode.type}`);
+                        
+                        // If this is a collapsed subgraph, also bypass all internal nodes
+                        if (targetNode.subgraph && targetNode.subgraph._nodes) {
+                            console.log(`[NodeBypasser] Subgraph detected in node ${targetNode.id}, bypassing internal nodes`);
+                            for (const internalNode of targetNode.subgraph._nodes) {
+                                internalNode.mode = newMode;
+                                processedCount++;
+                                results.push(`  └─ Internal: ${internalNode.id} (${internalNode.type})`);
+                            }
+                        }
                     }
                 } catch (error) {
                     console.error(`[NodeBypasser] Error processing pattern "${nodeName}":`, error);

@@ -52,6 +52,9 @@ class SimpleLinkSwitcher extends LGraphNode {
         // Add integer input for switch control
         this.addInput("switch_input", "INT");
         
+        // Add integer output for current active index
+        this.addOutput("active_index", "INT");
+        
         // Action button
         this.connectButton = ComfyWidgets["BOOLEAN"](this, "connect", ["BOOLEAN", { default: false }], app).widget;
         this.connectButton.name = "Connect";
@@ -113,6 +116,10 @@ class SimpleLinkSwitcher extends LGraphNode {
             // Clamp current value
             if (this.switchWidget.value >= count) {
                 this.switchWidget.value = count - 1;
+                // Update output with clamped value
+                if (this.outputs && this.outputs[0]) {
+                    this.setOutputData(0, this.switchWidget.value);
+                }
             }
         }
         
@@ -279,6 +286,15 @@ class SimpleLinkSwitcher extends LGraphNode {
         return Math.floor(this.switchWidget.value);
     }
     
+    // Provide output data for other nodes
+    getOutputData(slot) {
+        if (slot === 0) {
+            // Output the current active index
+            return this.getSwitchValue();
+        }
+        return null;
+    }
+    
     // Get the effective trigger value (from input or widget)
     getTriggerValue() {
         // Check if trigger_input is connected (input slot 1)
@@ -352,6 +368,16 @@ class SimpleLinkSwitcher extends LGraphNode {
             const currentInput = this.inputWidgets[inputIndex].value;
             const inputCount = currentInput.split(',').length;
             this.statusWidget.value = `Selected Input ${inputIndex}: ${currentInput} (${inputCount} nodes)`;
+        }
+        
+        // Update output for connected nodes
+        if (this.outputs && this.outputs[0]) {
+            this.setOutputData(0, inputIndex);
+        }
+        
+        // Trigger update for connected nodes
+        if (this.graph) {
+            this.graph.setDirtyCanvas(true, false);
         }
     }
     
