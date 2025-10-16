@@ -5,6 +5,7 @@ import { ComfyWidgets } from "../../scripts/widgets.js";
 class MomentaryButton extends LGraphNode {
     constructor(title = "Momentary Button") {
         super(title);
+        this.type = "NV/MomentaryButton";  // Explicitly set type for proper serialization
         this.comfyClass = "MomentaryButton";
         this.isVirtualNode = true;
         this.removed = false;
@@ -76,10 +77,25 @@ class MomentaryButton extends LGraphNode {
         this.color = "#2a363b";
         this.bgcolor = "#3e4a50";
         
-        // Mark as constructed
-        this.__constructed__ = true;
-        
         console.log("[MomentaryButton] Node created");
+        
+        // Call onConstructed after a brief delay to ensure full initialization
+        setTimeout(() => {
+            this.onConstructed();
+        }, 10);
+    }
+    
+    onConstructed() {
+        this.__constructed__ = true;
+        console.log("[MomentaryButton] Node fully constructed");
+    }
+    
+    computeSize() {
+        // Ensure size is always properly set
+        if (!this.size || this.size.length !== 2) {
+            this.size = [200, 130];
+        }
+        return this.size;
     }
     
     // Handle mode change
@@ -205,24 +221,31 @@ class MomentaryButton extends LGraphNode {
     serialize() {
         const data = super.serialize();
         if (data) {
-            data.trigger_value = this._triggerValue;
-            data.mode = this.modeWidget.value;
-            data.pulse_duration = this.pulseDurationWidget.value;
+            data.widget_values = {
+                trigger_value: this._triggerValue,
+                mode: this.modeWidget.value,
+                pulse_duration: this.pulseDurationWidget.value
+            };
         }
         return data;
     }
     
     // Restore state
     configure(data) {
-        if (data.trigger_value !== undefined) {
-            this._triggerValue = data.trigger_value;
+        super.configure(data);  // Critical for copy-paste to work!
+        
+        // Handle both old format (direct properties) and new format (widget_values)
+        const values = data.widget_values || data;
+        
+        if (values.trigger_value !== undefined) {
+            this._triggerValue = values.trigger_value;
         }
-        if (data.mode !== undefined) {
-            this.modeWidget.value = data.mode;
-            this.onModeChange(data.mode);
+        if (values.mode !== undefined) {
+            this.modeWidget.value = values.mode;
+            this.onModeChange(values.mode);
         }
-        if (data.pulse_duration !== undefined) {
-            this.pulseDurationWidget.value = data.pulse_duration;
+        if (values.pulse_duration !== undefined) {
+            this.pulseDurationWidget.value = values.pulse_duration;
         }
         
         // Update display based on current mode
@@ -233,8 +256,6 @@ class MomentaryButton extends LGraphNode {
         } else {
             this.displayWidget.value = this._triggerValue;
         }
-        
-        console.log("[MomentaryButton] Restored state:", data);
     }
 }
 
