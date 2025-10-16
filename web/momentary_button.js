@@ -203,12 +203,12 @@ class MomentaryButton extends LGraphNode {
     
     // Save state
     serialize() {
-        const data = {
-            trigger_value: this._triggerValue,
-            mode: this.modeWidget.value,
-            pulse_duration: this.pulseDurationWidget.value
-        };
-        console.log("[MomentaryButton] Serializing:", data);
+        const data = super.serialize();
+        if (data) {
+            data.trigger_value = this._triggerValue;
+            data.mode = this.modeWidget.value;
+            data.pulse_duration = this.pulseDurationWidget.value;
+        }
         return data;
     }
     
