@@ -834,6 +834,107 @@ subgraphNodes.forEach(sg => {
 4. **Use tree structure** (└─) when displaying nested nodes
 5. **Handle both cases** - nodes with and without subgraphs
 
+---
+
+## 🔘 **Momentary Button Pattern**
+
+Momentary buttons are useful for triggering workflow execution or incrementing counters. Unlike toggle switches, they:
+- **Trigger once** per press
+- **Output an incrementing value** to force workflow re-execution
+- **Provide visual feedback** during the press
+
+### **Implementation Example**
+
+```javascript
+function MomentaryButtonNode() {
+    this.addOutput("trigger", "INT");
+    
+    // Internal counter
+    this._triggerValue = 0;
+    
+    // Create button
+    this.pressButton = this.addWidget("button", "press_button", null, () => {
+        this.onButtonPress();
+    });
+    this.pressButton.label = "TRIGGER";
+    
+    // Display widget (read-only)
+    this.displayWidget = ComfyWidgets["INT"](this, "current_value", 
+        ["INT", { default: 0, min: 0, max: 999999, step: 1 }], app).widget;
+    this.displayWidget.callback = () => {
+        // Prevent manual changes
+        this.displayWidget.value = this._triggerValue;
+    };
+    
+    this.isVirtualNode = true;
+}
+
+MomentaryButtonNode.prototype.onButtonPress = function() {
+    // Increment trigger value
+    this._triggerValue = (this._triggerValue + 1) % 1000000;
+    this.displayWidget.value = this._triggerValue;
+    
+    // Visual feedback - flash the button
+    const originalBgColor = this.bgcolor;
+    this.bgcolor = "#5a7a9f";
+    this.setDirtyCanvas(true, true);
+    
+    setTimeout(() => {
+        this.bgcolor = originalBgColor;
+        this.setDirtyCanvas(true, true);
+    }, 150);
+    
+    // Mark graph as changed
+    if (this.graph) {
+        this.graph.change();
+    }
+};
+
+// Provide output value
+MomentaryButtonNode.prototype.onDrawBackground = function(ctx) {
+    if (this.outputs && this.outputs[0]) {
+        this.setOutputData(0, this._triggerValue);
+    }
+};
+
+// Save/restore state
+MomentaryButtonNode.prototype.serialize = function() {
+    return { trigger_value: this._triggerValue };
+};
+
+MomentaryButtonNode.prototype.configure = function(data) {
+    if (data.trigger_value !== undefined) {
+        this._triggerValue = data.trigger_value;
+        this.displayWidget.value = this._triggerValue;
+    }
+};
+```
+
+### **Key Features**
+
+1. **Incrementing Output**: Each press increments the output value, which can trigger downstream nodes
+2. **Visual Feedback**: Button flashes when pressed (150ms duration)
+3. **Read-Only Display**: Shows current value but prevents manual editing
+4. **State Persistence**: Saves trigger value when workflow is saved
+5. **Graph Change Notification**: Calls `graph.change()` to trigger workflow updates
+
+### **Common Use Cases**
+
+- **Force Workflow Re-execution**: Connect to a node to force it to re-run
+- **Increment Counters**: Use in loops or batch processing
+- **Manual Triggers**: User-initiated actions in automated workflows
+- **Debug Checkpoints**: Pause workflow and trigger specific steps manually
+
+### **Best Practices**
+
+1. **Wrap counter values** using modulo to prevent overflow
+2. **Provide visual feedback** so users know the button was pressed
+3. **Use short flash duration** (100-200ms) for responsive feel
+4. **Mark display widgets as read-only** to prevent confusion
+5. **Always call `graph.change()`** to ensure workflow updates
+
+---
+
 ## 🎓 **Key Takeaways for LLM Agents**
 
 ### **1. Choose the Right Architecture**

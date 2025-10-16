@@ -180,7 +180,7 @@ class NodeBypasser extends LGraphNode {
             if (this.graph && !this.removed) {
                 this.checkInputs();
             }
-        }, 100); // Check every 100ms
+        }, 50); // Check every 50ms for responsive input detection
     }
     
     onRemoved() {
@@ -213,6 +213,11 @@ class NodeBypasser extends LGraphNode {
                     if (originNode.widgets && originNode.widgets.length > 0) {
                         const widget = originNode.widgets.find(w => w.type === "toggle" || w.name === "boolean" || w.name === "value");
                         if (widget && widget.value !== undefined) {
+                            // Debug logging for momentary button
+                            if (this._lastDebugBypassValue !== widget.value) {
+                                console.log(`[NodeBypasser] Reading bypass from widget "${widget.name}": ${widget.value} (node: ${originNode.type})`);
+                                this._lastDebugBypassValue = widget.value;
+                            }
                             return widget.value;
                         }
                         if (originNode.widgets[0].value !== undefined) {
@@ -223,6 +228,10 @@ class NodeBypasser extends LGraphNode {
                     if (originNode.outputs && originNode.outputs[link.origin_slot]) {
                         const value = originNode.getOutputData ? originNode.getOutputData(link.origin_slot) : null;
                         if (value !== undefined && value !== null) {
+                            if (this._lastDebugBypassValue !== value) {
+                                console.log(`[NodeBypasser] Reading bypass from getOutputData: ${value} (node: ${originNode.type})`);
+                                this._lastDebugBypassValue = value;
+                            }
                             return value;
                         }
                     }
@@ -291,10 +300,9 @@ class NodeBypasser extends LGraphNode {
         return null;
     }
     
-    // Check inputs on every draw (this works for virtual nodes)
-    onDrawBackground(ctx) {
-        this.checkInputs();
-    }
+    // Note: We use setInterval in onConstructed() to check inputs every 100ms
+    // This is more efficient than checking every frame in onDrawBackground
+    // and also works when the node is off-screen
     
     // Check the input values and trigger actions
     checkInputs() {
@@ -310,7 +318,6 @@ class NodeBypasser extends LGraphNode {
         
         // Detect if selector has changed - reset state tracking when it does
         if (selectorValue !== this._lastSelectorValue) {
-            console.log(`[NodeBypasser ${myId}] Selector changed from ${this._lastSelectorValue} to ${selectorValue}`);
             // Reset state tracking so bypass/enable can trigger again
             this._lastBypassState = undefined;
             this._lastEnableState = undefined;
@@ -326,52 +333,43 @@ class NodeBypasser extends LGraphNode {
             this.bgcolor = null; // Normal when no selector connected
         }
         
-        // Update widgets to reflect input values (visual feedback)
-        if (this.inputs[1] && this.inputs[1].link != null) {
-            this.bypassButton.value = bypassValue;
-        }
-        if (this.inputs[2] && this.inputs[2].link != null) {
-            this.enableButton.value = enableValue;
-        }
+        // DON'T update widget values when connected - this fights with manual changes
+        // The widgets are just for manual control when no inputs are connected
         
-        // Check if bypass trigger is true and hasn't been processed yet
+        // Check if bypass input triggered (only respond to TRUE pulses)
         if (bypassValue === true && this._lastBypassState !== true) {
             // Only bypass if selector matches OR no selector connected
             if (selectorValue === null || isSelectorActive) {
-                console.log(`[NodeBypasser ${myId}] Bypass activated via input!`);
+                console.log(`[NodeBypasser ${myId}] Bypass triggered!`);
                 this.bypassNodesByName(true);
-                this._lastBypassState = true;
             } else {
-                console.log(`[NodeBypasser ${myId}] Bypass ignored - selector mismatch (${selectorValue} != ${myId})`);
-                this._lastBypassState = bypassValue; // Still track it to avoid spam
+                console.log(`[NodeBypasser ${myId}] Bypass blocked by selector (selector=${selectorValue}, myId=${myId})`);
             }
-        } else if (bypassValue === false || bypassValue === null) {
+            this._lastBypassState = true;
+        } else if (bypassValue !== true && this._lastBypassState === true) {
+            // Reset state when value drops, but don't take action
+            console.log(`[NodeBypasser ${myId}] Bypass pulse ended (value=${bypassValue})`);
             this._lastBypassState = bypassValue;
+        } else if (bypassValue === true) {
+            // Value is true but state is already true - duplicate
+            // console.log(`[NodeBypasser ${myId}] Bypass already triggered, ignoring`);
         }
         
-        // Check if enable trigger is true and hasn't been processed yet
+        // Check if enable input triggered (only respond to TRUE pulses)
         if (enableValue === true && this._lastEnableState !== true) {
             // Only enable if selector matches OR no selector connected
             if (selectorValue === null || isSelectorActive) {
-                console.log(`[NodeBypasser ${myId}] Enable activated via input!`);
+                console.log(`[NodeBypasser ${myId}] Enable triggered!`);
                 this.bypassNodesByName(false);
-                this._lastEnableState = true;
-            } else {
-                console.log(`[NodeBypasser ${myId}] Enable ignored - selector mismatch (${selectorValue} != ${myId})`);
-                this._lastEnableState = enableValue; // Still track it to avoid spam
             }
-        } else if (enableValue === false || enableValue === null) {
+            this._lastEnableState = true;
+        } else if (enableValue !== true && this._lastEnableState === true) {
+            // Reset state when value drops, but don't take action
             this._lastEnableState = enableValue;
         }
     }
     
-    // Also check on connection changes
-    onConnectionsChange(type, index, connected, link_info) {
-        // Small delay to ensure data is available
-        setTimeout(() => {
-            this.checkInputs();
-        }, 50);
-    }
+    // onConnectionsChange removed - the setInterval handles input checking automatically
     
     listAllNodes() {
         try {
@@ -631,4 +629,5 @@ app.registerExtension({
         }
     },
 });
+console.log("[NodeBypasser] Extension registered");
 console.log("[NodeBypasser] Extension registered");
