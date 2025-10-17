@@ -54,6 +54,9 @@ class NodeBypasser extends LGraphNode {
         // Add boolean input for enable trigger
         this.addInput("enable_input", "BOOLEAN");
         
+        // Add override boolean input (acts as disable switch)
+        this.addInput("override_input", "BOOLEAN");
+        
         // Add a result display widget
         this.resultWidget = ComfyWidgets["STRING"](this, "result", ["STRING", { multiline: true }], app).widget;
         this.resultWidget.name = "Status";
@@ -208,12 +211,27 @@ class NodeBypasser extends LGraphNode {
             const link = this.graph.links[this.inputs[bypassInputSlot].link];
             if (link) {
                 const originNode = this.graph.getNodeById(link.origin_id);
+                if (!this._connectionLogged) {
+                    console.log(`[NodeBypasser] Connected to bypass_input: ${originNode ? originNode.type : 'null'}`);
+                    this._connectionLogged = true;
+                }
                 if (originNode) {
-                    // Try to get value from widget (works for primitive nodes and most boolean sources)
+                    // Try getOutputData FIRST for momentary button compatibility
+                    if (originNode.getOutputData && originNode.outputs && originNode.outputs[link.origin_slot]) {
+                        const value = originNode.getOutputData(link.origin_slot);
+                        if (value !== undefined) {
+                            if (this._lastDebugBypassValue !== value) {
+                                console.log(`[NodeBypasser] Reading bypass from getOutputData: ${value} (node: ${originNode.type})`);
+                                this._lastDebugBypassValue = value;
+                            }
+                            return value;
+                        }
+                    }
+                    // Try to get value from widget as fallback (works for primitive nodes)
                     if (originNode.widgets && originNode.widgets.length > 0) {
                         const widget = originNode.widgets.find(w => w.type === "toggle" || w.name === "boolean" || w.name === "value");
                         if (widget && widget.value !== undefined) {
-                            // Debug logging for momentary button
+                            // Debug logging for widget reading
                             if (this._lastDebugBypassValue !== widget.value) {
                                 console.log(`[NodeBypasser] Reading bypass from widget "${widget.name}": ${widget.value} (node: ${originNode.type})`);
                                 this._lastDebugBypassValue = widget.value;
@@ -222,17 +240,6 @@ class NodeBypasser extends LGraphNode {
                         }
                         if (originNode.widgets[0].value !== undefined) {
                             return originNode.widgets[0].value;
-                        }
-                    }
-                    // Try getOutputData as fallback
-                    if (originNode.outputs && originNode.outputs[link.origin_slot]) {
-                        const value = originNode.getOutputData ? originNode.getOutputData(link.origin_slot) : null;
-                        if (value !== undefined && value !== null) {
-                            if (this._lastDebugBypassValue !== value) {
-                                console.log(`[NodeBypasser] Reading bypass from getOutputData: ${value} (node: ${originNode.type})`);
-                                this._lastDebugBypassValue = value;
-                            }
-                            return value;
                         }
                     }
                 }
@@ -251,7 +258,14 @@ class NodeBypasser extends LGraphNode {
             if (link) {
                 const originNode = this.graph.getNodeById(link.origin_id);
                 if (originNode) {
-                    // Try to get value from widget (works for primitive nodes and most boolean sources)
+                    // Try getOutputData FIRST for momentary button compatibility
+                    if (originNode.getOutputData && originNode.outputs && originNode.outputs[link.origin_slot]) {
+                        const value = originNode.getOutputData(link.origin_slot);
+                        if (value !== undefined) {
+                            return value;
+                        }
+                    }
+                    // Try to get value from widget as fallback (works for primitive nodes)
                     if (originNode.widgets && originNode.widgets.length > 0) {
                         const widget = originNode.widgets.find(w => w.type === "toggle" || w.name === "boolean" || w.name === "value");
                         if (widget && widget.value !== undefined) {
@@ -259,13 +273,6 @@ class NodeBypasser extends LGraphNode {
                         }
                         if (originNode.widgets[0].value !== undefined) {
                             return originNode.widgets[0].value;
-                        }
-                    }
-                    // Try getOutputData as fallback
-                    if (originNode.outputs && originNode.outputs[link.origin_slot]) {
-                        const value = originNode.getOutputData ? originNode.getOutputData(link.origin_slot) : null;
-                        if (value !== undefined && value !== null) {
-                            return value;
                         }
                     }
                 }
@@ -300,6 +307,40 @@ class NodeBypasser extends LGraphNode {
         return null;
     }
     
+    // Get the override value (from input)
+    getOverrideValue() {
+        // Find the override_input slot by name
+        const overrideInputSlot = this.inputs.findIndex(i => i.name === "override_input");
+        
+        if (overrideInputSlot >= 0 && this.inputs[overrideInputSlot].link != null) {
+            const link = this.graph.links[this.inputs[overrideInputSlot].link];
+            if (link) {
+                const originNode = this.graph.getNodeById(link.origin_id);
+                if (originNode) {
+                    // Try getOutputData FIRST for momentary button compatibility
+                    if (originNode.getOutputData && originNode.outputs && originNode.outputs[link.origin_slot]) {
+                        const value = originNode.getOutputData(link.origin_slot);
+                        if (value !== undefined) {
+                            return value;
+                        }
+                    }
+                    // Try to get value from widget as fallback (works for primitive nodes)
+                    if (originNode.widgets && originNode.widgets.length > 0) {
+                        const widget = originNode.widgets.find(w => w.type === "toggle" || w.name === "boolean" || w.name === "value");
+                        if (widget && widget.value !== undefined) {
+                            return widget.value;
+                        }
+                        if (originNode.widgets[0].value !== undefined) {
+                            return originNode.widgets[0].value;
+                        }
+                    }
+                }
+            }
+        }
+        // Default to false if not connected
+        return false;
+    }
+    
     // Note: We use setInterval in onConstructed() to check inputs every 100ms
     // This is more efficient than checking every frame in onDrawBackground
     // and also works when the node is off-screen
@@ -311,7 +352,15 @@ class NodeBypasser extends LGraphNode {
         const bypassValue = this.getBypassValue();
         const enableValue = this.getEnableValue();
         const selectorValue = this.getSelectorValue();
+        const overrideValue = this.getOverrideValue();
         const myId = this.selectorIdWidget.value;
+        
+        // Debug logging every few checks to help troubleshoot
+        if (!this._debugCounter) this._debugCounter = 0;
+        this._debugCounter++;
+        if (this._debugCounter % 100 === 0) {
+            console.log(`[NodeBypasser ${myId}] Status check - bypass=${bypassValue}, enable=${enableValue}, selector=${selectorValue}, override=${overrideValue}`);
+        }
         
         // Check if selector matches this bypasser's ID
         const isSelectorActive = selectorValue !== null && selectorValue === myId;
@@ -336,14 +385,34 @@ class NodeBypasser extends LGraphNode {
         // DON'T update widget values when connected - this fights with manual changes
         // The widgets are just for manual control when no inputs are connected
         
+        // Check if override is blocking actions
+        if (overrideValue === true) {
+            // Override is active - block all bypass/enable actions
+            // Only log state changes to avoid spam
+            if (bypassValue === true && this._lastBypassState !== true) {
+                console.log(`[NodeBypasser ${myId}] 🚫 Bypass blocked by override`);
+                this._lastBypassState = true;
+            } else if (bypassValue !== true && this._lastBypassState === true) {
+                this._lastBypassState = bypassValue;
+            }
+            
+            if (enableValue === true && this._lastEnableState !== true) {
+                console.log(`[NodeBypasser ${myId}] 🚫 Enable blocked by override`);
+                this._lastEnableState = true;
+            } else if (enableValue !== true && this._lastEnableState === true) {
+                this._lastEnableState = enableValue;
+            }
+            return; // Exit early - don't process any bypass/enable
+        }
+        
         // Check if bypass input triggered (only respond to TRUE pulses)
         if (bypassValue === true && this._lastBypassState !== true) {
             // Only bypass if selector matches OR no selector connected
             if (selectorValue === null || isSelectorActive) {
-                console.log(`[NodeBypasser ${myId}] Bypass triggered!`);
+                console.log(`[NodeBypasser ${myId}] ✅ Bypass triggered! Selector=${selectorValue}, Active=${isSelectorActive}`);
                 this.bypassNodesByName(true);
             } else {
-                console.log(`[NodeBypasser ${myId}] Bypass blocked by selector (selector=${selectorValue}, myId=${myId})`);
+                console.log(`[NodeBypasser ${myId}] ❌ Bypass blocked by selector (selector=${selectorValue}, myId=${myId})`);
             }
             this._lastBypassState = true;
         } else if (bypassValue !== true && this._lastBypassState === true) {
@@ -359,7 +428,7 @@ class NodeBypasser extends LGraphNode {
         if (enableValue === true && this._lastEnableState !== true) {
             // Only enable if selector matches OR no selector connected
             if (selectorValue === null || isSelectorActive) {
-                console.log(`[NodeBypasser ${myId}] Enable triggered!`);
+                console.log(`[NodeBypasser ${myId}] ✅ Enable triggered!`);
                 this.bypassNodesByName(false);
             }
             this._lastEnableState = true;
@@ -463,9 +532,6 @@ class NodeBypasser extends LGraphNode {
                 return;
             }
             
-            // Parse the comma-separated node names
-            const nodeNames = nodeNamesText.split(',').map(name => name.trim()).filter(name => name.length > 0);
-            
             const graph = app.graph;
             if (!graph) {
                 this.resultWidget.value = "Error: No graph found";
@@ -478,56 +544,18 @@ class NodeBypasser extends LGraphNode {
             const notFound = [];
             const errors = [];
             
-            for (const nodeName of nodeNames) {
-                try {
-                    let matchingNodes = [];
-                    
-                    // Check if it's a regex pattern (contains * or ! or other regex chars)
-                    if (this.isRegexPattern(nodeName)) {
-                        console.log("[NodeBypasser] Processing regex pattern:", nodeName);
-                        matchingNodes = this.findNodesByRegex(nodeName, nodes);
-                    } else {
-                        // Use simple string matching for non-regex patterns
-                        matchingNodes = nodes.filter(node => 
-                            node !== this && // Don't include the bypasser node itself
-                            (node.type.toLowerCase().includes(nodeName.toLowerCase()) ||
-                             (node.title && node.title.toLowerCase().includes(nodeName.toLowerCase())) ||
-                             (node.properties && node.properties.name && node.properties.name.toLowerCase().includes(nodeName.toLowerCase())) ||
-                             (node.properties && node.properties.variable_name && node.properties.variable_name.toLowerCase().includes(nodeName.toLowerCase())) ||
-                             (node.properties && node.properties.custom_name && node.properties.custom_name.toLowerCase().includes(nodeName.toLowerCase())) ||
-                             (node._stableCustomName && node._stableCustomName.toLowerCase().includes(nodeName.toLowerCase())))
-                        );
-                    }
-                    
-                    if (matchingNodes.length === 0) {
-                        notFound.push(nodeName);
-                        continue;
-                    }
-                    
-                    for (const targetNode of matchingNodes) {
-                        const newMode = bypass ? MODE_BYPASS : MODE_ALWAYS;
-                        targetNode.mode = newMode;
-                        processedCount++;
-                        results.push(`Node ${targetNode.id}: ${targetNode.type}`);
-                        
-                        // If this is a collapsed subgraph, also bypass all internal nodes
-                        if (targetNode.subgraph && targetNode.subgraph._nodes) {
-                            console.log(`[NodeBypasser] Subgraph detected in node ${targetNode.id}, bypassing internal nodes`);
-                            for (const internalNode of targetNode.subgraph._nodes) {
-                                internalNode.mode = newMode;
-                                processedCount++;
-                                results.push(`  └─ Internal: ${internalNode.id} (${internalNode.type})`);
-                            }
-                        }
-                    }
-                } catch (error) {
-                    console.error(`[NodeBypasser] Error processing pattern "${nodeName}":`, error);
-                    errors.push(`${nodeName}: ${error.message}`);
-                }
-            }
+            // Process main node names
+            const nodeNames = nodeNamesText.split(',').map(name => name.trim()).filter(name => name.length > 0);
+            const mainResults = this.processNodeList(nodeNames, nodes, bypass, "");
+            processedCount += mainResults.processedCount;
+            results.push(...mainResults.results);
+            notFound.push(...mainResults.notFound);
+            errors.push(...mainResults.errors);
             
+            // Build result message
             const action = bypass ? "Bypassed" : "Enabled";
             let resultText = `${action} ${processedCount} nodes:\n${results.join('\n')}`;
+            
             if (notFound.length > 0) {
                 resultText += `\n\nNot found: ${notFound.join(', ')}`;
             }
@@ -541,6 +569,69 @@ class NodeBypasser extends LGraphNode {
             console.error('[NodeBypasser] Error bypassing nodes:', error);
             this.resultWidget.value = `Error: ${error.message}`;
         }
+    }
+    
+    // Helper method to process a list of node names
+    processNodeList(nodeNames, nodes, bypass, label = "") {
+        const processedCount = { count: 0 };
+        const results = [];
+        const notFound = [];
+        const errors = [];
+        
+        for (const nodeName of nodeNames) {
+            try {
+                let matchingNodes = [];
+                
+                // Check if it's a regex pattern (contains * or ! or other regex chars)
+                if (this.isRegexPattern(nodeName)) {
+                    console.log(`[NodeBypasser] Processing regex pattern (${label}):`, nodeName);
+                    matchingNodes = this.findNodesByRegex(nodeName, nodes);
+                } else {
+                    // Use simple string matching for non-regex patterns
+                    matchingNodes = nodes.filter(node => 
+                        node !== this && // Don't include the bypasser node itself
+                        (node.type.toLowerCase().includes(nodeName.toLowerCase()) ||
+                         (node.title && node.title.toLowerCase().includes(nodeName.toLowerCase())) ||
+                         (node.properties && node.properties.name && node.properties.name.toLowerCase().includes(nodeName.toLowerCase())) ||
+                         (node.properties && node.properties.variable_name && node.properties.variable_name.toLowerCase().includes(nodeName.toLowerCase())) ||
+                         (node.properties && node.properties.custom_name && node.properties.custom_name.toLowerCase().includes(nodeName.toLowerCase())) ||
+                         (node._stableCustomName && node._stableCustomName.toLowerCase().includes(nodeName.toLowerCase())))
+                    );
+                }
+                
+                if (matchingNodes.length === 0) {
+                    notFound.push(`${label}: ${nodeName}`);
+                    continue;
+                }
+                
+                for (const targetNode of matchingNodes) {
+                    const newMode = bypass ? MODE_BYPASS : MODE_ALWAYS;
+                    targetNode.mode = newMode;
+                    processedCount.count++;
+                    results.push(`${label ? '[' + label + '] ' : ''}Node ${targetNode.id}: ${targetNode.type}`);
+                    
+                    // If this is a collapsed subgraph, also bypass all internal nodes
+                    if (targetNode.subgraph && targetNode.subgraph._nodes) {
+                        console.log(`[NodeBypasser] Subgraph detected in node ${targetNode.id}, bypassing internal nodes`);
+                        for (const internalNode of targetNode.subgraph._nodes) {
+                            internalNode.mode = newMode;
+                            processedCount.count++;
+                            results.push(`  └─ Internal: ${internalNode.id} (${internalNode.type})`);
+                        }
+                    }
+                }
+            } catch (error) {
+                console.error(`[NodeBypasser] Error processing pattern "${nodeName}":`, error);
+                errors.push(`${label}: ${nodeName}: ${error.message}`);
+            }
+        }
+        
+        return {
+            processedCount: processedCount.count,
+            results,
+            notFound,
+            errors
+        };
     }
     
     // Check if a pattern contains regex-like characters
