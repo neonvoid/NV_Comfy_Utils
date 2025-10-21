@@ -82,11 +82,24 @@ class GeminiVideoCaptioner:
                 "video_file": (sorted(files), {"video_upload": True}),
                 "prompt_text": ("STRING", {"multiline": True, "default": "Describe this video in detail."}),
                 "api_key": ("STRING", {"default": ""}),
-                "model": (["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.5-pro"], {"default": "gemini-2.5-pro"}),
+                "provider": (["Gemini", "OpenRouter"], {"default": "Gemini"}),
+                "model": ([
+                    # Gemini models
+                    "gemini-1.5-flash", 
+                    "gemini-1.5-pro", 
+                    "gemini-2.5-pro",
+                    # OpenRouter models (popular vision models)
+                    "qwen/qwen2.5-vl-72b-instruct",
+                    "qwen/qwen3-vl-235b-a22b-instruct",
+                    "meta-llama/llama-3.2-90b-vision-instruct",
+                ], {"default": "gemini-2.5-pro"}),
                 "fps": ("FLOAT", {"default": 30.0, "min": 1.0, "max": 120.0, "step": 0.1}),
             },
             "optional": {
-                "video_tensor": ("IMAGE",)
+                "video_tensor": ("IMAGE",),
+                "image_tensor": ("IMAGE",),  # For single image captioning (OpenRouter compatible)
+                "max_tokens": ("INT", {"default": 1000, "min": 100, "max": 4000, "step": 100}),  # For OpenRouter
+                "temperature": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 2.0, "step": 0.1}),  # For OpenRouter
             }
         }
 
@@ -149,6 +162,7 @@ class GeminiVideoCaptioner:
         """Determine MIME type based on file extension."""
         extension = Path(file_path).suffix.lower()
         mime_types = {
+            # Video formats
             '.mp4': 'video/mp4',
             '.avi': 'video/x-msvideo',
             '.mov': 'video/quicktime',
@@ -156,7 +170,14 @@ class GeminiVideoCaptioner:
             '.webm': 'video/webm',
             '.wmv': 'video/x-ms-wmv',
             '.flv': 'video/x-flv',
-            '.m4v': 'video/mp4'
+            '.m4v': 'video/mp4',
+            # Image formats
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.png': 'image/png',
+            '.gif': 'image/gif',
+            '.webp': 'image/webp',
+            '.bmp': 'image/bmp'
         }
         return mime_types.get(extension, 'video/mp4')
 
@@ -199,99 +220,320 @@ class GeminiVideoCaptioner:
         except Exception as e:
             print(f"Error converting tensor to video: {e}")
             return None
-
-    def caption_video(self, video_file=None, prompt_text="Describe this video in detail.", api_key="", model="gemini-2.5-pro", fps=30.0, video_tensor=None):
-        """Main function to caption video using Gemini API."""
+    
+    def tensor_to_image(self, image_tensor):
+        """Convert image tensor to temporary image file."""
+        try:
+            # Handle batch dimension - take first image
+            if len(image_tensor.shape) == 4:
+                # (batch, height, width, channels)
+                image_array = image_tensor[0].cpu().numpy()
+            elif len(image_tensor.shape) == 3:
+                # (height, width, channels)
+                image_array = image_tensor.cpu().numpy()
+            else:
+                raise ValueError(f"Expected 3D or 4D tensor, got {image_tensor.shape}")
+            
+            # Ensure values are in [0, 255] range
+            if image_array.max() <= 1.0:
+                image_array = (image_array * 255).astype(np.uint8)
+            else:
+                image_array = image_array.astype(np.uint8)
+            
+            # Create temporary image file
+            temp_dir = folder_paths.get_temp_directory()
+            temp_image_path = os.path.join(temp_dir, f"temp_image_{int(time.time())}.jpg")
+            
+            # Convert RGB to BGR for OpenCV
+            image_bgr = cv2.cvtColor(image_array, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(temp_image_path, image_bgr)
+            
+            return temp_image_path
+            
+        except Exception as e:
+            print(f"Error converting tensor to image: {e}")
+            return None
+    
+    def caption_video(self, video_file=None, prompt_text="Describe this video in detail.", api_key="", 
+                     provider="Gemini", model="gemini-2.5-pro", fps=30.0, video_tensor=None, 
+                     image_tensor=None, max_tokens=1000, temperature=0.7):
+        """Main function to caption video/image using selected API provider."""
         if not api_key:
             return ("Error: API key is required",)
         
-        video_path = None
+        file_path = None
+        is_temp_file = False
         
-        # Handle video tensor input (from node link)
-        if video_tensor is not None:
+        # Priority 1: Handle image tensor input (for OpenRouter compatibility)
+        if image_tensor is not None:
+            print("Processing image tensor input...")
+            file_path = self.tensor_to_image(image_tensor)
+            if file_path is None:
+                return ("Error: Failed to convert image tensor to file",)
+            is_temp_file = True
+        # Priority 2: Handle video tensor input (from node link)
+        elif video_tensor is not None:
             print(f"Processing video tensor input at {fps} FPS...")
-            video_path = self.tensor_to_video(video_tensor, fps)
-            if video_path is None:
+            file_path = self.tensor_to_video(video_tensor, fps)
+            if file_path is None:
                 return ("Error: Failed to convert video tensor to file",)
-        # Handle video file input
+            is_temp_file = True
+        # Priority 3: Handle video file input
         elif video_file:
             # Construct full path for ComfyUI video file
             if not os.path.isabs(video_file):
                 input_dir = folder_paths.get_input_directory()
-                video_path = os.path.join(input_dir, video_file)
+                file_path = os.path.join(input_dir, video_file)
             else:
-                video_path = video_file
+                file_path = video_file
             
-            if not os.path.exists(video_path):
-                return (f"Error: Video file not found: {video_path}",)
+            if not os.path.exists(file_path):
+                return (f"Error: Video file not found: {file_path}",)
         else:
-            return ("Error: Either video file or video tensor must be provided",)
+            return ("Error: Either video file, video tensor, or image tensor must be provided",)
         
         try:
-            # Get video metadata
-            metadata = self.get_video_metadata(video_path)
+            # Route to appropriate API provider
+            if provider == "Gemini":
+                result = self._call_gemini_api(file_path, prompt_text, api_key, model, is_temp_file)
+            elif provider == "OpenRouter":
+                result = self._call_openrouter_api(file_path, prompt_text, api_key, model, 
+                                                   max_tokens, temperature, is_temp_file)
+            else:
+                result = (f"Error: Unknown provider: {provider}",)
             
-            # Encode video to base64
-            print("Encoding video to base64...")
-            base64_data = self.encode_file_to_base64(video_path)
-            mime_type = self.get_mime_type(video_path)
-            
-            # Prepare API request
-            headers = {
-                "Content-Type": "application/json"
-            }
-            
-            payload = {
-                "contents": [{
-                    "parts": [
-                        {"text": prompt_text},
-                        {
-                            "inline_data": {
-                                "mime_type": mime_type,
-                                "data": base64_data
-                            }
+            return result
+                
+        except Exception as e:
+            # Clean up temporary file if it was created from tensor
+            if is_temp_file and file_path and os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                    print(f"Cleaned up temporary file after error: {file_path}")
+                except Exception as cleanup_error:
+                    print(f"Warning: Could not clean up temporary file {file_path}: {cleanup_error}")
+            return (f"Exception: {str(e)}",)
+    
+    def _call_gemini_api(self, file_path, prompt_text, api_key, model, is_temp_file=False):
+        """Call Gemini API for video/image captioning."""
+        # Get file info for debug
+        file_name = Path(file_path).name
+        file_size_bytes = os.path.getsize(file_path)
+        file_size_mb = file_size_bytes / (1024 * 1024)
+        
+        # Get metadata if it's a video
+        metadata = self.get_video_metadata(file_path)
+        mime_type = self.get_mime_type(file_path)
+        
+        # Print debug header
+        print("\n" + "="*50)
+        print(f"File: {file_name}")
+        print(f"Size: {file_size_mb:.2f} MB")
+        
+        if metadata and 'width' in metadata:
+            print(f"Resolution: {metadata['width']}x{metadata['height']}")
+            print(f"FPS: {metadata['fps']:.2f}")
+            print(f"Frames: {metadata['nb_frames']}")
+            print(f"⏱Duration: {metadata['duration']:.2f}s")
+        
+        print(f"Model: {model}")
+        print(f"MIME type: {mime_type}")
+        print("-"*50)
+        
+        # Encode file to base64
+        print("Encoding to base64...")
+        encode_start = time.time()
+        base64_data = self.encode_file_to_base64(file_path)
+        encode_time = time.time() - encode_start
+        base64_size_mb = len(base64_data) / (1024 * 1024)
+        
+        print(f"Base64 size: {base64_size_mb:.2f} MB")
+        print(f"Encoding time: {encode_time:.2f}s")
+        
+        # Prepare API request
+        headers = {
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"text": prompt_text},
+                    {
+                        "inline_data": {
+                            "mime_type": mime_type,
+                            "data": base64_data
                         }
-                    ]
-                }]
+                    }
+                ]
+            }]
+        }
+        
+        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+        
+        # Make API request
+        print("Sending request to Gemini API...")
+        request_start = time.time()
+        response = requests.post(api_url, headers=headers, json=payload, timeout=60)
+        request_time = time.time() - request_start
+        
+        print(f"API request time: {request_time:.2f}s")
+        print(f"Response status: {response.status_code}")
+        
+        if response.status_code == 200:
+            result = response.json()
+            print("API request successful!")
+            
+            # Show usage info if available
+            if 'usageMetadata' in result:
+                usage = result['usageMetadata']
+                print(f"Tokens: {usage.get('promptTokenCount', 'N/A')} prompt, {usage.get('candidatesTokenCount', 'N/A')} response")
+            
+            print("="*50 + "\n")
+            
+            if 'candidates' in result and len(result['candidates']) > 0:
+                candidate = result['candidates'][0]
+                if 'content' in candidate and 'parts' in candidate['content']:
+                    caption = candidate['content']['parts'][0]['text']
+                    # Clean up temporary file if it was created from tensor
+                    if is_temp_file and os.path.exists(file_path):
+                        try:
+                            os.remove(file_path)
+                        except:
+                            pass
+                    return (caption.strip(),)
+                else:
+                    print("❌ Error: No content in API response")
+                    print("="*50 + "\n")
+                    return ("Error: No content in API response",)
+            else:
+                print("❌ Error: No candidates in API response")
+                print("="*50 + "\n")
+                return ("Error: No candidates in API response",)
+        else:
+            print(f"❌ API Error: {response.status_code}")
+            print("="*50 + "\n")
+            return (f"API error: {response.status_code} - {response.text}",)
+    
+    def _call_openrouter_api(self, file_path, prompt_text, api_key, model, 
+                            max_tokens, temperature, is_temp_file=False):
+        """Call OpenRouter API for image/video captioning."""
+        try:
+            # Get file info for debug
+            file_name = Path(file_path).name
+            file_size_bytes = os.path.getsize(file_path)
+            file_size_mb = file_size_bytes / (1024 * 1024)
+            
+            # Get metadata if it's a video
+            metadata = self.get_video_metadata(file_path)
+            mime_type = self.get_mime_type(file_path)
+            
+            # Print debug header
+            print("\n" + "="*50)
+            print(f"File: {file_name}")
+            print(f"Size: {file_size_mb:.2f} MB")
+            
+            if metadata and 'width' in metadata:
+                print(f"Resolution: {metadata['width']}x{metadata['height']}")
+                print(f"FPS: {metadata['fps']:.2f}")
+                print(f"Frames: {metadata['nb_frames']}")
+                print(f"⏱Duration: {metadata['duration']:.2f}s")
+            
+            print(f"Model: {model}")
+            print(f"MIME type: {mime_type}")
+            print("-"*50)
+            
+            # Encode file to base64
+            print("Encoding to base64...")
+            encode_start = time.time()
+            base64_data = self.encode_file_to_base64(file_path)
+            encode_time = time.time() - encode_start
+            base64_size_mb = len(base64_data) / (1024 * 1024)
+            
+            print(f"Base64 size: {base64_size_mb:.2f} MB")
+            print(f"Encoding time: {encode_time:.2f}s")
+            
+            # Prepare headers
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+                "HTTP-Referer": "https://github.com/comfyui",
+                "X-Title": "ComfyUI Video Captioner"
             }
             
-            api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-            
-            print("Sending request to Gemini API...")
+            # OpenRouter payload
+            payload = {
+                "model": model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": prompt_text
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:{mime_type};base64,{base64_data}"
+                                }
+                            }
+                        ]
+                    }
+                ],
+                "max_tokens": max_tokens,
+                "temperature": temperature
+            }
             
             # Make API request
-            response = requests.post(api_url, headers=headers, json=payload, timeout=60)
+            print("Sending request to OpenRouter API...")
+            request_start = time.time()
+            response = requests.post("https://openrouter.ai/api/v1/chat/completions", 
+                                   headers=headers, json=payload, timeout=60)
+            request_time = time.time() - request_start
+            
+            print(f"API request time: {request_time:.2f}s")
+            print(f"Response status: {response.status_code}")
             
             if response.status_code == 200:
                 result = response.json()
+                print("API request successful!")
                 
-                if 'candidates' in result and len(result['candidates']) > 0:
-                    candidate = result['candidates'][0]
-                    if 'content' in candidate and 'parts' in candidate['content']:
-                        caption = candidate['content']['parts'][0]['text']
-                        # Clean up temporary video file if it was created from tensor
-                        if video_tensor is not None and os.path.exists(video_path):
-                            try:
-                                os.remove(video_path)
-                                print(f"Cleaned up temporary video file: {video_path}")
-                            except Exception as cleanup_error:
-                                print(f"Warning: Could not clean up temporary file {video_path}: {cleanup_error}")
-                        return (caption.strip(),)
-                    else:
-                        return ("Error: No content in API response",)
+                # Show usage info if available
+                if 'usage' in result:
+                    usage = result['usage']
+                    print(f"Tokens: {usage.get('prompt_tokens', 'N/A')} prompt, {usage.get('completion_tokens', 'N/A')} completion")
+                
+                print("="*50 + "\n")
+                
+                if 'choices' in result and len(result['choices']) > 0:
+                    caption = result['choices'][0]['message']['content']
+                    
+                    if not caption or caption.strip() == "":
+                        print("⚠️ Warning: Model returned empty response")
+                        return ("Error: Model returned empty response.",)
+                    
+                    # Clean up temp file
+                    if is_temp_file and os.path.exists(file_path):
+                        try:
+                            os.remove(file_path)
+                        except:
+                            pass
+                    
+                    return (caption.strip(),)
                 else:
-                    return ("Error: No candidates in API response",)
+                    print("❌ Error: No caption generated by API")
+                    print("="*50 + "\n")
+                    return ("Error: No caption generated by API",)
             else:
-                return (f"API error: {response.status_code} - {response.text}",)
+                print(f"❌ API Error: {response.status_code}")
+                print("="*50 + "\n")
+                error_msg = response.text[:200] if len(response.text) > 200 else response.text
+                return (f"API error {response.status_code}: {error_msg}",)
                 
         except Exception as e:
-            # Clean up temporary video file if it was created from tensor
-            if video_tensor is not None and video_path and os.path.exists(video_path):
-                try:
-                    os.remove(video_path)
-                    print(f"Cleaned up temporary video file after error: {video_path}")
-                except Exception as cleanup_error:
-                    print(f"Warning: Could not clean up temporary file {video_path}: {cleanup_error}")
+            print(f"❌ Exception: {str(e)}")
+            print("="*50 + "\n")
             return (f"Exception: {str(e)}",)
 
 
@@ -806,7 +1048,7 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "KNF_Organizer": "KNF_Organizer",
-    "GeminiVideoCaptioner": "Gemini Video Captioner",
+    "GeminiVideoCaptioner": "Multi-API Video Captioner",
     "AutomateVideoPathLoader": "Automate Video Path Loader",
     "CustomVideoSaver": "Custom Video Saver",
     "LazySwitch": "Lazy Switch",
