@@ -556,8 +556,9 @@ class CustomVideoSaver:
                 "filename_prefix": ("STRING", {"default": "ComfyUI_video"}),
                 "custom_directory": ("STRING", {"default": ""}),  # Empty = use default output
                 "video_format": (["mp4", "avi", "mov", "mkv", "webm", "wmv"], {"default": "mp4"}),
+                "codec": (["H.265/HEVC", "H.264/AVC", "MP4V", "XVID", "MJPEG"], {"default": "H.265/HEVC"}),
                 "fps": ("FLOAT", {"default": 30.0, "min": 1.0, "max": 120.0, "step": 0.1}),
-                "quality": ("INT", {"default": 18, "min": 0, "max": 51, "step": 1}),  # FFmpeg CRF quality
+                "quality": ("INT", {"default": 0, "min": 0, "max": 51, "step": 1}),  # CRF: 0=lossless, 18=visually lossless, 23=good
                 "preserve_colors": ("BOOLEAN", {"default": True}),  # Enable color preservation mode
             },
             "optional": {
@@ -574,7 +575,7 @@ class CustomVideoSaver:
     OUTPUT_NODE = True
     
     def save_video(self, video_tensor, filename_prefix="ComfyUI_video", custom_directory="", 
-                   video_format="mp4", fps=30.0, quality=18, preserve_colors=True, subfolder="", prompt=None, extra_pnginfo=None):
+                   video_format="mp4", codec="H.265/HEVC", fps=30.0, quality=0, preserve_colors=True, subfolder="", prompt=None, extra_pnginfo=None):
         """
         Save video tensor to specified directory with custom naming and color preservation.
         
@@ -625,14 +626,15 @@ class CustomVideoSaver:
             )
             
             # Convert tensor to video with color preservation
-            success = self._tensor_to_video_file(video_tensor, video_path, fps, quality, video_format, preserve_colors)
+            success = self._tensor_to_video_file(video_tensor, video_path, fps, quality, codec, preserve_colors)
             
             if not success:
                 return ("", "", f"Error: Failed to save video to {video_path}")
             
             # Create info string
             color_mode = "Color Preserved" if preserve_colors else "Standard"
-            info = f"Video saved: {video_filename} | FPS: {fps} | Quality: {quality} | Format: {video_format.upper()} | {color_mode}"
+            quality_desc = "Lossless" if quality == 0 else f"CRF {quality}"
+            info = f"Video saved: {video_filename} | Codec: {codec} | {quality_desc} | FPS: {fps} | Format: {video_format.upper()} | {color_mode}"
             if custom_directory:
                 info += f" | Custom dir: {custom_directory}"
             
@@ -643,7 +645,7 @@ class CustomVideoSaver:
             print(f"[CustomVideoSaver] {error_msg}")
             return ("", "", error_msg)
     
-    def _tensor_to_video_file(self, video_tensor, output_path, fps, quality, video_format, preserve_colors=True):
+    def _tensor_to_video_file(self, video_tensor, output_path, fps, quality, codec, preserve_colors=True):
         """
         Convert video tensor to video file using OpenCV with color data preservation.
         
@@ -651,8 +653,8 @@ class CustomVideoSaver:
             video_tensor: Video tensor (batch, frames, height, width, channels)
             output_path: Output file path
             fps: Frames per second
-            quality: Video quality (for codec-specific settings)
-            video_format: Video format extension
+            quality: Video quality (CRF value, 0=lossless)
+            codec: Video codec to use (H.265/HEVC, H.264/AVC, MP4V, XVID, MJPEG)
             preserve_colors: Enable color preservation mode
             
         Returns:
@@ -716,27 +718,25 @@ class CustomVideoSaver:
             num_frames, height, width, channels = video_array.shape
             
             print(f"[CustomVideoSaver] Processing {num_frames} frames of {width}x{height} with {channels} channels")
+            print(f"[CustomVideoSaver] Using codec: {codec} (CRF: {quality})")
             
-            # Set up video codec based on format with color preservation settings
-            fourcc = self._get_fourcc(video_format)
+            # Set up video codec
+            fourcc = self._get_fourcc_for_codec(codec)
             
-            # Create video writer with color preservation settings
+            # Create video writer
             out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
             
             if not out.isOpened():
-                print(f"[CustomVideoSaver] Failed to open video writer for {output_path}")
-                print(f"[CustomVideoSaver] Trying alternative codec...")
+                print(f"[CustomVideoSaver] Failed to open video writer with {codec}")
+                print(f"[CustomVideoSaver] Trying MP4V fallback codec...")
                 
-                # Try alternative codec as fallback
-                if video_format.lower() == "mp4":
-                    alternative_fourcc = cv2.VideoWriter_fourcc(*'XVID')
-                    out = cv2.VideoWriter(output_path, alternative_fourcc, fps, (width, height))
-                    if out.isOpened():
-                        print(f"[CustomVideoSaver] Using XVID codec as fallback")
-                    else:
-                        print(f"[CustomVideoSaver] All codecs failed, cannot create video")
-                        return False
+                # Try MP4V as universal fallback
+                fallback_fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                out = cv2.VideoWriter(output_path, fallback_fourcc, fps, (width, height))
+                if out.isOpened():
+                    print(f"[CustomVideoSaver] Using MP4V codec as fallback")
                 else:
+                    print(f"[CustomVideoSaver] All codecs failed, cannot create video")
                     return False
             
             # Write frames with careful color space handling
@@ -795,68 +795,32 @@ class CustomVideoSaver:
             print(f"[CustomVideoSaver] Error converting tensor to video: {e}")
             return False
     
-    def _get_fourcc(self, video_format):
-        """Get OpenCV fourcc codec for video format with robust fallback system."""
-        # Define codec preferences with fallbacks
-        codec_preferences = {
-            "mp4": [
-                ('mp4v', 'MP4V'),  # Most compatible fallback
-                ('XVID', 'XVID'),  # Alternative
-                ('MJPG', 'MJPG'),  # Motion JPEG
-            ],
-            "avi": [
-                ('XVID', 'XVID'),  # Most compatible for AVI
-                ('MJPG', 'MJPG'),  # Motion JPEG
-                ('mp4v', 'MP4V'),  # Alternative
-            ],
-            "mov": [
-                ('mp4v', 'MP4V'),  # Most compatible for MOV
-                ('XVID', 'XVID'),  # Alternative
-                ('MJPG', 'MJPG'),  # Motion JPEG
-            ],
-            "mkv": [
-                ('mp4v', 'MP4V'),  # Most compatible for MKV
-                ('XVID', 'XVID'),  # Alternative
-                ('MJPG', 'MJPG'),  # Motion JPEG
-            ],
-            "webm": [
-                ('VP80', 'VP8'),   # VP8 for WebM
-                ('mp4v', 'MP4V'),  # Fallback
-            ],
-            "wmv": [
-                ('WMV2', 'WMV2'),  # WMV2 for WMV
-                ('mp4v', 'MP4V'),  # Fallback
-            ],
+    def _get_fourcc_for_codec(self, codec):
+        """Get OpenCV fourcc code for the selected codec."""
+        codec_map = {
+            "H.265/HEVC": ['hev1', 'HEVC', 'H265', 'x265'],  # Try multiple H.265 codes
+            "H.264/AVC": ['H264', 'avc1', 'X264', 'h264'],   # Try multiple H.264 codes
+            "MP4V": ['mp4v', 'MP4V'],
+            "XVID": ['XVID', 'xvid'],
+            "MJPEG": ['MJPG', 'mjpg']
         }
         
-        # Get codec preferences for the format
-        preferences = codec_preferences.get(video_format.lower(), [('mp4v', 'MP4V')])
+        # Get possible fourcc codes for this codec
+        fourcc_codes = codec_map.get(codec, ['mp4v'])
         
-        # Try each codec in order of preference
-        for codec_name, display_name in preferences:
+        # Try each fourcc code
+        for fourcc_str in fourcc_codes:
             try:
-                fourcc = cv2.VideoWriter_fourcc(*codec_name)
-                # Test if codec works by creating a test writer
-                test_path = f"test_{codec_name}.{video_format}"
-                test_writer = cv2.VideoWriter(test_path, fourcc, 30, (640, 480))
-                
-                if test_writer.isOpened():
-                    test_writer.release()
-                    # Clean up test file if it was created
-                    if os.path.exists(test_path):
-                        os.remove(test_path)
-                    print(f"[CustomVideoSaver] Using {display_name} codec for {video_format.upper()}")
-                    return fourcc
-                else:
-                    print(f"[CustomVideoSaver] {display_name} codec not available, trying next...")
-                    
+                fourcc = cv2.VideoWriter_fourcc(*fourcc_str)
+                print(f"[CustomVideoSaver] Trying {codec} with fourcc: {fourcc_str}")
+                return fourcc
             except Exception as e:
-                print(f"[CustomVideoSaver] {display_name} codec test failed: {e}")
+                print(f"[CustomVideoSaver] fourcc '{fourcc_str}' failed: {e}")
                 continue
         
-        # If all codecs fail, return the first one as last resort
-        print(f"[CustomVideoSaver] All codecs failed, using fallback: {preferences[0][1]}")
-        return cv2.VideoWriter_fourcc(*preferences[0][0])
+        # Fallback to MP4V
+        print(f"[CustomVideoSaver] Using MP4V fallback")
+        return cv2.VideoWriter_fourcc(*'mp4v')
     
     def _get_unique_video_filename(self, filename_prefix, output_dir, video_format):
         """
