@@ -15,6 +15,31 @@ from typing import Dict, Optional, Tuple
 import time
 from datetime import datetime
 import cv2
+import sys
+import platform
+
+# Windows COM initialization for Media Foundation codecs
+_COM_INITIALIZED = False
+def _initialize_com_for_video():
+    """Initialize COM in MTA mode on Windows for Media Foundation codecs"""
+    global _COM_INITIALIZED
+    if _COM_INITIALIZED or platform.system() != 'Windows':
+        return True
+    
+    try:
+        import pythoncom
+        # Try to initialize COM in MTA mode (Multi-Threaded Apartment)
+        # This is required for Media Foundation video encoders
+        pythoncom.CoInitializeEx(pythoncom.COINIT_MULTITHREADED)
+        _COM_INITIALIZED = True
+        print("[CustomVideoSaver] COM initialized in MTA mode for Media Foundation")
+        return True
+    except Exception as e:
+        # COM might already be initialized in STA mode by ComfyUI or another component
+        print(f"[CustomVideoSaver] Warning: Could not initialize COM in MTA mode: {e}")
+        print("[CustomVideoSaver] Media Foundation codecs (HEVC/H.265) may not work")
+        print("[CustomVideoSaver] Will use fallback codecs (MP4V, MJPEG, XVID)")
+        return False
 
 # Import IO.ANY for proper wildcard type support
 try:
@@ -540,12 +565,29 @@ class GeminiVideoCaptioner:
 class CustomVideoSaver:
     """
     Custom video saver that allows saving videos to a user-specified directory.
-    Similar to ComfyUI's native video saving but with custom directory selection.
+    
+    ENCODING METHODS:
+    -----------------
+    - FFmpeg (RECOMMENDED): Professional encoding, supports all codecs including H.265/HEVC
+    - OpenCV: Simpler but limited codec support on Windows
+    
+    CODEC RECOMMENDATIONS:
+    ----------------------
+    - H.265/HEVC: Best compression, smallest files (FFmpeg only)
+    - H.264/AVC: Good compression, widely compatible (FFmpeg recommended)
+    - MP4V: Universal compatibility, works everywhere
+    - MJPEG: Highest quality, largest files
+    - VP9: Modern codec, good for web (FFmpeg only)
+    - ProRes: Professional editing (FFmpeg only)
+    
+    FFmpeg will be used automatically for H.265/HEVC and H.264/AVC to avoid
+    Windows COM threading issues. OpenCV is used for other codecs.
     """
     
     def __init__(self):
         self.type = "output"
         self.output_dir = folder_paths.get_output_directory()
+        self.ffmpeg_available = self._check_ffmpeg_available()
         self._check_codec_support()
     
     @classmethod
@@ -555,11 +597,13 @@ class CustomVideoSaver:
                 "video_tensor": ("IMAGE",),
                 "filename_prefix": ("STRING", {"default": "ComfyUI_video"}),
                 "custom_directory": ("STRING", {"default": ""}),  # Empty = use default output
-                "video_format": (["mp4", "avi", "mov", "mkv", "webm", "wmv"], {"default": "mp4"}),
-                "codec": (["H.265/HEVC", "H.264/AVC", "MP4V", "XVID", "MJPEG"], {"default": "H.265/HEVC"}),
+                "video_format": (["mp4", "mkv", "webm", "mov", "avi"], {"default": "mp4"}),
+                "codec": (["H.265/HEVC", "H.264/AVC", "VP9", "ProRes", "MP4V", "MJPEG", "XVID"], {"default": "H.265/HEVC"}),
                 "fps": ("FLOAT", {"default": 30.0, "min": 1.0, "max": 120.0, "step": 0.1}),
-                "quality": ("INT", {"default": 0, "min": 0, "max": 51, "step": 1}),  # CRF: 0=lossless, 18=visually lossless, 23=good
+                "quality": ("INT", {"default": 23, "min": 0, "max": 51, "step": 1}),  # CRF: 0=lossless, 18=visually lossless, 23=good, 28=default
+                "encoding_preset": (["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"], {"default": "medium"}),
                 "preserve_colors": ("BOOLEAN", {"default": True}),  # Enable color preservation mode
+                "use_ffmpeg": ("BOOLEAN", {"default": True}),  # Use FFmpeg when available
             },
             "optional": {
                 "subfolder": ("STRING", {"default": ""}),
@@ -575,7 +619,8 @@ class CustomVideoSaver:
     OUTPUT_NODE = True
     
     def save_video(self, video_tensor, filename_prefix="ComfyUI_video", custom_directory="", 
-                   video_format="mp4", codec="H.265/HEVC", fps=30.0, quality=0, preserve_colors=True, subfolder="", prompt=None, extra_pnginfo=None):
+                   video_format="mp4", codec="H.265/HEVC", fps=30.0, quality=23, encoding_preset="medium",
+                   preserve_colors=True, use_ffmpeg=True, subfolder="", prompt=None, extra_pnginfo=None):
         """
         Save video tensor to specified directory with custom naming and color preservation.
         
@@ -625,8 +670,22 @@ class CustomVideoSaver:
                 filename_prefix, output_dir, video_format
             )
             
-            # Convert tensor to video with color preservation
-            success = self._tensor_to_video_file(video_tensor, video_path, fps, quality, codec, preserve_colors)
+            # Determine encoding method
+            use_ffmpeg_encoding = False
+            if use_ffmpeg and self.ffmpeg_available:
+                # Use FFmpeg for these codecs (better quality, no COM issues)
+                if codec in ["H.265/HEVC", "H.264/AVC", "VP9", "ProRes"]:
+                    use_ffmpeg_encoding = True
+                    print(f"[CustomVideoSaver] Using FFmpeg for {codec} encoding")
+            
+            # Convert tensor to video
+            if use_ffmpeg_encoding:
+                success = self._tensor_to_video_ffmpeg(video_tensor, video_path, fps, quality, codec, 
+                                                       encoding_preset, preserve_colors)
+                encoding_method = "FFmpeg"
+            else:
+                success = self._tensor_to_video_opencv(video_tensor, video_path, fps, quality, codec, preserve_colors)
+                encoding_method = "OpenCV"
             
             if not success:
                 return ("", "", f"Error: Failed to save video to {video_path}")
@@ -634,7 +693,7 @@ class CustomVideoSaver:
             # Create info string
             color_mode = "Color Preserved" if preserve_colors else "Standard"
             quality_desc = "Lossless" if quality == 0 else f"CRF {quality}"
-            info = f"Video saved: {video_filename} | Codec: {codec} | {quality_desc} | FPS: {fps} | Format: {video_format.upper()} | {color_mode}"
+            info = f"Video saved: {video_filename} | Codec: {codec} | {quality_desc} | Preset: {encoding_preset} | FPS: {fps} | Format: {video_format.upper()} | {color_mode} | Encoder: {encoding_method}"
             if custom_directory:
                 info += f" | Custom dir: {custom_directory}"
             
@@ -645,7 +704,173 @@ class CustomVideoSaver:
             print(f"[CustomVideoSaver] {error_msg}")
             return ("", "", error_msg)
     
-    def _tensor_to_video_file(self, video_tensor, output_path, fps, quality, codec, preserve_colors=True):
+    def _tensor_to_video_ffmpeg(self, video_tensor, output_path, fps, quality, codec, preset, preserve_colors=True):
+        """
+        Convert video tensor to video file using FFmpeg subprocess.
+        This bypasses Windows COM issues and provides professional-grade encoding.
+        
+        Args:
+            video_tensor: Video tensor (batch, frames, height, width, channels)
+            output_path: Output file path
+            fps: Frames per second
+            quality: Video quality (CRF value, 0=lossless, 23=good)
+            codec: Video codec to use (H.265/HEVC, H.264/AVC, VP9, ProRes)
+            preset: Encoding preset (ultrafast to veryslow)
+            preserve_colors: Enable color preservation mode
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            # Handle tensor dimensions
+            if len(video_tensor.shape) == 5:
+                # (batch, frames, height, width, channels) - remove batch dimension
+                video_array = video_tensor[0].cpu().numpy()
+            elif len(video_tensor.shape) == 4:
+                # (frames, height, width, channels)
+                video_array = video_tensor.cpu().numpy()
+            else:
+                print(f"[CustomVideoSaver] Unexpected tensor shape: {video_tensor.shape}")
+                return False
+            
+            # Preserve original data type and range for maximum color fidelity
+            original_dtype = video_array.dtype
+            original_min = video_array.min()
+            original_max = video_array.max()
+            
+            print(f"[CustomVideoSaver] Original data: dtype={original_dtype}, range=[{original_min:.6f}, {original_max:.6f}]")
+            
+            # Convert to uint8 with color preservation
+            if preserve_colors:
+                if original_dtype == np.float32 or original_dtype == np.float64:
+                    if original_max <= 1.0:
+                        # Normalized float data [0,1] -> [0,255]
+                        video_array = np.clip(video_array * 255.0 + 0.5, 0, 255).astype(np.uint8)
+                    else:
+                        video_array = np.clip(video_array + 0.5, 0, 255).astype(np.uint8)
+                else:
+                    video_array = np.clip(video_array, 0, 255).astype(np.uint8)
+            else:
+                if original_dtype == np.float32 or original_dtype == np.float64:
+                    if original_max <= 1.0:
+                        video_array = np.clip(video_array * 255.0, 0, 255).astype(np.uint8)
+                    else:
+                        video_array = np.clip(video_array, 0, 255).astype(np.uint8)
+                else:
+                    video_array = np.clip(video_array, 0, 255).astype(np.uint8)
+            
+            # Get video dimensions
+            num_frames, height, width, channels = video_array.shape
+            
+            print(f"[CustomVideoSaver] Processing {num_frames} frames of {width}x{height} with {channels} channels")
+            print(f"[CustomVideoSaver] Using FFmpeg with codec: {codec} (CRF: {quality}, Preset: {preset})")
+            
+            # Map codec to FFmpeg codec name
+            codec_map = {
+                "H.265/HEVC": "libx265",
+                "H.264/AVC": "libx264",
+                "VP9": "libvpx-vp9",
+                "ProRes": "prores_ks"
+            }
+            
+            ffmpeg_codec = codec_map.get(codec, "libx264")
+            
+            # Build FFmpeg command
+            # Use pipe input for raw RGB frames
+            cmd = [
+                'ffmpeg',
+                '-y',  # Overwrite output file
+                '-f', 'rawvideo',
+                '-vcodec', 'rawvideo',
+                '-s', f'{width}x{height}',
+                '-pix_fmt', 'rgb24',
+                '-r', str(fps),
+                '-i', '-',  # Read from stdin
+                '-c:v', ffmpeg_codec,
+            ]
+            
+            # Add codec-specific parameters
+            if codec in ["H.265/HEVC", "H.264/AVC"]:
+                cmd.extend([
+                    '-crf', str(quality),
+                    '-preset', preset,
+                    '-pix_fmt', 'yuv420p',  # Maximum compatibility
+                ])
+            elif codec == "VP9":
+                cmd.extend([
+                    '-crf', str(quality),
+                    '-b:v', '0',  # Use CRF mode
+                    '-pix_fmt', 'yuv420p',
+                ])
+            elif codec == "ProRes":
+                # ProRes doesn't use CRF, use profile instead
+                cmd.extend([
+                    '-profile:v', '3',  # ProRes HQ
+                    '-pix_fmt', 'yuv422p10le',
+                ])
+            
+            # Add output file
+            cmd.append(output_path)
+            
+            print(f"[CustomVideoSaver] FFmpeg command: {' '.join(cmd[:10])}...")
+            
+            # Start FFmpeg process
+            process = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=10**8
+            )
+            
+            # Write frames to FFmpeg
+            for i, frame in enumerate(video_array):
+                # Ensure frame is contiguous in memory
+                frame = np.ascontiguousarray(frame)
+                
+                # Validate frame data
+                if preserve_colors:
+                    frame_min, frame_max = frame.min(), frame.max()
+                    if frame_min < 0 or frame_max > 255:
+                        print(f"[CustomVideoSaver] Warning: Frame {i} has values outside [0,255]: [{frame_min}, {frame_max}]")
+                        frame = np.clip(frame, 0, 255).astype(np.uint8)
+                
+                # Write raw RGB data
+                try:
+                    process.stdin.write(frame.tobytes())
+                except Exception as e:
+                    print(f"[CustomVideoSaver] Error writing frame {i}: {e}")
+                    process.kill()
+                    return False
+            
+            # Close stdin and wait for FFmpeg to finish
+            process.stdin.close()
+            stdout, stderr = process.communicate()
+            
+            # Check if encoding was successful
+            if process.returncode != 0:
+                print(f"[CustomVideoSaver] FFmpeg encoding failed with return code {process.returncode}")
+                if stderr:
+                    error_msg = stderr.decode('utf-8', errors='ignore')
+                    print(f"[CustomVideoSaver] FFmpeg error: {error_msg[-500:]}")  # Last 500 chars
+                return False
+            
+            # Verify file was created
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                file_size = os.path.getsize(output_path) / (1024 * 1024)  # MB
+                print(f"[CustomVideoSaver] Successfully saved video: {output_path} ({file_size:.2f} MB)")
+                return True
+            else:
+                print(f"[CustomVideoSaver] Video file was not created or is empty: {output_path}")
+                return False
+                
+        except Exception as e:
+            print(f"[CustomVideoSaver] Error in FFmpeg encoding: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+    
+    def _tensor_to_video_opencv(self, video_tensor, output_path, fps, quality, codec, preserve_colors=True):
         """
         Convert video tensor to video file using OpenCV with color data preservation.
         
@@ -685,13 +910,11 @@ class CustomVideoSaver:
                 if original_dtype == np.float32 or original_dtype == np.float64:
                     if original_max <= 1.0:
                         # Normalized float data [0,1] -> [0,255] with high precision
-                        video_array = np.clip(video_array * 255.0, 0, 255)
-                        # Use round() for more accurate conversion than direct casting
-                        video_array = np.round(video_array).astype(np.uint8)
+                        # Multiply by 255 and add 0.5 before floor (equivalent to round but faster)
+                        video_array = np.clip(video_array * 255.0 + 0.5, 0, 255).astype(np.uint8)
                     else:
                         # Float data in [0,255] range - preserve as much precision as possible
-                        video_array = np.clip(video_array, 0, 255)
-                        video_array = np.round(video_array).astype(np.uint8)
+                        video_array = np.clip(video_array + 0.5, 0, 255).astype(np.uint8)
                 elif original_dtype == np.uint8:
                     # Already in correct format - no conversion needed
                     video_array = video_array.astype(np.uint8)
@@ -720,23 +943,49 @@ class CustomVideoSaver:
             print(f"[CustomVideoSaver] Processing {num_frames} frames of {width}x{height} with {channels} channels")
             print(f"[CustomVideoSaver] Using codec: {codec} (CRF: {quality})")
             
+            # Initialize COM for Windows Media Foundation codecs
+            com_available = False
+            if codec in ["H.265/HEVC", "H.264/AVC"] and platform.system() == 'Windows':
+                com_available = _initialize_com_for_video()
+                if not com_available:
+                    print(f"[CustomVideoSaver] COM initialization failed, cannot use {codec}")
+                    print(f"[CustomVideoSaver] Falling back to MP4V codec...")
+                    codec = "MP4V"
+            
             # Set up video codec
-            fourcc = self._get_fourcc_for_codec(codec)
+            fourcc, codec_name = self._get_fourcc_for_codec(codec)
             
             # Create video writer
             out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
             
             if not out.isOpened():
-                print(f"[CustomVideoSaver] Failed to open video writer with {codec}")
-                print(f"[CustomVideoSaver] Trying MP4V fallback codec...")
+                print(f"[CustomVideoSaver] Failed to open video writer with {codec_name}")
+                print(f"[CustomVideoSaver] Trying fallback codecs...")
                 
-                # Try MP4V as universal fallback
-                fallback_fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                out = cv2.VideoWriter(output_path, fallback_fourcc, fps, (width, height))
-                if out.isOpened():
-                    print(f"[CustomVideoSaver] Using MP4V codec as fallback")
-                else:
+                # Try fallback codecs in order of preference
+                fallback_codecs = [
+                    ('mp4v', 'MP4V'),
+                    ('MJPG', 'MJPEG'),
+                    ('XVID', 'XVID'),
+                ]
+                
+                for fallback_fourcc_str, fallback_name in fallback_codecs:
+                    try:
+                        fallback_fourcc = cv2.VideoWriter_fourcc(*fallback_fourcc_str)
+                        out = cv2.VideoWriter(output_path, fallback_fourcc, fps, (width, height))
+                        if out.isOpened():
+                            print(f"[CustomVideoSaver] Successfully using {fallback_name} codec")
+                            break
+                    except Exception as e:
+                        print(f"[CustomVideoSaver] {fallback_name} codec failed: {e}")
+                        continue
+                
+                if not out.isOpened():
                     print(f"[CustomVideoSaver] All codecs failed, cannot create video")
+                    print(f"[CustomVideoSaver] This might be due to:")
+                    print(f"  1. COM threading mode conflict on Windows (try restarting ComfyUI)")
+                    print(f"  2. Missing video codec support in OpenCV")
+                    print(f"  3. Invalid output path or permissions")
                     return False
             
             # Write frames with careful color space handling
@@ -796,7 +1045,10 @@ class CustomVideoSaver:
             return False
     
     def _get_fourcc_for_codec(self, codec):
-        """Get OpenCV fourcc code for the selected codec."""
+        """
+        Get OpenCV fourcc code for the selected codec.
+        Returns tuple of (fourcc_code, codec_name_used).
+        """
         codec_map = {
             "H.265/HEVC": ['hev1', 'HEVC', 'H265', 'x265'],  # Try multiple H.265 codes
             "H.264/AVC": ['H264', 'avc1', 'X264', 'h264'],   # Try multiple H.264 codes
@@ -813,14 +1065,14 @@ class CustomVideoSaver:
             try:
                 fourcc = cv2.VideoWriter_fourcc(*fourcc_str)
                 print(f"[CustomVideoSaver] Trying {codec} with fourcc: {fourcc_str}")
-                return fourcc
+                return (fourcc, fourcc_str)
             except Exception as e:
                 print(f"[CustomVideoSaver] fourcc '{fourcc_str}' failed: {e}")
                 continue
         
         # Fallback to MP4V
         print(f"[CustomVideoSaver] Using MP4V fallback")
-        return cv2.VideoWriter_fourcc(*'mp4v')
+        return (cv2.VideoWriter_fourcc(*'mp4v'), 'mp4v')
     
     def _get_unique_video_filename(self, filename_prefix, output_dir, video_format):
         """
@@ -861,6 +1113,34 @@ class CustomVideoSaver:
                 video_filename = f"{filename_prefix}_{timestamp}.{video_format}"
                 video_path = os.path.join(output_dir, video_filename)
                 return video_filename, video_path
+    
+    def _check_ffmpeg_available(self):
+        """Check if FFmpeg is available in the system."""
+        try:
+            result = subprocess.run(
+                ['ffmpeg', '-version'],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=5
+            )
+            if result.returncode == 0:
+                # Parse FFmpeg version
+                output = result.stdout.decode('utf-8', errors='ignore')
+                first_line = output.split('\n')[0]
+                print(f"[CustomVideoSaver] {first_line}")
+                print(f"[CustomVideoSaver] FFmpeg is available - using for H.265/HEVC encoding")
+                return True
+            else:
+                print("[CustomVideoSaver] FFmpeg found but returned error")
+                return False
+        except FileNotFoundError:
+            print("[CustomVideoSaver] FFmpeg not found in PATH")
+            print("[CustomVideoSaver] H.265/HEVC and advanced codecs will not be available")
+            print("[CustomVideoSaver] Install FFmpeg for better codec support")
+            return False
+        except Exception as e:
+            print(f"[CustomVideoSaver] Error checking FFmpeg: {e}")
+            return False
     
     def _check_codec_support(self):
         """Check available codecs and provide helpful information."""
@@ -1000,6 +1280,7 @@ class LazySwitch:
             return (on_true,)
         else:
             return (on_false,)
+
 
 # Register the nodes (NodeBypasser is frontend-only, no Python registration needed)
 NODE_CLASS_MAPPINGS = {
