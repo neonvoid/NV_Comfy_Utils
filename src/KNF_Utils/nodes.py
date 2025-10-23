@@ -677,6 +677,11 @@ class CustomVideoSaver:
                 if codec in ["H.265/HEVC", "H.264/AVC", "VP9", "ProRes"]:
                     use_ffmpeg_encoding = True
                     print(f"[CustomVideoSaver] Using FFmpeg for {codec} encoding")
+            elif codec in ["H.265/HEVC", "H.264/AVC", "VP9", "ProRes"] and not self.ffmpeg_available:
+                # FFmpeg is required but not available
+                print(f"[CustomVideoSaver] Warning: {codec} requires FFmpeg but it's not available")
+                print(f"[CustomVideoSaver] Falling back to MP4V with OpenCV")
+                codec = "MP4V"
             
             # Convert tensor to video
             if use_ffmpeg_encoding:
@@ -815,16 +820,27 @@ class CustomVideoSaver:
             print(f"[CustomVideoSaver] FFmpeg command: {' '.join(cmd[:10])}...")
             
             # Start FFmpeg process
+            # CRITICAL: Use DEVNULL for stderr to prevent buffer deadlock
+            # FFmpeg writes progress to stderr, which can fill the pipe buffer
+            # and cause both processes to block waiting for each other
             process = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,  # Don't need stdout
+                stderr=subprocess.DEVNULL,  # CRITICAL: Prevents deadlock
                 bufsize=10**8
             )
             
             # Write frames to FFmpeg
+            frame_count = len(video_array)
+            print(f"[CustomVideoSaver] Encoding {frame_count} frames...")
+            
             for i, frame in enumerate(video_array):
+                # Progress update every 10 frames
+                if i > 0 and i % 10 == 0:
+                    progress = (i / frame_count) * 100
+                    print(f"[CustomVideoSaver] Progress: {progress:.1f}% ({i}/{frame_count})")
+                
                 # Ensure frame is contiguous in memory
                 frame = np.ascontiguousarray(frame)
                 
@@ -832,27 +848,42 @@ class CustomVideoSaver:
                 if preserve_colors:
                     frame_min, frame_max = frame.min(), frame.max()
                     if frame_min < 0 or frame_max > 255:
-                        print(f"[CustomVideoSaver] Warning: Frame {i} has values outside [0,255]: [{frame_min}, {frame_max}]")
+                        print(f"[CustomVideoSaver] Warning: Frame {i} has invalid range [{frame_min}, {frame_max}]")
                         frame = np.clip(frame, 0, 255).astype(np.uint8)
                 
                 # Write raw RGB data
                 try:
                     process.stdin.write(frame.tobytes())
+                except BrokenPipeError:
+                    print(f"[CustomVideoSaver] FFmpeg crashed at frame {i}")
+                    process.kill()
+                    return False
                 except Exception as e:
                     print(f"[CustomVideoSaver] Error writing frame {i}: {e}")
                     process.kill()
                     return False
             
+            print(f"[CustomVideoSaver] All frames written, finalizing...")
+            
             # Close stdin and wait for FFmpeg to finish
-            process.stdin.close()
-            stdout, stderr = process.communicate()
+            try:
+                process.stdin.flush()
+                process.stdin.close()
+            except:
+                pass
+            
+            # Wait with timeout to prevent infinite hang
+            try:
+                return_code = process.wait(timeout=300)  # 5 minute timeout
+            except subprocess.TimeoutExpired:
+                print(f"[CustomVideoSaver] FFmpeg timed out after 5 minutes")
+                process.kill()
+                return False
             
             # Check if encoding was successful
-            if process.returncode != 0:
-                print(f"[CustomVideoSaver] FFmpeg encoding failed with return code {process.returncode}")
-                if stderr:
-                    error_msg = stderr.decode('utf-8', errors='ignore')
-                    print(f"[CustomVideoSaver] FFmpeg error: {error_msg[-500:]}")  # Last 500 chars
+            if return_code != 0:
+                print(f"[CustomVideoSaver] FFmpeg failed with return code {return_code}")
+                print(f"[CustomVideoSaver] Try a different codec or preset")
                 return False
             
             # Verify file was created
