@@ -22,7 +22,7 @@ class AutomateVideoPathLoader:
             },
             "optional": {
                 "video_pattern": ("STRING", {"default": "*.mp4"}),
-                "video_types": ("STRING", {"default": "beauty,depth,stencil,alpha,openpose,restyled,optical_flow,motion_bbox"}),  # Types to look for
+                "video_types": ("STRING", {"default": "beauty,depth,stencil,alpha,openpose,restyled,optical_flow"}),  # Types to look for
                 "auto_detect": ("BOOLEAN", {"default": True}),  # Auto-detect available types
                 "auto_copy_missing": ("BOOLEAN", {"default": False}),  # Auto-create temp copies for missing passes
                 "base_pass_name": ("STRING", {"default": "beauty"}),  # Which pass to use as base for copies
@@ -35,7 +35,7 @@ class AutomateVideoPathLoader:
     CATEGORY = "KNF_Utils/Video"
     
     def load_videos(self, folder_path: str, base_name: str = "", video_pattern: str = "*.mp4", 
-                   video_types: str = "beauty,depth,stencil,alpha,openpose,restyled,optical_flow,motion_bbox", auto_detect: bool = True,
+                   video_types: str = "beauty,depth,stencil,alpha,openpose,restyled,optical_flow", auto_detect: bool = True,
                    auto_copy_missing: bool = False, base_pass_name: str = "beauty") -> Tuple[str, ...]:
         """
         Find and organize videos based on naming patterns.
@@ -44,7 +44,7 @@ class AutomateVideoPathLoader:
             folder_path: Path to folder containing videos
             base_name: Filter by specific base name (e.g., "KnightA")
             video_pattern: File pattern to match (e.g., "*.mp4", "*.mov")
-            video_types: Comma-separated list of video types to look for
+            video_types: Comma-separated list of video types to look for (add motion_bbox manually if needed)
             auto_detect: Whether to auto-detect available types
             
         Returns:
