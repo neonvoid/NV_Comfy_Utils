@@ -157,7 +157,7 @@ class AutomateVideoPathLoader:
         organized = {}
         
         # Define the standard video types we support
-        standard_types = ["beauty", "depth", "stencil" "openpose", "restyled", "optical_flow", "motion_bbox"]
+        standard_types = ["beauty", "depth", "stencil", "openpose", "restyled", "optical_flow", "motion_bbox"]
         
         # Process standard types first
         for video_type in standard_types:
@@ -278,7 +278,7 @@ class AutomateVideoPathLoader:
     
     def _create_empty_result(self, message: str) -> Tuple[str, ...]:
         """Create empty result with error message."""
-        return ("", "", "", "", "", "", "", "", "", message)
+        return ("", "", "", "", "", "", "", "", message)
     
     def _create_info_string(self, video_files: List[Path], matched_videos: Dict[str, Path], 
                            organized_videos: Dict[str, str], base_name: str, created_copies: List[str] = None) -> str:
