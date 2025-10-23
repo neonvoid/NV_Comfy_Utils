@@ -22,20 +22,20 @@ class AutomateVideoPathLoader:
             },
             "optional": {
                 "video_pattern": ("STRING", {"default": "*.mp4"}),
-                "video_types": ("STRING", {"default": "beauty,depth,stencil,openpose,restyled,optical_flow,motion_bbox"}),  # Types to look for
+                "video_types": ("STRING", {"default": "beauty,depth,stencil,alpha,openpose,restyled,optical_flow,motion_bbox"}),  # Types to look for
                 "auto_detect": ("BOOLEAN", {"default": True}),  # Auto-detect available types
                 "auto_copy_missing": ("BOOLEAN", {"default": False}),  # Auto-create temp copies for missing passes
                 "base_pass_name": ("STRING", {"default": "beauty"}),  # Which pass to use as base for copies
             }
         }
     
-    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING","STRING", "STRING", "STRING", "STRING", "STRING")
-    RETURN_NAMES = ("beauty_path", "depth_path", "stencil_path", "openpose_path", "restyled_path", "optical_flow_path", "motion_bbox_path", "extra_path", "info")
+    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING", "STRING", "STRING", "STRING", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("beauty_path", "depth_path", "stencil_path", "alpha_path", "openpose_path", "restyled_path", "optical_flow_path", "motion_bbox_path", "extra_path", "info")
     FUNCTION = "load_videos"
     CATEGORY = "KNF_Utils/Video"
     
     def load_videos(self, folder_path: str, base_name: str = "", video_pattern: str = "*.mp4", 
-                   video_types: str = "beauty,depth,stencil,openpose,restyled,optical_flow,motion_bbox", auto_detect: bool = True,
+                   video_types: str = "beauty,depth,stencil,alpha,openpose,restyled,optical_flow,motion_bbox", auto_detect: bool = True,
                    auto_copy_missing: bool = False, base_pass_name: str = "beauty") -> Tuple[str, ...]:
         """
         Find and organize videos based on naming patterns.
@@ -48,7 +48,7 @@ class AutomateVideoPathLoader:
             auto_detect: Whether to auto-detect available types
             
         Returns:
-            Tuple of video file paths: (beauty, depth, stencil, openpose, restyled, optical_flow, motion_bbox, extra, info)
+            Tuple of video file paths: (beauty, depth, stencil, alpha, openpose, restyled, optical_flow, motion_bbox, extra, info)
         """
         try:
             if not folder_path or not os.path.exists(folder_path):
@@ -91,6 +91,7 @@ class AutomateVideoPathLoader:
                 organized_videos.get("beauty", ""),
                 organized_videos.get("depth", ""),
                 organized_videos.get("stencil", ""),
+                organized_videos.get("alpha", ""),
                 organized_videos.get("openpose", ""),
                 organized_videos.get("restyled", ""),
                 organized_videos.get("optical_flow", ""),
@@ -132,7 +133,7 @@ class AutomateVideoPathLoader:
             
             # If no specific type found but auto-detect is on, try to find any known type
             if not matched_type and auto_detect:
-                known_types = ["beauty", "depth", "stencil", "openpose", "restyled", "optical_flow", "motion_bbox"]
+                known_types = ["beauty", "depth", "stencil", "alpha", "openpose", "restyled", "optical_flow", "motion_bbox"]
                 for known_type in known_types:
                     if known_type in filename:
                         matched_type = known_type
@@ -157,7 +158,7 @@ class AutomateVideoPathLoader:
         organized = {}
         
         # Define the standard video types we support
-        standard_types = ["beauty", "depth", "stencil", "openpose", "restyled", "optical_flow", "motion_bbox"]
+        standard_types = ["beauty", "depth", "stencil", "alpha", "openpose", "restyled", "optical_flow", "motion_bbox"]
         
         # Process standard types first
         for video_type in standard_types:
@@ -199,7 +200,7 @@ class AutomateVideoPathLoader:
         base_extension = base_path.suffix
         
         # Check each target type and create if missing
-        standard_types = ["beauty", "depth", "stencil", "openpose", "restyled", "optical_flow", "motion_bbox"]
+        standard_types = ["beauty", "depth", "stencil", "alpha", "openpose", "restyled", "optical_flow", "motion_bbox"]
         
         for pass_type in target_types:
             if pass_type not in standard_types:
@@ -253,7 +254,7 @@ class AutomateVideoPathLoader:
         if '.' in base_filename:
             parts = base_filename.split('.')
             # Find and replace the last part that looks like a pass name
-            known_passes = ["beauty", "depth", "stencil", "openpose", "restyled", "optical_flow", "motion_bbox"]
+            known_passes = ["beauty", "depth", "stencil", "alpha", "openpose", "restyled", "optical_flow", "motion_bbox"]
             for i in range(len(parts) - 1, -1, -1):
                 if parts[i].lower() in known_passes:
                     parts[i] = pass_type
@@ -264,7 +265,7 @@ class AutomateVideoPathLoader:
         # Pattern 2: KnightA_beauty_video -> tmp_KnightA_depth_video
         elif '_' in base_filename:
             parts = base_filename.split('_')
-            known_passes = ["beauty", "depth", "stencil", "openpose", "restyled", "optical_flow", "motion_bbox"]
+            known_passes = ["beauty", "depth", "stencil", "alpha", "openpose", "restyled", "optical_flow", "motion_bbox"]
             for i in range(len(parts)):
                 if parts[i].lower() in known_passes:
                     parts[i] = pass_type
@@ -278,7 +279,7 @@ class AutomateVideoPathLoader:
     
     def _create_empty_result(self, message: str) -> Tuple[str, ...]:
         """Create empty result with error message."""
-        return ("", "", "", "", "", "", "", "", message)
+        return ("", "", "", "", "", "", "", "", "", message)
     
     def _create_info_string(self, video_files: List[Path], matched_videos: Dict[str, Path], 
                            organized_videos: Dict[str, str], base_name: str, created_copies: List[str] = None) -> str:
