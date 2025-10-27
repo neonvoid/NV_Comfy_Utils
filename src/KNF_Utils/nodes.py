@@ -1216,6 +1216,9 @@ class CustomVideoSaver:
 # Import the video path loader
 from .smart_video_loader import AutomateVideoPathLoader
 
+# Import the video loader with frame replacement
+from .video_loader_with_frame_replacement import NV_Video_Loader_Path
+
 # Simple Get Variable Node - Python backend
 class GetVariableNode:
     """
@@ -1320,6 +1323,7 @@ NODE_CLASS_MAPPINGS = {
     "AutomateVideoPathLoader": AutomateVideoPathLoader,
     "CustomVideoSaver": CustomVideoSaver,
     "LazySwitch": LazySwitch,
+    "NV_Video_Loader_Path": NV_Video_Loader_Path,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1328,4 +1332,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "AutomateVideoPathLoader": "Automate Video Path Loader",
     "CustomVideoSaver": "Custom Video Saver",
     "LazySwitch": "Lazy Switch",
+    "NV_Video_Loader_Path": "NV Video Loader Path",
 }
