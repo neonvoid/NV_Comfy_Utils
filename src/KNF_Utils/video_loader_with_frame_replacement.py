@@ -106,22 +106,28 @@ class NV_Video_Loader_Path:
                 }
             }
         
+        # Build format input
+        if VHS_AVAILABLE:
+            format_options = get_load_formats()
+        else:
+            format_options = (["None"], {"default": "None"})
+        
         return {
             "required": {
                 "video": ("STRING", {
                     "placeholder": "X://insert/path/here.mp4", 
                     "vhs_path_extensions": video_extensions
                 }),
-                "force_rate": (floatOrInt, {"default": 0, "min": 0, "max": 60, "step": 1, "disable": 0}),
-                "custom_width": ("INT", {"default": 0, "min": 0, "max": DIMMAX, 'disable': 0}),
-                "custom_height": ("INT", {"default": 0, "min": 0, "max": DIMMAX, 'disable': 0}),
-                "frame_load_cap": ("INT", {"default": 0, "min": 0, "max": BIGMAX, "step": 1, "disable": 0}),
-                "start_time": ("FLOAT", {"default": 0, "min": 0, "max": BIGMAX, "step": .001, "widgetType": "VHSTIMESTAMP"}),
+                "force_rate": ("FLOAT", {"default": 0, "min": 0, "max": 60, "step": 1}),
+                "custom_width": ("INT", {"default": 0, "min": 0, "max": DIMMAX}),
+                "custom_height": ("INT", {"default": 0, "min": 0, "max": DIMMAX}),
+                "frame_load_cap": ("INT", {"default": 0, "min": 0, "max": BIGMAX, "step": 1}),
+                "start_time": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 9999.0, "step": 0.01}),
             },
             "optional": {
                 "meta_batch": ("VHS_BatchManager",),
                 "vae": ("VAE",),
-                "format": get_load_formats() if VHS_AVAILABLE else (["None"],),
+                "format": format_options,
                 "first_frame_image": ("IMAGE",),
                 "last_frame_image": ("IMAGE",),
                 "replace_first_frame": ("BOOLEAN", {"default": False}),
