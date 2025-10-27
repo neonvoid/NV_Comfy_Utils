@@ -10,12 +10,18 @@ import numpy as np
 from pathlib import Path
 
 # Import VideoHelperSuite components
-# We need to add the parent directory to path to import from videohelpersuite
-custom_nodes_path = Path(__file__).parent.parent.parent.parent
-videohelpersuite_path = custom_nodes_path / "comfyui-videohelpersuite"
-sys.path.insert(0, str(videohelpersuite_path))
+VHS_AVAILABLE = False
+load_video = None
+ffmpeg_frame_generator = None
+get_load_formats = None
+validate_path = None
+hash_path = None
+is_url = None
+try_download_video = None
+strip_path = None
 
 try:
+    # Try direct import first (if VHS is in Python path)
     from videohelpersuite.load_video_nodes import (
         load_video,
         ffmpeg_frame_generator,
@@ -32,16 +38,57 @@ try:
         imageOrLatent
     )
     VHS_AVAILABLE = True
-except ImportError as e:
-    print(f"[NV_Video_Loader_Path] Warning: Could not import VideoHelperSuite: {e}")
-    print(f"[NV_Video_Loader_Path] Make sure comfyui-videohelpersuite is installed")
-    VHS_AVAILABLE = False
-    # Define fallbacks for when VHS is not available
+    print("[NV_Video_Loader_Path] Successfully imported VideoHelperSuite")
+except ImportError as e1:
+    # Try adding to path and importing
+    try:
+        custom_nodes_path = Path(__file__).parent.parent.parent.parent
+        videohelpersuite_path = custom_nodes_path / "comfyui-videohelpersuite"
+        
+        if not videohelpersuite_path.exists():
+            raise ImportError(f"VideoHelperSuite path does not exist: {videohelpersuite_path}")
+        
+        sys.path.insert(0, str(videohelpersuite_path))
+        
+        from videohelpersuite.load_video_nodes import (
+            load_video,
+            ffmpeg_frame_generator,
+            get_load_formats,
+            validate_path,
+            hash_path,
+            is_url,
+            try_download_video,
+            strip_path,
+            video_extensions,
+            BIGMAX,
+            DIMMAX,
+            floatOrInt,
+            imageOrLatent
+        )
+        VHS_AVAILABLE = True
+        print("[NV_Video_Loader_Path] Successfully imported VideoHelperSuite (via path)")
+    except Exception as e2:
+        print("=" * 80)
+        print("[NV_Video_Loader_Path] ERROR: Could not import VideoHelperSuite!")
+        print(f"[NV_Video_Loader_Path] Error 1: {e1}")
+        print(f"[NV_Video_Loader_Path] Error 2: {e2}")
+        print(f"[NV_Video_Loader_Path] Expected path: {videohelpersuite_path if 'videohelpersuite_path' in locals() else 'unknown'}")
+        print("[NV_Video_Loader_Path] Please install comfyui-videohelpersuite:")
+        print("[NV_Video_Loader_Path]   cd ComfyUI/custom_nodes")
+        print("[NV_Video_Loader_Path]   git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite comfyui-videohelpersuite")
+        print("=" * 80)
+        VHS_AVAILABLE = False
+
+# Define fallbacks for when VHS is not available
+if not VHS_AVAILABLE:
     video_extensions = ['webm', 'mp4', 'mkv', 'gif', 'mov']
     BIGMAX = 999999999
     DIMMAX = 16384
     floatOrInt = "FLOAT"
     imageOrLatent = "IMAGE"
+    
+    def get_load_formats():
+        return (["None"], {"default": "None", "formats": {}})
 
 
 class NV_Video_Loader_Path:

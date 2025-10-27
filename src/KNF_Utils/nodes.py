@@ -1217,7 +1217,17 @@ class CustomVideoSaver:
 from .smart_video_loader import AutomateVideoPathLoader
 
 # Import the video loader with frame replacement
-from .video_loader_with_frame_replacement import NV_Video_Loader_Path
+try:
+    from .video_loader_with_frame_replacement import NV_Video_Loader_Path
+    NV_VIDEO_LOADER_AVAILABLE = True
+except Exception as e:
+    print(f"[NV_Comfy_Utils] Warning: Could not import NV_Video_Loader_Path: {e}")
+    import traceback
+    traceback.print_exc()
+    NV_VIDEO_LOADER_AVAILABLE = False
+    # Create a dummy class to prevent registration errors
+    class NV_Video_Loader_Path:
+        pass
 
 # Simple Get Variable Node - Python backend
 class GetVariableNode:
@@ -1323,7 +1333,6 @@ NODE_CLASS_MAPPINGS = {
     "AutomateVideoPathLoader": AutomateVideoPathLoader,
     "CustomVideoSaver": CustomVideoSaver,
     "LazySwitch": LazySwitch,
-    "NV_Video_Loader_Path": NV_Video_Loader_Path,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1332,5 +1341,12 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "AutomateVideoPathLoader": "Automate Video Path Loader",
     "CustomVideoSaver": "Custom Video Saver",
     "LazySwitch": "Lazy Switch",
-    "NV_Video_Loader_Path": "NV Video Loader Path",
 }
+
+# Conditionally add NV_Video_Loader_Path if it imported successfully
+if NV_VIDEO_LOADER_AVAILABLE:
+    NODE_CLASS_MAPPINGS["NV_Video_Loader_Path"] = NV_Video_Loader_Path
+    NODE_DISPLAY_NAME_MAPPINGS["NV_Video_Loader_Path"] = "NV Video Loader Path"
+    print("[NV_Comfy_Utils] NV_Video_Loader_Path registered successfully")
+else:
+    print("[NV_Comfy_Utils] NV_Video_Loader_Path NOT registered (import failed)")
