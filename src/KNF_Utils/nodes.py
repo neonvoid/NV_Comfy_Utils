@@ -3625,13 +3625,15 @@ class NV_ChunkConditioningPreprocessor:
                                 ctrl_frames, vae, tiled_vae
                             )
                             
-                            # Each is 16 channels
+                            # Each is 16 channels, no batch: [16, T, H, W]
                             C, T, H, W = inactive_latents.shape  # C = 16
                             num_frames = (T - 1) * 4 + 1
                             
                             # Package in EXACT ComfyUI Wan VACE format (from nodes_wan.py)
-                            # Concatenate inactive + reactive into single 32-channel tensor
-                            control_video_latent = torch.cat([inactive_latents, reactive_latents], dim=0)  # [32, T, H, W]
+                            # Add batch dimension and concatenate on channel dimension
+                            inactive_batched = inactive_latents.unsqueeze(0)  # [1, 16, T, H, W]
+                            reactive_batched = reactive_latents.unsqueeze(0)  # [1, 16, T, H, W]
+                            control_video_latent = torch.cat([inactive_batched, reactive_batched], dim=1)  # [1, 32, T, H, W]
                             
                             # Create 64-channel extended mask (8x8 spatial patches)
                             # Default: all ones (full control everywhere)
