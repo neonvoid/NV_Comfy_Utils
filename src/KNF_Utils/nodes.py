@@ -3752,6 +3752,8 @@ class NV_ChunkConditioningPreprocessor:
         Returns:
             32-channel latent: [32, T_lat, H_lat, W_lat]
         """
+        import torch
+        
         print(f"[VACE Dual] Encoding with dual-channel format")
         print(f"[VACE Dual] Input frames shape: {frames.shape}")
         
@@ -3790,6 +3792,9 @@ class NV_ChunkConditioningPreprocessor:
     
     def _encode_control_frames(self, frames, vae, tiled=False):
         """Encode control frames with VAE (WanVACE format)"""
+        import torch
+        import comfy.utils
+        
         # frames shape: [T, H, W, C] in range [0, 1]
         # Need to convert to VAE format: [C, T, H, W] in range [-1, 1]
         
@@ -3808,7 +3813,6 @@ class NV_ChunkConditioningPreprocessor:
             print(f"[Control Encode] Resizing {W}x{H} -> {new_width}x{new_height} (must be divisible by 16)")
             
             # Use ComfyUI's upscale function: [T, H, W, C] -> [T, C, H, W] -> upscale -> [T, H, W, C]
-            import comfy.utils
             frames = frames.permute(0, 3, 1, 2)  # [T, C, H, W]
             frames = comfy.utils.common_upscale(frames, new_width, new_height, "lanczos", "disabled")
             frames = frames.permute(0, 2, 3, 1)  # [T, H, W, C]
