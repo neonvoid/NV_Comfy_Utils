@@ -2373,9 +2373,6 @@ class NV_VideoSampler:
                 "model": ("MODEL", {
                     "tooltip": "The model used for denoising (works with any ComfyUI model type)"
                 }),
-                "latent_image": ("LATENT", {
-                    "tooltip": "Input latent (4D for images, 5D for videos). Noise for txt2img/vid, existing latent for img2img/vid2vid."
-                }),
                 "seed": ("INT", {
                     "default": 0, 
                     "min": 0, 
@@ -2409,6 +2406,9 @@ class NV_VideoSampler:
                 }),
             },
             "optional": {
+                "latent_image": ("LATENT", {
+                    "tooltip": "Input latent (canvas). Can be auto-generated from preprocessor or provided manually for img2img/vid2vid."
+                }),
                 "positive": ("CONDITIONING", {
                     "tooltip": "Positive conditioning (what you want). REQUIRED for standard mode. Optional for chunked mode (used as fallback)."
                 }),
@@ -2509,8 +2509,9 @@ class NV_VideoSampler:
     • Video-optimized sampling parameters
     """
     
-    def sample(self, model, latent_image, seed, steps, cfg, 
-               sampler_name, scheduler, sampler_mode="standard", positive=None, negative=None,
+    def sample(self, model, seed, steps, cfg, 
+               sampler_name, scheduler, sampler_mode="standard", latent_image=None,
+               positive=None, negative=None,
                denoise_strength=1.0, start_step=0, end_step=-1,
                selector=0, cfg_end=-1.0, add_noise="enable", 
                return_with_leftover_noise="disable", eta=0.0, noise_type="gaussian", 
@@ -2524,16 +2525,26 @@ class NV_VideoSampler:
         
         start_time = time.time()
         
-        # Validate conditioning inputs
+        # Validate inputs
         has_chunk_cond = chunk_conditionings is not None and len(chunk_conditionings) > 0
         has_global_cond = positive is not None and negative is not None
+        has_latent = latent_image is not None
         
+        # Check conditioning
         if not has_chunk_cond and not has_global_cond:
             raise ValueError(
                 "Either provide chunk_conditionings (from NV_ChunkConditioningPreprocessor) "
                 "OR provide both positive and negative conditioning.\n"
                 "For chunked workflows: Only connect chunk_conditionings.\n"
                 "For standard workflows: Connect positive and negative from CLIP encoding."
+            )
+        
+        # Check latent
+        if not has_latent:
+            raise ValueError(
+                "No latent_image provided!\n"
+                "Connect the 'latent' output from NV_ChunkConditioningPreprocessor (auto-generated)\n"
+                "OR provide an Empty Latent Video / VAE Encode output for custom dimensions."
             )
         
         # Get model sampling for sigma ranges (needed for RES4LYF noise)
@@ -2693,10 +2704,15 @@ class NV_VideoSampler:
         
         batch_size, channels, frames, height, width = latent.shape
         
+        # Start building info output
         info_lines = []
         info_lines.append("=" * 60)
         info_lines.append("NV VIDEO SAMPLER - SAMPLING INFO")
         info_lines.append("=" * 60)
+        
+        # Report latent source
+        latent_source = "from preprocessor (auto-generated)" if has_chunk_cond and not has_global_cond else "user-provided"
+        info_lines.append(f"Latent source: {latent_source}")
         info_lines.append(f"Selector ID: {selector}")
         info_lines.append(f"Input Type: {'IMAGE (4D)' if is_image_latent else 'VIDEO (5D)'}")
         info_lines.append(f"Latent Shape: {list(latent.shape)} (B×C×F×H×W)")
@@ -3494,8 +3510,8 @@ class NV_ChunkConditioningPreprocessor:
             }
         }
     
-    RETURN_TYPES = ("CHUNK_CONDITIONING_LIST", "STRING")
-    RETURN_NAMES = ("chunk_conditionings", "info")
+    RETURN_TYPES = ("CHUNK_CONDITIONING_LIST", "LATENT", "STRING")
+    RETURN_NAMES = ("chunk_conditionings", "latent", "info")
     FUNCTION = "preprocess"
     CATEGORY = "NV_Utils/Video/Chunking"
     
@@ -3648,12 +3664,39 @@ class NV_ChunkConditioningPreprocessor:
         
         info_lines.append("")
         info_lines.append(f"Encoded {len(chunk_conditionings)} chunk conditionings")
+        
+        # Create empty latent based on video metadata
+        # This automates latent creation for the sampler
+        import torch
+        
+        video_width = metadata.get("width", 832)
+        video_height = metadata.get("height", 480)
+        video_frames = metadata.get("total_frames", 81)
+        
+        # Wan uses 16-channel latents, but we'll use 16 as default for video models
+        # Users can override by providing their own latent to the sampler
+        latent_channels = 16  # Wan/video models
+        
+        # Convert pixel dimensions to latent dimensions (Wan VAE: ÷8 spatial, ÷4 temporal)
+        latent_height = video_height // 8
+        latent_width = video_width // 8
+        latent_frames = (video_frames - 1) // 4 + 1  # 4n+1 formula
+        
+        # Create empty latent: [batch, channels, frames, height, width]
+        empty_latent = torch.zeros(1, latent_channels, latent_frames, latent_height, latent_width)
+        
+        latent_dict = {"samples": empty_latent}
+        
+        info_lines.append("")
+        info_lines.append(f"Generated empty latent:")
+        info_lines.append(f"  Video: {video_frames}f × {video_height}h × {video_width}w")
+        info_lines.append(f"  Latent: {latent_frames}f × {latent_height}h × {latent_width}w × {latent_channels}ch")
         info_lines.append("=" * 60)
         
         info_text = "\n".join(info_lines)
         print(info_text)
         
-        return (chunk_conditionings, info_text)
+        return (chunk_conditionings, latent_dict, info_text)
     
     def _load_video_frames(self, video_path, start_frame, end_frame):
         """Load a range of frames from a video file"""
