@@ -3629,14 +3629,19 @@ class NV_ChunkConditioningPreprocessor:
                             C, T, H, W = inactive_latents.shape  # C = 16
                             num_frames = (T - 1) * 4 + 1
                             
-                            # Package in ComfyUI Wan VACE format
-                            # CRITICAL: Pass as TWO separate 16-channel tensors, not one 32-channel
-                            # The model processes them in 16-channel chunks
-                            # Create mask with same spatial/temporal shape as latents
-                            # Match the channel dimension (16) for each vace_frame
+                            # Package in EXACT ComfyUI Wan VACE format (from nodes_wan.py)
+                            # Concatenate inactive + reactive into single 32-channel tensor
+                            control_video_latent = torch.cat([inactive_latents, reactive_latents], dim=0)  # [32, T, H, W]
+                            
+                            # Create 64-channel extended mask (8x8 spatial patches)
+                            # Default: all ones (full control everywhere)
+                            vae_stride = 8
+                            mask_64ch = torch.ones(vae_stride * vae_stride, T, H, W)  # [64, T, H, W]
+                            mask_64ch = mask_64ch.unsqueeze(0)  # [1, 64, T, H, W]
+                            
                             control_embeds[ctrl_name] = {
-                                "vace_frames": [inactive_latents, reactive_latents],  # Two 16-channel tensors!
-                                "vace_mask": [torch.ones_like(inactive_latents), torch.ones_like(reactive_latents)],  # One mask per vace_frame
+                                "vace_frames": [control_video_latent],  # Single 32-channel tensor in list
+                                "vace_mask": [mask_64ch],               # [1, 64, T, H, W] extended mask
                                 "vace_strength": [ctrl_settings.get("weight", 1.0)],
                                 "start_percent": ctrl_settings.get("start_percent", 0.0),
                                 "end_percent": ctrl_settings.get("end_percent", 1.0),
