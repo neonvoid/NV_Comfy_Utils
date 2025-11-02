@@ -3353,9 +3353,11 @@ class NV_VideoChunkAnalyzer:
         json_data = {
             "metadata": {
                 "total_frames": total_frames,
+                "width": width,
+                "height": height,
                 "chunk_size": chunk_size,
                 "chunk_overlap": chunk_overlap,
-                "resolution": [width, height],
+                "resolution": [width, height],  # Keep for compatibility
                 "fps": chunk_fps,
             },
             "control_videos": control_paths,  # Dict of {name: path}
@@ -3522,6 +3524,7 @@ class NV_ChunkConditioningPreprocessor:
         import os
         import cv2
         import numpy as np
+        import torch
         
         # Load JSON
         if not os.path.exists(chunk_json_path):
@@ -3667,8 +3670,6 @@ class NV_ChunkConditioningPreprocessor:
         
         # Create empty latent based on video metadata
         # This automates latent creation for the sampler
-        import torch
-        
         video_width = metadata.get("width", 832)
         video_height = metadata.get("height", 480)
         video_frames = metadata.get("total_frames", 81)
