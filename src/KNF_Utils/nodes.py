@@ -2491,24 +2491,22 @@ class NV_VideoSampler:
     FUNCTION = "sample"
     CATEGORY = "NV_Utils/sampling"
     DESCRIPTION = """
-    NV Video Sampler - Automation-friendly diffusion sampler
+    NV Video Sampler - Wan-focused video automation sampler
     
     Features:
-    • Works with images (4D) and videos (5D latents)
-    • Works with any ComfyUI model (SD, SDXL, SD3, FLUX, Wan, etc.)
-    • Dynamic CFG for video temporal consistency
-    • Selector input for workflow automation
-    • Partial denoising for video2video/img2img
+    • Optimized for Wan video diffusion models
     • Context window chunking for long videos
-    • Comprehensive sampling info output
+    • Per-chunk VACE control support (depth, pose, etc.)
+    • Dynamic CFG for temporal consistency
+    • Selector input for workflow automation
+    • Latent space blending for seamless chunk transitions
+    • Compatible with standard models (SD/SDXL) for testing
     
-    Educational:
-    This node demonstrates the complete sampling pipeline:
-    1. Sigma schedule calculation (scheduler)
-    2. Noise preparation (seed + denoise handling)
-    3. CFG guidance application (positive/negative conditioning)
-    4. Iterative denoising loop (sampler algorithm)
-    5. Progress tracking and info reporting
+    Wan Integration:
+    • VACE controls properly formatted for Wan sampling
+    • Multiple controls per chunk via additional_vace_inputs
+    • Chunk-specific control weights and timing
+    • Video-optimized sampling parameters
     """
     
     def sample(self, model, positive, negative, latent_image, seed, steps, cfg, 
@@ -2907,6 +2905,38 @@ class NV_VideoSampler:
                     chunk_negative = negative
                     info_lines.append(f"  (Using global negative conditioning)")
                 
+                # Inject Wan VACE controls into conditioning if present
+                chunk_control_embeds = chunk_cond.get("control_embeds")
+                if chunk_control_embeds and len(chunk_control_embeds) > 0:
+                    info_lines.append(f"  → Chunk has {len(chunk_control_embeds)} control(s) encoded")
+                    
+                    # Combine all control embeds for this chunk
+                    # ComfyUI Wan VACE expects: vace_frames, vace_mask, vace_strength
+                    all_vace_frames = []
+                    all_vace_masks = []
+                    all_vace_strengths = []
+                    
+                    for ctrl_name, ctrl_data in chunk_control_embeds.items():
+                        # Each control's data
+                        all_vace_frames.extend(ctrl_data["vace_frames"])  # Add 32-channel latents
+                        all_vace_masks.extend(ctrl_data["vace_mask"])     # Add masks
+                        all_vace_strengths.extend(ctrl_data["vace_strength"])  # Add strengths
+                        
+                        info_lines.append(f"    • '{ctrl_name}': weight={ctrl_data['vace_strength'][0]:.2f}, frames={ctrl_data['num_frames']}")
+                    
+                    # Inject into positive conditioning
+                    # ComfyUI conditioning format: [[cond_tensor, {"key": value}], ...]
+                    if isinstance(chunk_positive, list) and len(chunk_positive) > 0:
+                        # Clone the conditioning to avoid modifying original
+                        chunk_positive = [[c[0], c[1].copy()] for c in chunk_positive]
+                        
+                        # Add Wan VACE keys to the first conditioning entry
+                        chunk_positive[0][1]["vace_frames"] = all_vace_frames
+                        chunk_positive[0][1]["vace_mask"] = all_vace_masks
+                        chunk_positive[0][1]["vace_strength"] = all_vace_strengths
+                        
+                        info_lines.append(f"    ✓ VACE controls injected: {len(all_vace_frames)} control(s)")
+                
                 # Sample this chunk
                 chunk_samples = comfy.sample.sample(
                     model,
@@ -3055,9 +3085,18 @@ class NV_VideoSampler:
         # ============================================================
         # STEP 6: Prepare output
         # ============================================================
-        # If input was image latent (4D), squeeze back to 4D
-        if is_image_latent:
-            samples = samples.squeeze(2)  # Remove temporal dimension [B, C, 1, H, W] -> [B, C, H, W]
+        # Decide output format based on channels
+        # Video models (Wan, etc.) have 16+ channels and need 5D format
+        # Image models (SD, SDXL) have 4 channels and can use 4D
+        output_channels = samples.shape[1]
+        
+        if is_image_latent and output_channels <= 4:
+            # Standard image model: squeeze back to 4D
+            samples = samples.squeeze(2)  # [B, C, 1, H, W] -> [B, C, H, W]
+            info_lines.append("  Output format: 4D (image latent)")
+        else:
+            # Video model or multi-channel: keep as 5D
+            info_lines.append("  Output format: 5D (video latent or high-channel model)")
         
         out = latent_image.copy()
         out["samples"] = samples
@@ -3534,20 +3573,27 @@ class NV_ChunkConditioningPreprocessor:
                         )
                         
                         if ctrl_frames is not None:
-                            # Encode with VAE (WanVACE format)
-                            ctrl_latents = self._encode_control_frames(
+                            # Encode with VAE using DUAL-CHANNEL Wan VACE format
+                            ctrl_latents_dual = self._encode_vace_dual_channel(
                                 ctrl_frames, vae, tiled_vae
                             )
                             
-                            # Package in WanVACE format
+                            # ctrl_latents_dual is now 32 channels (inactive + reactive)
+                            C, T, H, W = ctrl_latents_dual.shape  # C should be 32
+                            num_frames = (T - 1) * 4 + 1
+                            
+                            # Package in ComfyUI Wan VACE format
+                            # Uses vace_frames (not vace_context), vace_mask, vace_strength
                             control_embeds[ctrl_name] = {
-                                "control_latents": ctrl_latents,
-                                "weight": ctrl_settings.get("weight", 1.0),
+                                "vace_frames": [ctrl_latents_dual],  # 32-channel dual-encoded control
+                                "vace_mask": [torch.ones(1, 1, T, H, W)],  # Default: full control everywhere
+                                "vace_strength": [ctrl_settings.get("weight", 1.0)],
                                 "start_percent": ctrl_settings.get("start_percent", 0.0),
                                 "end_percent": ctrl_settings.get("end_percent", 1.0),
+                                "num_frames": num_frames,
                             }
                             
-                            info_lines.append(f"  ✓ Encoded control '{ctrl_name}': {ctrl_latents.shape}")
+                            info_lines.append(f"  ✓ Encoded control '{ctrl_name}': {ctrl_latents_dual.shape} (dual-channel)")
                     except Exception as e:
                         info_lines.append(f"  ✗ Failed to encode control '{ctrl_name}': {e}")
             
@@ -3619,6 +3665,58 @@ class NV_ChunkConditioningPreprocessor:
         # Convert to tensor: [T, H, W, C]
         frames_tensor = torch.from_numpy(np.stack(frames, axis=0))
         return frames_tensor
+    
+    def _encode_vace_dual_channel(self, frames, vae, tiled=False):
+        """
+        Encode control frames using Wan VACE dual-channel format.
+        
+        Implements the dual-stream architecture:
+        - Inactive stream (channels 0-15): Context preservation
+        - Reactive stream (channels 16-31): Active control
+        
+        Args:
+            frames: [T, H, W, C] in range [0, 1]
+            vae: VAE model
+            tiled: Whether to use tiled encoding
+            
+        Returns:
+            32-channel latent: [32, T_lat, H_lat, W_lat]
+        """
+        print(f"[VACE Dual] Encoding with dual-channel format")
+        print(f"[VACE Dual] Input frames shape: {frames.shape}")
+        
+        # Default mask: all ones (full control everywhere)
+        # mask shape: [T, H, W, 1]
+        mask = torch.ones(frames.shape[0], frames.shape[1], frames.shape[2], 1)
+        
+        # Step 1: Center control video around zero
+        # From guide: "control_video = control_video - 0.5"
+        frames_centered = frames - 0.5
+        print(f"[VACE Dual] Centered frames range: [{frames_centered.min():.3f}, {frames_centered.max():.3f}]")
+        
+        # Step 2: Split into inactive and reactive streams
+        # inactive = (centered * (1 - mask)) + 0.5  → Preserves non-masked areas
+        # reactive = (centered * mask) + 0.5        → Applies masked areas
+        inactive = (frames_centered * (1 - mask)) + 0.5  # [T, H, W, C]
+        reactive = (frames_centered * mask) + 0.5        # [T, H, W, C]
+        
+        print(f"[VACE Dual] Inactive range: [{inactive.min():.3f}, {inactive.max():.3f}]")
+        print(f"[VACE Dual] Reactive range: [{reactive.min():.3f}, {reactive.max():.3f}]")
+        
+        # Step 3: Encode both streams with VAE
+        inactive_latents = self._encode_control_frames(inactive, vae, tiled)  # [16, T_lat, H_lat, W_lat]
+        reactive_latents = self._encode_control_frames(reactive, vae, tiled)  # [16, T_lat, H_lat, W_lat]
+        
+        print(f"[VACE Dual] Inactive latents: {inactive_latents.shape}")
+        print(f"[VACE Dual] Reactive latents: {reactive_latents.shape}")
+        
+        # Step 4: Concatenate into 32-channel control
+        dual_latents = torch.cat([inactive_latents, reactive_latents], dim=0)  # [32, T_lat, H_lat, W_lat]
+        
+        print(f"[VACE Dual] Final dual-channel latents: {dual_latents.shape}")
+        print(f"[VACE Dual] ✓ Encoding complete")
+        
+        return dual_latents
     
     def _encode_control_frames(self, frames, vae, tiled=False):
         """Encode control frames with VAE (WanVACE format)"""
