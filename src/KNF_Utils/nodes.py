@@ -3620,18 +3620,20 @@ class NV_ChunkConditioningPreprocessor:
                         
                         if ctrl_frames is not None:
                             # Encode with VAE using DUAL-CHANNEL Wan VACE format
-                            ctrl_latents_dual = self._encode_vace_dual_channel(
+                            # Returns two separate 16-channel tensors (inactive, reactive)
+                            inactive_latents, reactive_latents = self._encode_vace_dual_channel(
                                 ctrl_frames, vae, tiled_vae
                             )
                             
-                            # ctrl_latents_dual is now 32 channels (inactive + reactive)
-                            C, T, H, W = ctrl_latents_dual.shape  # C should be 32
+                            # Each is 16 channels
+                            C, T, H, W = inactive_latents.shape  # C = 16
                             num_frames = (T - 1) * 4 + 1
                             
                             # Package in ComfyUI Wan VACE format
-                            # Uses vace_frames (not vace_context), vace_mask, vace_strength
+                            # CRITICAL: Pass as TWO separate 16-channel tensors, not one 32-channel
+                            # The model processes them in 16-channel chunks
                             control_embeds[ctrl_name] = {
-                                "vace_frames": [ctrl_latents_dual],  # 32-channel dual-encoded control
+                                "vace_frames": [inactive_latents, reactive_latents],  # Two 16-channel tensors!
                                 "vace_mask": [torch.ones(1, 1, T, H, W)],  # Default: full control everywhere
                                 "vace_strength": [ctrl_settings.get("weight", 1.0)],
                                 "start_percent": ctrl_settings.get("start_percent", 0.0),
@@ -3639,7 +3641,7 @@ class NV_ChunkConditioningPreprocessor:
                                 "num_frames": num_frames,
                             }
                             
-                            info_lines.append(f"  ✓ Encoded control '{ctrl_name}': {ctrl_latents_dual.shape} (dual-channel)")
+                            info_lines.append(f"  ✓ Encoded control '{ctrl_name}': inactive={inactive_latents.shape}, reactive={reactive_latents.shape}")
                     except Exception as e:
                         info_lines.append(f"  ✗ Failed to encode control '{ctrl_name}': {e}")
             
@@ -3783,13 +3785,11 @@ class NV_ChunkConditioningPreprocessor:
         print(f"[VACE Dual] Inactive latents: {inactive_latents.shape}")
         print(f"[VACE Dual] Reactive latents: {reactive_latents.shape}")
         
-        # Step 4: Concatenate into 32-channel control
-        dual_latents = torch.cat([inactive_latents, reactive_latents], dim=0)  # [32, T_lat, H_lat, W_lat]
+        # Step 4: Return as separate tensors (model will concatenate internally)
+        # DO NOT concatenate here - model expects them separate for processing
+        print(f"[VACE Dual] ✓ Encoding complete (returning as separate streams)")
         
-        print(f"[VACE Dual] Final dual-channel latents: {dual_latents.shape}")
-        print(f"[VACE Dual] ✓ Encoding complete")
-        
-        return dual_latents
+        return inactive_latents, reactive_latents
     
     def _encode_control_frames(self, frames, vae, tiled=False):
         """Encode control frames with VAE (WanVACE format)"""
