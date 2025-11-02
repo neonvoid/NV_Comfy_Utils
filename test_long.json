@@ -1,0 +1,100 @@
+{
+  "metadata": {
+    "total_frames": 201,
+    "width": 480,
+    "height": 832,
+    "chunk_size": 81,
+    "chunk_overlap": 16,
+    "resolution": [
+      480,
+      832
+    ],
+    "fps": 16
+  },
+  "control_videos": {
+    "depth": "E:\\Comfy_project_data\\automation_test\\full_test\\control\\depth_00001.mp4",
+    "openpose": "E:\\Comfy_project_data\\automation_test\\full_test\\control\\openpose_00001.mp4"
+  },
+  "global_settings": {
+    "default_negative": "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走, 3D, MMD, talking, speaking, MikuMikuDance, SFM, Source Filmmaker, Blender, Unity, Unreal, CGI, bad quality",
+    "notes": "Edit this JSON to customize prompts and control settings per chunk"
+  },
+  "chunks": 
+  [
+    {
+      "id": 0,
+      "start_frame": 0,
+      "end_frame": 81,
+      "num_frames": 81,
+      "is_first": true,
+      "is_last": false,
+      "prompt_positive": "ScottyJames is captured in a vibrant medium close-up against a plain white brick wall, the initial frame holding on a fixed camera. His tousled dark brown hair and expressive, light-colored eyes create an immediate sense of energy. He is mid-reaction, his mouth slightly open and head tilted back, his posture suggesting engagement with someone off-screen. At the one-second mark, this engagement escalates into theatrical shock; his mouth widens into a gasp, and his eyes go wide with playful disbelief. To amplify this moment, a very slow camera push-in begins, moving closer to capture the candid emotion. By second two, the shock melts away as he closes his eyes and breaks into a silent, heartfelt laugh, tilting his head back slightly further. This blissful moment is brief. At second three, his eyes flutter open, his features settling into a charming, authentic smile directed again towards his off-camera partner. The camera movement reverses into a gentle camera pull-out, slowly revealing more of the soft, textured fabric of his black high-collared jacket and giving the scene breathing room. The entire four-second clip feels spontaneous and intimate, a genuine slice of charismatic interaction under bright, even studio lights.",
+      "prompt_negative": "",
+      "controls": {
+        "depth": {
+          "enabled": true,
+          "weight": 1.0,
+          "start_percent": 0.0,
+          "end_percent": 1.0
+        },
+        "openpose": {
+          "enabled": true,
+          "weight": 1.0,
+          "start_percent": 0.0,
+          "end_percent": 1.0
+        }
+      },
+      "saved_video_path": "E:\\Comfy_project_data\\automation_test\\full_test\\videos\\chunk_0000.mp4"
+    },
+    {
+      "id": 1,
+      "start_frame": 65,
+      "end_frame": 146,
+      "num_frames": 81,
+      "is_first": false,
+      "is_last": false,
+      "prompt_positive": "ScottyJames stands full-body against a clean white paneled wall, his rugged, dark brown boots planted firmly on the warm wooden flooring. The scene opens with a slow camera push-in, the even, frontal lighting casting soft shadows that give him a grounded presence. In the first second, he throws his arms wide in an expansive, expressive gesture, palms open towards the ceiling. His facial expression is animated, mouth open mid-sentence, eyebrows raised with playful emphasis, conveying pure charisma. At second two, a subtle camera tilt down follows the graceful arc of his movement as he brings his hands down and inward, drawing the energy back toward his chest as if consolidating a grand idea into a single, potent point. His expression shifts concurrently, the initial exuberance softening into a look of wry, self-assured confidence. By the final second, his arms fall loosely to his sides, the simple ring on his left finger catching the light. The camera motion ceases, becoming a fixed camera on a medium-full shot. He locks eyes directly with the lens, a faint, knowing smile playing on his lips as he holds the quiet, powerful stillness. The sequence captures a complete thought, moving from bold declaration to an unshakeable, silent conclusion.",
+      "prompt_negative": "",
+      "controls": {
+        "depth": {
+          "enabled": true,
+          "weight": 1.0,
+          "start_percent": 0.0,
+          "end_percent": 1.0
+        },
+        "openpose": {
+          "enabled": true,
+          "weight": 1.0,
+          "start_percent": 0.0,
+          "end_percent": 1.0
+        }
+      },
+      "saved_video_path": "E:\\Comfy_project_data\\automation_test\\full_test\\videos\\chunk_0001.mp4"
+    },
+    {
+      "id": 2,
+      "start_frame": 130,
+      "end_frame": 201,
+      "num_frames": 71,
+      "is_first": false,
+      "is_last": true,
+      "prompt_positive": "ScottyJames, full-body shot, stands confidently against a stark white cinder block wall, his sturdy black hiking-style shoes planted on the cool grey floor. The shot opens with a `fixed camera` holding him center-frame, capturing his approachable and expressive demeanor under even studio lighting. Initially, his arms are thrown wide in a grand, welcoming gesture, palms open to the viewer, his face animated as if exclaiming a key point. His medium-length brown hair is neatly styled, and the silver zipper of his black hooded jacket provides a sharp contrast. At second one, his movements become more deliberate; he pulls his hands inward toward his chest, fingers shaping the air as he refines his explanation, his expression transitioning from expansive to deeply concentrated. The camera remains steady, allowing his dynamic body language to be the sole focus of the motion, drawing attention to the small circular patch on his left sleeve. By the final second, his energy shifts entirely. He drops his arms to his sides, gives a subtle, knowing shrug, and tilts his head with a slight, wry smirk. This final gesture, a moment of quiet punctuation after his energetic delivery, completes the conversational arc, leaving a lasting impression of a charismatic and self-aware presenter.",
+      "prompt_negative": "",
+      "controls": {
+        "depth": {
+          "enabled": true,
+          "weight": 1.0,
+          "start_percent": 0.0,
+          "end_percent": 1.0
+        },
+        "openpose": {
+          "enabled": true,
+          "weight": 1.0,
+          "start_percent": 0.0,
+          "end_percent": 1.0
+        }
+      },
+      "saved_video_path": "E:\\Comfy_project_data\\automation_test\\full_test\\videos\\chunk_0002.mp4"
+    }
+  ]
+}

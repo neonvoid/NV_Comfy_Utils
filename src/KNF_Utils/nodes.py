@@ -2867,6 +2867,16 @@ class NV_VideoSampler:
         # CONTEXT WINDOW SAMPLING (if chunk_conditionings provided)
         # ============================================================
         if chunk_conditionings is not None and len(chunk_conditionings) > 0:
+            start_time = time.time()
+            
+            print(f"\n{'='*60}")
+            print(f"CONTEXT WINDOW SAMPLING MODE")
+            print(f"{'='*60}")
+            print(f"Total chunks: {len(chunk_conditionings)}")
+            print(f"Blend mode: {blend_mode}")
+            print(f"Latent shape: {latent.shape}")
+            print("")
+            
             info_lines.append("=" * 60)
             info_lines.append("CONTEXT WINDOW SAMPLING ENABLED")
             info_lines.append("=" * 60)
@@ -2909,11 +2919,21 @@ class NV_VideoSampler:
                 chunk_overlap = 0
             
             # Process each chunk
+            print(f"\n{'='*60}")
+            print(f"NV_VIDEOSAMPLER: Processing {len(chunk_conditionings)} chunk(s)")
+            print(f"{'='*60}")
+            
             for chunk_idx, chunk_cond in enumerate(chunk_conditionings):
+                chunk_start_time = time.time()
+                
                 # Calculate latent frame indices (with fallback for image-based chunks)
                 chunk_start = chunk_cond.get("latent_start", chunk_cond["start_frame"] // 4)
                 chunk_end = chunk_cond.get("latent_end", (chunk_cond["end_frame"] - 1) // 4 + 1)
                 chunk_frames = chunk_end - chunk_start
+                
+                print(f"\n[Chunk {chunk_idx + 1}/{len(chunk_conditionings)}] Starting...")
+                print(f"  Frame range: {chunk_cond['start_frame']}-{chunk_cond['end_frame']}")
+                print(f"  Latent range: {chunk_start}-{chunk_end} ({chunk_frames} frames)")
                 
                 info_lines.append(f"Processing chunk {chunk_idx + 1}/{len(chunk_conditionings)}:")
                 info_lines.append(f"  Latent frames: {chunk_start}-{chunk_end} ({chunk_frames} frames)")
@@ -2944,7 +2964,8 @@ class NV_VideoSampler:
                 # Inject Wan VACE controls into conditioning if present
                 chunk_control_embeds = chunk_cond.get("control_embeds")
                 if chunk_control_embeds and len(chunk_control_embeds) > 0:
-                    info_lines.append(f"  → Chunk has {len(chunk_control_embeds)} control(s) encoded")
+                    print(f"  Injecting {len(chunk_control_embeds)} control(s)...")
+                    info_lines.append(f"  → Chunk has {len(chunk_control_embeds)} control(s)")
                     
                     # Combine all control embeds for this chunk
                     # ComfyUI Wan VACE expects: vace_frames, vace_mask, vace_strength
@@ -2953,12 +2974,20 @@ class NV_VideoSampler:
                     all_vace_strengths = []
                     
                     for ctrl_name, ctrl_data in chunk_control_embeds.items():
-                        # Each control's data
-                        all_vace_frames.extend(ctrl_data["vace_frames"])  # Add 32-channel latents
-                        all_vace_masks.extend(ctrl_data["vace_mask"])     # Add masks
-                        all_vace_strengths.extend(ctrl_data["vace_strength"])  # Add strengths
+                        # Extract control slice from FULL control latent (matches main latent logic)
+                        full_vace_frames = ctrl_data["vace_frames"]  # [1, 32, T_full, H, W]
+                        full_vace_mask = ctrl_data["vace_mask"]      # [1, 64, T_full, H, W]
                         
-                        info_lines.append(f"    • '{ctrl_name}': weight={ctrl_data['vace_strength'][0]:.2f}, frames={ctrl_data['num_frames']}")
+                        # Slice to match this chunk's temporal range
+                        chunk_vace_frames = full_vace_frames[:, :, chunk_start:chunk_end, :, :]  # [1, 32, chunk_frames, H, W]
+                        chunk_vace_mask = full_vace_mask[:, :, chunk_start:chunk_end, :, :]      # [1, 64, chunk_frames, H, W]
+                        
+                        all_vace_frames.append(chunk_vace_frames)
+                        all_vace_masks.append(chunk_vace_mask)
+                        all_vace_strengths.extend(ctrl_data["vace_strength"])
+                        
+                        print(f"    • {ctrl_name}: weight={ctrl_data['vace_strength'][0]:.2f}, shape={chunk_vace_frames.shape}")
+                        info_lines.append(f"    • '{ctrl_name}': weight={ctrl_data['vace_strength'][0]:.2f}, slice=[{chunk_start}:{chunk_end}]")
                     
                     # Inject into positive conditioning
                     # ComfyUI conditioning format: [[cond_tensor, {"key": value}], ...]
@@ -2971,9 +3000,33 @@ class NV_VideoSampler:
                         chunk_positive[0][1]["vace_mask"] = all_vace_masks
                         chunk_positive[0][1]["vace_strength"] = all_vace_strengths
                         
+                        print(f"    ✓ Controls injected into conditioning")
                         info_lines.append(f"    ✓ VACE controls injected: {len(all_vace_frames)} control(s)")
                 
                 # Sample this chunk
+                print(f"  Starting sampling...")
+                print(f"    Sampler: {sampler_name}, Scheduler: {scheduler}")
+                print(f"    Steps: {steps}, CFG: {cfg}, Denoise: {denoise_strength}")
+                print(f"    Seed: {seed + chunk_idx}")
+                
+                # Create progress callback
+                sample_start_time = time.time()
+                last_step_time = sample_start_time
+                
+                def progress_callback(step, total_steps, preview_image):
+                    nonlocal last_step_time
+                    current_time = time.time()
+                    step_time = current_time - last_step_time
+                    elapsed = current_time - sample_start_time
+                    
+                    if step % max(1, total_steps // 10) == 0 or step == total_steps - 1:
+                        avg_step_time = elapsed / (step + 1)
+                        eta = avg_step_time * (total_steps - step - 1)
+                        print(f"    Step {step + 1}/{total_steps} ({(step + 1) / total_steps * 100:.0f}%) | "
+                              f"Step: {step_time:.2f}s | ETA: {eta:.1f}s")
+                    
+                    last_step_time = current_time
+                
                 chunk_samples = comfy.sample.sample(
                     model,
                     chunk_noise,
@@ -2990,11 +3043,16 @@ class NV_VideoSampler:
                     last_step=end_step if end_step >= 0 else None,
                     force_full_denoise=force_full_denoise,
                     noise_mask=None,
-                    disable_pbar=True,  # Disable per-chunk progress
+                    callback=progress_callback,
+                    disable_pbar=False,  # Show progress bar
                     seed=seed + chunk_idx  # Vary seed per chunk
                 )
                 
+                sample_time = time.time() - sample_start_time
+                print(f"  ✓ Sampling complete: {sample_time:.2f}s ({sample_time/steps:.3f}s/step)")
+                
                 # Create blend weights for this chunk
+                print(f"  Blending with mode: {blend_mode}")
                 chunk_weight = torch.ones_like(chunk_samples)
                 
                 if blend_mode == "linear":
@@ -3024,10 +3082,22 @@ class NV_VideoSampler:
                 output_latent[:, :, chunk_start:chunk_end, :, :] += chunk_samples * chunk_weight
                 weight_sum[:, :, chunk_start:chunk_end, :, :] += chunk_weight
                 
+                chunk_total_time = time.time() - chunk_start_time
+                print(f"  ✓ Chunk {chunk_idx + 1} complete: {chunk_total_time:.2f}s total")
+                print("")
+                
                 info_lines.append(f"  ✓ Chunk {chunk_idx + 1} complete")
             
             # Normalize by weight sum
+            print(f"Finalizing blend normalization...")
             samples = output_latent / (weight_sum + 1e-8)
+            
+            total_time = time.time() - start_time
+            print(f"\n{'='*60}")
+            print(f"✓ ALL CHUNKS COMPLETE!")
+            print(f"  Total time: {total_time:.2f}s")
+            print(f"  Avg per chunk: {total_time/len(chunk_conditionings):.2f}s")
+            print(f"{'='*60}\n")
             
             info_lines.append("")
             info_lines.append("Context window sampling complete!")
@@ -3567,6 +3637,51 @@ class NV_ChunkConditioningPreprocessor:
             info_lines.append("⚠️ Control videos will NOT be encoded. Falling back to disabled.")
             control_mode = "disabled"
         
+        # Encode FULL control videos ONCE (not per-chunk)
+        # This matches how the main latent works and avoids temporal interpolation
+        full_control_latents = {}
+        if control_mode != "disabled" and control_videos and vae:
+            info_lines.append("Encoding full control videos...")
+            for ctrl_name, ctrl_path in control_videos.items():
+                if not ctrl_path or not os.path.exists(ctrl_path):
+                    info_lines.append(f"  ⚠️ Control '{ctrl_name}' path not found: {ctrl_path}")
+                    continue
+                
+                try:
+                    # Load ENTIRE control video (not chunked)
+                    total_frames = metadata.get("total_frames", 81)
+                    ctrl_frames = self._load_video_frames(ctrl_path, 0, total_frames)
+                    
+                    if ctrl_frames is not None:
+                        # Encode full video with VAE using DUAL-CHANNEL Wan VACE format
+                        inactive_latents, reactive_latents = self._encode_vace_dual_channel(
+                            ctrl_frames, vae, tiled_vae
+                        )
+                        
+                        # Package in ComfyUI Wan VACE format with batch dimension
+                        inactive_batched = inactive_latents.unsqueeze(0)  # [1, 16, T, H, W]
+                        reactive_batched = reactive_latents.unsqueeze(0)  # [1, 16, T, H, W]
+                        control_video_latent = torch.cat([inactive_batched, reactive_batched], dim=1)  # [1, 32, T, H, W]
+                        
+                        C, T, H, W = inactive_latents.shape
+                        
+                        # Create 64-channel extended mask for full video
+                        vae_stride = 8
+                        mask_64ch = torch.ones(vae_stride * vae_stride, T, H, W)  # [64, T, H, W]
+                        mask_64ch = mask_64ch.unsqueeze(0)  # [1, 64, T, H, W]
+                        
+                        # Store full control latents
+                        full_control_latents[ctrl_name] = {
+                            "vace_frames": control_video_latent,  # [1, 32, T_full, H, W]
+                            "vace_mask": mask_64ch,               # [1, 64, T_full, H, W]
+                        }
+                        
+                        info_lines.append(f"  ✓ Encoded '{ctrl_name}': {control_video_latent.shape} (full video)")
+                except Exception as e:
+                    info_lines.append(f"  ✗ Failed to encode control '{ctrl_name}': {e}")
+            
+            info_lines.append("")
+        
         # Process each chunk
         chunk_conditionings = []
         
@@ -3594,65 +3709,30 @@ class NV_ChunkConditioningPreprocessor:
             else:
                 negative_cond = global_negative if global_negative is not None else []
             
-            # Process control videos if enabled
+            # Reference full control videos for this chunk
             control_embeds = {}
-            if control_mode != "disabled" and control_videos and vae:
+            if control_mode != "disabled" and full_control_latents:
                 chunk_controls = chunk.get("controls", {})
                 for ctrl_name, ctrl_settings in chunk_controls.items():
                     # Skip if this control is disabled for this chunk
                     if not ctrl_settings.get("enabled", True):
                         continue
                     
-                    # Get control video path
-                    ctrl_path = control_videos.get(ctrl_name)
-                    if not ctrl_path or not os.path.exists(ctrl_path):
-                        info_lines.append(f"  ⚠️ Control '{ctrl_name}' path not found: {ctrl_path}")
+                    # Get full control latent
+                    if ctrl_name not in full_control_latents:
+                        info_lines.append(f"  ⚠️ Control '{ctrl_name}' not found in encoded controls")
                         continue
                     
-                    try:
-                        # Load control frames for this chunk
-                        start_frame = chunk.get("start_frame", 0)
-                        end_frame = chunk.get("end_frame", 0)
-                        
-                        ctrl_frames = self._load_video_frames(
-                            ctrl_path, start_frame, end_frame
-                        )
-                        
-                        if ctrl_frames is not None:
-                            # Encode with VAE using DUAL-CHANNEL Wan VACE format
-                            # Returns two separate 16-channel tensors (inactive, reactive)
-                            inactive_latents, reactive_latents = self._encode_vace_dual_channel(
-                                ctrl_frames, vae, tiled_vae
-                            )
-                            
-                            # Each is 16 channels, no batch: [16, T, H, W]
-                            C, T, H, W = inactive_latents.shape  # C = 16
-                            num_frames = (T - 1) * 4 + 1
-                            
-                            # Package in EXACT ComfyUI Wan VACE format (from nodes_wan.py)
-                            # Add batch dimension and concatenate on channel dimension
-                            inactive_batched = inactive_latents.unsqueeze(0)  # [1, 16, T, H, W]
-                            reactive_batched = reactive_latents.unsqueeze(0)  # [1, 16, T, H, W]
-                            control_video_latent = torch.cat([inactive_batched, reactive_batched], dim=1)  # [1, 32, T, H, W]
-                            
-                            # Create 64-channel extended mask (8x8 spatial patches)
-                            # Default: all ones (full control everywhere)
-                            vae_stride = 8
-                            mask_64ch = torch.ones(vae_stride * vae_stride, T, H, W)  # [64, T, H, W]
-                            mask_64ch = mask_64ch.unsqueeze(0)  # [1, 64, T, H, W]
-                            
-                            control_embeds[ctrl_name] = {
-                                "vace_frames": [control_video_latent],  # Single 32-channel tensor in list
-                                "vace_mask": [mask_64ch],               # [1, 64, T, H, W] extended mask
-                                "vace_strength": [ctrl_settings.get("weight", 1.0)],
-                                "start_percent": ctrl_settings.get("start_percent", 0.0),
-                                "end_percent": ctrl_settings.get("end_percent", 1.0),
-                                "num_frames": num_frames,
-                            }
-                            
-                            info_lines.append(f"  ✓ Encoded control '{ctrl_name}': inactive={inactive_latents.shape}, reactive={reactive_latents.shape}")
-                    except Exception as e:
-                        info_lines.append(f"  ✗ Failed to encode control '{ctrl_name}': {e}")
+                    # Store reference to FULL control latent
+                    # Sampler will extract the appropriate slice
+                    full_ctrl = full_control_latents[ctrl_name]
+                    control_embeds[ctrl_name] = {
+                        "vace_frames": full_ctrl["vace_frames"],  # [1, 32, T_full, H, W]
+                        "vace_mask": full_ctrl["vace_mask"],      # [1, 64, T_full, H, W]
+                        "vace_strength": [ctrl_settings.get("weight", 1.0)],
+                        "start_percent": ctrl_settings.get("start_percent", 0.0),
+                        "end_percent": ctrl_settings.get("end_percent", 1.0),
+                    }
             
             # Package conditioning for this chunk
             chunk_conditioning = {
