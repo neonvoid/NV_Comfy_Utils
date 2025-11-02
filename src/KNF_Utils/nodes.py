@@ -3086,7 +3086,14 @@ class NV_VideoSampler:
                 if start_image_latent_chunk is not None and start_image_mask_chunk is not None:
                     # Slice start_image to match this chunk's temporal range
                     concat_start = start_image_latent_chunk[:, :, chunk_start:chunk_end, :, :]
-                    mask_start = start_image_mask_chunk[:, :, chunk_start:chunk_end, :, :]
+                    
+                    # Create mask: Keep first frame of THIS CHUNK (0), generate rest (1)
+                    # This ensures each chunk maintains consistency with the start image
+                    chunk_frames = chunk_end - chunk_start
+                    B, C, _, H, W = concat_start.shape
+                    mask_start = torch.ones((B, 1, chunk_frames, H, W), 
+                                           device=concat_start.device, dtype=concat_start.dtype)
+                    mask_start[:, :, 0:1, :, :] = 0.0  # Keep first frame of chunk
                     
                     print(f"  Tier 1: Applying first frame reference")
                     print(f"    concat_start shape: {concat_start.shape}")
