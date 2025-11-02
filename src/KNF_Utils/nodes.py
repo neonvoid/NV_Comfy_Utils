@@ -3013,7 +3013,7 @@ class NV_VideoSampler:
                 sample_start_time = time.time()
                 last_step_time = sample_start_time
                 
-                def progress_callback(step, total_steps, preview_image):
+                def progress_callback(step, denoised, x, total_steps):
                     nonlocal last_step_time
                     current_time = time.time()
                     step_time = current_time - last_step_time
