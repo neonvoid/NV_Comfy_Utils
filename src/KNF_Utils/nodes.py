@@ -3003,6 +3003,74 @@ class NV_VideoSampler:
                         print(f"    ✓ Controls injected into conditioning")
                         info_lines.append(f"    ✓ VACE controls injected: {len(all_vace_frames)} control(s)")
                 
+                # TIER 1: Apply start_image (first frame reference) to ALL chunks
+                start_image_latent_chunk = chunk_cond.get("start_image_latent")
+                start_image_mask_chunk = chunk_cond.get("start_image_mask")
+                if start_image_latent_chunk is not None and start_image_mask_chunk is not None:
+                    # Slice start_image to match this chunk's temporal range
+                    concat_start = start_image_latent_chunk[:, :, chunk_start:chunk_end, :, :]
+                    mask_start = start_image_mask_chunk[:, :, chunk_start:chunk_end, :, :]
+                    
+                    print(f"  Tier 1: Applying first frame reference")
+                    info_lines.append(f"  → First frame reference applied")
+                    
+                    # Inject into both positive and negative conditioning
+                    chunk_positive = [[c[0], c[1].copy()] for c in chunk_positive]
+                    chunk_negative = [[c[0], c[1].copy()] for c in chunk_negative]
+                    
+                    chunk_positive[0][1]["concat_latent_image"] = concat_start
+                    chunk_positive[0][1]["concat_mask"] = mask_start
+                    chunk_negative[0][1]["concat_latent_image"] = concat_start
+                    chunk_negative[0][1]["concat_mask"] = mask_start
+                
+                # TIER 2: Apply previous chunk overlap (temporal continuity) for chunks 2+
+                if chunk_idx > 0 and 'prev_chunk_output' in locals():
+                    # Calculate overlap region
+                    overlap_frames = chunk_end - chunk_start if chunk_cond["is_first"] else min(chunk_overlap, chunk_frames)
+                    
+                    if overlap_frames > 0:
+                        # Extract overlap from previous chunk
+                        prev_chunk_end = chunk_start + overlap_frames
+                        prev_overlap = prev_chunk_output[:, :, chunk_start:prev_chunk_end, :, :]
+                        
+                        # Build concat_latent_image: [overlap, new_noise]
+                        new_noise_frames = chunk_frames - overlap_frames
+                        if new_noise_frames > 0:
+                            new_noise = torch.randn(
+                                prev_overlap.shape[0], prev_overlap.shape[1], new_noise_frames,
+                                prev_overlap.shape[3], prev_overlap.shape[4],
+                                device=prev_overlap.device, dtype=prev_overlap.dtype
+                            )
+                            concat_latent = torch.cat([prev_overlap, new_noise], dim=2)
+                        else:
+                            concat_latent = prev_overlap
+                        
+                        # Build concat_mask: [zeros_for_overlap, ones_for_new]
+                        concat_mask = torch.ones((1, 1, chunk_frames, chunk_latent.shape[3], chunk_latent.shape[4]),
+                                                  device=chunk_latent.device, dtype=chunk_latent.dtype)
+                        concat_mask[:, :, :overlap_frames, :, :] = 0.0  # 0 = KEEP overlap frames
+                        
+                        print(f"  Tier 2: Using {overlap_frames} overlap frames from previous chunk")
+                        info_lines.append(f"  → Temporal continuity: {overlap_frames} frames from prev chunk")
+                        
+                        # Merge with Tier 1 or apply directly
+                        if start_image_latent_chunk is None:
+                            # No Tier 1, apply Tier 2 only
+                            chunk_positive = [[c[0], c[1].copy()] for c in chunk_positive]
+                            chunk_negative = [[c[0], c[1].copy()] for c in chunk_negative]
+                            
+                            chunk_positive[0][1]["concat_latent_image"] = concat_latent
+                            chunk_positive[0][1]["concat_mask"] = concat_mask
+                            chunk_negative[0][1]["concat_latent_image"] = concat_latent
+                            chunk_negative[0][1]["concat_mask"] = concat_mask
+                        else:
+                            # Both Tier 1 and Tier 2: Tier 2 mask overrides Tier 1 mask
+                            # Use Tier 2's concat_latent but keep start_image influence via conditioning
+                            chunk_positive[0][1]["concat_latent_image"] = concat_latent
+                            chunk_positive[0][1]["concat_mask"] = concat_mask
+                            chunk_negative[0][1]["concat_latent_image"] = concat_latent
+                            chunk_negative[0][1]["concat_mask"] = concat_mask
+                
                 # Sample this chunk
                 print(f"  Starting sampling...")
                 print(f"    Sampler: {sampler_name}, Scheduler: {scheduler}")
@@ -3081,6 +3149,10 @@ class NV_VideoSampler:
                 # Accumulate weighted results
                 output_latent[:, :, chunk_start:chunk_end, :, :] += chunk_samples * chunk_weight
                 weight_sum[:, :, chunk_start:chunk_end, :, :] += chunk_weight
+                
+                # Store this chunk's output for next chunk's Tier 2 (temporal continuity)
+                # Store in full output_latent coordinate space for easy slicing
+                prev_chunk_output = output_latent.clone()
                 
                 chunk_total_time = time.time() - chunk_start_time
                 print(f"  ✓ Chunk {chunk_idx + 1} complete: {chunk_total_time:.2f}s total")
@@ -3565,6 +3637,9 @@ class NV_ChunkConditioningPreprocessor:
                 "vae": ("VAE", {
                     "tooltip": "VAE for encoding control videos (required if using WanVACE controls)"
                 }),
+                "start_image": ("IMAGE", {
+                    "tooltip": "First frame reference for ALL chunks (improves character/scene consistency)"
+                }),
                 "global_positive": ("CONDITIONING", {
                     "tooltip": "Fallback positive conditioning for chunks without custom prompts"
                 }),
@@ -3587,7 +3662,7 @@ class NV_ChunkConditioningPreprocessor:
     FUNCTION = "preprocess"
     CATEGORY = "NV_Utils/Video/Chunking"
     
-    def preprocess(self, chunk_json_path, clip, vae=None, 
+    def preprocess(self, chunk_json_path, clip, vae=None, start_image=None,
                    global_positive=None, global_negative=None,
                    control_mode="disabled", tiled_vae=False):
         import json
@@ -3595,6 +3670,7 @@ class NV_ChunkConditioningPreprocessor:
         import cv2
         import numpy as np
         import torch
+        import comfy.utils
         
         # Load JSON
         if not os.path.exists(chunk_json_path):
@@ -3636,6 +3712,51 @@ class NV_ChunkConditioningPreprocessor:
             info_lines.append("⚠️ WARNING: Control mode enabled but no VAE provided!")
             info_lines.append("⚠️ Control videos will NOT be encoded. Falling back to disabled.")
             control_mode = "disabled"
+        
+        # Encode start_image ONCE (Tier 1: First Frame Reference)
+        # This provides global character/scene consistency across ALL chunks
+        start_image_latent = None
+        start_image_mask = None
+        if start_image is not None and vae is not None:
+            info_lines.append("Encoding start image (first frame reference)...")
+            try:
+                # Resize to match video dimensions
+                video_width = metadata.get("width", 832)
+                video_height = metadata.get("height", 480)
+                total_frames = metadata.get("total_frames", 81)
+                
+                # Take first frame if multiple frames provided
+                if start_image.shape[0] > 1:
+                    start_image = start_image[0:1]
+                
+                # Resize to video resolution
+                start_image_resized = comfy.utils.common_upscale(
+                    start_image.movedim(-1, 1), 
+                    video_width, video_height, 
+                    "bilinear", "center"
+                ).movedim(1, -1)
+                
+                # Create full video with start image at beginning, rest filled with gray
+                full_start_video = torch.ones((total_frames, video_height, video_width, 3), 
+                                               device=start_image.device, dtype=start_image.dtype) * 0.5
+                full_start_video[0:1] = start_image_resized
+                
+                # Encode with VAE
+                start_image_latent = vae.encode(full_start_video[:, :, :, :3])
+                
+                # Create mask: 0 for first frame (keep), 1 for rest (generate)
+                latent_T = start_image_latent.shape[2]
+                latent_H = start_image_latent.shape[3]
+                latent_W = start_image_latent.shape[4]
+                start_image_mask = torch.ones((1, 1, latent_T, latent_H, latent_W), 
+                                               device=start_image.device, dtype=start_image.dtype)
+                start_image_mask[:, :, 0:1] = 0.0  # Keep first frame
+                
+                info_lines.append(f"  ✓ Start image encoded: {start_image_latent.shape}")
+            except Exception as e:
+                info_lines.append(f"  ✗ Failed to encode start image: {e}")
+                start_image_latent = None
+                start_image_mask = None
         
         # Encode FULL control videos ONCE (not per-chunk)
         # This matches how the main latent works and avoids temporal interpolation
@@ -3743,6 +3864,8 @@ class NV_ChunkConditioningPreprocessor:
                 "positive": positive_cond,
                 "negative": negative_cond,
                 "control_embeds": control_embeds if control_embeds else None,
+                "start_image_latent": start_image_latent,  # Tier 1: First frame reference
+                "start_image_mask": start_image_mask,
                 "is_first": chunk.get("is_first", False),
                 "is_last": chunk.get("is_last", False),
             }
