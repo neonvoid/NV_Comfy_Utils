@@ -2373,12 +2373,6 @@ class NV_VideoSampler:
                 "model": ("MODEL", {
                     "tooltip": "The model used for denoising (works with any ComfyUI model type)"
                 }),
-                "positive": ("CONDITIONING", {
-                    "tooltip": "Positive conditioning (what you want to generate). Used as fallback if chunk conditioning is empty."
-                }),
-                "negative": ("CONDITIONING", {
-                    "tooltip": "Negative conditioning (what to avoid). Used as fallback if chunk conditioning is empty."
-                }),
                 "latent_image": ("LATENT", {
                     "tooltip": "Input latent (4D for images, 5D for videos). Noise for txt2img/vid, existing latent for img2img/vid2vid."
                 }),
@@ -2415,6 +2409,12 @@ class NV_VideoSampler:
                 }),
             },
             "optional": {
+                "positive": ("CONDITIONING", {
+                    "tooltip": "Positive conditioning (what you want). REQUIRED for standard mode. Optional for chunked mode (used as fallback)."
+                }),
+                "negative": ("CONDITIONING", {
+                    "tooltip": "Negative conditioning (what to avoid). REQUIRED for standard mode. Optional for chunked mode (used as fallback)."
+                }),
                 "denoise_strength": ("FLOAT", {
                     "default": 1.0, 
                     "min": 0.0, 
@@ -2509,8 +2509,9 @@ class NV_VideoSampler:
     • Video-optimized sampling parameters
     """
     
-    def sample(self, model, positive, negative, latent_image, seed, steps, cfg, 
-               sampler_name, scheduler, sampler_mode="standard", denoise_strength=1.0, start_step=0, end_step=-1,
+    def sample(self, model, latent_image, seed, steps, cfg, 
+               sampler_name, scheduler, sampler_mode="standard", positive=None, negative=None,
+               denoise_strength=1.0, start_step=0, end_step=-1,
                selector=0, cfg_end=-1.0, add_noise="enable", 
                return_with_leftover_noise="disable", eta=0.0, noise_type="gaussian", 
                noise_mode="hard", noise_seed=-1, chunk_conditionings=None, blend_mode="linear"):
@@ -2522,6 +2523,18 @@ class NV_VideoSampler:
         import math
         
         start_time = time.time()
+        
+        # Validate conditioning inputs
+        has_chunk_cond = chunk_conditionings is not None and len(chunk_conditionings) > 0
+        has_global_cond = positive is not None and negative is not None
+        
+        if not has_chunk_cond and not has_global_cond:
+            raise ValueError(
+                "Either provide chunk_conditionings (from NV_ChunkConditioningPreprocessor) "
+                "OR provide both positive and negative conditioning.\n"
+                "For chunked workflows: Only connect chunk_conditionings.\n"
+                "For standard workflows: Connect positive and negative from CLIP encoding."
+            )
         
         # Get model sampling for sigma ranges (needed for RES4LYF noise)
         model_sampling = model.get_model_object("model_sampling")
@@ -2899,11 +2912,18 @@ class NV_VideoSampler:
                 
                 # Fallback to global conditioning if chunk conditioning is empty
                 if not chunk_positive or (isinstance(chunk_positive, list) and len(chunk_positive) == 0):
-                    chunk_positive = positive
-                    info_lines.append(f"  (Using global positive conditioning)")
+                    if positive is not None:
+                        chunk_positive = positive
+                        info_lines.append(f"  (Using global positive conditioning)")
+                    else:
+                        raise ValueError(f"Chunk {chunk_idx + 1} has no positive conditioning and no global fallback provided!")
+                        
                 if not chunk_negative or (isinstance(chunk_negative, list) and len(chunk_negative) == 0):
-                    chunk_negative = negative
-                    info_lines.append(f"  (Using global negative conditioning)")
+                    if negative is not None:
+                        chunk_negative = negative
+                        info_lines.append(f"  (Using global negative conditioning)")
+                    else:
+                        raise ValueError(f"Chunk {chunk_idx + 1} has no negative conditioning and no global fallback provided!")
                 
                 # Inject Wan VACE controls into conditioning if present
                 chunk_control_embeds = chunk_cond.get("control_embeds")
@@ -2999,6 +3019,13 @@ class NV_VideoSampler:
         
         # Call ComfyUI's sample function (standard mode)
         else:
+            # Double-check we have conditioning for standard mode
+            if positive is None or negative is None:
+                raise ValueError(
+                    "Standard (non-chunked) mode requires both positive and negative conditioning. "
+                    "Connect CLIP Text Encode outputs to positive and negative inputs."
+                )
+            
             try:
                 # For SDE sampling, we need to inject noise after each step
                 # This requires custom sampling loop
