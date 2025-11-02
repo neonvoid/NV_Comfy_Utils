@@ -2380,7 +2380,7 @@ class NV_VideoSampler:
                     "tooltip": "Negative conditioning (what to avoid). Used as fallback if chunk conditioning is empty."
                 }),
                 "latent_image": ("LATENT", {
-                    "tooltip": "Input latent to denoise (noise for text2video, existing video for video2video)"
+                    "tooltip": "Input latent (4D for images, 5D for videos). Noise for txt2img/vid, existing latent for img2img/vid2vid."
                 }),
                 "seed": ("INT", {
                     "default": 0, 
@@ -2491,13 +2491,15 @@ class NV_VideoSampler:
     FUNCTION = "sample"
     CATEGORY = "NV_Utils/sampling"
     DESCRIPTION = """
-    NV Video Sampler - Automation-friendly video diffusion sampler
+    NV Video Sampler - Automation-friendly diffusion sampler
     
     Features:
-    • Works with any ComfyUI model (SD, SDXL, SD3, FLUX, etc.)
+    • Works with images (4D) and videos (5D latents)
+    • Works with any ComfyUI model (SD, SDXL, SD3, FLUX, Wan, etc.)
     • Dynamic CFG for video temporal consistency
     • Selector input for workflow automation
-    • Partial denoising for video2video
+    • Partial denoising for video2video/img2img
+    • Context window chunking for long videos
     • Comprehensive sampling info output
     
     Educational:
@@ -2671,6 +2673,13 @@ class NV_VideoSampler:
         # STEP 1: Extract latent and prepare basic info
         # ============================================================
         latent = latent_image["samples"]
+        
+        # Handle both image (4D) and video (5D) latents
+        is_image_latent = latent.ndim == 4
+        if is_image_latent:
+            # Convert image latent [B, C, H, W] to video latent [B, C, 1, H, W]
+            latent = latent.unsqueeze(2)  # Add temporal dimension
+        
         batch_size, channels, frames, height, width = latent.shape
         
         info_lines = []
@@ -2678,8 +2687,10 @@ class NV_VideoSampler:
         info_lines.append("NV VIDEO SAMPLER - SAMPLING INFO")
         info_lines.append("=" * 60)
         info_lines.append(f"Selector ID: {selector}")
+        info_lines.append(f"Input Type: {'IMAGE (4D)' if is_image_latent else 'VIDEO (5D)'}")
         info_lines.append(f"Latent Shape: {list(latent.shape)} (B×C×F×H×W)")
-        info_lines.append(f"Video Frames: {(frames - 1) * 4 + 1} (latent: {frames})")
+        if not is_image_latent:
+            info_lines.append(f"Video Frames: {(frames - 1) * 4 + 1} (latent: {frames})")
         info_lines.append(f"Resolution: {height * 8}×{width * 8} (latent: {height}×{width})")
         info_lines.append("")
         
@@ -3044,12 +3055,16 @@ class NV_VideoSampler:
         # ============================================================
         # STEP 6: Prepare output
         # ============================================================
+        # If input was image latent (4D), squeeze back to 4D
+        if is_image_latent:
+            samples = samples.squeeze(2)  # Remove temporal dimension [B, C, 1, H, W] -> [B, C, H, W]
+        
         out = latent_image.copy()
         out["samples"] = samples
         
         # Final statistics
         info_lines.append("OUTPUT:")
-        info_lines.append(f"  Shape: {list(samples.shape)}")
+        info_lines.append(f"  Shape: {list(samples.shape)} ({'4D IMAGE' if is_image_latent else '5D VIDEO'})")
         info_lines.append(f"  Mean: {samples.mean().item():.6f}")
         info_lines.append(f"  Std: {samples.std().item():.6f}")
         info_lines.append(f"  Min: {samples.min().item():.6f}")
