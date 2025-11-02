@@ -3018,60 +3018,67 @@ class NV_VideoSampler:
                         info_lines.append(f"    ✓ VACE controls injected: {len(all_vace_frames)} control(s)")
                 
                 # TIER 3: Apply previous chunk's VACE control (strong temporal consistency)
+                # This APPENDS to existing controls, doesn't replace them
                 if prev_chunk_vace_control is not None and chunk_idx > 0:
                     overlap_start = prev_chunk_vace_control["overlap_start"]
                     overlap_end = prev_chunk_vace_control["overlap_end"]
                     
                     # Check if this chunk includes the overlap region
                     if chunk_start <= overlap_start < chunk_end:
-                        print(f"  Tier 3: Applying VACE control from previous chunk")
+                        # Check if we already have VACE controls from the chunk
+                        existing_vace = chunk_positive[0][1].get("vace_frames") if isinstance(chunk_positive, list) and len(chunk_positive) > 0 else None
                         
-                        # Calculate the slice we need from the VACE control
-                        # VACE control is relative to the overlap region
-                        vace_full = prev_chunk_vace_control["vace_frames"]  # [1, 32, T_overlap, H, W]
-                        vace_mask_full = prev_chunk_vace_control["vace_mask"]  # [1, 64, T_overlap, H, W]
-                        
-                        # Slice to match this chunk's portion of the overlap
-                        local_overlap_start = overlap_start - chunk_start
-                        local_overlap_end = min(overlap_end - chunk_start, chunk_frames)
-                        
-                        # Extract the portion we need
-                        vace_slice = vace_full[:, :, :local_overlap_end - local_overlap_start, :, :]
-                        vace_mask_slice = vace_mask_full[:, :, :local_overlap_end - local_overlap_start, :, :]
-                        
-                        # Need to pad to full chunk size (only control overlap region)
-                        # Create zero-filled tensors for full chunk
-                        full_vace = torch.zeros(
-                            (1, 32, chunk_frames, vace_slice.shape[3], vace_slice.shape[4]),
-                            device=vace_slice.device, dtype=vace_slice.dtype
-                        )
-                        full_mask = torch.zeros(
-                            (1, 64, chunk_frames, vace_mask_slice.shape[3], vace_mask_slice.shape[4]),
-                            device=vace_mask_slice.device, dtype=vace_mask_slice.dtype
-                        )
-                        
-                        # Place overlap control in the correct position
-                        full_vace[:, :, local_overlap_start:local_overlap_end, :, :] = vace_slice
-                        full_mask[:, :, local_overlap_start:local_overlap_end, :, :] = vace_mask_slice
-                        
-                        # Add to existing VACE controls (or create new list)
-                        if all_vace_frames:
-                            all_vace_frames.append(full_vace)
-                            all_vace_masks.append(full_mask)
-                            all_vace_strengths.append(1.0)  # Full strength for temporal consistency
+                        if existing_vace:
+                            print(f"  Tier 3: Appending VACE control to existing {len(existing_vace)} control(s)")
+                            
+                            # Calculate the slice we need from the VACE control
+                            vace_full = prev_chunk_vace_control["vace_frames"]  # [1, 32, T_overlap, H, W]
+                            vace_mask_full = prev_chunk_vace_control["vace_mask"]  # [1, 64, T_overlap, H, W]
+                            
+                            # Slice to match this chunk's portion of the overlap
+                            local_overlap_start = overlap_start - chunk_start
+                            local_overlap_end = min(overlap_end - chunk_start, chunk_frames)
+                            
+                            # Extract the portion we need
+                            vace_slice = vace_full[:, :, :local_overlap_end - local_overlap_start, :, :]
+                            vace_mask_slice = vace_mask_full[:, :, :local_overlap_end - local_overlap_start, :, :]
+                            
+                            # Need to pad to full chunk size (only control overlap region)
+                            # Create zero-filled tensors for full chunk
+                            full_vace = torch.zeros(
+                                (1, 32, chunk_frames, vace_slice.shape[3], vace_slice.shape[4]),
+                                device=vace_slice.device, dtype=vace_slice.dtype
+                            )
+                            full_mask = torch.zeros(
+                                (1, 64, chunk_frames, vace_mask_slice.shape[3], vace_mask_slice.shape[4]),
+                                device=vace_mask_slice.device, dtype=vace_mask_slice.dtype
+                            )
+                            
+                            # Place overlap control in the correct position
+                            full_vace[:, :, local_overlap_start:local_overlap_end, :, :] = vace_slice
+                            full_mask[:, :, local_overlap_start:local_overlap_end, :, :] = vace_mask_slice
+                            
+                            # APPEND to existing controls (don't replace!)
+                            chunk_positive = [[c[0], c[1].copy()] for c in chunk_positive]
+                            existing_frames = list(chunk_positive[0][1]["vace_frames"])  # Copy existing
+                            existing_masks = list(chunk_positive[0][1]["vace_mask"])    # Copy existing
+                            existing_strengths = list(chunk_positive[0][1]["vace_strength"])  # Copy existing
+                            
+                            existing_frames.append(full_vace)
+                            existing_masks.append(full_mask)
+                            existing_strengths.append(1.0)
+                            
+                            # Re-inject with Tier 3 ADDED
+                            chunk_positive[0][1]["vace_frames"] = existing_frames
+                            chunk_positive[0][1]["vace_mask"] = existing_masks
+                            chunk_positive[0][1]["vace_strength"] = existing_strengths
+                            
+                            print(f"    ✓ Tier 3 VACE appended: frames [{local_overlap_start}-{local_overlap_end}]")
+                            print(f"    Total VACE controls: {len(existing_frames)}")
+                            info_lines.append(f"  → Tier 3 VACE: Added to existing controls")
                         else:
-                            all_vace_frames = [full_vace]
-                            all_vace_masks = [full_mask]
-                            all_vace_strengths = [1.0]
-                        
-                        # Re-inject with Tier 3 added
-                        chunk_positive = [[c[0], c[1].copy()] for c in chunk_positive]
-                        chunk_positive[0][1]["vace_frames"] = all_vace_frames
-                        chunk_positive[0][1]["vace_mask"] = all_vace_masks
-                        chunk_positive[0][1]["vace_strength"] = all_vace_strengths
-                        
-                        print(f"    ✓ Tier 3 VACE applied: frames [{local_overlap_start}-{local_overlap_end}]")
-                        info_lines.append(f"  → Tier 3 VACE: Strong consistency on overlap")
+                            print(f"  Tier 3: Skipping (no existing VACE controls to append to)")
+
                 
                 # TIER 1: Apply start_image (first frame reference) to ALL chunks
                 start_image_latent_chunk = chunk_cond.get("start_image_latent")
