@@ -17,6 +17,10 @@ from datetime import datetime
 import cv2
 import sys
 import platform
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend for server-side rendering
+import matplotlib.pyplot as plt
+from io import BytesIO
 
 # Windows COM initialization for Media Foundation codecs
 _COM_INITIALIZED = False
@@ -670,8 +674,10 @@ class CustomVideoSaver:
                 filename_prefix, output_dir, video_format
             )
             
-            # Determine encoding method
+            # Determine encoding method with automatic fallback
             use_ffmpeg_encoding = False
+            original_codec = codec
+            
             if use_ffmpeg and self.ffmpeg_available:
                 # Use FFmpeg for these codecs (better quality, no COM issues)
                 if codec in ["H.265/HEVC", "H.264/AVC", "VP9", "ProRes"]:
@@ -683,17 +689,40 @@ class CustomVideoSaver:
                 print(f"[CustomVideoSaver] Falling back to MP4V with OpenCV")
                 codec = "MP4V"
             
-            # Convert tensor to video
+            # Convert tensor to video with automatic fallback
+            success = False
+            encoding_method = ""
+            
             if use_ffmpeg_encoding:
+                # Try FFmpeg first
+                print(f"[CustomVideoSaver] Attempting FFmpeg encoding with {codec}...")
                 success = self._tensor_to_video_ffmpeg(video_tensor, video_path, fps, quality, codec, 
                                                        encoding_preset, preserve_colors)
                 encoding_method = "FFmpeg"
+                
+                # If H.265 fails, automatically try H.264
+                if not success and codec == "H.265/HEVC":
+                    print(f"[CustomVideoSaver] H.265/HEVC failed, trying H.264/AVC as fallback...")
+                    codec = "H.264/AVC"
+                    success = self._tensor_to_video_ffmpeg(video_tensor, video_path, fps, quality, codec, 
+                                                           encoding_preset, preserve_colors)
+                    if success:
+                        encoding_method = "FFmpeg (H.264 fallback)"
+                
+                # If FFmpeg still fails, try OpenCV as last resort
+                if not success:
+                    print(f"[CustomVideoSaver] FFmpeg encoding failed, trying OpenCV with MP4V as fallback...")
+                    codec = "MP4V"
+                    success = self._tensor_to_video_opencv(video_tensor, video_path, fps, quality, codec, preserve_colors)
+                    if success:
+                        encoding_method = "OpenCV (MP4V fallback)"
             else:
+                # Use OpenCV directly
                 success = self._tensor_to_video_opencv(video_tensor, video_path, fps, quality, codec, preserve_colors)
                 encoding_method = "OpenCV"
             
             if not success:
-                return ("", "", f"Error: Failed to save video to {video_path}")
+                return ("", "", f"Error: All encoding methods failed for video {video_path}. Check logs for details.")
             
             # Create info string
             color_mode = "Color Preserved" if preserve_colors else "Standard"
@@ -726,6 +755,9 @@ class CustomVideoSaver:
         Returns:
             bool: True if successful, False otherwise
         """
+        import threading
+        import queue
+        
         try:
             # Handle tensor dimensions
             if len(video_tensor.shape) == 5:
@@ -780,8 +812,7 @@ class CustomVideoSaver:
             
             ffmpeg_codec = codec_map.get(codec, "libx264")
             
-            # Build FFmpeg command
-            # Use pipe input for raw RGB frames
+            # Build FFmpeg command with extra robustness options
             cmd = [
                 'ffmpeg',
                 '-y',  # Overwrite output file
@@ -792,6 +823,8 @@ class CustomVideoSaver:
                 '-r', str(fps),
                 '-i', '-',  # Read from stdin
                 '-c:v', ffmpeg_codec,
+                '-movflags', '+faststart',  # Enable fast start for MP4
+                '-max_muxing_queue_size', '9999',  # Prevent muxing queue overflow
             ]
             
             # Add codec-specific parameters
@@ -801,11 +834,17 @@ class CustomVideoSaver:
                     '-preset', preset,
                     '-pix_fmt', 'yuv420p',  # Maximum compatibility
                 ])
+                # Add extra params for stability with large videos
+                if codec == "H.265/HEVC":
+                    cmd.extend([
+                        '-x265-params', 'log-level=error',  # Reduce x265 verbosity
+                    ])
             elif codec == "VP9":
                 cmd.extend([
                     '-crf', str(quality),
                     '-b:v', '0',  # Use CRF mode
                     '-pix_fmt', 'yuv420p',
+                    '-row-mt', '1',  # Enable row-based multithreading
                 ])
             elif codec == "ProRes":
                 # ProRes doesn't use CRF, use profile instead
@@ -817,29 +856,58 @@ class CustomVideoSaver:
             # Add output file
             cmd.append(output_path)
             
-            print(f"[CustomVideoSaver] FFmpeg command: {' '.join(cmd[:10])}...")
+            print(f"[CustomVideoSaver] FFmpeg command: {' '.join(cmd[:12])}...")
             
-            # Start FFmpeg process
-            # CRITICAL: Use DEVNULL for stderr to prevent buffer deadlock
-            # FFmpeg writes progress to stderr, which can fill the pipe buffer
-            # and cause both processes to block waiting for each other
+            # Create a queue for stderr output
+            stderr_queue = queue.Queue()
+            stderr_lines = []
+            
+            def read_stderr(pipe, q):
+                """Read stderr in a separate thread to prevent deadlock"""
+                try:
+                    for line in iter(pipe.readline, b''):
+                        line_str = line.decode('utf-8', errors='ignore').strip()
+                        q.put(line_str)
+                        stderr_lines.append(line_str)
+                    pipe.close()
+                except Exception as e:
+                    q.put(f"Error reading stderr: {e}")
+            
+            # Start FFmpeg process with stderr capture
+            # CRITICAL: We now capture stderr in a separate thread to avoid deadlock
+            # while still being able to see error messages
             process = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,  # Don't need stdout
-                stderr=subprocess.DEVNULL,  # CRITICAL: Prevents deadlock
-                bufsize=10**8
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,  # Capture stderr for debugging
+                bufsize=10**8,
+                creationflags=subprocess.CREATE_NO_WINDOW if platform.system() == 'Windows' else 0
             )
+            
+            # Start stderr reading thread
+            stderr_thread = threading.Thread(target=read_stderr, args=(process.stderr, stderr_queue))
+            stderr_thread.daemon = True
+            stderr_thread.start()
             
             # Write frames to FFmpeg
             frame_count = len(video_array)
             print(f"[CustomVideoSaver] Encoding {frame_count} frames...")
+            
+            write_failed = False
+            last_error = None
             
             for i, frame in enumerate(video_array):
                 # Progress update every 10 frames
                 if i > 0 and i % 10 == 0:
                     progress = (i / frame_count) * 100
                     print(f"[CustomVideoSaver] Progress: {progress:.1f}% ({i}/{frame_count})")
+                
+                # Check if process is still alive
+                if process.poll() is not None:
+                    print(f"[CustomVideoSaver] FFmpeg process died at frame {i}")
+                    write_failed = True
+                    break
                 
                 # Ensure frame is contiguous in memory
                 frame = np.ascontiguousarray(frame)
@@ -854,14 +922,24 @@ class CustomVideoSaver:
                 # Write raw RGB data
                 try:
                     process.stdin.write(frame.tobytes())
+                    # Flush periodically to avoid buffer buildup
+                    if i % 30 == 0:
+                        process.stdin.flush()
                 except BrokenPipeError:
-                    print(f"[CustomVideoSaver] FFmpeg crashed at frame {i}")
-                    process.kill()
-                    return False
+                    print(f"[CustomVideoSaver] FFmpeg pipe broken at frame {i}")
+                    write_failed = True
+                    last_error = "BrokenPipeError"
+                    break
+                except OSError as e:
+                    print(f"[CustomVideoSaver] OS error writing frame {i}: {e}")
+                    write_failed = True
+                    last_error = str(e)
+                    break
                 except Exception as e:
                     print(f"[CustomVideoSaver] Error writing frame {i}: {e}")
-                    process.kill()
-                    return False
+                    write_failed = True
+                    last_error = str(e)
+                    break
             
             print(f"[CustomVideoSaver] All frames written, finalizing...")
             
@@ -869,21 +947,45 @@ class CustomVideoSaver:
             try:
                 process.stdin.flush()
                 process.stdin.close()
-            except:
-                pass
+            except Exception as e:
+                print(f"[CustomVideoSaver] Error closing stdin: {e}")
             
             # Wait with timeout to prevent infinite hang
+            # For 4K video, allow more time (10 minutes)
+            timeout = 600 if width >= 3840 or height >= 2160 else 300
             try:
-                return_code = process.wait(timeout=300)  # 5 minute timeout
+                return_code = process.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
-                print(f"[CustomVideoSaver] FFmpeg timed out after 5 minutes")
+                print(f"[CustomVideoSaver] FFmpeg timed out after {timeout} seconds")
                 process.kill()
+                process.wait()  # Clean up
                 return False
             
+            # Wait for stderr thread to finish
+            stderr_thread.join(timeout=5)
+            
             # Check if encoding was successful
-            if return_code != 0:
+            if return_code != 0 or write_failed:
+                print(f"[CustomVideoSaver] ==================== FFmpeg ERROR ====================")
                 print(f"[CustomVideoSaver] FFmpeg failed with return code {return_code}")
-                print(f"[CustomVideoSaver] Try a different codec or preset")
+                if last_error:
+                    print(f"[CustomVideoSaver] Last error: {last_error}")
+                
+                # Print last 20 lines of stderr for debugging
+                print(f"[CustomVideoSaver] Last FFmpeg messages:")
+                for line in stderr_lines[-20:]:
+                    if line.strip():  # Skip empty lines
+                        print(f"[CustomVideoSaver]   {line}")
+                print(f"[CustomVideoSaver] =====================================================")
+                
+                # Try to provide helpful suggestions
+                if "Invalid argument" in ' '.join(stderr_lines):
+                    print(f"[CustomVideoSaver] Suggestion: Try using H.264/AVC instead of {codec}")
+                elif "not supported" in ' '.join(stderr_lines).lower():
+                    print(f"[CustomVideoSaver] Suggestion: Codec {codec} may not be available")
+                elif any("memory" in line.lower() for line in stderr_lines):
+                    print(f"[CustomVideoSaver] Suggestion: Try reducing video resolution or using faster preset")
+                
                 return False
             
             # Verify file was created
@@ -1326,6 +1428,2311 @@ class LazySwitch:
             return (on_false,)
 
 
+class VideoExtensionDiagnostic:
+    """
+    Diagnose color drift and visual degradation in video extension workflows.
+    Compares original video with up to 3 generations of extended videos.
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "original_video": ("IMAGE",),
+                "frame_index": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 10000,
+                    "step": 1,
+                    "display": "number"
+                }),
+            },
+            "optional": {
+                "gen1_video": ("IMAGE",),
+                "gen2_video": ("IMAGE",),
+                "gen3_video": ("IMAGE",),
+            }
+        }
+    
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("diagnostic_image", "statistics")
+    FUNCTION = "diagnose"
+    CATEGORY = "NV_Comfy_Utils/Diagnostic"
+    
+    def diagnose(self, original_video, frame_index, gen1_video=None, gen2_video=None, gen3_video=None):
+        """
+        Create diagnostic visualization showing color drift over generations.
+        
+        Args:
+            original_video: Original video tensor [frames, height, width, channels]
+            frame_index: Which frame to visualize
+            gen1_video: First generation extended video (optional)
+            gen2_video: Second generation extended video (optional)
+            gen3_video: Third generation extended video (optional)
+        
+        Returns:
+            diagnostic_image: Matplotlib visualization as IMAGE tensor
+            statistics: Text statistics string
+        """
+        # Collect available videos
+        videos = [original_video]
+        titles = ['Original']
+        
+        if gen1_video is not None:
+            videos.append(gen1_video)
+            titles.append('Gen 1')
+        if gen2_video is not None:
+            videos.append(gen2_video)
+            titles.append('Gen 2')
+        if gen3_video is not None:
+            videos.append(gen3_video)
+            titles.append('Gen 3')
+        
+        num_videos = len(videos)
+        
+        # Validate frame index
+        for i, video in enumerate(videos):
+            if frame_index >= video.shape[0]:
+                print(f"[VideoExtensionDiagnostic] Warning: frame_index {frame_index} >= {video.shape[0]} frames in {titles[i]}, using last frame")
+                frame_index = min(frame_index, video.shape[0] - 1)
+        
+        # Create figure with 2 rows: sample frames and histograms
+        fig, axes = plt.subplots(2, num_videos, figsize=(4 * num_videos, 8))
+        
+        # Handle single video case (axes won't be 2D array)
+        if num_videos == 1:
+            axes = axes.reshape(2, 1)
+        
+        # Convert tensors to numpy for visualization
+        video_arrays = []
+        for video in videos:
+            # ComfyUI format: [frames, height, width, channels], values in [0, 1]
+            video_np = video.cpu().numpy()
+            video_arrays.append(video_np)
+        
+        # Row 1: Sample frames
+        for i, (video_np, title) in enumerate(zip(video_arrays, titles)):
+            frame = video_np[frame_index]
+            axes[0, i].imshow(frame)
+            axes[0, i].set_title(f'{title}\nFrame {frame_index}', fontsize=10, fontweight='bold')
+            axes[0, i].axis('off')
+        
+        # Row 2: Histograms showing color distribution
+        for i, (video_np, title) in enumerate(zip(video_arrays, titles)):
+            # Flatten all frames to analyze overall distribution
+            flattened = video_np.flatten()
+            
+            axes[1, i].hist(flattened, bins=50, alpha=0.7, color='steelblue', edgecolor='black')
+            axes[1, i].set_xlim([0, 1])
+            axes[1, i].set_xlabel('Pixel Value', fontsize=9)
+            axes[1, i].set_ylabel('Frequency', fontsize=9)
+            
+            mean_val = flattened.mean()
+            std_val = flattened.std()
+            axes[1, i].set_title(f'μ={mean_val:.3f}, σ={std_val:.3f}', fontsize=9)
+            axes[1, i].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        
+        # Convert matplotlib figure to IMAGE tensor
+        buf = BytesIO()
+        plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+        buf.seek(0)
+        plt.close(fig)
+        
+        # Load image from buffer
+        img_pil = Image.open(buf)
+        img_np = np.array(img_pil).astype(np.float32) / 255.0
+        
+        # Convert to ComfyUI format: [batch, height, width, channels]
+        if img_np.ndim == 3:
+            img_tensor = torch.from_numpy(img_np)[None, :]
+        else:
+            img_tensor = torch.from_numpy(img_np[:, :, :3])[None, :]
+        
+        # Generate statistics text
+        stats_lines = []
+        stats_lines.append("=" * 60)
+        stats_lines.append("VIDEO EXTENSION DIAGNOSTIC REPORT")
+        stats_lines.append("=" * 60)
+        stats_lines.append(f"Analysis Frame: {frame_index}")
+        stats_lines.append("")
+        
+        for i, (video_np, title) in enumerate(zip(video_arrays, titles)):
+            stats_lines.append(f"{title}:")
+            stats_lines.append(f"  Frames:        {video_np.shape[0]}")
+            stats_lines.append(f"  Resolution:    {video_np.shape[1]}x{video_np.shape[2]}")
+            stats_lines.append(f"  Mean:          {video_np.mean():.6f}")
+            stats_lines.append(f"  Std:           {video_np.std():.6f}")
+            stats_lines.append(f"  Min:           {video_np.min():.6f}")
+            stats_lines.append(f"  Max:           {video_np.max():.6f}")
+            
+            # Calculate clipping percentages
+            clipped_to_0 = (video_np == 0).sum() / video_np.size * 100
+            clipped_to_1 = (video_np == 1).sum() / video_np.size * 100
+            stats_lines.append(f"  % clipped to 0: {clipped_to_0:.2f}%")
+            stats_lines.append(f"  % clipped to 1: {clipped_to_1:.2f}%")
+            
+            # Calculate drift from original (if not the original)
+            if i > 0:
+                diff = video_np.mean() - video_arrays[0].mean()
+                diff_percent = (diff / video_arrays[0].mean()) * 100
+                stats_lines.append(f"  Mean drift from original: {diff:+.6f} ({diff_percent:+.2f}%)")
+            
+            stats_lines.append("")
+        
+        # Add color drift summary
+        if num_videos > 1:
+            stats_lines.append("=" * 60)
+            stats_lines.append("COLOR DRIFT ANALYSIS")
+            stats_lines.append("=" * 60)
+            
+            orig_mean = video_arrays[0].mean()
+            for i in range(1, num_videos):
+                gen_mean = video_arrays[i].mean()
+                drift = gen_mean - orig_mean
+                drift_percent = (drift / orig_mean) * 100
+                
+                if abs(drift_percent) > 5:
+                    severity = "⚠️ SIGNIFICANT"
+                elif abs(drift_percent) > 2:
+                    severity = "⚡ MODERATE"
+                else:
+                    severity = "✓ MINIMAL"
+                
+                stats_lines.append(f"{titles[i]}: {drift:+.6f} ({drift_percent:+.2f}%) - {severity}")
+            
+            stats_lines.append("")
+        
+        statistics_text = "\n".join(stats_lines)
+        print(f"\n{statistics_text}")
+        
+        return (img_tensor, statistics_text)
+
+
+class VAE_LUT_Generator:
+    """
+    Generate a VAE correction LUT by analyzing videos with different VAE cycle counts.
+    This node helps you build a calibration profile for your specific VAE.
+    
+    Now supports AUTOMATIC degradation testing - just provide a VAE and video!
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "original_video": ("IMAGE",),
+                "vae_name": ("STRING", {"default": "my_vae", "multiline": False}),
+            },
+            "optional": {
+                # NEW: Automated testing mode
+                "vae": ("VAE",),
+                
+                # Simple mode: Test 1, 2, 3, ... up to max_cycles
+                "max_cycles": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 100,
+                    "step": 1,
+                    "display": "number"
+                }),
+                
+                # Advanced mode: Specify exact cycles (e.g., "1,3,6,10")
+                "test_cycles": ("STRING", {"default": "", "multiline": False}),
+                
+                # Codec degradation options (save/load between cycles)
+                "include_codec_degradation": ("BOOLEAN", {"default": False}),
+                "codec_quality": ("INT", {"default": 23, "min": 0, "max": 51, "step": 1}),
+                "fps": ("FLOAT", {"default": 30.0, "min": 1.0, "max": 120.0, "step": 0.1}),
+                
+                # Legacy: Manual pre-generated videos (still supported)
+                "cycle_1_video": ("IMAGE",),
+                "cycle_2_video": ("IMAGE",),
+                "cycle_3_video": ("IMAGE",),
+                "cycle_4_video": ("IMAGE",),
+                "cycle_5_video": ("IMAGE",),
+                "cycle_6_video": ("IMAGE",),
+                "cycle_8_video": ("IMAGE",),
+                "cycle_10_video": ("IMAGE",),
+            }
+        }
+    
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("lut_json", "lut_report")
+    FUNCTION = "generate_lut"
+    CATEGORY = "NV_Comfy_Utils/Diagnostic"
+    
+    def _apply_vae_cycles(self, video_tensor, vae, num_cycles, include_codec_degradation=False, 
+                         codec_quality=23, fps=30.0):
+        """
+        Apply N VAE encode/decode cycles to a video tensor.
+        Uses the EXACT same logic as ComfyUI's native VAEEncode/VAEDecode nodes.
+        
+        Args:
+            video_tensor: Input video [frames, height, width, channels]
+            vae: VAE model
+            num_cycles: Number of encode/decode cycles
+            include_codec_degradation: If True, save/load video between cycles
+            codec_quality: FFmpeg CRF quality (0=lossless, 23=default, 51=worst)
+            fps: Frames per second for video encoding
+        
+        Returns:
+            Degraded video tensor
+        """
+        current_pixels = video_tensor
+        original_frame_count = current_pixels.shape[0]
+        
+        print(f"[VAE_LUT_Generator] Applying {num_cycles} VAE cycles...")
+        print(f"[VAE_LUT_Generator] Input shape: {current_pixels.shape}, dtype: {current_pixels.dtype}")
+        
+        # Check if this is a temporal/video VAE (compresses frames)
+        vae_type = type(vae.first_stage_model).__name__ if hasattr(vae, 'first_stage_model') else "Unknown"
+        is_temporal_vae = 'wan' in vae_type.lower() or 'video' in vae_type.lower() or 'temporal' in vae_type.lower()
+        
+        if is_temporal_vae:
+            print(f"[VAE_LUT_Generator] ⚠️  Detected temporal/video VAE ({vae_type})")
+            print(f"[VAE_LUT_Generator] This VAE compresses the temporal dimension (frame count)")
+            print(f"[VAE_LUT_Generator] Frame count may decrease with each cycle")
+            print(f"[VAE_LUT_Generator] ")
+            print(f"[VAE_LUT_Generator] 💡 RECOMMENDATION for temporal VAEs:")
+            print(f"[VAE_LUT_Generator]    • Use videos with {original_frame_count * 2}+ frames")
+            print(f"[VAE_LUT_Generator]    • Start with max_cycles: 2-3 to test")
+            print(f"[VAE_LUT_Generator]    • Monitor frame count reduction")
+            print(f"[VAE_LUT_Generator] ")
+        
+        for cycle in range(num_cycles):
+            try:
+                # DEBUG: Show mean BEFORE encode
+                mean_before = float(current_pixels.mean())
+                print(f"[VAE_LUT_Generator]   🔍 Cycle {cycle + 1} - Mean BEFORE encode: {mean_before:.6f}")
+                
+                # === EXACT NATIVE COMFYUI VAE ENCODE LOGIC ===
+                # From: ComfyUI/nodes.py line 342 (VAEEncode)
+                # t = vae.encode(pixels[:,:,:,:3])
+                # 
+                # NOTE: We do NOT call vae_encode_crop_pixels() because:
+                # 1. Native ComfyUI VAEEncode doesn't use it
+                # 2. Cropping reduces degradation by removing edge artifacts
+                # 3. We want to measure the FULL degradation that users experience
+                
+                # Encode: ensure RGB only (first 3 channels), no cropping
+                latent = vae.encode(current_pixels[:,:,:,:3])
+                
+                # === EXACT NATIVE COMFYUI VAE DECODE LOGIC ===
+                # From: ComfyUI/nodes.py line 294 (VAEDecode)
+                # images = vae.decode(samples["samples"])
+                # if len(images.shape) == 5: #Combine batches
+                #     images = images.reshape(-1, images.shape[-3], images.shape[-2], images.shape[-1])
+                
+                # Decode: vae.decode returns pixels directly
+                current_pixels = vae.decode(latent)
+                
+                # Reshape 5D to 4D if needed (for temporal VAEs)
+                if len(current_pixels.shape) == 5:
+                    current_pixels = current_pixels.reshape(-1, current_pixels.shape[-3], current_pixels.shape[-2], current_pixels.shape[-1])
+                
+                # DEBUG: Show mean AFTER decode (before clamp)
+                mean_after_decode = float(current_pixels.mean())
+                print(f"[VAE_LUT_Generator]   🔍 After decode: {mean_after_decode:.6f}")
+                
+                # Clamp to valid range [0, 1]
+                current_pixels = torch.clamp(current_pixels, 0.0, 1.0)
+                
+                # DEBUG: Show mean AFTER clamp
+                mean_after_clamp = float(current_pixels.mean())
+                if abs(mean_after_clamp - mean_after_decode) > 0.0001:
+                    print(f"[VAE_LUT_Generator]   🔍 After clamp: {mean_after_clamp:.6f} (clamp changed it!)")
+                
+                # DEBUG: Show degradation for this cycle
+                degradation = mean_after_clamp - mean_before
+                degradation_pct = (degradation / mean_before) * 100
+                print(f"[VAE_LUT_Generator]   📉 Cycle {cycle + 1} degradation: {degradation:+.6f} ({degradation_pct:+.2f}%)")
+                
+                # === CODEC DEGRADATION (Optional) ===
+                # If enabled, save and reload the video to include codec degradation
+                # IMPORTANT: Always do this after EVERY cycle (including the last one)
+                # because we need to measure the degradation state AFTER save/load
+                if include_codec_degradation:
+                    print(f"[VAE_LUT_Generator]   💾 Saving/loading video (codec degradation)...")
+                    mean_before_codec = float(current_pixels.mean())
+                    
+                    try:
+                        # Save video to temporary file using H.265
+                        import tempfile
+                        import subprocess
+                        import cv2
+                        
+                        temp_dir = tempfile.gettempdir()
+                        temp_path = os.path.join(temp_dir, f"vae_lut_temp_cycle{cycle+1}.mp4")
+                        
+                        # Convert tensor to numpy with CustomVideoSaver's exact rounding
+                        # This matches: video_array = np.clip(video_array * 255.0 + 0.5, 0, 255)
+                        video_np = np.clip(current_pixels.cpu().numpy() * 255.0 + 0.5, 0, 255).astype(np.uint8)
+                        height, width = video_np.shape[1], video_np.shape[2]
+                        
+                        # Use FFmpeg with EXACT CustomVideoSaver settings
+                        ffmpeg_cmd = [
+                            'ffmpeg', '-y',
+                            '-f', 'rawvideo',
+                            '-vcodec', 'rawvideo',
+                            '-s', f'{width}x{height}',
+                            '-pix_fmt', 'rgb24',
+                            '-r', str(fps),
+                            '-i', '-',
+                            '-c:v', 'libx264',
+                            '-movflags', '+faststart',  # CustomVideoSaver uses this
+                            '-max_muxing_queue_size', '9999',  # CustomVideoSaver uses this
+                            '-crf', str(codec_quality),
+                            '-preset', 'medium',
+                            '-pix_fmt', 'yuv420p',
+                            temp_path
+                        ]
+                        
+                        # Use DEVNULL for stdout/stderr to prevent pipe deadlock
+                        process = subprocess.Popen(ffmpeg_cmd, 
+                                                  stdin=subprocess.PIPE, 
+                                                  stdout=subprocess.DEVNULL, 
+                                                  stderr=subprocess.DEVNULL)
+                        
+                        # Write all frames as one block
+                        video_bytes = video_np.tobytes()
+                        process.stdin.write(video_bytes)
+                        process.stdin.close()
+                        
+                        # Wait for completion
+                        return_code = process.wait()
+                        
+                        if return_code != 0:
+                            print(f"[VAE_LUT_Generator]   ⚠️  FFmpeg returned error code {return_code}")
+                            raise Exception(f"FFmpeg encoding failed with code {return_code}")
+                        
+                        # Load video back
+                        cap = cv2.VideoCapture(temp_path)
+                        frames = []
+                        while True:
+                            ret, frame = cap.read()
+                            if not ret:
+                                break
+                            # Convert BGR to RGB
+                            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                            frames.append(frame_rgb)
+                        cap.release()
+                        
+                        # Clean up temp file
+                        if os.path.exists(temp_path):
+                            os.remove(temp_path)
+                        
+                        # Convert back to tensor
+                        if frames:
+                            current_pixels = torch.from_numpy(np.array(frames)).float() / 255.0
+                            current_pixels = current_pixels.to(video_tensor.device)
+                            
+                            mean_after_codec = float(current_pixels.mean())
+                            codec_degradation = mean_after_codec - mean_before_codec
+                            codec_degradation_pct = (codec_degradation / mean_before_codec) * 100
+                            print(f"[VAE_LUT_Generator]   🎬 Codec degradation: {codec_degradation:+.6f} ({codec_degradation_pct:+.2f}%)")
+                        else:
+                            print(f"[VAE_LUT_Generator]   ⚠️  Warning: Failed to load video frames")
+                            
+                    except Exception as e:
+                        print(f"[VAE_LUT_Generator]   ⚠️  Warning: Codec save/load failed: {e}")
+                        print(f"[VAE_LUT_Generator]   Continuing without codec degradation for this cycle")
+                
+                # Get current frame count
+                # After reshape, tensor is always 4D: [frames, height, width, channels]
+                current_frames = current_pixels.shape[0]  # Frames is dimension 0
+                
+                if (cycle + 1) % 2 == 0 or num_cycles <= 3:
+                    print(f"[VAE_LUT_Generator]   Completed cycle {cycle + 1}/{num_cycles} (shape: {current_pixels.shape}, frames: {current_frames})")
+                
+                # Check if temporal VAE has compressed frames too much
+                if is_temporal_vae and current_frames < 3 and cycle < num_cycles - 1:
+                    print(f"[VAE_LUT_Generator] ⚠️  Frame count too low ({current_frames} frames)")
+                    print(f"[VAE_LUT_Generator] ⚠️  Cannot continue to cycle {cycle + 2}")
+                    print(f"[VAE_LUT_Generator] ⚠️  Stopping at cycle {cycle + 1}")
+                    print(f"[VAE_LUT_Generator] ⚠️  This temporal VAE requires more input frames!")
+                    raise RuntimeError(
+                        f"Temporal VAE compressed video to {current_frames} frames. "
+                        f"Cannot perform cycle {cycle + 2}. "
+                        f"Original video had {original_frame_count} frames. "
+                        f"Recommendation: Use a video with {original_frame_count * 2} or more frames, "
+                        f"or reduce max_cycles to {cycle + 1}."
+                    )
+                    
+            except Exception as e:
+                print(f"[VAE_LUT_Generator] ❌ Error in cycle {cycle + 1}:")
+                print(f"[VAE_LUT_Generator]    Error type: {type(e).__name__}")
+                print(f"[VAE_LUT_Generator]    Error message: {e}")
+                print(f"[VAE_LUT_Generator]    Current tensor shape: {current_pixels.shape if hasattr(current_pixels, 'shape') else 'N/A'}")
+                
+                # Provide specific guidance for temporal VAE issues
+                if is_temporal_vae and ('out' in str(e) or 'UnboundLocalError' in str(e) or 'Temporal VAE' in str(e)):
+                    # Get frame count from current_pixels (always 4D after reshape)
+                    if hasattr(current_pixels, 'shape'):
+                        current_frames = current_pixels.shape[0]
+                    else:
+                        current_frames = 0
+                    
+                    print(f"[VAE_LUT_Generator] ")
+                    print(f"[VAE_LUT_Generator] 🎥 TEMPORAL VAE ISSUE DETECTED:")
+                    print(f"[VAE_LUT_Generator] Your video VAE compresses the frame count with each cycle.")
+                    print(f"[VAE_LUT_Generator] Frame count reduced: {original_frame_count} → {current_frames}")
+                    print(f"[VAE_LUT_Generator] ")
+                    print(f"[VAE_LUT_Generator] SOLUTIONS:")
+                    print(f"[VAE_LUT_Generator] 1. Use MORE frames: Try {original_frame_count * 3}+ frames")
+                    print(f"[VAE_LUT_Generator] 2. Use FEWER cycles: Set max_cycles to {cycle} instead of {num_cycles}")
+                    print(f"[VAE_LUT_Generator] 3. Use LONGER video: This VAE needs substantial temporal data")
+                    print(f"[VAE_LUT_Generator] ")
+                
+                import traceback
+                traceback.print_exc()
+                raise RuntimeError(f"VAE cycle {cycle + 1} failed. See error above for details.") from e
+        
+        print(f"[VAE_LUT_Generator] ✓ {num_cycles} cycles complete")
+        print(f"[VAE_LUT_Generator] Output shape: {current_pixels.shape}")
+        
+        # DEBUG: Show total degradation
+        original_mean = float(video_tensor.mean())
+        final_mean = float(current_pixels.mean())
+        total_degradation = final_mean - original_mean
+        total_degradation_pct = (total_degradation / original_mean) * 100
+        print(f"[VAE_LUT_Generator] ")
+        print(f"[VAE_LUT_Generator] 📊 TOTAL DEGRADATION AFTER {num_cycles} CYCLES:")
+        print(f"[VAE_LUT_Generator]    Original mean: {original_mean:.6f}")
+        print(f"[VAE_LUT_Generator]    Final mean:    {final_mean:.6f}")
+        print(f"[VAE_LUT_Generator]    Total drift:   {total_degradation:+.6f} ({total_degradation_pct:+.2f}%)")
+        print(f"[VAE_LUT_Generator] ")
+        
+        return current_pixels
+    
+    def generate_lut(self, original_video, vae_name, vae=None, max_cycles=0, test_cycles="",
+                    include_codec_degradation=False, codec_quality=23, fps=30.0, **kwargs):
+        """
+        Analyze multiple VAE-cycled videos and generate correction LUT.
+        
+        Three modes:
+        1. AUTOMATIC (Simple): Provide VAE + max_cycles, tests 1..max_cycles
+        2. AUTOMATIC (Advanced): Provide VAE + test_cycles string for specific cycles
+        3. MANUAL: Provide pre-generated cycle_N_video inputs (legacy mode)
+        
+        Args:
+            include_codec_degradation: If True, save/load video between cycles to include H.265 codec degradation
+            codec_quality: FFmpeg CRF quality (0=lossless, 23=default, 51=worst)
+            fps: Frames per second for video encoding/decoding
+        """
+        cycle_videos = {}
+        mode = "unknown"
+        
+        # Check if we're in automatic mode (VAE provided)
+        if vae is not None:
+            mode = "automatic"
+            print("[VAE_LUT_Generator] ═══════════════════════════════════════════")
+            print("[VAE_LUT_Generator] AUTOMATIC MODE - Generating test videos...")
+            print("[VAE_LUT_Generator] ═══════════════════════════════════════════")
+            
+            if include_codec_degradation:
+                print(f"[VAE_LUT_Generator] 🎬 Codec degradation: ENABLED (H.264, CRF {codec_quality}, {fps} fps)")
+                print(f"[VAE_LUT_Generator]    Will save/load video between cycles (matches manual workflow)")
+            else:
+                print(f"[VAE_LUT_Generator] ⚡ Codec degradation: DISABLED (pure VAE only)")
+            
+            # Determine which cycles to test
+            cycle_list = []
+            
+            # Priority 1: max_cycles (simple mode)
+            if max_cycles > 0:
+                cycle_list = list(range(1, max_cycles + 1))
+                print(f"[VAE_LUT_Generator] Simple Mode: Testing cycles 1 through {max_cycles}")
+            
+            # Priority 2: test_cycles string (advanced mode)
+            elif test_cycles.strip():
+                try:
+                    cycle_list = [int(c.strip()) for c in test_cycles.split(",") if c.strip()]
+                    cycle_list = sorted(set(cycle_list))  # Remove duplicates and sort
+                    print(f"[VAE_LUT_Generator] Advanced Mode: Testing specific cycles: {cycle_list}")
+                except ValueError as e:
+                    return ("{}", f"Error parsing test_cycles: {e}. Use format like '1,2,3,4,5,6,8,10'")
+            
+            # Fallback: Use default if nothing specified
+            else:
+                cycle_list = [1, 2, 3, 4, 5, 6, 8, 10]
+                print(f"[VAE_LUT_Generator] Using default cycles: {cycle_list}")
+            
+            if not cycle_list:
+                return ("{}", 
+                       "Error: No test cycles specified.\n"
+                       "Either:\n"
+                       "  1. Set max_cycles (e.g., 10 tests cycles 1-10), or\n"
+                       "  2. Set test_cycles (e.g., '1,3,6,10' for specific cycles)")
+            
+            # Generate degraded videos for each cycle count
+            try:
+                print(f"[VAE_LUT_Generator] Testing {len(cycle_list)} cycle counts: {cycle_list}")
+                print(f"[VAE_LUT_Generator] This will take approximately {len(cycle_list) * 5} seconds...")
+                print()
+                
+                for i, num_cycles in enumerate(cycle_list, 1):
+                    print(f"[VAE_LUT_Generator] ─── Test {i}/{len(cycle_list)}: {num_cycles} cycles ───")
+                    degraded = self._apply_vae_cycles(original_video, vae, num_cycles,
+                                                     include_codec_degradation=include_codec_degradation,
+                                                     codec_quality=codec_quality,
+                                                     fps=fps)
+                    cycle_videos[num_cycles] = degraded
+                    print()
+                
+                print("[VAE_LUT_Generator] ✓ All test videos generated successfully!")
+                print()
+                
+            except Exception as e:
+                return ("{}", f"Error during automatic testing: {e}")
+        
+        else:
+            # Manual mode: collect pre-generated videos from kwargs
+            mode = "manual"
+            print("[VAE_LUT_Generator] ═══════════════════════════════════════════")
+            print("[VAE_LUT_Generator] MANUAL MODE - Using pre-generated videos...")
+            print("[VAE_LUT_Generator] ═══════════════════════════════════════════")
+            
+            for key, video in kwargs.items():
+                if video is not None and key.startswith("cycle_"):
+                    # Extract cycle number from key (e.g., "cycle_3_video" -> 3)
+                    cycle_num = int(key.split("_")[1])
+                    cycle_videos[cycle_num] = video
+            
+            if not cycle_videos:
+                return ("{}", 
+                       "Error: No cycle videos provided.\n"
+                       "Either:\n"
+                       "  1. Connect a VAE for automatic testing (recommended), or\n"
+                       "  2. Connect at least one cycle_N_video input for manual mode")
+        
+        # Get original statistics
+        orig_np = original_video.cpu().numpy()
+        orig_stats = {
+            "mean": float(orig_np.mean()),
+            "std": float(orig_np.std()),
+            "min": float(orig_np.min()),
+            "max": float(orig_np.max()),
+            "clip_0": float((orig_np == 0).sum() / orig_np.size),
+            "clip_1": float((orig_np == 1).sum() / orig_np.size),
+        }
+        
+        # Analyze each cycle video
+        lut_data = {
+            "vae_name": vae_name,
+            "generation_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "calibration_video_stats": orig_stats,
+            "corrections": {},
+            "drift_analysis": {},
+        }
+        
+        drift_rates = []
+        report_lines = []
+        report_lines.append("=" * 70)
+        report_lines.append("VAE LUT GENERATION REPORT")
+        report_lines.append("=" * 70)
+        report_lines.append(f"VAE Name: {vae_name}")
+        report_lines.append(f"Generation Mode: {mode.upper()}")
+        if mode == "automatic":
+            if max_cycles > 0:
+                report_lines.append(f"Test Mode: SIMPLE (cycles 1-{max_cycles})")
+            elif test_cycles.strip():
+                report_lines.append(f"Test Mode: ADVANCED (custom cycles)")
+            else:
+                report_lines.append(f"Test Mode: DEFAULT")
+            report_lines.append(f"Test Cycles: {sorted(cycle_videos.keys())}")
+        report_lines.append(f"Calibration Video: {orig_np.shape[0]} frames, {orig_np.shape[1]}x{orig_np.shape[2]}")
+        report_lines.append(f"Original Mean: {orig_stats['mean']:.6f}")
+        report_lines.append(f"Original Std:  {orig_stats['std']:.6f}")
+        report_lines.append("")
+        report_lines.append("CYCLE ANALYSIS:")
+        report_lines.append("-" * 70)
+        
+        for cycle_num in sorted(cycle_videos.keys()):
+            video_np = cycle_videos[cycle_num].cpu().numpy()
+            
+            # Calculate statistics
+            stats = {
+                "mean": float(video_np.mean()),
+                "std": float(video_np.std()),
+                "min": float(video_np.min()),
+                "max": float(video_np.max()),
+                "clip_0": float((video_np == 0).sum() / video_np.size),
+                "clip_1": float((video_np == 1).sum() / video_np.size),
+            }
+            
+            # Calculate drift
+            mean_drift = stats["mean"] - orig_stats["mean"]
+            mean_drift_pct = (mean_drift / orig_stats["mean"]) * 100
+            std_drift = stats["std"] - orig_stats["std"]
+            std_drift_pct = (std_drift / orig_stats["std"]) * 100
+            
+            # Calculate correction factors (inverse of degradation)
+            brightness_correction = orig_stats["mean"] / stats["mean"] if stats["mean"] > 0 else 1.0
+            contrast_correction = orig_stats["std"] / stats["std"] if stats["std"] > 0 else 1.0
+            
+            # Calculate shadow lift needed
+            clip_increase = stats["clip_0"] - orig_stats["clip_0"]
+            shadow_lift = max(0.0, clip_increase * 0.05)  # Heuristic: 5% of clipping increase
+            
+            # Store in LUT
+            lut_data["corrections"][cycle_num] = {
+                "brightness_mult": round(brightness_correction, 6),
+                "contrast_mult": round(contrast_correction, 6),
+                "shadow_lift": round(shadow_lift, 6),
+            }
+            
+            lut_data["drift_analysis"][cycle_num] = {
+                "mean_drift": round(mean_drift, 6),
+                "mean_drift_pct": round(mean_drift_pct, 2),
+                "std_drift": round(std_drift, 6),
+                "std_drift_pct": round(std_drift_pct, 2),
+                "clip_0_increase": round(clip_increase * 100, 2),
+            }
+            
+            drift_rates.append((cycle_num, mean_drift_pct / cycle_num))
+            
+            # Add to report
+            report_lines.append(f"Cycle {cycle_num}:")
+            report_lines.append(f"  Mean: {stats['mean']:.6f} (drift: {mean_drift_pct:+.2f}%)")
+            report_lines.append(f"  Std:  {stats['std']:.6f} (drift: {std_drift_pct:+.2f}%)")
+            report_lines.append(f"  Clip0: {stats['clip_0']*100:.2f}% (increase: {clip_increase*100:+.2f}%)")
+            report_lines.append(f"  → Brightness correction: ×{brightness_correction:.4f}")
+            report_lines.append(f"  → Contrast correction:   ×{contrast_correction:.4f}")
+            report_lines.append(f"  → Shadow lift:           +{shadow_lift:.4f}")
+            report_lines.append("")
+        
+        # Estimate drift model
+        if len(drift_rates) >= 2:
+            avg_drift_rate = sum(rate for _, rate in drift_rates) / len(drift_rates)
+            lut_data["drift_model"] = {
+                "type": "linear",
+                "mean_decay_rate_per_cycle": round(abs(avg_drift_rate) / 100, 6),
+            }
+            
+            report_lines.append("=" * 70)
+            report_lines.append("DRIFT MODEL:")
+            report_lines.append(f"Average drift rate: {avg_drift_rate:.2f}% per cycle")
+            report_lines.append(f"Model type: Linear")
+            report_lines.append("")
+        
+        # Usage instructions
+        report_lines.append("=" * 70)
+        report_lines.append("USAGE:")
+        report_lines.append("1. Save the LUT JSON output to a file (e.g., 'my_vae_lut.json')")
+        report_lines.append("2. Use 'VAE Correction Applier' node with this LUT")
+        report_lines.append("3. Specify the number of VAE cycles your video has undergone")
+        report_lines.append("")
+        if mode == "automatic":
+            report_lines.append("NOTE: Generated in AUTOMATIC mode - all test videos created internally!")
+            report_lines.append(f"      Tested {len(cycle_videos)} cycle counts in ~{len(cycle_videos) * 5} seconds")
+            if max_cycles > 0:
+                report_lines.append(f"      Simple mode used: tested every cycle from 1 to {max_cycles}")
+            elif test_cycles.strip():
+                report_lines.append(f"      Advanced mode used: tested specific cycles {sorted(cycle_videos.keys())}")
+        report_lines.append("=" * 70)
+        
+        lut_json = json.dumps(lut_data, indent=2)
+        report_text = "\n".join(report_lines)
+        
+        print(f"\n{report_text}")
+        print(f"\nGenerated LUT JSON:\n{lut_json}")
+        
+        return (lut_json, report_text)
+
+
+class VAE_Correction_Applier:
+    """
+    Apply VAE correction using a LUT generated by VAE_LUT_Generator.
+    Restores brightness, contrast, and shadow detail lost during VAE encode/decode cycles.
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": ("IMAGE",),
+                "lut_json": ("STRING", {"default": "{}", "multiline": True}),
+                "num_cycles": ("INT", {
+                    "default": 1,
+                    "min": 0,
+                    "max": 50,
+                    "step": 1,
+                }),
+                "correction_strength": ("FLOAT", {
+                    "default": 1.0,
+                    "min": 0.0,
+                    "max": 2.0,
+                    "step": 0.1,
+                    "display": "slider",
+                }),
+                "content_adaptive": ("BOOLEAN", {"default": True}),
+            }
+        }
+    
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("corrected_video", "correction_report")
+    FUNCTION = "apply_correction"
+    CATEGORY = "NV_Comfy_Utils/Diagnostic"
+    
+    def apply_correction(self, video, lut_json, num_cycles, correction_strength=1.0, content_adaptive=True):
+        """
+        Apply VAE cycle corrections to restore video quality.
+        """
+        if num_cycles == 0:
+            return (video, "No correction needed (0 cycles)")
+        
+        # Parse LUT
+        try:
+            lut = json.loads(lut_json)
+        except json.JSONDecodeError as e:
+            return (video, f"Error: Invalid LUT JSON: {e}")
+        
+        if "corrections" not in lut:
+            return (video, "Error: LUT JSON missing 'corrections' key")
+        
+        corrections = lut["corrections"]
+        
+        # Find correction for this cycle count (or interpolate)
+        if str(num_cycles) in corrections:
+            corr = corrections[str(num_cycles)]
+        elif num_cycles in corrections:
+            corr = corrections[num_cycles]
+        else:
+            # Interpolate from available data
+            available_cycles = sorted([int(k) for k in corrections.keys()])
+            if not available_cycles:
+                return (video, "Error: LUT has no correction data")
+            
+            if num_cycles < available_cycles[0]:
+                # Extrapolate downward
+                corr = corrections[str(available_cycles[0])]
+                scale = num_cycles / available_cycles[0]
+                corr = {
+                    "brightness_mult": 1 + (corr["brightness_mult"] - 1) * scale,
+                    "contrast_mult": 1 + (corr["contrast_mult"] - 1) * scale,
+                    "shadow_lift": corr["shadow_lift"] * scale,
+                }
+            elif num_cycles > available_cycles[-1]:
+                # Extrapolate upward
+                corr = corrections[str(available_cycles[-1])]
+                scale = num_cycles / available_cycles[-1]
+                corr = {
+                    "brightness_mult": 1 + (corr["brightness_mult"] - 1) * scale,
+                    "contrast_mult": 1 + (corr["contrast_mult"] - 1) * scale,
+                    "shadow_lift": corr["shadow_lift"] * scale,
+                }
+            else:
+                # Interpolate between two points
+                lower = max(c for c in available_cycles if c < num_cycles)
+                upper = min(c for c in available_cycles if c > num_cycles)
+                weight = (num_cycles - lower) / (upper - lower)
+                
+                corr_lower = corrections[str(lower)]
+                corr_upper = corrections[str(upper)]
+                
+                corr = {
+                    "brightness_mult": corr_lower["brightness_mult"] * (1 - weight) + corr_upper["brightness_mult"] * weight,
+                    "contrast_mult": corr_lower["contrast_mult"] * (1 - weight) + corr_upper["contrast_mult"] * weight,
+                    "shadow_lift": corr_lower["shadow_lift"] * (1 - weight) + corr_upper["shadow_lift"] * weight,
+                }
+        
+        # Convert to numpy
+        video_np = video.cpu().numpy()
+        original_mean = video_np.mean()
+        original_std = video_np.std()
+        
+        # Content-adaptive scaling
+        if content_adaptive and "calibration_video_stats" in lut:
+            calib_mean = lut["calibration_video_stats"]["mean"]
+            brightness_ratio = original_mean / calib_mean if calib_mean > 0 else 1.0
+            
+            # Adjust corrections based on content brightness
+            # Dark videos need stronger correction
+            if brightness_ratio < 0.8:
+                content_factor = 1.2
+            elif brightness_ratio > 1.2:
+                content_factor = 0.85
+            else:
+                content_factor = 1.0
+            
+            corr["brightness_mult"] = 1 + (corr["brightness_mult"] - 1) * content_factor
+            corr["shadow_lift"] = corr["shadow_lift"] * content_factor
+        
+        # Apply correction strength multiplier
+        brightness_mult = 1 + (corr["brightness_mult"] - 1) * correction_strength
+        contrast_mult = 1 + (corr["contrast_mult"] - 1) * correction_strength
+        shadow_lift = corr["shadow_lift"] * correction_strength
+        
+        # Apply corrections
+        corrected = video_np.copy()
+        
+        # 1. Brightness correction
+        corrected = corrected * brightness_mult
+        
+        # 2. Contrast correction (around mean)
+        mean = corrected.mean()
+        corrected = (corrected - mean) * contrast_mult + mean
+        
+        # 3. Shadow lift
+        corrected = corrected + shadow_lift
+        
+        # 4. Clamp to valid range
+        corrected = np.clip(corrected, 0.0, 1.0)
+        
+        # Convert back to tensor
+        corrected_tensor = torch.from_numpy(corrected.astype(np.float32))
+        
+        # Generate report
+        final_mean = corrected.mean()
+        final_std = corrected.std()
+        mean_change = ((final_mean - original_mean) / original_mean) * 100
+        std_change = ((final_std - original_std) / original_std) * 100
+        
+        report = []
+        report.append("VAE CORRECTION APPLIED")
+        report.append("=" * 50)
+        report.append(f"VAE: {lut.get('vae_name', 'Unknown')}")
+        report.append(f"Cycles: {num_cycles}")
+        report.append(f"Correction Strength: {correction_strength:.1%}")
+        report.append(f"Content Adaptive: {'Yes' if content_adaptive else 'No'}")
+        report.append("")
+        report.append("CORRECTIONS APPLIED:")
+        report.append(f"  Brightness: ×{brightness_mult:.4f}")
+        report.append(f"  Contrast:   ×{contrast_mult:.4f}")
+        report.append(f"  Shadow Lift: +{shadow_lift:.4f}")
+        report.append("")
+        report.append("RESULTS:")
+        report.append(f"  Original mean: {original_mean:.6f}")
+        report.append(f"  Corrected mean: {final_mean:.6f} ({mean_change:+.2f}%)")
+        report.append(f"  Original std: {original_std:.6f}")
+        report.append(f"  Corrected std: {final_std:.6f} ({std_change:+.2f}%)")
+        report.append("=" * 50)
+        
+        report_text = "\n".join(report)
+        print(f"\n{report_text}")
+        
+        return (corrected_tensor, report_text)
+
+
+class NV_VideoSampler:
+    """
+    Custom video sampler with automation-friendly features + SDE support.
+    
+    Features:
+    - SDE (Stochastic) sampling with multiple noise types
+    - Brownian/Pyramid noise for temporal consistency (RES4LYF quality if available)
+    - RES samplers (res_2m, res_3s, etc.) if RES4LYF installed
+    - Custom schedulers (beta57, bong_tangent) if available
+    - Unsample/Resample for advanced img2img
+    - Dynamic CFG and automation support
+    """
+    
+    # Try to import RES4LYF noise generators
+    try:
+        from RES4LYF.beta.noise_classes import (
+            BrownianNoiseGenerator,
+            PyramidNoiseGenerator,
+            HiresPyramidNoiseGenerator
+        )
+        RES4LYF_NOISE_AVAILABLE = True
+    except ImportError:
+        RES4LYF_NOISE_AVAILABLE = False
+    
+    # RES4LYF samplers/schedulers availability is checked via comfy.samplers lists
+    # (RES4LYF automatically registers them when loaded)
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        import comfy.samplers
+        
+        # Build sampler list
+        # RES4LYF samplers (res_2m, res_3s, etc.) are automatically registered
+        # in comfy.samplers.KSampler.SAMPLERS by RES4LYF's add_samplers() function
+        all_samplers = list(comfy.samplers.KSampler.SAMPLERS)
+        
+        # Build scheduler list
+        # RES4LYF registers bong_tangent and other schedulers in comfy.samplers.SCHEDULER_NAMES
+        base_schedulers = list(comfy.samplers.KSampler.SCHEDULERS)
+        
+        # Add beta57 as custom scheduler if not present
+        if "beta57" not in base_schedulers:
+            all_schedulers = sorted(base_schedulers + ["beta57"])
+        else:
+            all_schedulers = base_schedulers
+        
+        # Build noise type list
+        if s.RES4LYF_NOISE_AVAILABLE:
+            noise_types = ["gaussian", "brownian", "pyramid", "hires-pyramid", "pink", "blue"]
+        else:
+            noise_types = ["gaussian", "brownian", "pyramid", "pink", "blue"]
+        
+        return {
+            "required": {
+                "model": ("MODEL", {
+                    "tooltip": "The model used for denoising (works with any ComfyUI model type)"
+                }),
+                "positive": ("CONDITIONING", {
+                    "tooltip": "Positive conditioning (what you want to generate). Used as fallback if chunk conditioning is empty."
+                }),
+                "negative": ("CONDITIONING", {
+                    "tooltip": "Negative conditioning (what to avoid). Used as fallback if chunk conditioning is empty."
+                }),
+                "latent_image": ("LATENT", {
+                    "tooltip": "Input latent to denoise (noise for text2video, existing video for video2video)"
+                }),
+                "seed": ("INT", {
+                    "default": 0, 
+                    "min": 0, 
+                    "max": 0xffffffffffffffff,
+                    "tooltip": "Random seed for noise generation (ensures reproducibility)"
+                }),
+                "steps": ("INT", {
+                    "default": 30, 
+                    "min": 1, 
+                    "max": 200,
+                    "tooltip": "Number of denoising steps (more = higher quality but slower)"
+                }),
+                "cfg": ("FLOAT", {
+                    "default": 6.0, 
+                    "min": 0.0, 
+                    "max": 30.0, 
+                    "step": 0.1,
+                    "tooltip": "Classifier-Free Guidance scale (1=no guidance, 7-8=balanced, 15+=very strong)"
+                }),
+                "sampler_name": (all_samplers, {
+                    "default": "euler",
+                    "tooltip": "RES samplers (res_2m, res_3s, res_5s) available if RES4LYF installed"
+                }),
+                "scheduler": (all_schedulers, {
+                    "default": "normal",
+                    "tooltip": "beta57/bong_tangent recommended for video (if RES4LYF installed)"
+                }),
+                "sampler_mode": (["standard", "unsample", "resample"], {
+                    "default": "standard",
+                    "tooltip": "standard=normal, unsample=reverse to noise, resample=denoise after unsample"
+                }),
+            },
+            "optional": {
+                "denoise_strength": ("FLOAT", {
+                    "default": 1.0, 
+                    "min": 0.0, 
+                    "max": 1.0, 
+                    "step": 0.01,
+                    "tooltip": "Amount of denoising (1.0=full, <1.0=partial for video2video)"
+                }),
+                "start_step": ("INT", {
+                    "default": 0, 
+                    "min": 0, 
+                    "max": 10000,
+                    "tooltip": "Start sampling at this step (for advanced workflows)"
+                }),
+                "end_step": ("INT", {
+                    "default": -1, 
+                    "min": -1, 
+                    "max": 10000,
+                    "tooltip": "End sampling at this step (-1=full sampling)"
+                }),
+                "selector": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 999,
+                    "tooltip": "Selector ID for multi-configuration automation (connect to switch nodes)"
+                }),
+                "cfg_end": ("FLOAT", {
+                    "default": -1.0,
+                    "min": -1.0,
+                    "max": 30.0,
+                    "step": 0.1,
+                    "tooltip": "End CFG value for dynamic CFG (-1=use same as cfg throughout)"
+                }),
+                "add_noise": (["enable", "disable"], {
+                    "default": "enable",
+                    "tooltip": "Add initial noise (disable for img2img with already-noised latents)"
+                }),
+                "return_with_leftover_noise": (["disable", "enable"], {
+                    "default": "disable",
+                    "tooltip": "Return with remaining noise (enable for multi-pass sampling)"
+                }),
+                "eta": ("FLOAT", {
+                    "default": 0.0,
+                    "min": 0.0,
+                    "max": 2.0,
+                    "step": 0.01,
+                    "tooltip": "SDE noise amount (0=ODE/deterministic, 0.25=subtle, 0.5=balanced, 1.0=full SDE)"
+                }),
+                "noise_type": (noise_types, {
+                    "default": "gaussian",
+                    "tooltip": "brownian=best for video (RES4LYF quality if available), hires-pyramid for high-res"
+                }),
+                "noise_mode": (["hard", "soft", "comfy"], {
+                    "default": "hard",
+                    "tooltip": "hard=aggressive, soft=gradual decay, comfy=balanced"
+                }),
+                "noise_seed": ("INT", {
+                    "default": -1,
+                    "min": -1,
+                    "max": 0xffffffffffffffff,
+                    "tooltip": "Separate seed for SDE noise (-1 = use main seed + 1)"
+                }),
+                "chunk_conditionings": ("CHUNK_CONDITIONING_LIST", {
+                    "tooltip": "Optional: Enable context window sampling (from NV_ChunkConditioningPreprocessor)"
+                }),
+                "blend_mode": (["linear", "pyramid"], {
+                    "default": "linear",
+                    "tooltip": "How to blend overlapping chunks (linear=ramps, pyramid=triangular weights)"
+                }),
+            }
+        }
+    
+    RETURN_TYPES = ("LATENT", "STRING")
+    RETURN_NAMES = ("samples", "info")
+    FUNCTION = "sample"
+    CATEGORY = "NV_Utils/sampling"
+    DESCRIPTION = """
+    NV Video Sampler - Automation-friendly video diffusion sampler
+    
+    Features:
+    • Works with any ComfyUI model (SD, SDXL, SD3, FLUX, etc.)
+    • Dynamic CFG for video temporal consistency
+    • Selector input for workflow automation
+    • Partial denoising for video2video
+    • Comprehensive sampling info output
+    
+    Educational:
+    This node demonstrates the complete sampling pipeline:
+    1. Sigma schedule calculation (scheduler)
+    2. Noise preparation (seed + denoise handling)
+    3. CFG guidance application (positive/negative conditioning)
+    4. Iterative denoising loop (sampler algorithm)
+    5. Progress tracking and info reporting
+    """
+    
+    def sample(self, model, positive, negative, latent_image, seed, steps, cfg, 
+               sampler_name, scheduler, sampler_mode="standard", denoise_strength=1.0, start_step=0, end_step=-1,
+               selector=0, cfg_end=-1.0, add_noise="enable", 
+               return_with_leftover_noise="disable", eta=0.0, noise_type="gaussian", 
+               noise_mode="hard", noise_seed=-1, chunk_conditionings=None, blend_mode="linear"):
+        
+        import comfy.sample
+        import comfy.samplers
+        import comfy.utils
+        import time
+        import math
+        
+        start_time = time.time()
+        
+        # Get model sampling for sigma ranges (needed for RES4LYF noise)
+        model_sampling = model.get_model_object("model_sampling")
+        sigma_min = float(model_sampling.sigma_min) if hasattr(model_sampling, 'sigma_min') else 0.03
+        sigma_max = float(model_sampling.sigma_max) if hasattr(model_sampling, 'sigma_max') else 14.6
+        
+        # SDE noise generator functions
+        def generate_noise_res4lyf(noise_type, samples, noise_seed, sigma_current=None, sigma_next=None):
+            """Generate noise using RES4LYF generators (best quality)"""
+            if noise_type == "brownian":
+                gen = self.BrownianNoiseGenerator(
+                    x=samples,
+                    sigma_min=sigma_min,
+                    sigma_max=sigma_max,
+                    seed=noise_seed
+                )
+                return gen(sigma=sigma_current, sigma_next=sigma_next)
+            elif noise_type == "pyramid":
+                gen = self.PyramidNoiseGenerator(
+                    x=samples,
+                    sigma_min=sigma_min,
+                    sigma_max=sigma_max,
+                    seed=noise_seed,
+                    discount=0.8,
+                    mode='nearest-exact'
+                )
+                return gen()
+            elif noise_type == "hires-pyramid":
+                gen = self.HiresPyramidNoiseGenerator(
+                    x=samples,
+                    sigma_min=sigma_min,
+                    sigma_max=sigma_max,
+                    seed=noise_seed,
+                    discount=0.7,
+                    mode='nearest-exact'
+                )
+                return gen()
+            return None
+        
+        def generate_brownian_noise_fallback(shape, device, dtype):
+            """Fallback brownian (simplified)"""
+            noise = torch.randn(shape, device=device, dtype=dtype)
+            if len(shape) == 5 and shape[2] > 1:  # [B, C, F, H, W]
+                kernel_size = 3
+                kernel = torch.ones(1, 1, kernel_size, 1, 1, device=device, dtype=dtype) / kernel_size
+                noise = torch.nn.functional.conv3d(
+                    noise, kernel, padding=(kernel_size//2, 0, 0)
+                )
+            return noise
+        
+        def generate_pyramid_noise_fallback(shape, device, dtype):
+            """Fallback pyramid (simplified)"""
+            noise = torch.zeros(shape, device=device, dtype=dtype)
+            for scale in [1, 2, 4]:
+                if len(shape) == 5:  # Video
+                    scaled_shape = (shape[0], shape[1], 
+                                  max(1, shape[2]//scale),
+                                  max(1, shape[3]//scale), 
+                                  max(1, shape[4]//scale))
+                else:  # Image
+                    scaled_shape = (shape[0], shape[1],
+                                  max(1, shape[2]//scale),
+                                  max(1, shape[3]//scale))
+                
+                scale_noise = torch.randn(scaled_shape, device=device, dtype=dtype)
+                scale_noise = torch.nn.functional.interpolate(
+                    scale_noise if len(shape) == 4 else scale_noise.flatten(0, 1),
+                    size=shape[2:] if len(shape) == 4 else shape[3:],
+                    mode='nearest'
+                )
+                if len(shape) == 5:
+                    scale_noise = scale_noise.view(shape[0], shape[1], shape[2], shape[3], shape[4])
+                noise += scale_noise / scale
+            return noise / noise.std()
+        
+        def generate_pink_noise(shape, device, dtype):
+            """Pink (1/f) noise"""
+            noise = torch.randn(shape, device=device, dtype=dtype)
+            # FFT-based pink noise generation
+            fft_noise = torch.fft.fftn(noise, dim=list(range(2, len(shape))))
+            freqs = torch.fft.fftfreq(shape[-1], device=device)
+            freq_mag = torch.sqrt(freqs**2 + 1e-8)
+            fft_noise = fft_noise / (freq_mag.view(*([1]*(len(shape)-1)), -1) + 1e-8)
+            return torch.fft.ifftn(fft_noise, dim=list(range(2, len(shape)))).real
+        
+        def generate_blue_noise(shape, device, dtype):
+            """Blue (high-frequency) noise"""
+            noise = torch.randn(shape, device=device, dtype=dtype)
+            fft_noise = torch.fft.fftn(noise, dim=list(range(2, len(shape))))
+            freqs = torch.fft.fftfreq(shape[-1], device=device)
+            freq_mag = torch.sqrt(freqs**2 + 1e-8)
+            fft_noise = fft_noise * freq_mag.view(*([1]*(len(shape)-1)), -1)
+            return torch.fft.ifftn(fft_noise, dim=list(range(2, len(shape)))).real
+        
+        def calculate_noise_scaling(sigma, sigma_next, noise_mode):
+            """Calculate how much noise to add based on mode"""
+            if noise_mode == "hard":
+                return (sigma_next**2 * (sigma**2 - sigma_next**2) / sigma**2).sqrt()
+            elif noise_mode == "soft":
+                # Gradual decay
+                progress = 1.0 - (sigma_next / sigma)
+                return (sigma_next**2 * (sigma**2 - sigma_next**2) / sigma**2).sqrt() * (1.0 - progress)
+            elif noise_mode == "comfy":
+                # Balanced approach
+                return ((sigma_next**2 * (sigma**2 - sigma_next**2)) / sigma**2).sqrt() * 0.5
+            return torch.tensor(0.0, device=sigma.device)
+        
+        def get_beta57_sigmas(model_sampling, steps):
+            """Beta schedule with alpha=0.5, beta=0.7"""
+            timesteps = 1000
+            beta_start = 0.00085
+            beta_end = 0.012
+            
+            betas = (
+                torch.linspace(beta_start**0.5, beta_end**0.5, timesteps, dtype=torch.float32) ** 2
+            )
+            
+            alphas = 1.0 - betas
+            alphas_cumprod = torch.cumprod(alphas, dim=0)
+            
+            sigmas = ((1 - alphas_cumprod) / alphas_cumprod) ** 0.5
+            
+            # Sample evenly
+            timestep_indices = torch.linspace(0, len(sigmas) - 1, steps).long()
+            sigmas = sigmas[timestep_indices]
+            
+            return torch.cat([sigmas, torch.zeros(1)])
+        
+        def get_custom_scheduler_sigmas(scheduler_name, steps):
+            """Get sigmas for custom schedulers using RES4LYF"""
+            try:
+                # Import RES4LYF scheduler function
+                from RES4LYF.res4lyf import calculate_sigmas_RES4LYF
+                
+                # This should work with custom schedulers
+                sigmas = calculate_sigmas_RES4LYF(model_sampling, scheduler_name, steps)
+                return sigmas
+            except Exception as e:
+                info_lines.append(f"  Warning: Failed to use RES4LYF scheduler {scheduler_name}: {e}")
+                return None
+        
+        # Noise seed handling
+        if noise_seed == -1:
+            noise_seed = seed + 1
+        
+        # ============================================================
+        # STEP 1: Extract latent and prepare basic info
+        # ============================================================
+        latent = latent_image["samples"]
+        batch_size, channels, frames, height, width = latent.shape
+        
+        info_lines = []
+        info_lines.append("=" * 60)
+        info_lines.append("NV VIDEO SAMPLER - SAMPLING INFO")
+        info_lines.append("=" * 60)
+        info_lines.append(f"Selector ID: {selector}")
+        info_lines.append(f"Latent Shape: {list(latent.shape)} (B×C×F×H×W)")
+        info_lines.append(f"Video Frames: {(frames - 1) * 4 + 1} (latent: {frames})")
+        info_lines.append(f"Resolution: {height * 8}×{width * 8} (latent: {height}×{width})")
+        info_lines.append("")
+        
+        # ============================================================
+        # STEP 2: Calculate sigma schedule (noise levels)
+        # ============================================================
+        # Calculate base sigmas
+        if scheduler == "beta57":
+            sigmas = get_beta57_sigmas(model_sampling, steps)
+        elif scheduler not in comfy.samplers.KSampler.SCHEDULERS:
+            # Try RES4LYF custom scheduler (e.g., bong_tangent)
+            custom_sigmas = get_custom_scheduler_sigmas(scheduler, steps)
+            if custom_sigmas is not None:
+                sigmas = custom_sigmas
+            else:
+                # Fallback to normal
+                sigmas = comfy.samplers.calculate_sigmas(model_sampling, "normal", steps)
+                info_lines.append(f"  Warning: Unknown scheduler '{scheduler}', using 'normal' as fallback")
+        else:
+            sigmas = comfy.samplers.calculate_sigmas(
+                model_sampling,
+                scheduler,
+                steps
+            )
+        
+        # Handle partial denoising (for video2video workflows)
+        if denoise_strength < 1.0:
+            # Calculate total steps needed for this denoise strength
+            total_steps = int(steps / denoise_strength)
+            sigmas_full = comfy.samplers.calculate_sigmas(
+                model_sampling, 
+                scheduler, 
+                total_steps
+            )
+            # Take the last N+1 sigmas (N steps + final 0)
+            sigmas = sigmas_full[-(steps + 1):]
+        
+        # Apply start_step and end_step slicing
+        if end_step >= 0 and end_step < (len(sigmas) - 1):
+            sigmas = sigmas[:end_step + 1]
+            if return_with_leftover_noise == "disable":
+                sigmas[-1] = 0.0  # Force clean output
+        
+        if start_step > 0 and start_step < (len(sigmas) - 1):
+            sigmas = sigmas[start_step:]
+        
+        info_lines.append("SAMPLING SCHEDULE:")
+        info_lines.append(f"  Scheduler: {scheduler}")
+        info_lines.append(f"  Sampler: {sampler_name}")
+        info_lines.append(f"  Mode: {sampler_mode}")
+        info_lines.append(f"  Total Steps: {len(sigmas) - 1}")
+        info_lines.append(f"  Denoise Strength: {denoise_strength:.2f}")
+        if cfg_end > 0 and cfg_end != cfg:
+            info_lines.append(f"  CFG: {cfg:.1f} → {cfg_end:.1f} (dynamic)")
+        else:
+            info_lines.append(f"  CFG: {cfg:.1f} (constant)")
+        info_lines.append(f"  Sigma Range: [{sigmas[0]:.4f}, {sigmas[-1]:.4f}]")
+        if eta > 0:
+            noise_quality = "RES4LYF" if self.RES4LYF_NOISE_AVAILABLE and noise_type in ["brownian", "pyramid", "hires-pyramid"] else "builtin"
+            info_lines.append(f"  SDE: eta={eta:.2f}, noise={noise_type} ({noise_quality}), mode={noise_mode}")
+        
+        # Check if RES samplers are available (they would be in the sampler list)
+        has_res_samplers = any(s.startswith("res_") for s in comfy.samplers.KSampler.SAMPLERS)
+        if has_res_samplers:
+            info_lines.append(f"  RES4LYF: Samplers available ({len([s for s in comfy.samplers.KSampler.SAMPLERS if s.startswith('res_')])} RES variants)")
+        info_lines.append("")
+        
+        # ============================================================
+        # STEP 3: Prepare noise
+        # ============================================================
+        # Handle unsample/resample modes
+        if sampler_mode in ["unsample", "resample"]:
+            disable_noise = True
+            add_noise = "disable"
+        else:
+            disable_noise = (add_noise == "disable")
+        
+        if disable_noise:
+            noise = torch.zeros(
+                latent.size(), 
+                dtype=latent.dtype, 
+                layout=latent.layout, 
+                device="cpu"
+            )
+            info_lines.append(f"NOISE: Disabled (mode={sampler_mode})")
+        else:
+            batch_inds = latent_image.get("batch_index", None)
+            noise = comfy.sample.prepare_noise(latent, seed, batch_inds)
+            info_lines.append(f"NOISE: Generated with seed {seed}")
+        
+        # Handle noise mask (for inpainting)
+        noise_mask = latent_image.get("noise_mask", None)
+        if noise_mask is not None:
+            info_lines.append("MASK: Inpainting mask detected")
+        
+        info_lines.append("")
+        
+        # ============================================================
+        # STEP 4: Dynamic CFG setup
+        # ============================================================
+        use_dynamic_cfg = (cfg_end > 0 and cfg_end != cfg)
+        
+        def get_cfg_for_step(step_idx, total_steps):
+            """Calculate CFG value for current step"""
+            if not use_dynamic_cfg:
+                return cfg
+            # Linear interpolation from cfg to cfg_end
+            progress = step_idx / max(total_steps - 1, 1)
+            return cfg + (cfg_end - cfg) * progress
+        
+        # ============================================================
+        # STEP 5: Run the sampler
+        # ============================================================
+        info_lines.append("SAMPLING:")
+        info_lines.append(f"  Starting sampling with {sampler_name}...")
+        
+        # Set up progress bar
+        disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+        
+        # Determine full denoise behavior
+        force_full_denoise = (return_with_leftover_noise == "disable")
+        
+        # Fix latent channels if needed
+        latent = comfy.sample.fix_empty_latent_channels(model, latent)
+        
+        # For dynamic CFG, we need to wrap the model
+        if use_dynamic_cfg:
+            # We'll handle this through model options
+            model_options = {
+                "transformer_options": {
+                    "dynamic_cfg": True,
+                    "cfg_start": cfg,
+                    "cfg_end": cfg_end,
+                }
+            }
+        else:
+            model_options = {}
+        
+        # Handle unsample mode (reverse sigmas)
+        if sampler_mode == "unsample":
+            sigmas = torch.flip(sigmas, [0])
+            info_lines.append("  Mode: UNSAMPLE (reversing to noise)")
+        elif sampler_mode == "resample":
+            info_lines.append("  Mode: RESAMPLE (denoising after unsample)")
+        
+        # ============================================================
+        # CONTEXT WINDOW SAMPLING (if chunk_conditionings provided)
+        # ============================================================
+        if chunk_conditionings is not None and len(chunk_conditionings) > 0:
+            info_lines.append("=" * 60)
+            info_lines.append("CONTEXT WINDOW SAMPLING ENABLED")
+            info_lines.append("=" * 60)
+            info_lines.append(f"Total chunks: {len(chunk_conditionings)}")
+            info_lines.append(f"Blend mode: {blend_mode}")
+            info_lines.append("")
+            
+            # Initialize full output latent (preserve original as fallback)
+            output_latent = latent.clone()  # Start with original latent
+            weight_sum = torch.ones_like(latent)  # Weight 1.0 for original
+            
+            # Track which regions will be overwritten
+            processed_regions = torch.zeros(latent.shape[2], dtype=torch.bool)  # Per latent frame
+            for chunk_cond in chunk_conditionings:
+                chunk_start = chunk_cond.get("latent_start", chunk_cond["start_frame"] // 4)
+                chunk_end = chunk_cond.get("latent_end", (chunk_cond["end_frame"] - 1) // 4 + 1)
+                processed_regions[chunk_start:chunk_end] = True
+            
+            # Warn if there are gaps
+            unprocessed_frames = (~processed_regions).sum().item()
+            if unprocessed_frames > 0:
+                info_lines.append(f"⚠️ WARNING: {unprocessed_frames} latent frames not covered by any chunk!")
+                info_lines.append(f"⚠️ These will use original/input latent (may cause artifacts)")
+                info_lines.append("")
+            
+            # Reset weight_sum to zero for regions that will be processed
+            # (so we can accumulate weighted chunks)
+            for chunk_cond in chunk_conditionings:
+                chunk_start = chunk_cond.get("latent_start", chunk_cond["start_frame"] // 4)
+                chunk_end = chunk_cond.get("latent_end", (chunk_cond["end_frame"] - 1) // 4 + 1)
+                output_latent[:, :, chunk_start:chunk_end, :, :] = 0  # Clear for accumulation
+                weight_sum[:, :, chunk_start:chunk_end, :, :] = 0
+            
+            # Calculate chunk overlap from first two chunks (if multiple exist)
+            if len(chunk_conditionings) > 1:
+                chunk0_end = chunk_conditionings[0].get("latent_end", (chunk_conditionings[0]["end_frame"] - 1) // 4 + 1)
+                chunk1_start = chunk_conditionings[1].get("latent_start", chunk_conditionings[1]["start_frame"] // 4)
+                chunk_overlap = chunk0_end - chunk1_start if chunk1_start < chunk0_end else 0
+            else:
+                chunk_overlap = 0
+            
+            # Process each chunk
+            for chunk_idx, chunk_cond in enumerate(chunk_conditionings):
+                # Calculate latent frame indices (with fallback for image-based chunks)
+                chunk_start = chunk_cond.get("latent_start", chunk_cond["start_frame"] // 4)
+                chunk_end = chunk_cond.get("latent_end", (chunk_cond["end_frame"] - 1) // 4 + 1)
+                chunk_frames = chunk_end - chunk_start
+                
+                info_lines.append(f"Processing chunk {chunk_idx + 1}/{len(chunk_conditionings)}:")
+                info_lines.append(f"  Latent frames: {chunk_start}-{chunk_end} ({chunk_frames} frames)")
+                
+                # Extract chunk from latent and noise
+                chunk_latent = latent[:, :, chunk_start:chunk_end, :, :]
+                chunk_noise = noise[:, :, chunk_start:chunk_end, :, :] if not disable_noise else torch.zeros_like(chunk_latent)
+                
+                # Use pre-encoded conditioning from chunk (with fallback to global)
+                chunk_positive = chunk_cond.get("positive")
+                chunk_negative = chunk_cond.get("negative")
+                
+                # Fallback to global conditioning if chunk conditioning is empty
+                if not chunk_positive or (isinstance(chunk_positive, list) and len(chunk_positive) == 0):
+                    chunk_positive = positive
+                    info_lines.append(f"  (Using global positive conditioning)")
+                if not chunk_negative or (isinstance(chunk_negative, list) and len(chunk_negative) == 0):
+                    chunk_negative = negative
+                    info_lines.append(f"  (Using global negative conditioning)")
+                
+                # Sample this chunk
+                chunk_samples = comfy.sample.sample(
+                    model,
+                    chunk_noise,
+                    steps,
+                    cfg,
+                    sampler_name,
+                    scheduler if scheduler != "beta57" else "normal",
+                    chunk_positive,
+                    chunk_negative,
+                    chunk_latent,
+                    denoise=denoise_strength,
+                    disable_noise=disable_noise,
+                    start_step=start_step if start_step > 0 else None,
+                    last_step=end_step if end_step >= 0 else None,
+                    force_full_denoise=force_full_denoise,
+                    noise_mask=None,
+                    disable_pbar=True,  # Disable per-chunk progress
+                    seed=seed + chunk_idx  # Vary seed per chunk
+                )
+                
+                # Create blend weights for this chunk
+                chunk_weight = torch.ones_like(chunk_samples)
+                
+                if blend_mode == "linear":
+                    # Linear blending at edges
+                    if not chunk_cond["is_first"] and chunk_overlap > 0:
+                        # Fade in from left
+                        for i in range(min(chunk_overlap, chunk_frames)):
+                            weight = i / chunk_overlap
+                            chunk_weight[:, :, i, :, :] = weight
+                    
+                    if not chunk_cond["is_last"] and chunk_overlap > 0:
+                        # Fade out to right
+                        for i in range(min(chunk_overlap, chunk_frames)):
+                            weight = 1.0 - (i / chunk_overlap)
+                            chunk_weight[:, :, -(i+1), :, :] = weight
+                
+                elif blend_mode == "pyramid":
+                    # Pyramid weights (triangular)
+                    for i in range(chunk_frames):
+                        if i < chunk_frames / 2:
+                            weight = (i + 1) / (chunk_frames / 2)
+                        else:
+                            weight = (chunk_frames - i) / (chunk_frames / 2)
+                        chunk_weight[:, :, i, :, :] = weight
+                
+                # Accumulate weighted results
+                output_latent[:, :, chunk_start:chunk_end, :, :] += chunk_samples * chunk_weight
+                weight_sum[:, :, chunk_start:chunk_end, :, :] += chunk_weight
+                
+                info_lines.append(f"  ✓ Chunk {chunk_idx + 1} complete")
+            
+            # Normalize by weight sum
+            samples = output_latent / (weight_sum + 1e-8)
+            
+            info_lines.append("")
+            info_lines.append("Context window sampling complete!")
+            info_lines.append("=" * 60)
+        
+        # Call ComfyUI's sample function (standard mode)
+        else:
+            try:
+                # For SDE sampling, we need to inject noise after each step
+                # This requires custom sampling loop
+                if eta > 0 and sampler_mode == "standard":
+                    info_lines.append(f"  Using SDE sampling (eta={eta:.2f})")
+                
+                # We'll use ComfyUI's sampler but post-process with SDE noise
+                # Note: This is a simplified approach
+                # Full SDE would require hooking into the sampling loop
+                samples = comfy.sample.sample(
+                    model,
+                    noise,
+                    steps,
+                    cfg,
+                    sampler_name,
+                    scheduler if scheduler != "beta57" else "normal",
+                    positive,
+                    negative,
+                    latent,
+                    denoise=denoise_strength,
+                    disable_noise=disable_noise,
+                    start_step=start_step if start_step > 0 else None,
+                    last_step=end_step if end_step >= 0 else None,
+                    force_full_denoise=force_full_denoise,
+                    noise_mask=noise_mask,
+                    disable_pbar=disable_pbar,
+                    seed=seed
+                )
+                
+                # Apply SDE noise as post-processing
+                # (Note: True SDE requires per-step injection, this is an approximation)
+                if eta > 0.05:  # Only apply if meaningful
+                    torch.manual_seed(noise_seed)
+                    
+                    # Try RES4LYF noise generators first (best quality)
+                    if self.RES4LYF_NOISE_AVAILABLE and noise_type in ["brownian", "pyramid", "hires-pyramid"]:
+                        try:
+                            sde_noise = generate_noise_res4lyf(
+                                noise_type, samples, noise_seed,
+                                sigma_current=sigmas[0], sigma_next=sigmas[-1]
+                            )
+                            info_lines.append(f"  Applied {noise_type} SDE noise (RES4LYF quality)")
+                        except Exception as e:
+                            info_lines.append(f"  Warning: RES4LYF noise failed, using fallback: {e}")
+                            # Fallback to simple implementations
+                            if noise_type in ["brownian", "hires-pyramid"]:
+                                sde_noise = generate_brownian_noise_fallback(samples.shape, samples.device, samples.dtype)
+                            else:
+                                sde_noise = generate_pyramid_noise_fallback(samples.shape, samples.device, samples.dtype)
+                            info_lines.append(f"  Applied {noise_type} SDE noise (fallback)")
+                    else:
+                        # Use fallback implementations
+                        if noise_type == "gaussian":
+                            sde_noise = torch.randn_like(samples)
+                        elif noise_type == "brownian":
+                            sde_noise = generate_brownian_noise_fallback(samples.shape, samples.device, samples.dtype)
+                        elif noise_type == "pyramid":
+                            sde_noise = generate_pyramid_noise_fallback(samples.shape, samples.device, samples.dtype)
+                        elif noise_type == "pink":
+                            sde_noise = generate_pink_noise(samples.shape, samples.device, samples.dtype)
+                        elif noise_type == "blue":
+                            sde_noise = generate_blue_noise(samples.shape, samples.device, samples.dtype)
+                        
+                        quality_note = " (RES4LYF)" if self.RES4LYF_NOISE_AVAILABLE else " (fallback)"
+                        info_lines.append(f"  Applied {noise_type} SDE noise{quality_note}")
+                    
+                    # Apply noise with scaling
+                    noise_scale = eta * 0.1  # Scale factor
+                    samples = samples + sde_noise * noise_scale
+                
+                sampling_time = time.time() - start_time
+                
+                info_lines.append(f"  ✓ Sampling completed successfully")
+                info_lines.append(f"  Time: {sampling_time:.2f}s ({sampling_time/(len(sigmas)-1):.3f}s/step)")
+                
+            except Exception as e:
+                info_lines.append(f"  ✗ Sampling failed: {str(e)}")
+                import traceback
+                info_lines.append(f"  Traceback: {traceback.format_exc()}")
+                samples = latent  # Return input on failure
+        
+        info_lines.append("")
+        
+        # ============================================================
+        # STEP 6: Prepare output
+        # ============================================================
+        out = latent_image.copy()
+        out["samples"] = samples
+        
+        # Final statistics
+        info_lines.append("OUTPUT:")
+        info_lines.append(f"  Shape: {list(samples.shape)}")
+        info_lines.append(f"  Mean: {samples.mean().item():.6f}")
+        info_lines.append(f"  Std: {samples.std().item():.6f}")
+        info_lines.append(f"  Min: {samples.min().item():.6f}")
+        info_lines.append(f"  Max: {samples.max().item():.6f}")
+        info_lines.append("=" * 60)
+        
+        info_text = "\n".join(info_lines)
+        print(f"\n{info_text}")
+        
+        return (out, info_text)
+
+
+class NV_VideoChunkAnalyzer:
+    """
+    Node 1: Analyzes videos and creates chunk structure with JSON output.
+    Pure data layer - no model dependencies. Supports control videos for WanVACE.
+    """
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "images": ("IMAGE", {
+                    "tooltip": "Input video frames to analyze and chunk"
+                }),
+                "chunk_size": ("INT", {
+                    "default": 81,
+                    "min": 9,
+                    "max": 1000,
+                    "step": 1,
+                    "tooltip": "Number of frames per chunk"
+                }),
+                "chunk_overlap": ("INT", {
+                    "default": 16,
+                    "min": 0,
+                    "max": 200,
+                    "step": 1,
+                    "tooltip": "Overlap between chunks in frames (for smooth blending)"
+                }),
+                "output_json_path": ("STRING", {
+                    "default": "chunks/project.json",
+                    "multiline": False,
+                    "tooltip": "Path to save chunk JSON file (will be created)"
+                }),
+                "save_chunks": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Save each chunk as a separate video file for preview"
+                }),
+            },
+            "optional": {
+                "chunks_folder": ("STRING", {
+                    "default": "chunks/videos",
+                    "multiline": False,
+                    "tooltip": "Folder to save chunk videos (if save_chunks is enabled)"
+                }),
+                "chunk_fps": ("INT", {
+                    "default": 30,
+                    "min": 1,
+                    "max": 120,
+                    "tooltip": "FPS for saved chunk videos"
+                }),
+                # Support for AutomateVideoPathLoader outputs
+                "beauty_path": ("STRING", {"default": "", "tooltip": "Beauty/main video pass"}),
+                "depth_path": ("STRING", {"default": "", "tooltip": "Depth map video"}),
+                "openpose_path": ("STRING", {"default": "", "tooltip": "OpenPose video"}),
+                "canny_path": ("STRING", {"default": "", "tooltip": "Canny edge video"}),
+                "lineart_path": ("STRING", {"default": "", "tooltip": "Line art video"}),
+                # Manual control paths (one per line)
+                "control_video_paths": ("STRING", {
+                    "default": "",
+                    "multiline": True,
+                    "tooltip": "Optional: Manual control paths (format: name:path per line, e.g., 'depth:D:/depth.mp4')"
+                }),
+            }
+        }
+    
+    RETURN_TYPES = ("STRING", "INT", "STRING")
+    RETURN_NAMES = ("json_path", "num_chunks", "info")
+    FUNCTION = "analyze"
+    CATEGORY = "NV_Utils/Video/Chunking"
+    
+    def analyze(self, images, chunk_size, chunk_overlap, output_json_path, 
+                save_chunks=False, chunks_folder="chunks/videos", chunk_fps=30,
+                beauty_path="", depth_path="", openpose_path="", canny_path="", lineart_path="",
+                control_video_paths=""):
+        import json
+        import os
+        from pathlib import Path
+        
+        # Get image dimensions (batch, height, width, channels)
+        total_frames, height, width, channels = images.shape
+        
+        # Parse control video paths - combine structured inputs and manual paths
+        control_paths = {}
+        
+        # Add structured control paths (from AutomateVideoPathLoader)
+        if beauty_path and beauty_path.strip():
+            control_paths["beauty"] = beauty_path.strip()
+        if depth_path and depth_path.strip():
+            control_paths["depth"] = depth_path.strip()
+        if openpose_path and openpose_path.strip():
+            control_paths["openpose"] = openpose_path.strip()
+        if canny_path and canny_path.strip():
+            control_paths["canny"] = canny_path.strip()
+        if lineart_path and lineart_path.strip():
+            control_paths["lineart"] = lineart_path.strip()
+        
+        # Parse manual control paths (format: "name:path" per line)
+        if control_video_paths.strip():
+            for line in control_video_paths.split('\n'):
+                line = line.strip()
+                if not line:
+                    continue
+                if ':' in line:
+                    # Format: "name:path"
+                    name, path = line.split(':', 1)
+                    control_paths[name.strip()] = path.strip()
+                else:
+                    # Just a path - use filename as name
+                    control_paths[os.path.splitext(os.path.basename(line))[0]] = line
+        
+        # Calculate stride (no rounding needed for image-based chunking)
+        stride = chunk_size - chunk_overlap
+        
+        if stride <= 0:
+            raise ValueError(f"Invalid chunk settings: overlap ({chunk_overlap}) must be less than chunk_size ({chunk_size})")
+        
+        # Calculate chunks
+        chunks = []
+        chunk_idx = 0
+        current_frame = 0
+        
+        info_lines = []
+        info_lines.append("=" * 60)
+        info_lines.append("NV VIDEO CHUNK ANALYZER")
+        info_lines.append("=" * 60)
+        info_lines.append(f"Input: {total_frames} frames")
+        info_lines.append(f"Resolution: {width}×{height}")
+        info_lines.append(f"Chunk size: {chunk_size} frames")
+        info_lines.append(f"Chunk overlap: {chunk_overlap} frames")
+        info_lines.append(f"Stride: {stride} frames")
+        if control_paths:
+            info_lines.append(f"Control videos: {len(control_paths)} detected")
+            for ctrl_name, ctrl_path in control_paths.items():
+                info_lines.append(f"  - {ctrl_name}: {os.path.basename(ctrl_path)}")
+        if save_chunks:
+            info_lines.append(f"Saving chunks to: {chunks_folder}")
+        info_lines.append("")
+        
+        # Create chunks folder if saving
+        if save_chunks:
+            os.makedirs(chunks_folder, exist_ok=True)
+        
+        while current_frame < total_frames:
+            end_frame = min(current_frame + chunk_size, total_frames)
+            
+            # Create per-chunk control settings (user can enable/disable per chunk)
+            chunk_controls = {}
+            for ctrl_name in control_paths.keys():
+                chunk_controls[ctrl_name] = {
+                    "enabled": True,  # Default: all controls enabled
+                    "weight": 1.0,
+                    "start_percent": 0.0,
+                    "end_percent": 1.0,
+                }
+            
+            chunk_info = {
+                "id": chunk_idx,
+                "start_frame": current_frame,
+                "end_frame": end_frame,
+                "num_frames": end_frame - current_frame,
+                "is_first": (current_frame == 0),
+                "is_last": (end_frame >= total_frames),
+                # Prompts to be filled by user
+                "prompt_positive": "",
+                "prompt_negative": "",
+                # Per-chunk control settings
+                "controls": chunk_controls,
+            }
+            
+            # Save chunk video if requested
+            if save_chunks:
+                chunk_frames = images[current_frame:end_frame]
+                chunk_filename = f"chunk_{chunk_idx:04d}.mp4"
+                chunk_path = os.path.join(chunks_folder, chunk_filename)
+                
+                try:
+                    self._save_chunk_video(chunk_frames, chunk_path, fps=chunk_fps)
+                    chunk_info["saved_video_path"] = chunk_path
+                    info_lines.append(f"Chunk {chunk_idx}: frames {current_frame}-{end_frame} ({end_frame - current_frame} frames) -> {chunk_filename}")
+                except Exception as e:
+                    info_lines.append(f"Chunk {chunk_idx}: frames {current_frame}-{end_frame} (SAVE FAILED: {e})")
+            else:
+                info_lines.append(f"Chunk {chunk_idx}: frames {current_frame}-{end_frame} ({end_frame - current_frame} frames)")
+            
+            chunks.append(chunk_info)
+            chunk_idx += 1
+            current_frame += stride
+            
+            if chunk_idx > 10000:
+                raise ValueError("Too many chunks! Check your chunk_size and overlap settings.")
+        
+        # Build JSON structure
+        json_data = {
+            "metadata": {
+                "total_frames": total_frames,
+                "chunk_size": chunk_size,
+                "chunk_overlap": chunk_overlap,
+                "resolution": [width, height],
+                "fps": chunk_fps,
+            },
+            "control_videos": control_paths,  # Dict of {name: path}
+            "global_settings": {
+                "default_negative": "blurry, low quality, distorted",
+                "notes": "Edit this JSON to customize prompts and control settings per chunk",
+            },
+            "chunks": chunks
+        }
+        
+        # Save JSON with debug output and error handling
+        info_lines.append("")
+        info_lines.append(f"Total chunks: {len(chunks)}")
+        info_lines.append("")
+        info_lines.append("Attempting to save JSON...")
+        
+        # Get absolute path
+        json_absolute_path = os.path.abspath(output_json_path)
+        json_dir = os.path.dirname(json_absolute_path)
+        
+        info_lines.append(f"  Target path: {json_absolute_path}")
+        info_lines.append(f"  Target directory: {json_dir}")
+        
+        try:
+            # Create directory if needed
+            if json_dir:
+                os.makedirs(json_dir, exist_ok=True)
+                info_lines.append(f"  Directory exists: {os.path.exists(json_dir)}")
+                info_lines.append(f"  Directory writable: {os.access(json_dir, os.W_OK)}")
+            
+            # Try to write JSON
+            with open(json_absolute_path, 'w', encoding='utf-8') as f:
+                json.dump(json_data, f, indent=2, ensure_ascii=False)
+            
+            info_lines.append(f"  ✓ JSON saved successfully!")
+            info_lines.append(f"  File size: {os.path.getsize(json_absolute_path)} bytes")
+            
+        except PermissionError as e:
+            info_lines.append(f"  ✗ Permission denied: {e}")
+            info_lines.append(f"  Current working directory: {os.getcwd()}")
+            
+            # Try fallback to ComfyUI output directory
+            try:
+                import folder_paths
+                fallback_dir = os.path.join(folder_paths.get_output_directory(), "chunks")
+                os.makedirs(fallback_dir, exist_ok=True)
+                fallback_path = os.path.join(fallback_dir, os.path.basename(output_json_path))
+                
+                info_lines.append(f"  Trying fallback location: {fallback_path}")
+                
+                with open(fallback_path, 'w', encoding='utf-8') as f:
+                    json.dump(json_data, f, indent=2, ensure_ascii=False)
+                
+                json_absolute_path = fallback_path
+                info_lines.append(f"  ✓ JSON saved to fallback location!")
+                
+            except Exception as fallback_error:
+                info_lines.append(f"  ✗ Fallback also failed: {fallback_error}")
+                raise  # Re-raise the original error
+                
+        except Exception as e:
+            info_lines.append(f"  ✗ Unexpected error: {type(e).__name__}: {e}")
+            info_lines.append(f"  Current working directory: {os.getcwd()}")
+            raise
+        info_lines.append("")
+        info_lines.append("NEXT STEPS:")
+        info_lines.append("1. Edit the JSON file to add prompts per chunk")
+        if control_paths:
+            info_lines.append("2. Enable/disable controls per chunk in 'controls' section")
+            info_lines.append("   - Set 'enabled': false to disable a control for a chunk")
+            info_lines.append("   - Adjust 'weight' to control strength (0.0-2.0)")
+            info_lines.append("3. Feed JSON to NV_ChunkConditioningPreprocessor")
+        else:
+            info_lines.append("2. Feed JSON to NV_ChunkConditioningPreprocessor")
+        info_lines.append("=" * 60)
+        
+        info_text = "\n".join(info_lines)
+        print(info_text)
+        
+        return (json_absolute_path, len(chunks), info_text)
+    
+    def _save_chunk_video(self, frames, output_path, fps=30):
+        """Helper to save a chunk of frames as a video using CustomVideoSaver"""
+        # Use the existing CustomVideoSaver class
+        video_saver = CustomVideoSaver()
+        
+        # Extract directory and filename from output_path
+        output_dir = os.path.dirname(output_path)
+        filename = os.path.splitext(os.path.basename(output_path))[0]
+        
+        # Save the video using CustomVideoSaver with good defaults
+        result = video_saver.save_video(
+            video_tensor=frames,
+            filename_prefix=filename,
+            custom_directory=output_dir,
+            video_format="mp4",
+            codec="H.264/AVC",  # Good compatibility and quality
+            fps=float(fps),
+            quality=23,  # Good quality
+            encoding_preset="fast",  # Faster encoding for chunks
+            preserve_colors=True,
+            use_ffmpeg=True,
+            subfolder=""
+        )
+        
+        # CustomVideoSaver returns (video_path, filename, info)
+        # We just need to verify it succeeded
+        if result[0] != output_path:
+            # Rename if the filename doesn't match exactly (due to counter increment)
+            import shutil
+            if os.path.exists(result[0]):
+                shutil.move(result[0], output_path)
+
+
+class NV_ChunkConditioningPreprocessor:
+    """
+    Node 2: Loads chunk JSON and encodes all conditioning (prompts + controls).
+    General-purpose conditioning encoder supporting CLIP, VAE, and WanVACE control formats.
+    """
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "chunk_json_path": ("STRING", {
+                    "default": "chunks/project.json",
+                    "multiline": False,
+                    "tooltip": "Path to chunk JSON from NV_VideoChunkAnalyzer"
+                }),
+                "clip": ("CLIP", {
+                    "tooltip": "CLIP model for encoding text prompts"
+                }),
+            },
+            "optional": {
+                "vae": ("VAE", {
+                    "tooltip": "VAE for encoding control videos (required if using WanVACE controls)"
+                }),
+                "global_positive": ("CONDITIONING", {
+                    "tooltip": "Fallback positive conditioning for chunks without custom prompts"
+                }),
+                "global_negative": ("CONDITIONING", {
+                    "tooltip": "Fallback negative conditioning"
+                }),
+                "control_mode": (["disabled", "wan_vace", "wan_controlnet"], {
+                    "default": "disabled",
+                    "tooltip": "Control mode: disabled, wan_vace (VACE controls), wan_controlnet"
+                }),
+                "tiled_vae": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Use tiled VAE encoding for large videos (saves VRAM)"
+                }),
+            }
+        }
+    
+    RETURN_TYPES = ("CHUNK_CONDITIONING_LIST", "STRING")
+    RETURN_NAMES = ("chunk_conditionings", "info")
+    FUNCTION = "preprocess"
+    CATEGORY = "NV_Utils/Video/Chunking"
+    
+    def preprocess(self, chunk_json_path, clip, vae=None, 
+                   global_positive=None, global_negative=None,
+                   control_mode="disabled", tiled_vae=False):
+        import json
+        import os
+        import cv2
+        import numpy as np
+        
+        # Load JSON
+        if not os.path.exists(chunk_json_path):
+            # Provide helpful error message
+            if os.path.isdir(chunk_json_path):
+                raise FileNotFoundError(
+                    f"Chunk JSON path is a directory, not a file: {chunk_json_path}\n"
+                    f"Please provide the full path including .json filename (e.g., '{os.path.join(chunk_json_path, 'project.json')}')"
+                )
+            elif not chunk_json_path.endswith('.json'):
+                raise FileNotFoundError(
+                    f"Chunk JSON file not found: {chunk_json_path}\n"
+                    f"Did you forget the .json extension? Try: {chunk_json_path}.json"
+                )
+            else:
+                raise FileNotFoundError(f"Chunk JSON not found: {chunk_json_path}")
+        
+        with open(chunk_json_path, 'r', encoding='utf-8') as f:
+            json_data = json.load(f)
+        
+        chunks = json_data.get("chunks", [])
+        metadata = json_data.get("metadata", {})
+        global_settings = json_data.get("global_settings", {})
+        control_videos = json_data.get("control_videos", {})
+        
+        info_lines = []
+        info_lines.append("=" * 60)
+        info_lines.append("NV CHUNK CONDITIONING PREPROCESSOR")
+        info_lines.append("=" * 60)
+        info_lines.append(f"Loading: {chunk_json_path}")
+        info_lines.append(f"Total chunks: {len(chunks)}")
+        info_lines.append(f"Control mode: {control_mode}")
+        if control_mode != "disabled" and control_videos:
+            info_lines.append(f"Control videos: {list(control_videos.keys())}")
+        info_lines.append("")
+        
+        # Validate control mode setup
+        if control_mode != "disabled" and not vae:
+            info_lines.append("⚠️ WARNING: Control mode enabled but no VAE provided!")
+            info_lines.append("⚠️ Control videos will NOT be encoded. Falling back to disabled.")
+            control_mode = "disabled"
+        
+        # Process each chunk
+        chunk_conditionings = []
+        
+        for chunk_idx, chunk in enumerate(chunks):
+            prompt_pos = chunk.get("prompt_positive", "").strip()
+            prompt_neg = chunk.get("prompt_negative", "").strip()
+            
+            # Use default if empty
+            if not prompt_neg:
+                prompt_neg = global_settings.get("default_negative", "")
+            
+            # Encode prompts with CLIP
+            if prompt_pos:
+                # Use ComfyUI's CLIPTextEncode equivalent
+                tokens_pos = clip.tokenize(prompt_pos)
+                cond_pos, pooled_pos = clip.encode_from_tokens(tokens_pos, return_pooled=True)
+                positive_cond = [[cond_pos, {"pooled_output": pooled_pos}]]
+            else:
+                positive_cond = global_positive if global_positive is not None else []
+            
+            if prompt_neg:
+                tokens_neg = clip.tokenize(prompt_neg)
+                cond_neg, pooled_neg = clip.encode_from_tokens(tokens_neg, return_pooled=True)
+                negative_cond = [[cond_neg, {"pooled_output": pooled_neg}]]
+            else:
+                negative_cond = global_negative if global_negative is not None else []
+            
+            # Process control videos if enabled
+            control_embeds = {}
+            if control_mode != "disabled" and control_videos and vae:
+                chunk_controls = chunk.get("controls", {})
+                for ctrl_name, ctrl_settings in chunk_controls.items():
+                    # Skip if this control is disabled for this chunk
+                    if not ctrl_settings.get("enabled", True):
+                        continue
+                    
+                    # Get control video path
+                    ctrl_path = control_videos.get(ctrl_name)
+                    if not ctrl_path or not os.path.exists(ctrl_path):
+                        info_lines.append(f"  ⚠️ Control '{ctrl_name}' path not found: {ctrl_path}")
+                        continue
+                    
+                    try:
+                        # Load control frames for this chunk
+                        start_frame = chunk.get("start_frame", 0)
+                        end_frame = chunk.get("end_frame", 0)
+                        
+                        ctrl_frames = self._load_video_frames(
+                            ctrl_path, start_frame, end_frame
+                        )
+                        
+                        if ctrl_frames is not None:
+                            # Encode with VAE (WanVACE format)
+                            ctrl_latents = self._encode_control_frames(
+                                ctrl_frames, vae, tiled_vae
+                            )
+                            
+                            # Package in WanVACE format
+                            control_embeds[ctrl_name] = {
+                                "control_latents": ctrl_latents,
+                                "weight": ctrl_settings.get("weight", 1.0),
+                                "start_percent": ctrl_settings.get("start_percent", 0.0),
+                                "end_percent": ctrl_settings.get("end_percent", 1.0),
+                            }
+                            
+                            info_lines.append(f"  ✓ Encoded control '{ctrl_name}': {ctrl_latents.shape}")
+                    except Exception as e:
+                        info_lines.append(f"  ✗ Failed to encode control '{ctrl_name}': {e}")
+            
+            # Package conditioning for this chunk
+            chunk_conditioning = {
+                "chunk_id": chunk.get("id", chunk_idx),
+                "start_frame": chunk.get("start_frame", 0),
+                "end_frame": chunk.get("end_frame", 0),
+                "num_frames": chunk.get("num_frames", 0),
+                "positive": positive_cond,
+                "negative": negative_cond,
+                "control_embeds": control_embeds if control_embeds else None,
+                "is_first": chunk.get("is_first", False),
+                "is_last": chunk.get("is_last", False),
+            }
+            
+            chunk_conditionings.append(chunk_conditioning)
+            
+            info_lines.append(f"Chunk {chunk_idx}:")
+            if prompt_pos:
+                info_lines.append(f"  Positive: \"{prompt_pos[:60]}...\"" if len(prompt_pos) > 60 else f"  Positive: \"{prompt_pos}\"")
+            else:
+                info_lines.append(f"  Positive: (using global)")
+            info_lines.append(f"  Negative: \"{prompt_neg[:40]}...\"" if len(prompt_neg) > 40 else f"  Negative: \"{prompt_neg}\"")
+        
+        info_lines.append("")
+        info_lines.append(f"Encoded {len(chunk_conditionings)} chunk conditionings")
+        info_lines.append("=" * 60)
+        
+        info_text = "\n".join(info_lines)
+        print(info_text)
+        
+        return (chunk_conditionings, info_text)
+    
+    def _load_video_frames(self, video_path, start_frame, end_frame):
+        """Load a range of frames from a video file"""
+        import cv2
+        import numpy as np
+        
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise RuntimeError(f"Failed to open video: {video_path}")
+        
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        # Clamp to video length
+        start_frame = max(0, min(start_frame, total_frames - 1))
+        end_frame = max(start_frame + 1, min(end_frame, total_frames))
+        
+        frames = []
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        
+        for frame_idx in range(start_frame, end_frame):
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            # Convert BGR to RGB
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            # Normalize to [0, 1]
+            frame_normalized = frame_rgb.astype(np.float32) / 255.0
+            frames.append(frame_normalized)
+        
+        cap.release()
+        
+        if not frames:
+            return None
+        
+        # Convert to tensor: [T, H, W, C]
+        frames_tensor = torch.from_numpy(np.stack(frames, axis=0))
+        return frames_tensor
+    
+    def _encode_control_frames(self, frames, vae, tiled=False):
+        """Encode control frames with VAE (WanVACE format)"""
+        # frames shape: [T, H, W, C] in range [0, 1]
+        # Need to convert to VAE format: [C, T, H, W] in range [-1, 1]
+        
+        device = vae.device if hasattr(vae, 'device') else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        dtype = vae.dtype if hasattr(vae, 'dtype') else torch.float32
+        
+        # Move to device and convert dtype
+        frames = frames.to(device).to(dtype)
+        
+        T, H, W, C = frames.shape
+        
+        # CRITICAL: Resize to make dimensions divisible by 16 (required by Wan VAE)
+        if W % 16 != 0 or H % 16 != 0:
+            new_height = (H // 16) * 16
+            new_width = (W // 16) * 16
+            print(f"[Control Encode] Resizing {W}x{H} -> {new_width}x{new_height} (must be divisible by 16)")
+            
+            # Use ComfyUI's upscale function: [T, H, W, C] -> [T, C, H, W] -> upscale -> [T, H, W, C]
+            import comfy.utils
+            frames = frames.permute(0, 3, 1, 2)  # [T, C, H, W]
+            frames = comfy.utils.common_upscale(frames, new_width, new_height, "lanczos", "disabled")
+            frames = frames.permute(0, 2, 3, 1)  # [T, H, W, C]
+            H, W = new_height, new_width
+        
+        # NOTE: Empirically, very small chunks (<9 frames) may fail with temporal VAE
+        # This might be due to temporal convolution requirements, not confirmed
+        # Wan VAE *can* encode single images for I2V, but control encoding may differ
+        T, H, W, C = frames.shape  # Still [T, H, W, C]
+        MIN_FRAMES = 9  # Empirically determined safe minimum (may be reducible)
+        
+        original_T = T
+        if T < MIN_FRAMES:
+            print(f"[Control Encode] ⚠️ Chunk has only {T} frames, padding to {MIN_FRAMES} (temporal VAE requirement)")
+            # Pad by repeating the last frame
+            padding_needed = MIN_FRAMES - T
+            last_frame = frames[-1:, :, :, :].repeat(padding_needed, 1, 1, 1)  # Repeat last frame
+            frames = torch.cat([frames, last_frame], dim=0)  # [MIN_FRAMES, H, W, C]
+            T = frames.shape[0]
+            print(f"[Control Encode] Padded shape: {frames.shape}")
+        
+        # Keep in ComfyUI video format: [T, H, W, C] with values in [0, 1]
+        # DON'T normalize or permute - VAE wrapper handles this
+        
+        # Encode with VAE
+        with torch.no_grad():
+            try:
+                print(f"[Control Encode] Attempting VAE encode...")
+                print(f"[Control Encode] VAE type: {type(vae)}")
+                print(f"[Control Encode] Input shape: {frames.shape} (format: [T, H, W, C])")
+                print(f"[Control Encode] Value range: [{frames.min():.3f}, {frames.max():.3f}]")
+                
+                # ComfyUI VAE expects [T, H, W, C] format (video frames) just like LoadVideo output
+                # Ensure only RGB channels (first 3)
+                if frames.shape[-1] == 4:
+                    frames = frames[:, :, :, :3]  # Remove alpha channel if present
+                
+                # Check if this is a ComfyUI VAE wrapper
+                if hasattr(vae, 'first_stage_model'):
+                    print(f"[Control Encode] Detected ComfyUI VAE wrapper")
+                    # This is the comfy VAE wrapper, call encode directly
+                    # Pass frames as [T, H, W, C] - same format as VAEEncode node
+                    latents = vae.encode(frames[:, :, :, :3])
+                elif hasattr(vae, 'model'):
+                    print(f"[Control Encode] Detected raw VAE model")
+                    latents = vae.encode(frames[:, :, :, :3])
+                else:
+                    print(f"[Control Encode] Unknown VAE type, trying direct encode")
+                    latents = vae.encode(frames[:, :, :, :3])
+                
+                print(f"[Control Encode] Encode successful!")
+                print(f"[Control Encode] Latents type: {type(latents)}")
+                print(f"[Control Encode] Latents shape: {latents.shape if hasattr(latents, 'shape') else 'N/A'}")
+                
+                # Handle different return types
+                if isinstance(latents, list):
+                    print(f"[Control Encode] Latents is list, getting first element")
+                    latents = latents[0]
+                elif isinstance(latents, tuple):
+                    print(f"[Control Encode] Latents is tuple, getting first element")
+                    latents = latents[0]
+                
+                print(f"[Control Encode] Latents shape after unwrapping: {latents.shape}")
+                
+                # Determine temporal dimension based on shape
+                # Could be [B, C, T, H, W] or [C, T, H, W]
+                if latents.dim() == 5:
+                    # Has batch dimension
+                    if latents.shape[0] == 1:
+                        latents = latents.squeeze(0)  # Remove batch: [1, C, T, H, W] -> [C, T, H, W]
+                        print(f"[Control Encode] Removed batch dim: {latents.shape}")
+                    
+                    # Now should be [C, T, H, W]
+                    temporal_dim_idx = 1
+                elif latents.dim() == 4:
+                    # No batch dimension, already [C, T, H, W]
+                    temporal_dim_idx = 1
+                else:
+                    print(f"[Control Encode] ⚠️ Unexpected latent dimensions: {latents.dim()}")
+                    temporal_dim_idx = 1
+                
+                # Trim back to original temporal size if we padded
+                if original_T < MIN_FRAMES and latents.dim() >= 4:
+                    latent_T = latents.shape[temporal_dim_idx]
+                    # Wan VAE downsamples by 4 temporally
+                    original_latent_T = (original_T - 1) // 4 + 1
+                    if latent_T > original_latent_T:
+                        print(f"[Control Encode] Trimming latents from {latent_T} to {original_latent_T} temporal frames")
+                        latents = latents[:, :original_latent_T, :, :]
+                
+                print(f"[Control Encode] ✓ Final latents shape: {latents.shape}")
+                    
+            except Exception as e:
+                import traceback
+                print(f"[Control Encode] ✗ ENCODE FAILED!")
+                print(f"[Control Encode] Exception: {e}")
+                print(f"[Control Encode] Traceback:")
+                traceback.print_exc()
+                raise RuntimeError(f"Failed to encode control frames with VAE: {e}\n"
+                                 f"Input shape: {frames.shape}, dtype: {frames.dtype}, device: {frames.device}\n"
+                                 f"VAE type: {type(vae)}\n\n"
+                                 f"SUGGESTION: Try setting control_mode='disabled' to test without controls first.")
+        
+        # latents shape should now be [C, T_lat, H_lat, W_lat]
+        return latents
+
+
 # Register the nodes (NodeBypasser is frontend-only, no Python registration needed)
 NODE_CLASS_MAPPINGS = {
     "KNF_Organizer": KNF_Organizer,
@@ -1333,6 +3740,12 @@ NODE_CLASS_MAPPINGS = {
     "AutomateVideoPathLoader": AutomateVideoPathLoader,
     "CustomVideoSaver": CustomVideoSaver,
     "LazySwitch": LazySwitch,
+    "VideoExtensionDiagnostic": VideoExtensionDiagnostic,
+    "VAE_LUT_Generator": VAE_LUT_Generator,
+    "VAE_Correction_Applier": VAE_Correction_Applier,
+    "NV_VideoSampler": NV_VideoSampler,
+    "NV_VideoChunkAnalyzer": NV_VideoChunkAnalyzer,
+    "NV_ChunkConditioningPreprocessor": NV_ChunkConditioningPreprocessor,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1341,6 +3754,12 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "AutomateVideoPathLoader": "Automate Video Path Loader",
     "CustomVideoSaver": "Custom Video Saver",
     "LazySwitch": "Lazy Switch",
+    "VideoExtensionDiagnostic": "Video Extension Diagnostic",
+    "VAE_LUT_Generator": "VAE LUT Generator",
+    "VAE_Correction_Applier": "VAE Correction Applier",
+    "NV_VideoSampler": "NV Video Sampler",
+    "NV_VideoChunkAnalyzer": "NV Video Chunk Analyzer",
+    "NV_ChunkConditioningPreprocessor": "NV Chunk Conditioning Preprocessor",
 }
 
 # Conditionally add NV_Video_Loader_Path if it imported successfully
