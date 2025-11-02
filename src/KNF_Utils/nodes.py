@@ -3632,9 +3632,11 @@ class NV_ChunkConditioningPreprocessor:
                             # Package in ComfyUI Wan VACE format
                             # CRITICAL: Pass as TWO separate 16-channel tensors, not one 32-channel
                             # The model processes them in 16-channel chunks
+                            # Create mask with same spatial/temporal shape as latents
+                            # Match the channel dimension (16) for each vace_frame
                             control_embeds[ctrl_name] = {
                                 "vace_frames": [inactive_latents, reactive_latents],  # Two 16-channel tensors!
-                                "vace_mask": [torch.ones(1, T, H, W)],  # 4D to match vace_frames: [1, T, H, W]
+                                "vace_mask": [torch.ones_like(inactive_latents), torch.ones_like(reactive_latents)],  # One mask per vace_frame
                                 "vace_strength": [ctrl_settings.get("weight", 1.0)],
                                 "start_percent": ctrl_settings.get("start_percent", 0.0),
                                 "end_percent": ctrl_settings.get("end_percent", 1.0),
