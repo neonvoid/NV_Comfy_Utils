@@ -3160,7 +3160,7 @@ class NV_VideoSampler:
                 print(f"  Starting sampling...")
                 print(f"    Sampler: {sampler_name}, Scheduler: {scheduler}")
                 print(f"    Steps: {steps}, CFG: {cfg}, Denoise: {denoise_strength}")
-                print(f"    Seed: {seed + chunk_idx}")
+                print(f"    Seed: {seed}")
                 
                 # Create progress callback
                 sample_start_time = time.time()
@@ -3198,7 +3198,7 @@ class NV_VideoSampler:
                     noise_mask=None,
                     callback=progress_callback,
                     disable_pbar=False,  # Show progress bar
-                    seed=seed + chunk_idx  # Vary seed per chunk
+                    seed=seed  # Use same seed for all chunks for consistency
                 )
                 
                 sample_time = time.time() - sample_start_time
@@ -3267,13 +3267,17 @@ class NV_VideoSampler:
                                 print(f"    Decoded overlap to pixels: {overlap_pixels.shape}")
                                 
                                 # Ensure [T, H, W, C] format
-                                if overlap_pixels.dim() == 5:  # [B, C, T, H, W]
-                                    overlap_pixels = overlap_pixels[0].permute(1, 2, 3, 0)  # [T, H, W, C]
+                                # Wan VAE returns [B, T, H, W, C], so just squeeze batch dimension
+                                if overlap_pixels.dim() == 5 and overlap_pixels.shape[0] == 1:
+                                    overlap_pixels = overlap_pixels.squeeze(0)  # [1, T, H, W, C] -> [T, H, W, C]
                                 elif overlap_pixels.dim() == 4:  # [T, H, W, C] already
                                     pass
+                                else:
+                                    raise ValueError(f"Unexpected decoded pixel shape: {overlap_pixels.shape}")
                                 
                                 # Clamp to valid range
                                 overlap_pixels = torch.clamp(overlap_pixels, 0.0, 1.0)
+                                print(f"    Prepared pixels for encoding: {overlap_pixels.shape}")
                                 
                                 # Encode as VACE control (dual-channel)
                                 from types import SimpleNamespace
