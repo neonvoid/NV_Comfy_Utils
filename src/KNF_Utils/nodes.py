@@ -3457,6 +3457,82 @@ class NV_VideoSampler:
         print(f"\n{info_text}")
         
         return (out, info_text)
+    
+    def _encode_vace_dual_channel_standalone(self, frames, vae, tiled=False):
+        """
+        Standalone method to encode frames into dual-channel VACE format.
+        Used by Tier 3 to encode overlap regions during sampling.
+        
+        Args:
+            frames: [T, H, W, C] tensor in [0, 1] range
+            vae: VAE object for encoding
+            tiled: Whether to use tiled VAE (unused for Wan VAE)
+        
+        Returns:
+            inactive_latents: [16, T, H, W] tensor
+            reactive_latents: [16, T, H, W] tensor
+        """
+        import torch
+        import comfy.utils
+        
+        device = vae.device if hasattr(vae, 'device') else torch.device('cpu')
+        dtype = vae.dtype if hasattr(vae, 'dtype') else torch.float32
+        
+        # Ensure frames are on the right device and dtype
+        frames = frames.to(device=device, dtype=dtype)
+        
+        # Frames should be [T, H, W, C] in [0, 1] range
+        # Center to [-0.5, 0.5] for splitting
+        centered_frames = frames - 0.5
+        
+        # Inactive stream: set all to 0.5 (neutral gray in [0, 1])
+        inactive_frames = torch.full_like(frames, 0.5)
+        
+        # Reactive stream: use the actual frames [0, 1]
+        reactive_frames = frames.clone()
+        
+        # Encode both streams
+        def encode_stream(stream_frames):
+            # Ensure divisible by 16
+            T, H, W, C = stream_frames.shape
+            H_new = ((H + 15) // 16) * 16
+            W_new = ((W + 15) // 16) * 16
+            
+            if H != H_new or W != W_new:
+                # Resize using comfy.utils.common_upscale
+                # Input: [B, C, H, W] or [B, C, T, H, W]
+                # We have [T, H, W, C], need to permute to [T, C, H, W]
+                stream_frames_perm = stream_frames.permute(0, 3, 1, 2)  # [T, C, H, W]
+                stream_frames_perm = stream_frames_perm.unsqueeze(0)  # [1, T, C, H, W]
+                # Reshape to [1, T*C, H, W] for upscale
+                B, T, C, H, W = stream_frames_perm.shape
+                stream_frames_flat = stream_frames_perm.reshape(B, T*C, H, W)
+                stream_frames_resized = comfy.utils.common_upscale(
+                    stream_frames_flat, W_new, H_new, "bilinear", "disabled"
+                )
+                # Reshape back to [1, T, C, H, W]
+                stream_frames_resized = stream_frames_resized.reshape(B, T, C, H_new, W_new)
+                # Remove batch and permute back to [T, H, W, C]
+                stream_frames = stream_frames_resized.squeeze(0).permute(0, 2, 3, 1)
+            
+            # Encode using VAE
+            # VAE expects [T, H, W, C] in [0, 1] range for ComfyUI wrapper
+            latents = vae.encode(stream_frames)
+            
+            # Handle different return formats
+            if isinstance(latents, (list, tuple)):
+                latents = latents[0]
+            
+            # Expected shape: [1, 16, T, H, W] or [16, T, H, W]
+            if latents.dim() == 5 and latents.shape[0] == 1:
+                latents = latents.squeeze(0)  # Remove batch dim
+            
+            return latents  # [16, T, H, W]
+        
+        inactive_latents = encode_stream(inactive_frames)
+        reactive_latents = encode_stream(reactive_frames)
+        
+        return inactive_latents, reactive_latents
 
 
 class NV_VideoChunkAnalyzer:
