@@ -3076,8 +3076,7 @@ class NV_VideoSampler:
                     print(f"    ✓ Injected into conditioning keys: {list(chunk_positive[0][1].keys())}")
                 
                 # TIER 2: Apply previous chunk overlap (temporal continuity) for chunks 2+
-                # TEMPORARILY DISABLED FOR DEBUGGING
-                if False and chunk_idx > 0 and 'prev_chunk_samples' in locals():
+                if chunk_idx > 0 and 'prev_chunk_samples' in locals():
                     # Calculate overlap region
                     overlap_frames = min(chunk_overlap, chunk_frames)
                     
@@ -3211,10 +3210,9 @@ class NV_VideoSampler:
                 prev_chunk_start = chunk_start
                 prev_chunk_end = chunk_end
                 
-                # TIER 3: Direct latent extension (no VAE cycle)
-                # Uses raw latents from previous chunk with mask=0
-                # Hypothesis: mask=0 tells model to ignore control format, just use as reference
-                # This avoids decode/re-encode quality loss while providing temporal continuity
+                # TIER 3: VACE Frame Extension with VAE cycle + inline correction
+                # Decode overlap, re-encode with dual-channel VACE, apply as extension frames
+                # Apply inline brightness/contrast correction to compensate for VAE degradation
                 prev_chunk_vace_control = None
                 if chunk_idx < len(chunk_conditionings) - 1:  # Not the last chunk
                     try:
@@ -3222,23 +3220,58 @@ class NV_VideoSampler:
                         # Extract from the END of the current chunk's RAW output
                         overlap_frames_to_encode = min(chunk_overlap, chunk_frames)
                         
-                        if overlap_frames_to_encode > 0:
+                        if overlap_frames_to_encode > 0 and hasattr(self, '_temp_vae') and self._temp_vae is not None:
                             print(f"  Tier 3: Preparing VACE extension for next chunk...")
-                            print(f"    Using last {overlap_frames_to_encode} frames directly (no VAE cycle)")
+                            print(f"    Decoding {overlap_frames_to_encode} overlap frames with VAE correction...")
                             
                             # Extract overlap latent from END of RAW chunk output [1, 16, T, H, W]
-                            overlap_latent = prev_chunk_samples[:, :, -overlap_frames_to_encode:, :, :].clone()
+                            overlap_latent = prev_chunk_samples[:, :, -overlap_frames_to_encode:, :, :]
                             
-                            # Create 32-channel format: [latents, zeros] instead of [latents, latents]
-                            # This prevents signal amplification while maintaining VACE structure
-                            zeros_pad = torch.zeros_like(overlap_latent)
-                            control_video_latent = torch.cat([overlap_latent, zeros_pad], dim=1)  # [1, 32, T, H, W]
+                            # Decode to pixels
+                            overlap_pixels = self._temp_vae.decode(overlap_latent)
+                            
+                            # Handle shape: Wan VAE returns [B, T, H, W, C]
+                            if overlap_pixels.dim() == 5 and overlap_pixels.shape[0] == 1:
+                                overlap_pixels = overlap_pixels.squeeze(0)  # [T, H, W, C]
+                            elif overlap_pixels.dim() == 4:
+                                pass  # Already [T, H, W, C]
+                            else:
+                                raise ValueError(f"Unexpected decoded pixel shape: {overlap_pixels.shape}")
+                            
+                            # Track original statistics for correction
+                            original_mean = overlap_pixels.mean().item()
+                            original_std = overlap_pixels.std().item()
+                            
+                            # Apply pre-emptive correction to compensate for VAE degradation
+                            # Based on VAE_Correction_Applier logic: typical 1-cycle degradation
+                            # Brightness: ~0.98x (loses 2%), so boost by 1.02x pre-emptively
+                            # Contrast: ~0.97x (loses 3%), so boost by 1.03x pre-emptively
+                            brightness_boost = 1.02
+                            contrast_boost = 1.03
+                            shadow_lift = 0.005  # Small additive boost for shadows
+                            
+                            corrected_pixels = overlap_pixels.clone()
+                            corrected_pixels = corrected_pixels * brightness_boost
+                            mean = corrected_pixels.mean()
+                            corrected_pixels = (corrected_pixels - mean) * contrast_boost + mean
+                            corrected_pixels = corrected_pixels + shadow_lift
+                            corrected_pixels = torch.clamp(corrected_pixels, 0.0, 1.0)
+                            
+                            corrected_mean = corrected_pixels.mean().item()
+                            print(f"    Pre-correction: mean={original_mean:.4f}, std={original_std:.4f}")
+                            print(f"    Post-correction: mean={corrected_mean:.4f} (boost: {corrected_mean/original_mean:.4f}x)")
+                            
+                            # Encode with dual-channel VACE format
+                            inactive_latents, reactive_latents = self._encode_vace_dual_channel_standalone(
+                                corrected_pixels, self._temp_vae, False
+                            )
+                            control_video_latent = torch.cat([inactive_latents.unsqueeze(0), reactive_latents.unsqueeze(0)], dim=1)
                             
                             # Create 64-channel mask: 0 = no control (use as reference/extension)
                             vae_stride = 8
-                            T_vace = overlap_latent.shape[2]
-                            H_vace = overlap_latent.shape[3]
-                            W_vace = overlap_latent.shape[4]
+                            T_vace = control_video_latent.shape[2]
+                            H_vace = control_video_latent.shape[3]
+                            W_vace = control_video_latent.shape[4]
                             mask_64ch = torch.zeros((1, vae_stride * vae_stride, T_vace, H_vace, W_vace), 
                                                     device=control_video_latent.device, dtype=control_video_latent.dtype)
                             
@@ -3247,8 +3280,8 @@ class NV_VideoSampler:
                                 "vace_mask": mask_64ch,               # [1, 64, overlap_frames, H, W]
                             }
                             
-                            print(f"    ✓ VACE extension prepared: {control_video_latent.shape} (direct latents)")
-                            info_lines.append(f"  → Tier 3: Direct latent extension (no VAE degradation)")
+                            print(f"    ✓ VACE extension prepared: {control_video_latent.shape} (with correction)")
+                            info_lines.append(f"  → Tier 3: VACE frame extension (VAE + correction)")
                     except Exception as e:
                         print(f"    ✗ Failed to prepare VACE extension: {e}")
                         import traceback
