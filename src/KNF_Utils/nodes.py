@@ -2882,7 +2882,11 @@ class NV_VideoSampler:
                 first_chunk = chunk_conditionings[0]
                 if "start_image_pixels" in first_chunk and first_chunk["start_image_pixels"] is not None:
                     self._temp_start_image = first_chunk["start_image_pixels"]
-                    print(f"Start image available for color matching: {self._temp_start_image.shape}")
+                    print(f"✓ Start image available for color matching: {self._temp_start_image.shape}")
+                else:
+                    print(f"⚠️  WARNING: No start_image_pixels found in chunk_conditionings")
+                    print(f"   Available keys: {list(first_chunk.keys())}")
+                    print(f"   Color matching will be SKIPPED!")
             
             print(f"\n{'='*60}")
             print(f"CONTEXT WINDOW SAMPLING MODE")
@@ -4087,9 +4091,12 @@ class NV_ChunkConditioningPreprocessor:
                 print(f"  ✓ Start image encoded: {start_image_latent.shape}")
                 print(f"    Mask shape: {start_image_mask.shape}")
                 print(f"    Mask range: [{start_image_mask.min():.2f}, {start_image_mask.max():.2f}]")
+                print(f"    Pixels stored for color matching: {start_image_resized.shape}")
                 info_lines.append(f"  ✓ Start image encoded: {start_image_latent.shape}")
+                info_lines.append(f"  ✓ Start image pixels stored for color matching")
                 
                 # Store pixels for color matching in sampler
+                # (Will be passed through chunk_conditionings)
                 self._start_image_pixels = start_image_resized
             except Exception as e:
                 info_lines.append(f"  ✗ Failed to encode start image: {e}")
