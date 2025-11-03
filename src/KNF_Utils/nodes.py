@@ -2965,8 +2965,13 @@ class NV_VideoSampler:
                 info_lines.append(f"  Latent frames: {chunk_start}-{chunk_end} ({chunk_frames} frames)")
                 
                 # Extract chunk from latent and noise
+                # Will be extended later if VACE reference is present
                 chunk_latent = latent[:, :, chunk_start:chunk_end, :, :]
                 chunk_noise = noise[:, :, chunk_start:chunk_end, :, :] if not disable_noise else torch.zeros_like(chunk_latent)
+                
+                # Store for later potential extension
+                chunk_latent_for_sampling = chunk_latent
+                chunk_noise_for_sampling = chunk_noise
                 
                 # Use pre-encoded conditioning from chunk (with fallback to global)
                 chunk_positive = chunk_cond.get("positive")
@@ -2987,14 +2992,16 @@ class NV_VideoSampler:
                     else:
                         raise ValueError(f"Chunk {chunk_idx + 1} has no negative conditioning and no global fallback provided!")
                 
+                # Get VACE reference for potential first frame conditioning
+                vace_reference = chunk_cond.get("vace_reference")  # [1, 32, 1, H, W] if present
+                has_vace_reference = vace_reference is not None and chunk_idx == 0
+                
                 # Inject Wan VACE controls into conditioning if present
                 chunk_control_embeds = chunk_cond.get("control_embeds")
-                vace_reference = chunk_cond.get("vace_reference")  # [1, 32, 1, H, W] if present
-                
                 if chunk_control_embeds and len(chunk_control_embeds) > 0:
                     print(f"  Injecting {len(chunk_control_embeds)} control(s)...")
-                    if vace_reference is not None:
-                        print(f"  VACE reference will be prepended to each control")
+                    if has_vace_reference:
+                        print(f"  VACE reference will be prepended as frame 0 to each control")
                     info_lines.append(f"  → Chunk has {len(chunk_control_embeds)} control(s)")
                     
                     # Combine all control embeds for this chunk
@@ -3025,9 +3032,9 @@ class NV_VideoSampler:
                             chunk_vace_mask[:, :, :actual_overlap, :, :] = 0.0
                             # Rest already has mask = 1.0 from original
                         
-                        # PREPEND VACE REFERENCE (if present)
+                        # PREPEND VACE REFERENCE (if present and first chunk)
                         # Per WAN VACE guide: reference becomes frame 0, temporally prepended
-                        if vace_reference is not None:
+                        if has_vace_reference:
                             # Prepend reference to control frames [1, 32, 1, H, W] + [1, 32, T, H, W]
                             chunk_vace_frames = torch.cat([vace_reference, chunk_vace_frames], dim=2)
                             
@@ -3040,9 +3047,9 @@ class NV_VideoSampler:
                         all_vace_masks.append(chunk_vace_mask)
                         all_vace_strengths.extend(ctrl_data["vace_strength"])
                         
-                        ref_info = " (with reference)" if vace_reference is not None else ""
-                        print(f"    • {ctrl_name}: weight={ctrl_data['vace_strength'][0]:.2f}, shape={chunk_vace_frames.shape}{ref_info}")
-                        info_lines.append(f"    • '{ctrl_name}': weight={ctrl_data['vace_strength'][0]:.2f}, slice=[{chunk_start}:{chunk_end}]{ref_info}")
+                        ref_suffix = " +ref" if has_vace_reference else ""
+                        print(f"    • {ctrl_name}: weight={ctrl_data['vace_strength'][0]:.2f}, shape={chunk_vace_frames.shape}{ref_suffix}")
+                        info_lines.append(f"    • '{ctrl_name}': weight={ctrl_data['vace_strength'][0]:.2f}, slice=[{chunk_start}:{chunk_end}]{ref_suffix}")
                     
                     # Inject into both positive AND negative conditioning
                     # ComfyUI conditioning format: [[cond_tensor, {"key": value}], ...]
@@ -3062,8 +3069,6 @@ class NV_VideoSampler:
                         
                         print(f"    ✓ Controls injected into conditioning")
                         info_lines.append(f"    ✓ VACE controls injected: {len(all_vace_frames)} control(s)")
-                        if vace_reference is not None:
-                            info_lines.append(f"    ✓ VACE reference prepended (global style anchor)")
                         
                         # Log Tier 3 replacement if it happened
                         if prev_chunk_vace_control is not None and chunk_idx > 0:
@@ -3071,8 +3076,31 @@ class NV_VideoSampler:
                             print(f"    ✓ Tier 3: Replaced first {overlap_count} frames with prev chunk (mask=0)")
                             info_lines.append(f"  → Tier 3: Frame extension applied ({overlap_count} frames)")
                 
-                # REMOVED: Tier 1 I2V conditioning (concat_latent_image)
-                # Now using VACE reference_image instead (prepended to control videos below)
+                # VACE REFERENCE: Extend latent for first chunk if reference present
+                # Per WAN VACE architecture: generate with reference, then trim
+                trim_reference_frame = 0
+                
+                if has_vace_reference:
+                    # Extend the chunk latent and noise by 1 frame to accommodate reference
+                    # The reference frame will be frame 0, actual generation starts at frame 1
+                    if chunk_end + 1 <= latent.shape[2]:
+                        chunk_latent_for_sampling = latent[:, :, chunk_start:chunk_end+1, :, :]  # +1 frame
+                        chunk_noise_for_sampling = noise[:, :, chunk_start:chunk_end+1, :, :] if not disable_noise else torch.zeros_like(chunk_latent_for_sampling)
+                    else:
+                        # At the end, just extend with zeros
+                        extra_frame = torch.zeros((1, latent.shape[1], 1, latent.shape[3], latent.shape[4]), 
+                                                  device=latent.device, dtype=latent.dtype)
+                        chunk_latent_for_sampling = torch.cat([chunk_latent, extra_frame], dim=2)
+                        if not disable_noise:
+                            chunk_noise_for_sampling = torch.cat([chunk_noise, torch.randn_like(extra_frame)], dim=2)
+                        else:
+                            chunk_noise_for_sampling = torch.zeros_like(chunk_latent_for_sampling)
+                    
+                    trim_reference_frame = 1
+                    print(f"  VACE reference: Extended latent by 1 frame for generation")
+                    print(f"    Latent shape: {chunk_latent_for_sampling.shape}")
+                    print(f"    Will trim {trim_reference_frame} frame after generation")
+                    info_lines.append(f"  → VACE reference: Latent extended, will trim after gen")
                 # TIER 2: Apply previous chunk overlap (temporal continuity) for chunks 2+
                 if chunk_idx > 0 and 'prev_chunk_samples' in locals():
                     # Calculate overlap region
@@ -3146,14 +3174,14 @@ class NV_VideoSampler:
                 
                 chunk_samples = comfy.sample.sample(
                     model,
-                    chunk_noise,
+                    chunk_noise_for_sampling,
                     steps,
                     cfg,
                     sampler_name,
                     scheduler if scheduler != "beta57" else "normal",
                     chunk_positive,
                     chunk_negative,
-                    chunk_latent,
+                    chunk_latent_for_sampling,
                     denoise=denoise_strength,
                     disable_noise=disable_noise,
                     start_step=start_step if start_step > 0 else None,
@@ -3167,6 +3195,15 @@ class NV_VideoSampler:
                 
                 sample_time = time.time() - sample_start_time
                 print(f"  ✓ Sampling complete: {sample_time:.2f}s ({sample_time/steps:.3f}s/step)")
+                
+                # TRIM REFERENCE FRAME if present
+                # Per WAN VACE architecture: remove the reference frame from output
+                if trim_reference_frame > 0:
+                    print(f"  Trimming {trim_reference_frame} reference frame from output...")
+                    print(f"    Before trim: {chunk_samples.shape}")
+                    chunk_samples = chunk_samples[:, :, trim_reference_frame:, :, :]  # Remove first frame
+                    print(f"    After trim: {chunk_samples.shape}")
+                    info_lines.append(f"  → Reference frame trimmed from output")
                 
                 # Decode chunk to pixels immediately for pixel-space processing
                 if vae is not None:
