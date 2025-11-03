@@ -3063,12 +3063,11 @@ class NV_VideoSampler:
                     concat_start = first_frame_latent.repeat(1, 1, chunk_frames, 1, 1)  # [B, C, T, H, W]
                     
                     # Create mask for I2V concat_latent_image:
-                    # Convention: 1 = KEEP reference, 0 = GENERATE new
-                    # This ensures each chunk maintains consistency with the start image
+                    # Testing inverted convention: 0 = KEEP reference, 1 = GENERATE new
                     B, C, _, H, W = concat_start.shape
-                    mask_start = torch.zeros((B, 1, chunk_frames, H, W), 
+                    mask_start = torch.ones((B, 1, chunk_frames, H, W), 
                                             device=concat_start.device, dtype=concat_start.dtype)
-                    mask_start[:, :, 0:1, :, :] = 1.0  # KEEP first frame (reference)
+                    mask_start[:, :, 0:1, :, :] = 0.0  # KEEP first frame (reference) - 0 means USE concat_latent
                     
                     print(f"  Tier 1: Applying first frame reference")
                     print(f"    concat_start shape: {concat_start.shape}")
@@ -3114,15 +3113,15 @@ class NV_VideoSampler:
                             concat_latent = prev_overlap
                         
                         # Build concat_mask for I2V:
-                        # Convention: 1 = KEEP reference, 0 = GENERATE new
-                        concat_mask = torch.zeros((1, 1, chunk_frames, chunk_latent.shape[3], chunk_latent.shape[4]),
+                        # Inverted convention: 0 = KEEP reference, 1 = GENERATE new
+                        concat_mask = torch.ones((1, 1, chunk_frames, chunk_latent.shape[3], chunk_latent.shape[4]),
                                                    device=chunk_latent.device, dtype=chunk_latent.dtype)
-                        concat_mask[:, :, :overlap_frames, :, :] = 1.0  # 1 = KEEP overlap frames
+                        concat_mask[:, :, :overlap_frames, :, :] = 0.0  # 0 = KEEP overlap frames from concat_latent
                         
                         print(f"  Tier 2: Using {overlap_frames} overlap frames from previous chunk")
                         print(f"    concat_latent shape: {concat_latent.shape}")
                         print(f"    concat_mask shape: {concat_mask.shape}")
-                        print(f"    mask values: {overlap_frames} ones (keep), {new_noise_frames} zeros (generate)")
+                        print(f"    mask values: {overlap_frames} zeros (keep), {new_noise_frames} ones (generate)")
                         info_lines.append(f"  → Temporal continuity: {overlap_frames} frames from prev chunk")
                         
                         # Apply Tier 2 (chunks 1+ only, no conflict with Tier 1)
