@@ -3177,17 +3177,20 @@ class NV_VideoSampler:
                 chunk_weight = torch.ones_like(chunk_samples)
                 
                 if blend_mode == "linear":
-                    # Linear blending at edges
+                    # Minimal blending - Tier 3 frame extension already provides continuity
+                    # Only feather the very edges (2 frames) to smooth any remaining artifacts
+                    feather_frames = 2
+                    
                     if not chunk_cond["is_first"] and chunk_overlap > 0:
-                        # Fade in from left
-                        for i in range(min(chunk_overlap, chunk_frames)):
-                            weight = i / chunk_overlap
+                        # Gentle fade in from left (only first 2 frames)
+                        for i in range(min(feather_frames, chunk_frames)):
+                            weight = (i + 1) / (feather_frames + 1)  # 0.33, 0.67
                             chunk_weight[:, :, i, :, :] = weight
                     
                     if not chunk_cond["is_last"] and chunk_overlap > 0:
-                        # Fade out to right
-                        for i in range(min(chunk_overlap, chunk_frames)):
-                            weight = 1.0 - (i / chunk_overlap)
+                        # Gentle fade out to right (only last 2 frames)
+                        for i in range(min(feather_frames, chunk_frames)):
+                            weight = (feather_frames - i) / (feather_frames + 1)  # 0.67, 0.33
                             chunk_weight[:, :, -(i+1), :, :] = weight
                 
                 elif blend_mode == "pyramid":
@@ -3209,77 +3212,47 @@ class NV_VideoSampler:
                 prev_chunk_start = chunk_start
                 prev_chunk_end = chunk_end
                 
-                # TIER 3: Prepare VACE frame extension for next chunk
-                # Decode overlap from current chunk, use as first N frames of next chunk's controls
-                # This implements VACE frame extension: overlap frames replace control frames with mask=0
+                # TIER 3: Direct latent extension (no VAE cycle)
+                # Uses raw latents from previous chunk with mask=0
+                # Hypothesis: mask=0 tells model to ignore control format, just use as reference
+                # This avoids decode/re-encode quality loss while providing temporal continuity
                 prev_chunk_vace_control = None
                 if chunk_idx < len(chunk_conditionings) - 1:  # Not the last chunk
-                    # Check if we have access to VAE for decoding
-                    if hasattr(self, '_temp_vae') and self._temp_vae is not None:
-                        try:
-                            # Calculate overlap for NEXT chunk
-                            # Extract from the END of the current chunk's RAW output
-                            overlap_frames_to_encode = min(chunk_overlap, chunk_frames)
+                    try:
+                        # Calculate overlap for NEXT chunk
+                        # Extract from the END of the current chunk's RAW output
+                        overlap_frames_to_encode = min(chunk_overlap, chunk_frames)
+                        
+                        if overlap_frames_to_encode > 0:
+                            print(f"  Tier 3: Preparing VACE extension for next chunk...")
+                            print(f"    Using last {overlap_frames_to_encode} frames directly (no VAE cycle)")
                             
-                            if overlap_frames_to_encode > 0:
-                                print(f"  Tier 3: Preparing VACE control for next chunk...")
-                                print(f"    Overlap region: last {overlap_frames_to_encode} frames of current chunk")
-                                
-                                # Extract overlap latent from END of RAW chunk output
-                                overlap_latent = prev_chunk_samples[:, :, -overlap_frames_to_encode:, :, :]
-                                
-                                # Decode to pixels (MINIMAL degradation - only overlap region!)
-                                overlap_pixels = self._temp_vae.decode(overlap_latent)
-                                print(f"    Decoded overlap to pixels: {overlap_pixels.shape}")
-                                
-                                # Ensure [T, H, W, C] format
-                                # Wan VAE returns [B, T, H, W, C], so just squeeze batch dimension
-                                if overlap_pixels.dim() == 5 and overlap_pixels.shape[0] == 1:
-                                    overlap_pixels = overlap_pixels.squeeze(0)  # [1, T, H, W, C] -> [T, H, W, C]
-                                elif overlap_pixels.dim() == 4:  # [T, H, W, C] already
-                                    pass
-                                else:
-                                    raise ValueError(f"Unexpected decoded pixel shape: {overlap_pixels.shape}")
-                                
-                                # Clamp to valid range
-                                overlap_pixels = torch.clamp(overlap_pixels, 0.0, 1.0)
-                                print(f"    Prepared pixels for encoding: {overlap_pixels.shape}")
-                                
-                                # Encode as VACE control (dual-channel)
-                                from types import SimpleNamespace
-                                preprocessor = SimpleNamespace()
-                                preprocessor._encode_vace_dual_channel = lambda frames, vae, tiled: self._encode_vace_dual_channel_standalone(frames, vae, tiled)
-                                
-                                inactive_latents, reactive_latents = self._encode_vace_dual_channel_standalone(
-                                    overlap_pixels, self._temp_vae, False
-                                )
-                                
-                                # Package as VACE control
-                                inactive_batched = inactive_latents.unsqueeze(0)  # [1, 16, T, H, W]
-                                reactive_batched = reactive_latents.unsqueeze(0)  # [1, 16, T, H, W]
-                                control_video_latent = torch.cat([inactive_batched, reactive_batched], dim=1)  # [1, 32, T, H, W]
-                                
-                                # Create 64-channel mask: 0 = no control (use as reference/extension)
-                                # These decoded frames will replace the first N frames of control videos
-                                vae_stride = 8
-                                T_vace = inactive_latents.shape[1]
-                                H_vace = inactive_latents.shape[2]
-                                W_vace = inactive_latents.shape[3]
-                                mask_64ch = torch.zeros(vae_stride * vae_stride, T_vace, H_vace, W_vace, 
-                                                        device=control_video_latent.device, dtype=control_video_latent.dtype)
-                                mask_64ch = mask_64ch.unsqueeze(0)  # [1, 64, T, H, W]
-                                
-                                prev_chunk_vace_control = {
-                                    "vace_frames": control_video_latent,  # [1, 32, overlap_frames, H, W]
-                                    "vace_mask": mask_64ch,               # [1, 64, overlap_frames, H, W]
-                                }
-                                
-                                print(f"    ✓ VACE control prepared: {control_video_latent.shape}")
-                                info_lines.append(f"  → VACE control prepared for next chunk overlap")
-                        except Exception as e:
-                            print(f"    ✗ Failed to prepare VACE control: {e}")
-                            import traceback
-                            traceback.print_exc()
+                            # Extract overlap latent from END of RAW chunk output [1, 16, T, H, W]
+                            overlap_latent = prev_chunk_samples[:, :, -overlap_frames_to_encode:, :, :]
+                            
+                            # Duplicate to create 32-channel format [1, 32, T, H, W]
+                            # This matches VACE format but preserves original quality
+                            control_video_latent = torch.cat([overlap_latent, overlap_latent], dim=1)
+                            
+                            # Create 64-channel mask: 0 = no control (use as reference/extension)
+                            vae_stride = 8
+                            T_vace = overlap_latent.shape[2]
+                            H_vace = overlap_latent.shape[3]
+                            W_vace = overlap_latent.shape[4]
+                            mask_64ch = torch.zeros((1, vae_stride * vae_stride, T_vace, H_vace, W_vace), 
+                                                    device=control_video_latent.device, dtype=control_video_latent.dtype)
+                            
+                            prev_chunk_vace_control = {
+                                "vace_frames": control_video_latent,  # [1, 32, overlap_frames, H, W]
+                                "vace_mask": mask_64ch,               # [1, 64, overlap_frames, H, W]
+                            }
+                            
+                            print(f"    ✓ VACE extension prepared: {control_video_latent.shape} (direct latents)")
+                            info_lines.append(f"  → Tier 3: Direct latent extension (no VAE degradation)")
+                    except Exception as e:
+                        print(f"    ✗ Failed to prepare VACE extension: {e}")
+                        import traceback
+                        traceback.print_exc()
                 
                 chunk_total_time = time.time() - chunk_start_time
                 print(f"  ✓ Chunk {chunk_idx + 1} complete: {chunk_total_time:.2f}s total")
