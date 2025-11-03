@@ -2483,8 +2483,33 @@ class NV_VideoSampler:
                     "default": "linear",
                     "tooltip": "How to blend overlapping chunks (linear=ramps, pyramid=triangular weights)"
                 }),
+                "blend_transition_frames": ("INT", {
+                    "default": 32,
+                    "min": 4,
+                    "max": 64,
+                    "step": 4,
+                    "tooltip": "Crossfade duration in video frames for chunk blending (32=smooth like KJNodes, 16=medium, 4=fast)"
+                }),
                 "vae": ("VAE", {
                     "tooltip": "VAE for Tier 3 VACE overlap encoding (optional, enables strong temporal consistency)"
+                }),
+                "enable_diffusion_refine": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Enable diffusion-based quality restoration for Tier 3 extension frames (fixes VAE degradation, ~6-10% overhead)"
+                }),
+                "refine_denoise": ("FLOAT", {
+                    "default": 0.25,
+                    "min": 0.1,
+                    "max": 0.5,
+                    "step": 0.05,
+                    "tooltip": "Denoise strength for extension frame refinement (0.25=balanced, 0.1=subtle, 0.5=heavy)"
+                }),
+                "refine_steps": ("INT", {
+                    "default": 5,
+                    "min": 3,
+                    "max": 15,
+                    "step": 1,
+                    "tooltip": "Diffusion steps for refinement (5=fast, 10=quality, 15=overkill)"
                 }),
             }
         }
@@ -2512,22 +2537,36 @@ class NV_VideoSampler:
     • Video-optimized sampling parameters
     """
     
-    def sample(self, model, seed, steps, cfg, 
+    def sample(self, model, seed, steps, cfg,
                sampler_name, scheduler, sampler_mode="standard", latent_image=None,
                positive=None, negative=None,
                denoise_strength=1.0, start_step=0, end_step=-1,
-               selector=0, cfg_end=-1.0, add_noise="enable", 
-               return_with_leftover_noise="disable", eta=0.0, noise_type="gaussian", 
-               noise_mode="hard", noise_seed=-1, chunk_conditionings=None, blend_mode="linear", vae=None):
+               selector=0, cfg_end=-1.0, add_noise="enable",
+               return_with_leftover_noise="disable", eta=0.0, noise_type="gaussian",
+               noise_mode="hard", noise_seed=-1, chunk_conditionings=None, blend_mode="linear",
+               blend_transition_frames=32, vae=None,
+               enable_diffusion_refine=False, refine_denoise=0.25, refine_steps=5):
         
         import comfy.sample
         import comfy.samplers
         import comfy.utils
         import time
         import math
-        
+
         start_time = time.time()
-        
+
+        # Store sampling parameters for diffusion refinement (used in Tier 3 extension frame processing)
+        self._refine_model = model
+        self._refine_sampler_name = sampler_name
+        self._refine_scheduler = scheduler
+        self._refine_cfg = cfg
+        self._refine_positive = positive
+        self._refine_negative = negative
+        self._refine_seed = seed
+        self._refine_enable = enable_diffusion_refine
+        self._refine_denoise = refine_denoise
+        self._refine_steps = refine_steps
+
         # Validate inputs
         has_chunk_cond = chunk_conditionings is not None and len(chunk_conditionings) > 0
         has_global_cond = positive is not None and negative is not None
@@ -3329,6 +3368,60 @@ class NV_VideoSampler:
                             except Exception as e:
                                 print(f"    ⚠️  Bilateral filter failed: {e}, continuing without filtering")
 
+                            # OPTIONAL: Diffusion-based refinement to restore quality lost from VAE degradation
+                            if hasattr(self, '_refine_enable') and self._refine_enable:
+                                try:
+                                    print(f"    🎨 Applying diffusion refinement ({self._refine_steps} steps @ {self._refine_denoise} denoise)...")
+
+                                    # Import common_ksampler from nodes.py
+                                    from nodes import common_ksampler
+
+                                    # Encode filtered pixels to latent (need batch dimension)
+                                    # overlap_pixels shape: [T, H, W, C]
+                                    overlap_pixels_batched = overlap_pixels.unsqueeze(0)  # [1, T, H, W, C]
+                                    overlap_latent_for_refine = self._temp_vae.encode(overlap_pixels_batched.to(torch.float32))
+
+                                    # Run low-denoise diffusion pass (img2img-style quality restoration)
+                                    refined_output = common_ksampler(
+                                        model=self._refine_model,
+                                        seed=self._refine_seed + 999 + chunk_idx,  # Unique seed per chunk
+                                        steps=self._refine_steps,
+                                        cfg=self._refine_cfg,
+                                        sampler_name=self._refine_sampler_name,
+                                        scheduler=self._refine_scheduler,
+                                        positive=self._refine_positive,
+                                        negative=self._refine_negative,
+                                        latent={"samples": overlap_latent_for_refine},
+                                        denoise=self._refine_denoise,
+                                        force_full_denoise=True
+                                    )
+
+                                    # Decode refined latent back to pixels
+                                    refined_latent = refined_output["samples"]
+                                    overlap_pixels_refined = self._temp_vae.decode(refined_latent.to(torch.float32))
+
+                                    # Handle shape: Wan VAE returns [B, T, H, W, C]
+                                    if overlap_pixels_refined.dim() == 5 and overlap_pixels_refined.shape[0] == 1:
+                                        overlap_pixels = overlap_pixels_refined.squeeze(0)  # [T, H, W, C]
+                                    elif overlap_pixels_refined.dim() == 4:
+                                        overlap_pixels = overlap_pixels_refined  # Already [T, H, W, C]
+                                    else:
+                                        raise ValueError(f"Unexpected refined pixel shape: {overlap_pixels_refined.shape}")
+
+                                    overlap_pixels = overlap_pixels.to(original_dtype)  # Convert back to original dtype
+                                    print(f"    ✓ Diffusion refinement complete: mean={overlap_pixels.mean():.4f}, std={overlap_pixels.std():.4f}")
+
+                                    # Store refined last frame as updated reference for color matching
+                                    # This ensures each chunk uses the highest-quality reference from the previous chunk
+                                    refined_last_frame = overlap_pixels[-1:].clone()  # [1, H, W, C]
+                                    self._temp_start_image = refined_last_frame.squeeze(0).unsqueeze(0)  # [1, H, W, C] batch format
+                                    print(f"    ✓ Updated color matching reference to refined last frame (shape: {self._temp_start_image.shape})")
+
+                                except Exception as e:
+                                    print(f"    ⚠️  Diffusion refinement failed: {e}, using filtered pixels without refinement")
+                                    import traceback
+                                    traceback.print_exc()
+
                             # Encode with dual-channel VACE format
                             inactive_latents, reactive_latents = self._encode_vace_dual_channel_standalone(
                                 overlap_pixels, self._temp_vae, False
@@ -3396,9 +3489,10 @@ class NV_VideoSampler:
 
                         print(f"\n  Blending chunks...")
 
-                        # FEATHER BLENDING at chunk boundaries
-                        # Keep small overlap (1 latent ~4 video frames) for gentle temporal blending
-                        blend_frames_video = 4  # ~1 latent frame × 4 temporal compression
+                        # 32-FRAME CROSSFADE BLENDING (matching KJNodes CrossFadeImages workflow)
+                        # Crossfade starts at (chunk_length - overlap) of previous chunk
+                        # and extends for blend_transition_frames total
+                        blend_frames_video = blend_transition_frames  # User-configurable (default: 32 frames)
 
                         current_position = 0
                         for chunk_data in chunk_pixels_list:
@@ -3412,20 +3506,35 @@ class NV_VideoSampler:
                                 current_position += num_frames
                                 print(f"  Chunk {chunk_idx}: placed {num_frames} frames at position 0-{num_frames-1}")
                             else:
-                                # Subsequent chunks: feather blend the first few frames
-                                blend_frames_actual = min(blend_frames_video, num_frames, len(final_video) - current_position)
+                                # Subsequent chunks: crossfade blend
+                                # The blend starts BEFORE current_position (in the previous chunk's tail)
+                                # and extends INTO the current chunk
+
+                                blend_frames_actual = min(blend_frames_video, num_frames, current_position)
+
+                                # Calculate how many frames from previous chunk to blend back into
+                                prev_chunk_blend_start = max(0, current_position - blend_frames_actual)
 
                                 if blend_frames_actual > 0:
-                                    # Linear feather blend
+                                    # Crossfade: gradually transition from prev chunk to current chunk
                                     for i in range(blend_frames_actual):
-                                        weight_new = (i + 1) / (blend_frames_actual + 1)  # 0.2, 0.4, 0.6, 0.8 for 4 frames
-                                        weight_old = 1.0 - weight_new
+                                        # Linear crossfade weights
+                                        weight_new = (i + 1) / (blend_frames_actual + 1)  # 0 → 1
+                                        weight_old = 1.0 - weight_new  # 1 → 0
 
-                                        # Blend this frame
-                                        final_video[current_position + i] = (
-                                            final_video[current_position + i] * weight_old +
-                                            chunk_pixels[i] * weight_new
-                                        )
+                                        # Position in final video
+                                        final_pos = prev_chunk_blend_start + i
+
+                                        # Only blend if we have both old and new content
+                                        if final_pos < current_position and i < num_frames:
+                                            # Blend with existing content (from previous chunk)
+                                            final_video[final_pos] = (
+                                                final_video[final_pos] * weight_old +
+                                                chunk_pixels[i] * weight_new
+                                            )
+                                        elif i < num_frames:
+                                            # No existing content, just place new frames
+                                            final_video[current_position + i] = chunk_pixels[i]
 
                                     # Place remaining frames (after blend zone)
                                     if num_frames > blend_frames_actual:
@@ -3433,7 +3542,7 @@ class NV_VideoSampler:
                                             chunk_pixels[blend_frames_actual:]
 
                                     current_position += num_frames
-                                    print(f"  Chunk {chunk_idx}: blended {blend_frames_actual} frames, placed {num_frames - blend_frames_actual} frames")
+                                    print(f"  Chunk {chunk_idx}: crossfaded {blend_frames_actual} frames, placed {num_frames - blend_frames_actual} frames")
                                 else:
                                     # Fallback: no blend space
                                     final_video[current_position:current_position + num_frames] = chunk_pixels
