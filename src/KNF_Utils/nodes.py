@@ -2993,8 +2993,21 @@ class NV_VideoSampler:
                         full_vace_mask = ctrl_data["vace_mask"]      # [1, 64, T_full, H, W]
                         
                         # Slice to match this chunk's temporal range
-                        chunk_vace_frames = full_vace_frames[:, :, chunk_start:chunk_end, :, :]  # [1, 32, chunk_frames, H, W]
-                        chunk_vace_mask = full_vace_mask[:, :, chunk_start:chunk_end, :, :]      # [1, 64, chunk_frames, H, W]
+                        chunk_vace_frames = full_vace_frames[:, :, chunk_start:chunk_end, :, :].clone()  # [1, 32, chunk_frames, H, W]
+                        chunk_vace_mask = full_vace_mask[:, :, chunk_start:chunk_end, :, :].clone()      # [1, 64, chunk_frames, H, W]
+                        
+                        # TIER 3: Replace first N frames with decoded overlap from previous chunk
+                        if prev_chunk_vace_control is not None and chunk_idx > 0:
+                            overlap_vace = prev_chunk_vace_control["vace_frames"]  # [1, 32, overlap_frames, H, W]
+                            overlap_frames_count = overlap_vace.shape[2]
+                            actual_overlap = min(overlap_frames_count, chunk_vace_frames.shape[2])
+                            
+                            # Replace first N frames of this control with decoded overlap
+                            chunk_vace_frames[:, :, :actual_overlap, :, :] = overlap_vace[:, :, :actual_overlap, :, :]
+                            
+                            # Set mask to 0 for overlap frames (no control), 1 for rest (apply control)
+                            chunk_vace_mask[:, :, :actual_overlap, :, :] = 0.0
+                            # Rest already has mask = 1.0 from original
                         
                         all_vace_frames.append(chunk_vace_frames)
                         all_vace_masks.append(chunk_vace_mask)
@@ -3016,61 +3029,12 @@ class NV_VideoSampler:
                         
                         print(f"    ✓ Controls injected into conditioning")
                         info_lines.append(f"    ✓ VACE controls injected: {len(all_vace_frames)} control(s)")
-                
-                # TIER 3: Apply previous chunk's VACE control (strong temporal consistency)
-                # This APPENDS to existing controls, doesn't replace them
-                # Applied to beginning of chunks 2+ (overlap with end of previous chunk)
-                if prev_chunk_vace_control is not None and chunk_idx > 0:
-                    # Check if we already have VACE controls from the chunk
-                    existing_vace = chunk_positive[0][1].get("vace_frames") if isinstance(chunk_positive, list) and len(chunk_positive) > 0 else None
-                    
-                    if existing_vace:
-                        print(f"  Tier 3: Appending VACE control to existing {len(existing_vace)} control(s)")
                         
-                        # Get the VACE control for the overlap
-                        vace_full = prev_chunk_vace_control["vace_frames"]  # [1, 32, T_overlap, H, W]
-                        vace_mask_full = prev_chunk_vace_control["vace_mask"]  # [1, 64, T_overlap, H, W]
-                        overlap_frames = prev_chunk_vace_control["overlap_frames"]
-                        
-                        # The overlap from prev chunk = first N frames of current chunk
-                        # Apply to frames [0:overlap_frames] of current chunk
-                        
-                        # Create zero-filled tensors for full chunk
-                        full_vace = torch.zeros(
-                            (1, 32, chunk_frames, vace_full.shape[3], vace_full.shape[4]),
-                            device=vace_full.device, dtype=vace_full.dtype
-                        )
-                        full_mask = torch.zeros(
-                            (1, 64, chunk_frames, vace_mask_full.shape[3], vace_mask_full.shape[4]),
-                            device=vace_mask_full.device, dtype=vace_mask_full.dtype
-                        )
-                        
-                        # Place overlap control at the BEGINNING of this chunk
-                        actual_overlap = min(overlap_frames, chunk_frames)
-                        full_vace[:, :, :actual_overlap, :, :] = vace_full[:, :, :actual_overlap, :, :]
-                        full_mask[:, :, :actual_overlap, :, :] = vace_mask_full[:, :, :actual_overlap, :, :]
-                        
-                        # APPEND to existing controls (don't replace!)
-                        chunk_positive = [[c[0], c[1].copy()] for c in chunk_positive]
-                        existing_frames = list(chunk_positive[0][1]["vace_frames"])  # Copy existing
-                        existing_masks = list(chunk_positive[0][1]["vace_mask"])    # Copy existing
-                        existing_strengths = list(chunk_positive[0][1]["vace_strength"])  # Copy existing
-                        
-                        existing_frames.append(full_vace)
-                        existing_masks.append(full_mask)
-                        existing_strengths.append(1.0)
-                        
-                        # Re-inject with Tier 3 ADDED
-                        chunk_positive[0][1]["vace_frames"] = existing_frames
-                        chunk_positive[0][1]["vace_mask"] = existing_masks
-                        chunk_positive[0][1]["vace_strength"] = existing_strengths
-                        
-                        print(f"    ✓ Tier 3 VACE appended: frames [0-{actual_overlap}]")
-                        print(f"    Total VACE controls: {len(existing_frames)}")
-                        info_lines.append(f"  → Tier 3 VACE: Added to existing controls")
-                    else:
-                        print(f"  Tier 3: Skipping (no existing VACE controls to append to)")
-
+                        # Log Tier 3 replacement if it happened
+                        if prev_chunk_vace_control is not None and chunk_idx > 0:
+                            overlap_count = prev_chunk_vace_control["vace_frames"].shape[2]
+                            print(f"    ✓ Tier 3: Replaced first {overlap_count} frames with prev chunk (mask=0)")
+                            info_lines.append(f"  → Tier 3: Frame extension applied ({overlap_count} frames)")
                 
                 # TIER 1: Apply start_image (first frame reference) to FIRST CHUNK ONLY
                 # Subsequent chunks use Tier 2 (overlap) for temporal continuity
@@ -3245,11 +3209,11 @@ class NV_VideoSampler:
                 prev_chunk_start = chunk_start
                 prev_chunk_end = chunk_end
                 
-                # TIER 3: Prepare VACE control for next chunk (if not last chunk)
-                # Decode overlap region to pixels, re-encode as VACE control
-                # TEMPORARILY DISABLED FOR DEBUGGING
+                # TIER 3: Prepare VACE frame extension for next chunk
+                # Decode overlap from current chunk, use as first N frames of next chunk's controls
+                # This implements VACE frame extension: overlap frames replace control frames with mask=0
                 prev_chunk_vace_control = None
-                if False and chunk_idx < len(chunk_conditionings) - 1:  # Not the last chunk
+                if chunk_idx < len(chunk_conditionings) - 1:  # Not the last chunk
                     # Check if we have access to VAE for decoding
                     if hasattr(self, '_temp_vae') and self._temp_vae is not None:
                         try:
@@ -3295,19 +3259,19 @@ class NV_VideoSampler:
                                 reactive_batched = reactive_latents.unsqueeze(0)  # [1, 16, T, H, W]
                                 control_video_latent = torch.cat([inactive_batched, reactive_batched], dim=1)  # [1, 32, T, H, W]
                                 
-                                # Create 64-channel mask
+                                # Create 64-channel mask: 0 = no control (use as reference/extension)
+                                # These decoded frames will replace the first N frames of control videos
                                 vae_stride = 8
                                 T_vace = inactive_latents.shape[1]
                                 H_vace = inactive_latents.shape[2]
                                 W_vace = inactive_latents.shape[3]
-                                mask_64ch = torch.ones(vae_stride * vae_stride, T_vace, H_vace, W_vace, 
-                                                       device=control_video_latent.device, dtype=control_video_latent.dtype)
+                                mask_64ch = torch.zeros(vae_stride * vae_stride, T_vace, H_vace, W_vace, 
+                                                        device=control_video_latent.device, dtype=control_video_latent.dtype)
                                 mask_64ch = mask_64ch.unsqueeze(0)  # [1, 64, T, H, W]
                                 
                                 prev_chunk_vace_control = {
-                                    "vace_frames": control_video_latent,  # [1, 32, T, H, W]
-                                    "vace_mask": mask_64ch,               # [1, 64, T, H, W]
-                                    "overlap_frames": overlap_frames_to_encode,  # How many frames
+                                    "vace_frames": control_video_latent,  # [1, 32, overlap_frames, H, W]
+                                    "vace_mask": mask_64ch,               # [1, 64, overlap_frames, H, W]
                                 }
                                 
                                 print(f"    ✓ VACE control prepared: {control_video_latent.shape}")
