@@ -2876,6 +2876,14 @@ class NV_VideoSampler:
             # This is needed to decode/re-encode overlap regions
             self._temp_vae = vae
             
+            # Extract start_image pixels for color matching (if available)
+            self._temp_start_image = None
+            if len(chunk_conditionings) > 0:
+                first_chunk = chunk_conditionings[0]
+                if "start_image_pixels" in first_chunk and first_chunk["start_image_pixels"] is not None:
+                    self._temp_start_image = first_chunk["start_image_pixels"]
+                    print(f"Start image available for color matching: {self._temp_start_image.shape}")
+            
             print(f"\n{'='*60}")
             print(f"CONTEXT WINDOW SAMPLING MODE")
             print(f"{'='*60}")
@@ -3170,54 +3178,30 @@ class NV_VideoSampler:
                 sample_time = time.time() - sample_start_time
                 print(f"  ✓ Sampling complete: {sample_time:.2f}s ({sample_time/steps:.3f}s/step)")
                 
-                # POST-GENERATION COLOR CORRECTION (match to previous chunk)
-                if chunk_idx > 0 and 'prev_chunk_samples' in locals() and chunk_overlap > 0:
-                    print(f"  Applying post-generation color correction...")
-                    
-                    # Calculate actual overlap frames
-                    overlap_for_correction = min(chunk_overlap, chunk_frames, prev_chunk_samples.shape[2])
-                    
-                    if overlap_for_correction > 0:
-                        # Get reference colors from END of previous chunk
-                        prev_overlap_region = prev_chunk_samples[:, :, -overlap_for_correction:, :, :]
-                        prev_mean = prev_overlap_region.mean().item()
-                        prev_std = prev_overlap_region.std().item()
+                # Decode chunk to pixels immediately for pixel-space processing
+                if vae is not None:
+                    try:
+                        print(f"  Decoding chunk to pixels...")
+                        chunk_pixels = vae.decode(chunk_samples)
                         
-                        # Get colors from START of current chunk
-                        curr_overlap_region = chunk_samples[:, :, :overlap_for_correction, :, :]
-                        curr_mean = curr_overlap_region.mean().item()
-                        curr_std = curr_overlap_region.std().item()
+                        # Handle shape
+                        if chunk_pixels.dim() == 5 and chunk_pixels.shape[0] == 1:
+                            chunk_pixels = chunk_pixels.squeeze(0)
                         
-                        print(f"    Prev chunk overlap: mean={prev_mean:.4f}, std={prev_std:.4f}")
-                        print(f"    Curr chunk overlap: mean={curr_mean:.4f}, std={curr_std:.4f}")
+                        # Store for pixel-space blending
+                        if not hasattr(self, '_chunk_pixels_list'):
+                            self._chunk_pixels_list = []
                         
-                        # Calculate correction (latent space: additive for mean, multiplicative for std)
-                        if abs(curr_mean) > 0.001 and curr_std > 0.001:
-                            # Brightness correction: SHIFT the mean (additive in latent space)
-                            brightness_shift = prev_mean - curr_mean
-                            
-                            # Contrast correction: SCALE the std (multiplicative)
-                            contrast_ratio = prev_std / curr_std
-                            
-                            print(f"    Correction: brightness shift={brightness_shift:+.4f}, contrast={contrast_ratio:.4f}x")
-                            
-                            # Apply color matching to entire current chunk
-                            # 1. First scale contrast around current mean
-                            chunk_mean = chunk_samples.mean()
-                            chunk_samples = (chunk_samples - chunk_mean) * contrast_ratio + chunk_mean
-                            
-                            # 2. Then shift brightness (additive)
-                            chunk_samples = chunk_samples + brightness_shift
-                            
-                            # 3. Clamp to prevent overflow
-                            chunk_samples = torch.clamp(chunk_samples, -10.0, 10.0)  # Latent space range
-                            
-                            corrected_mean = chunk_samples[:, :, :overlap_for_correction, :, :].mean().item()
-                            corrected_std = chunk_samples[:, :, :overlap_for_correction, :, :].std().item()
-                            print(f"    After correction: mean={corrected_mean:.4f}, std={corrected_std:.4f}")
-                            info_lines.append(f"  → Post-gen color correction: {brightness_shift:+.3f} shift, {contrast_ratio:.3f}x contrast")
-                        else:
-                            print(f"    Skipping correction (values too close to zero)")
+                        self._chunk_pixels_list.append({
+                            'pixels': chunk_pixels.cpu(),  # Move to CPU to save VRAM
+                            'chunk_idx': chunk_idx,
+                            'latent_start': chunk_start,
+                            'latent_end': chunk_end,
+                        })
+                        
+                        print(f"  ✓ Chunk decoded and stored: {chunk_pixels.shape}")
+                    except Exception as e:
+                        print(f"  ✗ Failed to decode chunk: {e}")
                 
                 # Create blend weights for this chunk
                 print(f"  Blending with mode: {blend_mode}")
@@ -3260,10 +3244,10 @@ class NV_VideoSampler:
                 prev_chunk_end = chunk_end
                 
                 # TIER 3: VACE Frame Extension with VAE cycle
-                # FULLY DISABLED: Even one VAE cycle causes fade-to-grey artifacts
-                # Tier 1 + Tier 2 + post-correction provides clean, self-correcting continuity
+                # RE-ENABLED: Provides visual reference for next chunk generation
+                # Pixel-space blending will fix VAE degradation at the end
                 prev_chunk_vace_control = None
-                if False:  # Disabled - post-correction handles color matching better
+                if chunk_idx < len(chunk_conditionings) - 1:  # Not the last chunk
                     try:
                         # Calculate overlap for NEXT chunk
                         # Extract from the END of the current chunk's RAW output
@@ -3329,6 +3313,112 @@ class NV_VideoSampler:
             # Normalize by weight sum
             print(f"Finalizing blend normalization...")
             samples = output_latent / (weight_sum + 1e-8)
+            
+            # PIXEL-SPACE COLOR MATCHING & OVERLAP BLENDING
+            # Use stored chunk pixels, color match, blend overlaps, re-encode
+            if vae is not None and hasattr(self, '_chunk_pixels_list') and hasattr(self, '_temp_start_image') and self._temp_start_image is not None:
+                print(f"\n{'='*60}")
+                print(f"PIXEL-SPACE OVERLAP BLENDING & COLOR MATCHING")
+                print(f"{'='*60}")
+                
+                try:
+                    chunk_pixels_list = self._chunk_pixels_list
+                    print(f"Processing {len(chunk_pixels_list)} decoded chunks...")
+                    
+                    # Build complete video dimensions
+                    first_chunk = chunk_pixels_list[0]
+                    total_latent_frames = latent.shape[2]
+                    H, W, C = first_chunk['pixels'].shape[1], first_chunk['pixels'].shape[2], first_chunk['pixels'].shape[3]
+                    
+                    # Initialize final blended video
+                    final_video = torch.zeros((total_latent_frames, H, W, C), dtype=first_chunk['pixels'].dtype)
+                    
+                    # Color match each chunk to start_image
+                    try:
+                        from color_matcher import ColorMatcher
+                        ref_np = self._temp_start_image.cpu().numpy().squeeze()
+                        cm = ColorMatcher()
+                        
+                        print(f"\n  Color matching & blending chunks...")
+                        
+                        for chunk_data in chunk_pixels_list:
+                            chunk_idx = chunk_data['chunk_idx']
+                            chunk_pixels_np = chunk_data['pixels'].numpy()  # [T, H, W, C]
+                            chunk_start = chunk_data['latent_start']
+                            chunk_end = chunk_data['latent_end']
+                            
+                            print(f"  Chunk {chunk_idx}: frames {chunk_start}-{chunk_end}")
+                            
+                            # Color match each frame
+                            matched_chunk = []
+                            for frame in chunk_pixels_np:
+                                try:
+                                    matched = cm.transfer(src=frame, ref=ref_np, method='mkl')
+                                    matched = frame + 0.7 * (matched - frame)  # 70% strength
+                                    matched_chunk.append(matched)
+                                except:
+                                    matched_chunk.append(frame)
+                            
+                            matched_chunk_np = np.stack(matched_chunk, axis=0)
+                            matched_chunk_tensor = torch.from_numpy(matched_chunk_np)
+                            
+                            # Blend into final video with linear crossfade in overlap regions
+                            for local_frame_idx in range(len(matched_chunk_tensor)):
+                                global_frame_idx = chunk_start + local_frame_idx
+                                
+                                # Calculate blend weight based on position in chunk
+                                if chunk_idx == 0:
+                                    # First chunk: fade out at end
+                                    if local_frame_idx >= len(matched_chunk_tensor) - chunk_overlap:
+                                        fade_pos = local_frame_idx - (len(matched_chunk_tensor) - chunk_overlap)
+                                        weight = 1.0 - (fade_pos / chunk_overlap)
+                                    else:
+                                        weight = 1.0
+                                elif chunk_idx == len(chunk_pixels_list) - 1:
+                                    # Last chunk: fade in at start
+                                    if local_frame_idx < chunk_overlap:
+                                        weight = local_frame_idx / chunk_overlap
+                                    else:
+                                        weight = 1.0
+                                else:
+                                    # Middle chunks: fade in at start, fade out at end
+                                    if local_frame_idx < chunk_overlap:
+                                        weight = local_frame_idx / chunk_overlap
+                                    elif local_frame_idx >= len(matched_chunk_tensor) - chunk_overlap:
+                                        fade_pos = local_frame_idx - (len(matched_chunk_tensor) - chunk_overlap)
+                                        weight = 1.0 - (fade_pos / chunk_overlap)
+                                    else:
+                                        weight = 1.0
+                                
+                                # Blend with existing content
+                                final_video[global_frame_idx] = final_video[global_frame_idx] * (1.0 - weight) + matched_chunk_tensor[local_frame_idx] * weight
+                            
+                            print(f"    ✓ Chunk {chunk_idx} blended")
+                        
+                        print(f"  ✓ All chunks color matched and blended")
+                        info_lines.append("  → Pixel-space color matching & overlap blending applied")
+                        
+                    except ImportError:
+                        print(f"  ⚠️  color-matcher not installed")
+                        print(f"      Install with: pip install color-matcher")
+                        # Fallback: just use first chunk's pixels
+                        final_video = chunk_pixels_list[0]['pixels']
+                    
+                    final_video = torch.clamp(final_video, 0.0, 1.0)
+                    
+                    # Re-encode to latents
+                    print(f"\n  Encoding blended pixels back to latents...")
+                    samples = vae.encode(final_video.to(vae.device)[:,:,:,:3])
+                    print(f"  ✓ Re-encoded shape: {samples.shape}")
+                    
+                    # Clean up stored pixels
+                    delattr(self, '_chunk_pixels_list')
+                    
+                except Exception as e:
+                    print(f"  ✗ Pixel-space processing failed: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    print(f"  Continuing with latent-space result...")
             
             total_time = time.time() - start_time
             print(f"\n{'='*60}")
@@ -3998,6 +4088,9 @@ class NV_ChunkConditioningPreprocessor:
                 print(f"    Mask shape: {start_image_mask.shape}")
                 print(f"    Mask range: [{start_image_mask.min():.2f}, {start_image_mask.max():.2f}]")
                 info_lines.append(f"  ✓ Start image encoded: {start_image_latent.shape}")
+                
+                # Store pixels for color matching in sampler
+                self._start_image_pixels = start_image_resized
             except Exception as e:
                 info_lines.append(f"  ✗ Failed to encode start image: {e}")
                 start_image_latent = None
@@ -4111,6 +4204,7 @@ class NV_ChunkConditioningPreprocessor:
                 "control_embeds": control_embeds if control_embeds else None,
                 "start_image_latent": start_image_latent,  # Tier 1: First frame reference
                 "start_image_mask": start_image_mask,
+                "start_image_pixels": getattr(self, '_start_image_pixels', None),  # For pixel-space color matching
                 "is_first": chunk.get("is_first", False),
                 "is_last": chunk.get("is_last", False),
             }
