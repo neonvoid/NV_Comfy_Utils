@@ -2989,8 +2989,12 @@ class NV_VideoSampler:
                 
                 # Inject Wan VACE controls into conditioning if present
                 chunk_control_embeds = chunk_cond.get("control_embeds")
+                vace_reference = chunk_cond.get("vace_reference")  # [1, 32, 1, H, W] if present
+                
                 if chunk_control_embeds and len(chunk_control_embeds) > 0:
                     print(f"  Injecting {len(chunk_control_embeds)} control(s)...")
+                    if vace_reference is not None:
+                        print(f"  VACE reference will be prepended to each control")
                     info_lines.append(f"  → Chunk has {len(chunk_control_embeds)} control(s)")
                     
                     # Combine all control embeds for this chunk
@@ -3021,26 +3025,45 @@ class NV_VideoSampler:
                             chunk_vace_mask[:, :, :actual_overlap, :, :] = 0.0
                             # Rest already has mask = 1.0 from original
                         
+                        # PREPEND VACE REFERENCE (if present)
+                        # Per WAN VACE guide: reference becomes frame 0, temporally prepended
+                        if vace_reference is not None:
+                            # Prepend reference to control frames [1, 32, 1, H, W] + [1, 32, T, H, W]
+                            chunk_vace_frames = torch.cat([vace_reference, chunk_vace_frames], dim=2)
+                            
+                            # Create zero mask for reference frame [1, 64, 1, H, W]
+                            zero_mask = torch.zeros((1, 64, 1, chunk_vace_mask.shape[3], chunk_vace_mask.shape[4]),
+                                                   device=chunk_vace_mask.device, dtype=chunk_vace_mask.dtype)
+                            chunk_vace_mask = torch.cat([zero_mask, chunk_vace_mask], dim=2)
+                        
                         all_vace_frames.append(chunk_vace_frames)
                         all_vace_masks.append(chunk_vace_mask)
                         all_vace_strengths.extend(ctrl_data["vace_strength"])
                         
-                        print(f"    • {ctrl_name}: weight={ctrl_data['vace_strength'][0]:.2f}, shape={chunk_vace_frames.shape}")
-                        info_lines.append(f"    • '{ctrl_name}': weight={ctrl_data['vace_strength'][0]:.2f}, slice=[{chunk_start}:{chunk_end}]")
+                        ref_info = " (with reference)" if vace_reference is not None else ""
+                        print(f"    • {ctrl_name}: weight={ctrl_data['vace_strength'][0]:.2f}, shape={chunk_vace_frames.shape}{ref_info}")
+                        info_lines.append(f"    • '{ctrl_name}': weight={ctrl_data['vace_strength'][0]:.2f}, slice=[{chunk_start}:{chunk_end}]{ref_info}")
                     
-                    # Inject into positive conditioning
+                    # Inject into both positive AND negative conditioning
                     # ComfyUI conditioning format: [[cond_tensor, {"key": value}], ...]
                     if isinstance(chunk_positive, list) and len(chunk_positive) > 0:
                         # Clone the conditioning to avoid modifying original
                         chunk_positive = [[c[0], c[1].copy()] for c in chunk_positive]
+                        chunk_negative = [[c[0], c[1].copy()] for c in chunk_negative]
                         
-                        # Add Wan VACE keys to the first conditioning entry
+                        # Add Wan VACE keys to the first conditioning entry (both positive and negative)
                         chunk_positive[0][1]["vace_frames"] = all_vace_frames
                         chunk_positive[0][1]["vace_mask"] = all_vace_masks
                         chunk_positive[0][1]["vace_strength"] = all_vace_strengths
                         
+                        chunk_negative[0][1]["vace_frames"] = all_vace_frames
+                        chunk_negative[0][1]["vace_mask"] = all_vace_masks
+                        chunk_negative[0][1]["vace_strength"] = all_vace_strengths
+                        
                         print(f"    ✓ Controls injected into conditioning")
                         info_lines.append(f"    ✓ VACE controls injected: {len(all_vace_frames)} control(s)")
+                        if vace_reference is not None:
+                            info_lines.append(f"    ✓ VACE reference prepended (global style anchor)")
                         
                         # Log Tier 3 replacement if it happened
                         if prev_chunk_vace_control is not None and chunk_idx > 0:
@@ -3048,46 +3071,8 @@ class NV_VideoSampler:
                             print(f"    ✓ Tier 3: Replaced first {overlap_count} frames with prev chunk (mask=0)")
                             info_lines.append(f"  → Tier 3: Frame extension applied ({overlap_count} frames)")
                 
-                # TIER 1: Apply start_image (first frame reference) to FIRST CHUNK ONLY
-                # Subsequent chunks use Tier 2 (overlap) for temporal continuity
-                start_image_latent_chunk = chunk_cond.get("start_image_latent")
-                start_image_mask_chunk = chunk_cond.get("start_image_mask")
-                if chunk_idx == 0 and start_image_latent_chunk is not None and start_image_mask_chunk is not None:
-                    # Use the FIRST ENCODED FRAME for all chunks (don't slice!)
-                    # The preprocessor encodes: [start_image, gray, gray, gray...]
-                    # We want ALL chunks to reference the same start_image (frame 0)
-                    first_frame_latent = start_image_latent_chunk[:, :, 0:1, :, :]  # [B, C, 1, H, W]
-                    
-                    # Repeat/tile to match chunk size
-                    chunk_frames = chunk_end - chunk_start
-                    concat_start = first_frame_latent.repeat(1, 1, chunk_frames, 1, 1)  # [B, C, T, H, W]
-                    
-                    # Create mask for I2V concat_latent_image:
-                    # Testing inverted convention: 0 = KEEP reference, 1 = GENERATE new
-                    B, C, _, H, W = concat_start.shape
-                    mask_start = torch.ones((B, 1, chunk_frames, H, W), 
-                                            device=concat_start.device, dtype=concat_start.dtype)
-                    mask_start[:, :, 0:1, :, :] = 0.0  # KEEP first frame (reference) - 0 means USE concat_latent
-                    
-                    print(f"  Tier 1: Applying first frame reference")
-                    print(f"    concat_start shape: {concat_start.shape}")
-                    print(f"    mask_start shape: {mask_start.shape}")
-                    print(f"    mask values: min={mask_start.min():.2f}, max={mask_start.max():.2f}")
-                    print(f"    first_frame_latent stats: mean={first_frame_latent.mean():.4f}, std={first_frame_latent.std():.4f}")
-                    print(f"    Mask convention: 0 = KEEP (use concat_latent), 1 = GENERATE")
-                    info_lines.append(f"  → First frame reference applied")
-                    
-                    # Inject into both positive and negative conditioning
-                    chunk_positive = [[c[0], c[1].copy()] for c in chunk_positive]
-                    chunk_negative = [[c[0], c[1].copy()] for c in chunk_negative]
-                    
-                    chunk_positive[0][1]["concat_latent_image"] = concat_start
-                    chunk_positive[0][1]["concat_mask"] = mask_start
-                    chunk_negative[0][1]["concat_latent_image"] = concat_start
-                    chunk_negative[0][1]["concat_mask"] = mask_start
-                    
-                    print(f"    ✓ Injected into conditioning keys: {list(chunk_positive[0][1].keys())}")
-                
+                # REMOVED: Tier 1 I2V conditioning (concat_latent_image)
+                # Now using VACE reference_image instead (prepended to control videos below)
                 # TIER 2: Apply previous chunk overlap (temporal continuity) for chunks 2+
                 if chunk_idx > 0 and 'prev_chunk_samples' in locals():
                     # Calculate overlap region
@@ -3419,14 +3404,39 @@ class NV_VideoSampler:
                         
                         print(f"  ✓ All chunks color matched and blended")
                         
-                        # GUARANTEE first frame matches start_image exactly
-                        if self._temp_start_image is not None:
-                            print(f"\n  Enforcing exact first frame match...")
-                            final_video[0] = self._temp_start_image.squeeze(0)
-                            print(f"    ✓ First frame replaced with original start_image")
+                        # POST-BLEND COLOR CORRECTION for transition regions
+                        # Blending can create darker/lighter averages, so re-match transition zones
+                        print(f"\n  Applying post-blend color correction to transitions...")
+                        try:
+                            for chunk_idx in range(1, len(chunk_pixels_list)):
+                                # Get the overlap region for this transition
+                                chunk_info = chunk_conditionings[chunk_idx]
+                                chunk_video_start = chunk_info["start_frame"]
+                                
+                                # Transition region: video_overlap frames starting at chunk_video_start
+                                if video_overlap > 0:
+                                    transition_start = chunk_video_start
+                                    transition_end = min(chunk_video_start + video_overlap, total_video_frames)
+                                    
+                                    print(f"    Chunk {chunk_idx} transition: frames {transition_start}-{transition_end}")
+                                    
+                                    # Color match each frame in the transition
+                                    for frame_idx in range(transition_start, transition_end):
+                                        try:
+                                            frame_np = final_video[frame_idx].numpy()
+                                            matched = cm.transfer(src=frame_np, ref=ref_np, method='mkl')
+                                            # Apply at reduced strength (50%) to preserve temporal coherence
+                                            matched = frame_np + 0.5 * (matched - frame_np)
+                                            final_video[frame_idx] = torch.from_numpy(matched)
+                                        except:
+                                            pass  # Skip if color matching fails
+                            
+                            print(f"    ✓ Post-blend color correction applied to {len(chunk_pixels_list)-1} transitions")
+                        except Exception as e:
+                            print(f"    ⚠️  Post-blend correction failed: {e}")
                         
                         info_lines.append("  → Pixel-space color matching & overlap blending applied")
-                        info_lines.append("  → First frame exactly matches start_image")
+                        info_lines.append("  → Post-blend color correction applied to transitions")
                         
                     except ImportError:
                         print(f"  ⚠️  color-matcher not installed")
@@ -4075,17 +4085,15 @@ class NV_ChunkConditioningPreprocessor:
             info_lines.append("⚠️ Control videos will NOT be encoded. Falling back to disabled.")
             control_mode = "disabled"
         
-        # Encode start_image ONCE (Tier 1: First Frame Reference)
-        # This provides global character/scene consistency across ALL chunks
-        start_image_latent = None
-        start_image_mask = None
-        if start_image is not None and vae is not None:
-            info_lines.append("Encoding start image (first frame reference)...")
+        # Encode start_image as VACE reference (NOT I2V concat_latent)
+        # Per WAN VACE guide: reference_image is prepended to control videos as frame 0
+        vace_reference_latent = None
+        if start_image is not None and vae is not None and control_mode == "wan_vace":
+            info_lines.append("Encoding start image as VACE reference...")
             try:
                 # Resize to match video dimensions
                 video_width = metadata.get("width", 832)
                 video_height = metadata.get("height", 480)
-                total_frames = metadata.get("total_frames", 81)
                 
                 # Take first frame if multiple frames provided
                 if start_image.shape[0] > 1:
@@ -4098,36 +4106,24 @@ class NV_ChunkConditioningPreprocessor:
                     "bilinear", "center"
                 ).movedim(1, -1)
                 
-                # Create full video with start image at beginning, rest filled with gray
-                full_start_video = torch.ones((total_frames, video_height, video_width, 3), 
-                                               device=start_image.device, dtype=start_image.dtype) * 0.5
-                full_start_video[0:1] = start_image_resized
+                # Encode single frame with VAE → 16 channels
+                reference_encoded = vae.encode(start_image_resized[:, :, :, :3])  # [1, 16, 1, H, W]
                 
-                # Encode with VAE
-                start_image_latent = vae.encode(full_start_video[:, :, :, :3])
+                # Pad with zeros to make 32 channels (no reactive stream for reference)
+                # Per guide: reference = [16ch VAE, 16ch ZEROS]
+                zeros_padding = torch.zeros_like(reference_encoded)
+                vace_reference_latent = torch.cat([reference_encoded, zeros_padding], dim=1)  # [1, 32, 1, H, W]
                 
-                # Create mask: 0 for first frame (keep), 1 for rest (generate)
-                latent_T = start_image_latent.shape[2]
-                latent_H = start_image_latent.shape[3]
-                latent_W = start_image_latent.shape[4]
-                start_image_mask = torch.ones((1, 1, latent_T, latent_H, latent_W), 
-                                               device=start_image.device, dtype=start_image.dtype)
-                start_image_mask[:, :, 0:1] = 0.0  # Keep first frame
-                
-                print(f"  ✓ Start image encoded: {start_image_latent.shape}")
-                print(f"    Mask shape: {start_image_mask.shape}")
-                print(f"    Mask range: [{start_image_mask.min():.2f}, {start_image_mask.max():.2f}]")
+                print(f"  ✓ VACE reference encoded: {vace_reference_latent.shape}")
+                print(f"    Structure: 16ch VAE + 16ch zeros")
                 print(f"    Pixels stored for color matching: {start_image_resized.shape}")
-                info_lines.append(f"  ✓ Start image encoded: {start_image_latent.shape}")
-                info_lines.append(f"  ✓ Start image pixels stored for color matching")
+                info_lines.append(f"  ✓ Start image encoded as VACE reference: {vace_reference_latent.shape}")
                 
                 # Store pixels for color matching in sampler
-                # (Will be passed through chunk_conditionings)
                 self._start_image_pixels = start_image_resized
             except Exception as e:
-                info_lines.append(f"  ✗ Failed to encode start image: {e}")
-                start_image_latent = None
-                start_image_mask = None
+                info_lines.append(f"  ✗ Failed to encode VACE reference: {e}")
+                vace_reference_latent = None
         
         # Encode FULL control videos ONCE (not per-chunk)
         # This matches how the main latent works and avoids temporal interpolation
@@ -4235,8 +4231,7 @@ class NV_ChunkConditioningPreprocessor:
                 "positive": positive_cond,
                 "negative": negative_cond,
                 "control_embeds": control_embeds if control_embeds else None,
-                "start_image_latent": start_image_latent,  # Tier 1: First frame reference
-                "start_image_mask": start_image_mask,
+                "vace_reference": vace_reference_latent,  # VACE reference (global anchor)
                 "start_image_pixels": getattr(self, '_start_image_pixels', None),  # For pixel-space color matching
                 "is_first": chunk.get("is_first", False),
                 "is_last": chunk.get("is_last", False),
