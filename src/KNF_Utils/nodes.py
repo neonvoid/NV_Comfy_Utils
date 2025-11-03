@@ -3365,56 +3365,44 @@ class NV_VideoSampler:
                     # Initialize final blended video (in PIXEL space, not latent space!)
                     final_video = torch.zeros((total_video_frames, H, W, C), dtype=first_chunk['pixels'].dtype)
                     
-                    # Color match each chunk to start_image
+                    # Blend chunks first, then apply color matching to final result
                     try:
                         from color_matcher import ColorMatcher
-                        ref_np = self._temp_start_image.cpu().numpy().squeeze()
-                        cm = ColorMatcher()
-                        
-                        print(f"\n  Color matching & blending chunks...")
-                        
+
+                        print(f"\n  Blending chunks...")
+
                         # Calculate video-space overlap (latent overlap * 4)
                         video_overlap = chunk_overlap * 4 if chunk_overlap > 0 else 0
                         print(f"  Video-space overlap: {video_overlap} frames")
-                        
+
                         for chunk_data in chunk_pixels_list:
                             chunk_idx = chunk_data['chunk_idx']
-                            chunk_pixels_np = chunk_data['pixels'].numpy()  # [T_video, H, W, C]
-                            
+                            chunk_pixels = chunk_data['pixels']  # Keep as tensor
+
                             # Get VIDEO frame range from chunk_conditionings
                             chunk_info = chunk_conditionings[chunk_idx]
                             chunk_video_start = chunk_info["start_frame"]
                             chunk_video_end = chunk_info["end_frame"]
-                            
-                            print(f"  Chunk {chunk_idx}: video frames {chunk_video_start}-{chunk_video_end} ({len(chunk_pixels_np)} pixels)")
-                            
-                            # Color match each frame
-                            matched_chunk = []
-                            for frame in chunk_pixels_np:
-                                try:
-                                    matched = cm.transfer(src=frame, ref=ref_np, method='mkl')
-                                    matched = frame + 0.7 * (matched - frame)  # 70% strength
-                                    matched_chunk.append(matched)
-                                except:
-                                    matched_chunk.append(frame)
-                            
-                            matched_chunk_np = np.stack(matched_chunk, axis=0)
-                            matched_chunk_tensor = torch.from_numpy(matched_chunk_np)
-                            
+
+                            print(f"  Chunk {chunk_idx}: video frames {chunk_video_start}-{chunk_video_end} ({len(chunk_pixels)} pixels)")
+
+                            # Store raw decoded pixels without color matching
+                            chunk_tensor = chunk_pixels
+
                             # Blend into final video with linear crossfade in overlap regions
                             # Only process frames within the valid global range
-                            for local_frame_idx in range(len(matched_chunk_tensor)):
+                            for local_frame_idx in range(len(chunk_tensor)):
                                 global_frame_idx = chunk_video_start + local_frame_idx
-                                
+
                                 # Skip if this frame is out of bounds
                                 if global_frame_idx >= total_video_frames:
                                     break
-                                
+
                                 # Calculate blend weight based on position in chunk
                                 if chunk_idx == 0:
                                     # First chunk: fade out at end
-                                    if video_overlap > 0 and local_frame_idx >= len(matched_chunk_tensor) - video_overlap:
-                                        fade_pos = local_frame_idx - (len(matched_chunk_tensor) - video_overlap)
+                                    if video_overlap > 0 and local_frame_idx >= len(chunk_tensor) - video_overlap:
+                                        fade_pos = local_frame_idx - (len(chunk_tensor) - video_overlap)
                                         weight = 1.0 - (fade_pos / video_overlap)
                                     else:
                                         weight = 1.0
@@ -3428,52 +3416,48 @@ class NV_VideoSampler:
                                     # Middle chunks: fade in at start, fade out at end
                                     if video_overlap > 0 and local_frame_idx < video_overlap:
                                         weight = local_frame_idx / video_overlap
-                                    elif video_overlap > 0 and local_frame_idx >= len(matched_chunk_tensor) - video_overlap:
-                                        fade_pos = local_frame_idx - (len(matched_chunk_tensor) - video_overlap)
+                                    elif video_overlap > 0 and local_frame_idx >= len(chunk_tensor) - video_overlap:
+                                        fade_pos = local_frame_idx - (len(chunk_tensor) - video_overlap)
                                         weight = 1.0 - (fade_pos / video_overlap)
                                     else:
                                         weight = 1.0
-                                
+
                                 # Blend with existing content
-                                final_video[global_frame_idx] = final_video[global_frame_idx] * (1.0 - weight) + matched_chunk_tensor[local_frame_idx] * weight
+                                final_video[global_frame_idx] = final_video[global_frame_idx] * (1.0 - weight) + chunk_tensor[local_frame_idx] * weight
                             
                             print(f"    ✓ Chunk {chunk_idx} blended")
-                        
-                        print(f"  ✓ All chunks color matched and blended")
-                        
-                        # POST-BLEND COLOR CORRECTION for transition regions
-                        # Blending can create darker/lighter averages, so re-match transition zones
-                        print(f"\n  Applying post-blend color correction to transitions...")
+
+                        print(f"  ✓ All chunks blended")
+
+                        # SINGLE-PASS COLOR MATCHING after blending
+                        # This ensures uniform color matching strength across ALL frames (including transitions)
+                        print(f"\n  Applying color matching to final video...")
                         try:
-                            for chunk_idx in range(1, len(chunk_pixels_list)):
-                                # Get the overlap region for this transition
-                                chunk_info = chunk_conditionings[chunk_idx]
-                                chunk_video_start = chunk_info["start_frame"]
-                                
-                                # Transition region: video_overlap frames starting at chunk_video_start
-                                if video_overlap > 0:
-                                    transition_start = chunk_video_start
-                                    transition_end = min(chunk_video_start + video_overlap, total_video_frames)
-                                    
-                                    print(f"    Chunk {chunk_idx} transition: frames {transition_start}-{transition_end}")
-                                    
-                                    # Color match each frame in the transition
-                                    for frame_idx in range(transition_start, transition_end):
-                                        try:
-                                            frame_np = final_video[frame_idx].numpy()
-                                            matched = cm.transfer(src=frame_np, ref=ref_np, method='mkl')
-                                            # Apply at reduced strength (50%) to preserve temporal coherence
-                                            matched = frame_np + 0.5 * (matched - frame_np)
-                                            final_video[frame_idx] = torch.from_numpy(matched)
-                                        except:
-                                            pass  # Skip if color matching fails
-                            
-                            print(f"    ✓ Post-blend color correction applied to {len(chunk_pixels_list)-1} transitions")
+                            ref_np = self._temp_start_image.cpu().numpy().squeeze()
+                            cm = ColorMatcher()
+
+                            # Color match each frame in the final blended video
+                            matched_frames = []
+                            for frame_idx in range(len(final_video)):
+                                try:
+                                    frame_np = final_video[frame_idx].numpy()
+                                    matched = cm.transfer(src=frame_np, ref=ref_np, method='mkl')
+                                    # Apply at 70% strength for consistent look
+                                    matched = frame_np + 0.7 * (matched - frame_np)
+                                    matched_frames.append(torch.from_numpy(matched))
+                                except Exception as e:
+                                    # Fallback: use original frame
+                                    matched_frames.append(final_video[frame_idx])
+
+                            final_video = torch.stack(matched_frames, dim=0)
+                            print(f"  ✓ Color matching applied to {len(final_video)} frames")
+
                         except Exception as e:
-                            print(f"    ⚠️  Post-blend correction failed: {e}")
-                        
-                        info_lines.append("  → Pixel-space color matching & overlap blending applied")
-                        info_lines.append("  → Post-blend color correction applied to transitions")
+                            print(f"  ⚠️  Color matching failed: {e}")
+                            print(f"      Continuing with raw blended video...")
+
+                        info_lines.append("  → Pixel-space overlap blending applied")
+                        info_lines.append("  → Single-pass color matching applied to final video (70% strength)")
                         
                     except ImportError:
                         print(f"  ⚠️  color-matcher not installed")
@@ -4242,7 +4226,12 @@ class NV_ChunkConditioningPreprocessor:
                     # Skip if this control is disabled for this chunk
                     if not ctrl_settings.get("enabled", True):
                         continue
-                    
+
+                    # Skip controls with weight=0 (no effect)
+                    weight = ctrl_settings.get("weight", 1.0)
+                    if weight == 0.0:
+                        continue
+
                     # Get full control latent
                     if ctrl_name not in full_control_latents:
                         info_lines.append(f"  ⚠️ Control '{ctrl_name}' not found in encoded controls")
