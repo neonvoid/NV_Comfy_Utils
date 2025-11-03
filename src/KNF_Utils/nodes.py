@@ -3204,7 +3204,18 @@ class NV_VideoSampler:
                     chunk_samples = chunk_samples[:, :, trim_reference_frame:, :, :]  # Remove first frame
                     print(f"    After trim: {chunk_samples.shape}")
                     info_lines.append(f"  → Reference frame trimmed from output")
-                
+
+                # TIER 3 EXTENSION FRAME TRIMMING: Use extension frames for conditioning only
+                # For chunks 2+, skip the first N overlap frames (these are degraded from decode+encode)
+                # Only use clean frames in final output
+                if chunk_idx > 0 and chunk_overlap > 0:
+                    overlap_frames_latent = min(chunk_overlap, chunk_samples.shape[2])
+                    print(f"  Trimming {overlap_frames_latent} extension frames from output (used for conditioning only)...")
+                    print(f"    Before trim: {chunk_samples.shape}")
+                    chunk_samples = chunk_samples[:, :, overlap_frames_latent:, :, :]
+                    print(f"    After trim: {chunk_samples.shape}")
+                    info_lines.append(f"  → {overlap_frames_latent} extension frames trimmed (conditioning only)")
+
                 # Decode chunk to pixels immediately for pixel-space processing
                 if vae is not None:
                     try:
@@ -3390,12 +3401,12 @@ class NV_VideoSampler:
                     
                     # Build complete video dimensions
                     first_chunk = chunk_pixels_list[0]
-                    # Get total VIDEO frames from chunk metadata
-                    last_chunk = chunk_conditionings[-1]
-                    total_video_frames = last_chunk["end_frame"]
                     H, W, C = first_chunk['pixels'].shape[1], first_chunk['pixels'].shape[2], first_chunk['pixels'].shape[3]
-                    
-                    print(f"  Total video frames: {total_video_frames}")
+
+                    # Calculate total frames from actual decoded chunks (accounts for trimming)
+                    total_video_frames = sum(c['pixels'].shape[0] for c in chunk_pixels_list)
+
+                    print(f"  Total video frames: {total_video_frames} (calculated from trimmed chunks)")
                     print(f"  Video dimensions: {H}x{W}x{C}")
                     
                     # Initialize final blended video (in PIXEL space, not latent space!)
@@ -3407,63 +3418,26 @@ class NV_VideoSampler:
 
                         print(f"\n  Blending chunks...")
 
-                        # Calculate video-space overlap (latent overlap * 4)
-                        video_overlap = chunk_overlap * 4 if chunk_overlap > 0 else 0
-                        print(f"  Video-space overlap: {video_overlap} frames")
+                        # SIMPLE CONCATENATION (No blending needed - extension frames already trimmed)
+                        # Since extension frames are trimmed from chunks 2+, we can directly concatenate
+                        print(f"  Note: Extension frames trimmed from chunks 2+, using direct concatenation")
 
+                        current_position = 0
                         for chunk_data in chunk_pixels_list:
                             chunk_idx = chunk_data['chunk_idx']
-                            chunk_pixels = chunk_data['pixels']  # Keep as tensor
+                            chunk_pixels = chunk_data['pixels']  # Already trimmed if chunk_idx > 0
 
-                            # Get VIDEO frame range from chunk_conditionings
-                            chunk_info = chunk_conditionings[chunk_idx]
-                            chunk_video_start = chunk_info["start_frame"]
-                            chunk_video_end = chunk_info["end_frame"]
+                            num_frames = len(chunk_pixels)
+                            print(f"  Chunk {chunk_idx}: placing {num_frames} frames at position {current_position}-{current_position + num_frames - 1}")
 
-                            print(f"  Chunk {chunk_idx}: video frames {chunk_video_start}-{chunk_video_end} ({len(chunk_pixels)} pixels)")
+                            # Direct placement (no blending)
+                            final_video[current_position:current_position + num_frames] = chunk_pixels
 
-                            # Store raw decoded pixels without color matching
-                            chunk_tensor = chunk_pixels
+                            current_position += num_frames
 
-                            # Blend into final video with linear crossfade in overlap regions
-                            # Only process frames within the valid global range
-                            for local_frame_idx in range(len(chunk_tensor)):
-                                global_frame_idx = chunk_video_start + local_frame_idx
+                            print(f"    ✓ Chunk {chunk_idx} placed")
 
-                                # Skip if this frame is out of bounds
-                                if global_frame_idx >= total_video_frames:
-                                    break
-
-                                # Calculate blend weight based on position in chunk
-                                if chunk_idx == 0:
-                                    # First chunk: fade out at end
-                                    if video_overlap > 0 and local_frame_idx >= len(chunk_tensor) - video_overlap:
-                                        fade_pos = local_frame_idx - (len(chunk_tensor) - video_overlap)
-                                        weight = 1.0 - (fade_pos / video_overlap)
-                                    else:
-                                        weight = 1.0
-                                elif chunk_idx == len(chunk_pixels_list) - 1:
-                                    # Last chunk: fade in at start
-                                    if video_overlap > 0 and local_frame_idx < video_overlap:
-                                        weight = local_frame_idx / video_overlap
-                                    else:
-                                        weight = 1.0
-                                else:
-                                    # Middle chunks: fade in at start, fade out at end
-                                    if video_overlap > 0 and local_frame_idx < video_overlap:
-                                        weight = local_frame_idx / video_overlap
-                                    elif video_overlap > 0 and local_frame_idx >= len(chunk_tensor) - video_overlap:
-                                        fade_pos = local_frame_idx - (len(chunk_tensor) - video_overlap)
-                                        weight = 1.0 - (fade_pos / video_overlap)
-                                    else:
-                                        weight = 1.0
-
-                                # Blend with existing content
-                                final_video[global_frame_idx] = final_video[global_frame_idx] * (1.0 - weight) + chunk_tensor[local_frame_idx] * weight
-                            
-                            print(f"    ✓ Chunk {chunk_idx} blended")
-
-                        print(f"  ✓ All chunks blended")
+                        print(f"  ✓ All {len(chunk_pixels_list)} chunks concatenated ({current_position} total frames)")
 
                         # SINGLE-PASS COLOR MATCHING after blending
                         # This ensures uniform color matching strength across ALL frames (including transitions)
