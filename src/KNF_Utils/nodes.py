@@ -3330,11 +3330,16 @@ class NV_VideoSampler:
                     
                     # Build complete video dimensions
                     first_chunk = chunk_pixels_list[0]
-                    total_latent_frames = latent.shape[2]
+                    # Get total VIDEO frames from chunk metadata
+                    last_chunk = chunk_conditionings[-1]
+                    total_video_frames = last_chunk["end_frame"]
                     H, W, C = first_chunk['pixels'].shape[1], first_chunk['pixels'].shape[2], first_chunk['pixels'].shape[3]
                     
-                    # Initialize final blended video
-                    final_video = torch.zeros((total_latent_frames, H, W, C), dtype=first_chunk['pixels'].dtype)
+                    print(f"  Total video frames: {total_video_frames}")
+                    print(f"  Video dimensions: {H}x{W}x{C}")
+                    
+                    # Initialize final blended video (in PIXEL space, not latent space!)
+                    final_video = torch.zeros((total_video_frames, H, W, C), dtype=first_chunk['pixels'].dtype)
                     
                     # Color match each chunk to start_image
                     try:
@@ -3344,13 +3349,20 @@ class NV_VideoSampler:
                         
                         print(f"\n  Color matching & blending chunks...")
                         
+                        # Calculate video-space overlap (latent overlap * 4)
+                        video_overlap = chunk_overlap * 4 if chunk_overlap > 0 else 0
+                        print(f"  Video-space overlap: {video_overlap} frames")
+                        
                         for chunk_data in chunk_pixels_list:
                             chunk_idx = chunk_data['chunk_idx']
-                            chunk_pixels_np = chunk_data['pixels'].numpy()  # [T, H, W, C]
-                            chunk_start = chunk_data['latent_start']
-                            chunk_end = chunk_data['latent_end']
+                            chunk_pixels_np = chunk_data['pixels'].numpy()  # [T_video, H, W, C]
                             
-                            print(f"  Chunk {chunk_idx}: frames {chunk_start}-{chunk_end}")
+                            # Get VIDEO frame range from chunk_conditionings
+                            chunk_info = chunk_conditionings[chunk_idx]
+                            chunk_video_start = chunk_info["start_frame"]
+                            chunk_video_end = chunk_info["end_frame"]
+                            
+                            print(f"  Chunk {chunk_idx}: video frames {chunk_video_start}-{chunk_video_end} ({len(chunk_pixels_np)} pixels)")
                             
                             # Color match each frame
                             matched_chunk = []
@@ -3367,29 +3379,29 @@ class NV_VideoSampler:
                             
                             # Blend into final video with linear crossfade in overlap regions
                             for local_frame_idx in range(len(matched_chunk_tensor)):
-                                global_frame_idx = chunk_start + local_frame_idx
+                                global_frame_idx = chunk_video_start + local_frame_idx
                                 
                                 # Calculate blend weight based on position in chunk
                                 if chunk_idx == 0:
                                     # First chunk: fade out at end
-                                    if local_frame_idx >= len(matched_chunk_tensor) - chunk_overlap:
-                                        fade_pos = local_frame_idx - (len(matched_chunk_tensor) - chunk_overlap)
-                                        weight = 1.0 - (fade_pos / chunk_overlap)
+                                    if video_overlap > 0 and local_frame_idx >= len(matched_chunk_tensor) - video_overlap:
+                                        fade_pos = local_frame_idx - (len(matched_chunk_tensor) - video_overlap)
+                                        weight = 1.0 - (fade_pos / video_overlap)
                                     else:
                                         weight = 1.0
                                 elif chunk_idx == len(chunk_pixels_list) - 1:
                                     # Last chunk: fade in at start
-                                    if local_frame_idx < chunk_overlap:
-                                        weight = local_frame_idx / chunk_overlap
+                                    if video_overlap > 0 and local_frame_idx < video_overlap:
+                                        weight = local_frame_idx / video_overlap
                                     else:
                                         weight = 1.0
                                 else:
                                     # Middle chunks: fade in at start, fade out at end
-                                    if local_frame_idx < chunk_overlap:
-                                        weight = local_frame_idx / chunk_overlap
-                                    elif local_frame_idx >= len(matched_chunk_tensor) - chunk_overlap:
-                                        fade_pos = local_frame_idx - (len(matched_chunk_tensor) - chunk_overlap)
-                                        weight = 1.0 - (fade_pos / chunk_overlap)
+                                    if video_overlap > 0 and local_frame_idx < video_overlap:
+                                        weight = local_frame_idx / video_overlap
+                                    elif video_overlap > 0 and local_frame_idx >= len(matched_chunk_tensor) - video_overlap:
+                                        fade_pos = local_frame_idx - (len(matched_chunk_tensor) - video_overlap)
+                                        weight = 1.0 - (fade_pos / video_overlap)
                                     else:
                                         weight = 1.0
                                 
