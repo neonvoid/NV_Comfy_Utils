@@ -3260,10 +3260,10 @@ class NV_VideoSampler:
                 prev_chunk_end = chunk_end
                 
                 # TIER 3: VACE Frame Extension with VAE cycle
-                # ENABLED ONLY FOR FIRST TRANSITION: Provides character consistency for chunk 0→1
-                # Subsequent chunks use Tier 2 only to avoid cumulative VAE degradation
+                # FULLY DISABLED: Even one VAE cycle causes fade-to-grey artifacts
+                # Tier 1 + Tier 2 + post-correction provides clean, self-correcting continuity
                 prev_chunk_vace_control = None
-                if chunk_idx == 0 and chunk_idx < len(chunk_conditionings) - 1:  # Only chunk 0 → chunk 1
+                if False:  # Disabled - post-correction handles color matching better
                     try:
                         # Calculate overlap for NEXT chunk
                         # Extract from the END of the current chunk's RAW output
