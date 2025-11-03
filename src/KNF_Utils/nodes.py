@@ -3222,7 +3222,7 @@ class NV_VideoSampler:
                         
                         if overlap_frames_to_encode > 0 and hasattr(self, '_temp_vae') and self._temp_vae is not None:
                             print(f"  Tier 3: Preparing VACE extension for next chunk...")
-                            print(f"    Decoding {overlap_frames_to_encode} overlap frames with VAE correction...")
+                            print(f"    Measuring VAE degradation with test cycle...")
                             
                             # Extract overlap latent from END of RAW chunk output [1, 16, T, H, W]
                             overlap_latent = prev_chunk_samples[:, :, -overlap_frames_to_encode:, :, :]
@@ -3238,32 +3238,52 @@ class NV_VideoSampler:
                             else:
                                 raise ValueError(f"Unexpected decoded pixel shape: {overlap_pixels.shape}")
                             
-                            # Track original statistics for correction
-                            original_mean = overlap_pixels.mean().item()
-                            original_std = overlap_pixels.std().item()
+                            # === PROCEDURAL VAE DEGRADATION MEASUREMENT (VAE LUT approach) ===
+                            # Test encode→decode cycle to measure actual degradation
+                            mean_before_cycle = float(overlap_pixels.mean())
+                            std_before_cycle = float(overlap_pixels.std())
                             
-                            # Apply pre-emptive correction to compensate for VAE degradation
-                            # Based on VAE_Correction_Applier logic: typical 1-cycle degradation
-                            # Brightness: ~0.98x (loses 2%), so boost by 1.02x pre-emptively
-                            # Contrast: ~0.97x (loses 3%), so boost by 1.03x pre-emptively
-                            brightness_boost = 1.02
-                            contrast_boost = 1.03
-                            shadow_lift = 0.005  # Small additive boost for shadows
+                            # Test cycle: encode then decode to measure degradation
+                            test_latent = self._temp_vae.encode(overlap_pixels[:,:,:,:3])
+                            test_decoded = self._temp_vae.decode(test_latent)
                             
-                            corrected_pixels = overlap_pixels.clone()
-                            corrected_pixels = corrected_pixels * brightness_boost
-                            mean = corrected_pixels.mean()
-                            corrected_pixels = (corrected_pixels - mean) * contrast_boost + mean
-                            corrected_pixels = corrected_pixels + shadow_lift
-                            corrected_pixels = torch.clamp(corrected_pixels, 0.0, 1.0)
+                            # Handle shape
+                            if test_decoded.dim() == 5 and test_decoded.shape[0] == 1:
+                                test_decoded = test_decoded.squeeze(0)
                             
-                            corrected_mean = corrected_pixels.mean().item()
-                            print(f"    Pre-correction: mean={original_mean:.4f}, std={original_std:.4f}")
-                            print(f"    Post-correction: mean={corrected_mean:.4f} (boost: {corrected_mean/original_mean:.4f}x)")
+                            test_decoded = torch.clamp(test_decoded, 0.0, 1.0)
+                            mean_after_cycle = float(test_decoded.mean())
+                            std_after_cycle = float(test_decoded.std())
+                            
+                            # Calculate degradation ratios
+                            brightness_degradation = mean_after_cycle / mean_before_cycle if mean_before_cycle > 0 else 1.0
+                            contrast_degradation = std_after_cycle / std_before_cycle if std_before_cycle > 0 else 1.0
+                            
+                            print(f"    Measured degradation: brightness={brightness_degradation:.4f}x, contrast={contrast_degradation:.4f}x")
+                            print(f"    Before: mean={mean_before_cycle:.4f}, std={std_before_cycle:.4f}")
+                            print(f"    After:  mean={mean_after_cycle:.4f}, std={std_after_cycle:.4f}")
+                            
+                            # Apply inverse correction to compensate for measured degradation
+                            if brightness_degradation < 0.999:  # Only correct if there's actual degradation
+                                brightness_correction = 1.0 / brightness_degradation
+                                overlap_pixels = overlap_pixels * brightness_correction
+                                print(f"    Applied brightness correction: {brightness_correction:.4f}x")
+                            
+                            if contrast_degradation < 0.999:  # Only correct if there's actual degradation
+                                contrast_correction = 1.0 / contrast_degradation
+                                mean = overlap_pixels.mean()
+                                overlap_pixels = (overlap_pixels - mean) * contrast_correction + mean
+                                print(f"    Applied contrast correction: {contrast_correction:.4f}x")
+                            
+                            overlap_pixels = torch.clamp(overlap_pixels, 0.0, 1.0)
+                            
+                            final_mean = float(overlap_pixels.mean())
+                            final_std = float(overlap_pixels.std())
+                            print(f"    Corrected: mean={final_mean:.4f}, std={final_std:.4f}")
                             
                             # Encode with dual-channel VACE format
                             inactive_latents, reactive_latents = self._encode_vace_dual_channel_standalone(
-                                corrected_pixels, self._temp_vae, False
+                                overlap_pixels, self._temp_vae, False
                             )
                             control_video_latent = torch.cat([inactive_latents.unsqueeze(0), reactive_latents.unsqueeze(0)], dim=1)
                             
@@ -3280,8 +3300,8 @@ class NV_VideoSampler:
                                 "vace_mask": mask_64ch,               # [1, 64, overlap_frames, H, W]
                             }
                             
-                            print(f"    ✓ VACE extension prepared: {control_video_latent.shape} (with correction)")
-                            info_lines.append(f"  → Tier 3: VACE frame extension (VAE + correction)")
+                            print(f"    ✓ VACE extension prepared: {control_video_latent.shape} (procedural correction)")
+                            info_lines.append(f"  → Tier 3: VACE frame extension (procedural VAE correction)")
                     except Exception as e:
                         print(f"    ✗ Failed to prepare VACE extension: {e}")
                         import traceback
