@@ -3083,7 +3083,17 @@ class NV_VideoSampler:
                     if overlap_frames > 0:
                         # Extract overlap from the END of previous chunk's RAW output
                         # The overlap is the last N frames of prev_chunk_samples
-                        prev_overlap = prev_chunk_samples[:, :, -overlap_frames:, :, :]
+                        prev_overlap = prev_chunk_samples[:, :, -overlap_frames:, :, :].clone()
+                        
+                        # Normalize overlap latents to prevent cumulative drift
+                        # Standard VAE latent space has roughly mean=0, std=1
+                        overlap_mean = prev_overlap.mean()
+                        overlap_std = prev_overlap.std()
+                        if overlap_std > 0:
+                            prev_overlap = (prev_overlap - overlap_mean) / overlap_std
+                        
+                        print(f"  Tier 2: Normalized overlap - mean: {overlap_mean:.4f} -> {prev_overlap.mean():.4f}, "
+                              f"std: {overlap_std:.4f} -> {prev_overlap.std():.4f}")
                         
                         # Build concat_latent_image: [overlap, new_noise]
                         new_noise_frames = chunk_frames - overlap_frames
@@ -3226,7 +3236,16 @@ class NV_VideoSampler:
                             print(f"    Using last {overlap_frames_to_encode} frames directly (no VAE cycle)")
                             
                             # Extract overlap latent from END of RAW chunk output [1, 16, T, H, W]
-                            overlap_latent = prev_chunk_samples[:, :, -overlap_frames_to_encode:, :, :]
+                            overlap_latent = prev_chunk_samples[:, :, -overlap_frames_to_encode:, :, :].clone()
+                            
+                            # Normalize to prevent cumulative drift (same as Tier 2)
+                            overlap_mean = overlap_latent.mean()
+                            overlap_std = overlap_latent.std()
+                            if overlap_std > 0:
+                                overlap_latent = (overlap_latent - overlap_mean) / overlap_std
+                            
+                            print(f"    Normalized Tier 3 overlap - mean: {overlap_mean:.4f} -> {overlap_latent.mean():.4f}, "
+                                  f"std: {overlap_std:.4f} -> {overlap_latent.std():.4f}")
                             
                             # Create 32-channel format: [latents, zeros] instead of [latents, latents]
                             # This prevents signal amplification while maintaining VACE structure
