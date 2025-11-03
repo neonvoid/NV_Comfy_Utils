@@ -3170,6 +3170,52 @@ class NV_VideoSampler:
                 sample_time = time.time() - sample_start_time
                 print(f"  ✓ Sampling complete: {sample_time:.2f}s ({sample_time/steps:.3f}s/step)")
                 
+                # POST-GENERATION COLOR CORRECTION (match to previous chunk)
+                if chunk_idx > 0 and 'prev_chunk_samples' in locals() and chunk_overlap > 0:
+                    print(f"  Applying post-generation color correction...")
+                    
+                    # Calculate actual overlap frames
+                    overlap_for_correction = min(chunk_overlap, chunk_frames, prev_chunk_samples.shape[2])
+                    
+                    if overlap_for_correction > 0:
+                        # Get reference colors from END of previous chunk
+                        prev_overlap_region = prev_chunk_samples[:, :, -overlap_for_correction:, :, :]
+                        prev_mean = prev_overlap_region.mean().item()
+                        prev_std = prev_overlap_region.std().item()
+                        
+                        # Get colors from START of current chunk
+                        curr_overlap_region = chunk_samples[:, :, :overlap_for_correction, :, :]
+                        curr_mean = curr_overlap_region.mean().item()
+                        curr_std = curr_overlap_region.std().item()
+                        
+                        print(f"    Prev chunk overlap: mean={prev_mean:.4f}, std={prev_std:.4f}")
+                        print(f"    Curr chunk overlap: mean={curr_mean:.4f}, std={curr_std:.4f}")
+                        
+                        # Calculate correction ratios
+                        if curr_mean > 0.001 and curr_std > 0.001:
+                            brightness_ratio = prev_mean / curr_mean
+                            contrast_ratio = prev_std / curr_std
+                            
+                            print(f"    Correction: brightness={brightness_ratio:.4f}x, contrast={contrast_ratio:.4f}x")
+                            
+                            # Apply color matching to entire current chunk
+                            # 1. Scale contrast around mean
+                            chunk_mean = chunk_samples.mean()
+                            chunk_samples = (chunk_samples - chunk_mean) * contrast_ratio + chunk_mean
+                            
+                            # 2. Scale brightness
+                            chunk_samples = chunk_samples * brightness_ratio
+                            
+                            # 3. Clamp to prevent overflow
+                            chunk_samples = torch.clamp(chunk_samples, -10.0, 10.0)  # Latent space range
+                            
+                            corrected_mean = chunk_samples[:, :, :overlap_for_correction, :, :].mean().item()
+                            corrected_std = chunk_samples[:, :, :overlap_for_correction, :, :].std().item()
+                            print(f"    After correction: mean={corrected_mean:.4f}, std={corrected_std:.4f}")
+                            info_lines.append(f"  → Post-gen color correction: {brightness_ratio:.3f}x brightness, {contrast_ratio:.3f}x contrast")
+                        else:
+                            print(f"    Skipping correction (values too close to zero)")
+                
                 # Create blend weights for this chunk
                 print(f"  Blending with mode: {blend_mode}")
                 chunk_weight = torch.ones_like(chunk_samples)
