@@ -3072,10 +3072,11 @@ class NV_VideoSampler:
                         print(f"  Tier 3: Skipping (no existing VACE controls to append to)")
 
                 
-                # TIER 1: Apply start_image (first frame reference) to ALL chunks
+                # TIER 1: Apply start_image (first frame reference) to FIRST CHUNK ONLY
+                # Subsequent chunks use Tier 2 (overlap) for temporal continuity
                 start_image_latent_chunk = chunk_cond.get("start_image_latent")
                 start_image_mask_chunk = chunk_cond.get("start_image_mask")
-                if start_image_latent_chunk is not None and start_image_mask_chunk is not None:
+                if chunk_idx == 0 and start_image_latent_chunk is not None and start_image_mask_chunk is not None:
                     # Use the FIRST ENCODED FRAME for all chunks (don't slice!)
                     # The preprocessor encodes: [start_image, gray, gray, gray...]
                     # We want ALL chunks to reference the same start_image (frame 0)
@@ -3123,11 +3124,17 @@ class NV_VideoSampler:
                         # Build concat_latent_image: [overlap, new_noise]
                         new_noise_frames = chunk_frames - overlap_frames
                         if new_noise_frames > 0:
+                            # Match noise statistics to overlap latents for smooth transition
                             new_noise = torch.randn(
                                 prev_overlap.shape[0], prev_overlap.shape[1], new_noise_frames,
                                 prev_overlap.shape[3], prev_overlap.shape[4],
                                 device=prev_overlap.device, dtype=prev_overlap.dtype
                             )
+                            # Scale noise to match overlap statistics
+                            overlap_mean = prev_overlap.mean()
+                            overlap_std = prev_overlap.std()
+                            new_noise = new_noise * overlap_std + overlap_mean
+                            
                             concat_latent = torch.cat([prev_overlap, new_noise], dim=2)
                         else:
                             concat_latent = prev_overlap
@@ -3144,23 +3151,14 @@ class NV_VideoSampler:
                         print(f"    mask values: {overlap_frames} ones (keep), {new_noise_frames} zeros (generate)")
                         info_lines.append(f"  → Temporal continuity: {overlap_frames} frames from prev chunk")
                         
-                        # Merge with Tier 1 or apply directly
-                        if start_image_latent_chunk is None:
-                            # No Tier 1, apply Tier 2 only
-                            chunk_positive = [[c[0], c[1].copy()] for c in chunk_positive]
-                            chunk_negative = [[c[0], c[1].copy()] for c in chunk_negative]
-                            
-                            chunk_positive[0][1]["concat_latent_image"] = concat_latent
-                            chunk_positive[0][1]["concat_mask"] = concat_mask
-                            chunk_negative[0][1]["concat_latent_image"] = concat_latent
-                            chunk_negative[0][1]["concat_mask"] = concat_mask
-                        else:
-                            # Both Tier 1 and Tier 2: Tier 2 mask overrides Tier 1 mask
-                            # Use Tier 2's concat_latent but keep start_image influence via conditioning
-                            chunk_positive[0][1]["concat_latent_image"] = concat_latent
-                            chunk_positive[0][1]["concat_mask"] = concat_mask
-                            chunk_negative[0][1]["concat_latent_image"] = concat_latent
-                            chunk_negative[0][1]["concat_mask"] = concat_mask
+                        # Apply Tier 2 (chunks 1+ only, no conflict with Tier 1)
+                        chunk_positive = [[c[0], c[1].copy()] for c in chunk_positive]
+                        chunk_negative = [[c[0], c[1].copy()] for c in chunk_negative]
+                        
+                        chunk_positive[0][1]["concat_latent_image"] = concat_latent
+                        chunk_positive[0][1]["concat_mask"] = concat_mask
+                        chunk_negative[0][1]["concat_latent_image"] = concat_latent
+                        chunk_negative[0][1]["concat_mask"] = concat_mask
                 
                 # Sample this chunk
                 print(f"  Starting sampling...")
@@ -3249,8 +3247,9 @@ class NV_VideoSampler:
                 
                 # TIER 3: Prepare VACE control for next chunk (if not last chunk)
                 # Decode overlap region to pixels, re-encode as VACE control
+                # TEMPORARILY DISABLED FOR DEBUGGING
                 prev_chunk_vace_control = None
-                if chunk_idx < len(chunk_conditionings) - 1:  # Not the last chunk
+                if False and chunk_idx < len(chunk_conditionings) - 1:  # Not the last chunk
                     # Check if we have access to VAE for decoding
                     if hasattr(self, '_temp_vae') and self._temp_vae is not None:
                         try:
