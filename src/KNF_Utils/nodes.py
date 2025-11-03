@@ -3241,39 +3241,13 @@ class NV_VideoSampler:
                     except Exception as e:
                         print(f"  ✗ Failed to decode chunk: {e}")
                 
-                # Create blend weights for this chunk
-                print(f"  Blending with mode: {blend_mode}")
-                chunk_weight = torch.ones_like(chunk_samples)
-                
-                if blend_mode == "linear":
-                    # Minimal blending - Tier 3 frame extension already provides continuity
-                    # Only feather the very edges (2 frames) to smooth any remaining artifacts
-                    feather_frames = 2
-                    
-                    if not chunk_cond["is_first"] and chunk_overlap > 0:
-                        # Gentle fade in from left (only first 2 frames)
-                        for i in range(min(feather_frames, chunk_frames)):
-                            weight = (i + 1) / (feather_frames + 1)  # 0.33, 0.67
-                            chunk_weight[:, :, i, :, :] = weight
-                    
-                    if not chunk_cond["is_last"] and chunk_overlap > 0:
-                        # Gentle fade out to right (only last 2 frames)
-                        for i in range(min(feather_frames, chunk_frames)):
-                            weight = (feather_frames - i) / (feather_frames + 1)  # 0.67, 0.33
-                            chunk_weight[:, :, -(i+1), :, :] = weight
-                
-                elif blend_mode == "pyramid":
-                    # Pyramid weights (triangular)
-                    for i in range(chunk_frames):
-                        if i < chunk_frames / 2:
-                            weight = (i + 1) / (chunk_frames / 2)
-                        else:
-                            weight = (chunk_frames - i) / (chunk_frames / 2)
-                        chunk_weight[:, :, i, :, :] = weight
-                
-                # Accumulate weighted results
-                output_latent[:, :, chunk_start:chunk_end, :, :] += chunk_samples * chunk_weight
-                weight_sum[:, :, chunk_start:chunk_end, :, :] += chunk_weight
+                # SKIP LATENT-SPACE BLENDING
+                # Since extension frames are trimmed from chunks 2+, latent-space blending
+                # would cause dimension mismatches. We use pixel-space concatenation instead.
+                print(f"  Skipping latent-space blending (using pixel-space concatenation)")
+
+                # Note: output_latent and weight_sum are not used when doing pixel-space concatenation
+                # They remain as zeros and will be replaced by the pixel-space result at the end
                 
                 # Store this chunk's RAW output for next chunk's Tier 2 (temporal continuity)
                 # Store the actual chunk samples, not the accumulated blend
