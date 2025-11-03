@@ -3287,8 +3287,11 @@ class NV_VideoSampler:
                             # Extract overlap latent from END of RAW chunk output [1, 16, T, H, W]
                             overlap_latent = prev_chunk_samples[:, :, -overlap_frames_to_encode:, :, :]
                             
-                            # Decode to pixels
-                            overlap_pixels = self._temp_vae.decode(overlap_latent)
+                            # Decode to pixels with FP32 for higher quality (reduces quantization noise)
+                            original_dtype = overlap_latent.dtype
+                            overlap_latent_fp32 = overlap_latent.to(torch.float32)
+                            overlap_pixels = self._temp_vae.decode(overlap_latent_fp32)
+                            overlap_pixels = overlap_pixels.to(original_dtype)  # Convert back for consistency
                             
                             # Handle shape: Wan VAE returns [B, T, H, W, C]
                             if overlap_pixels.dim() == 5 and overlap_pixels.shape[0] == 1:
@@ -3303,7 +3306,40 @@ class NV_VideoSampler:
                             # Now: decode (1 cycle) + VACE encode (2 cycles) = matches manual workflow
                             print(f"    Using decoded pixels directly (no test cycle to avoid extra degradation)")
                             print(f"    Pixel stats: mean={overlap_pixels.mean():.4f}, std={overlap_pixels.std():.4f}")
-                            
+
+                            # Apply bilateral filter to reduce VAE compression noise
+                            try:
+                                import cv2
+                                import numpy as np
+
+                                # Convert to numpy for cv2 processing
+                                overlap_np = overlap_pixels.cpu().numpy()
+
+                                # Apply bilateral filter per frame (edge-preserving denoising)
+                                filtered_frames = []
+                                for frame in overlap_np:
+                                    # Convert to uint8 for cv2.bilateralFilter
+                                    frame_uint8 = (np.clip(frame, 0, 1) * 255).astype(np.uint8)
+
+                                    # Parameters: d=5 (neighbor diameter), sigmaColor=5, sigmaSpace=1.5
+                                    # Gentle denoising that preserves edges
+                                    filtered = cv2.bilateralFilter(
+                                        frame_uint8,
+                                        d=5,
+                                        sigmaColor=5,  # 5/255 ≈ 0.02 in [0,1] range
+                                        sigmaSpace=1.5
+                                    )
+
+                                    # Convert back to float32 [0,1]
+                                    filtered_frames.append(filtered.astype(np.float32) / 255.0)
+
+                                overlap_pixels = torch.from_numpy(np.stack(filtered_frames)).to(overlap_pixels.device, original_dtype)
+                                print(f"    ℹ️  Bilateral filter applied to {len(filtered_frames)} extension frames")
+                            except ImportError:
+                                print(f"    ⚠️  OpenCV not available, skipping bilateral filter (install with: pip install opencv-python)")
+                            except Exception as e:
+                                print(f"    ⚠️  Bilateral filter failed: {e}, continuing without filtering")
+
                             # Encode with dual-channel VACE format
                             inactive_latents, reactive_latents = self._encode_vace_dual_channel_standalone(
                                 overlap_pixels, self._temp_vae, False
@@ -3635,8 +3671,9 @@ class NV_VideoSampler:
         import comfy.utils
         
         device = vae.device if hasattr(vae, 'device') else torch.device('cpu')
-        dtype = vae.dtype if hasattr(vae, 'dtype') else torch.float32
-        
+        # Force FP32 for Tier 3 VACE encoding to reduce quantization noise
+        dtype = torch.float32  # Always use FP32 for extension frames
+
         # Ensure frames are on the right device and dtype
         frames = frames.to(device=device, dtype=dtype)
         
