@@ -3205,16 +3205,20 @@ class NV_VideoSampler:
                     print(f"    After trim: {chunk_samples.shape}")
                     info_lines.append(f"  → Reference frame trimmed from output")
 
-                # TIER 3 EXTENSION FRAME TRIMMING: Use extension frames for conditioning only
-                # For chunks 2+, skip the first N overlap frames (these are degraded from decode+encode)
-                # Only use clean frames in final output
+                # TIER 3 EXTENSION FRAME TRIMMING: Use most extension frames for conditioning only
+                # Keep a small overlap (1 latent frame ~4 video frames) for pixel-space feather blending
                 if chunk_idx > 0 and chunk_overlap > 0:
                     overlap_frames_latent = min(chunk_overlap, chunk_samples.shape[2])
-                    print(f"  Trimming {overlap_frames_latent} extension frames from output (used for conditioning only)...")
+
+                    # Keep 1 latent frame for blending, trim the rest
+                    blend_frames_latent = 1
+                    trim_amount = max(0, overlap_frames_latent - blend_frames_latent)
+
+                    print(f"  Trimming {trim_amount} extension frames, keeping {blend_frames_latent} for blending...")
                     print(f"    Before trim: {chunk_samples.shape}")
-                    chunk_samples = chunk_samples[:, :, overlap_frames_latent:, :, :]
+                    chunk_samples = chunk_samples[:, :, trim_amount:, :, :]
                     print(f"    After trim: {chunk_samples.shape}")
-                    info_lines.append(f"  → {overlap_frames_latent} extension frames trimmed (conditioning only)")
+                    info_lines.append(f"  → {trim_amount} extension frames trimmed, {blend_frames_latent} kept for blending")
 
                 # Decode chunk to pixels immediately for pixel-space processing
                 if vae is not None:
@@ -3392,26 +3396,51 @@ class NV_VideoSampler:
 
                         print(f"\n  Blending chunks...")
 
-                        # SIMPLE CONCATENATION (No blending needed - extension frames already trimmed)
-                        # Since extension frames are trimmed from chunks 2+, we can directly concatenate
-                        print(f"  Note: Extension frames trimmed from chunks 2+, using direct concatenation")
+                        # FEATHER BLENDING at chunk boundaries
+                        # Keep small overlap (1 latent ~4 video frames) for gentle temporal blending
+                        blend_frames_video = 4  # ~1 latent frame × 4 temporal compression
 
                         current_position = 0
                         for chunk_data in chunk_pixels_list:
                             chunk_idx = chunk_data['chunk_idx']
-                            chunk_pixels = chunk_data['pixels']  # Already trimmed if chunk_idx > 0
-
+                            chunk_pixels = chunk_data['pixels']
                             num_frames = len(chunk_pixels)
-                            print(f"  Chunk {chunk_idx}: placing {num_frames} frames at position {current_position}-{current_position + num_frames - 1}")
 
-                            # Direct placement (no blending)
-                            final_video[current_position:current_position + num_frames] = chunk_pixels
+                            if chunk_idx == 0:
+                                # First chunk: place entirely
+                                final_video[current_position:current_position + num_frames] = chunk_pixels
+                                current_position += num_frames
+                                print(f"  Chunk {chunk_idx}: placed {num_frames} frames at position 0-{num_frames-1}")
+                            else:
+                                # Subsequent chunks: feather blend the first few frames
+                                blend_frames_actual = min(blend_frames_video, num_frames, len(final_video) - current_position)
 
-                            current_position += num_frames
+                                if blend_frames_actual > 0:
+                                    # Linear feather blend
+                                    for i in range(blend_frames_actual):
+                                        weight_new = (i + 1) / (blend_frames_actual + 1)  # 0.2, 0.4, 0.6, 0.8 for 4 frames
+                                        weight_old = 1.0 - weight_new
 
-                            print(f"    ✓ Chunk {chunk_idx} placed")
+                                        # Blend this frame
+                                        final_video[current_position + i] = (
+                                            final_video[current_position + i] * weight_old +
+                                            chunk_pixels[i] * weight_new
+                                        )
 
-                        print(f"  ✓ All {len(chunk_pixels_list)} chunks concatenated ({current_position} total frames)")
+                                    # Place remaining frames (after blend zone)
+                                    if num_frames > blend_frames_actual:
+                                        final_video[current_position + blend_frames_actual:current_position + num_frames] = \
+                                            chunk_pixels[blend_frames_actual:]
+
+                                    current_position += num_frames
+                                    print(f"  Chunk {chunk_idx}: blended {blend_frames_actual} frames, placed {num_frames - blend_frames_actual} frames")
+                                else:
+                                    # Fallback: no blend space
+                                    final_video[current_position:current_position + num_frames] = chunk_pixels
+                                    current_position += num_frames
+                                    print(f"  Chunk {chunk_idx}: placed {num_frames} frames (no blend space)")
+
+                        print(f"  ✓ All {len(chunk_pixels_list)} chunks blended ({current_position} total frames)")
 
                         # SINGLE-PASS COLOR MATCHING after blending
                         # This ensures uniform color matching strength across ALL frames (including transitions)
