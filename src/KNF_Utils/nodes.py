@@ -3191,20 +3191,23 @@ class NV_VideoSampler:
                         print(f"    Prev chunk overlap: mean={prev_mean:.4f}, std={prev_std:.4f}")
                         print(f"    Curr chunk overlap: mean={curr_mean:.4f}, std={curr_std:.4f}")
                         
-                        # Calculate correction ratios (latent space can have negative means)
+                        # Calculate correction (latent space: additive for mean, multiplicative for std)
                         if abs(curr_mean) > 0.001 and curr_std > 0.001:
-                            brightness_ratio = prev_mean / curr_mean
+                            # Brightness correction: SHIFT the mean (additive in latent space)
+                            brightness_shift = prev_mean - curr_mean
+                            
+                            # Contrast correction: SCALE the std (multiplicative)
                             contrast_ratio = prev_std / curr_std
                             
-                            print(f"    Correction: brightness={brightness_ratio:.4f}x, contrast={contrast_ratio:.4f}x")
+                            print(f"    Correction: brightness shift={brightness_shift:+.4f}, contrast={contrast_ratio:.4f}x")
                             
                             # Apply color matching to entire current chunk
-                            # 1. Scale contrast around mean
+                            # 1. First scale contrast around current mean
                             chunk_mean = chunk_samples.mean()
                             chunk_samples = (chunk_samples - chunk_mean) * contrast_ratio + chunk_mean
                             
-                            # 2. Scale brightness
-                            chunk_samples = chunk_samples * brightness_ratio
+                            # 2. Then shift brightness (additive)
+                            chunk_samples = chunk_samples + brightness_shift
                             
                             # 3. Clamp to prevent overflow
                             chunk_samples = torch.clamp(chunk_samples, -10.0, 10.0)  # Latent space range
@@ -3212,7 +3215,7 @@ class NV_VideoSampler:
                             corrected_mean = chunk_samples[:, :, :overlap_for_correction, :, :].mean().item()
                             corrected_std = chunk_samples[:, :, :overlap_for_correction, :, :].std().item()
                             print(f"    After correction: mean={corrected_mean:.4f}, std={corrected_std:.4f}")
-                            info_lines.append(f"  → Post-gen color correction: {brightness_ratio:.3f}x brightness, {contrast_ratio:.3f}x contrast")
+                            info_lines.append(f"  → Post-gen color correction: {brightness_shift:+.3f} shift, {contrast_ratio:.3f}x contrast")
                         else:
                             print(f"    Skipping correction (values too close to zero)")
                 
