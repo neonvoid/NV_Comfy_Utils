@@ -3230,9 +3230,10 @@ class NV_VideoSampler:
                             # Extract overlap latent from END of RAW chunk output [1, 16, T, H, W]
                             overlap_latent = prev_chunk_samples[:, :, -overlap_frames_to_encode:, :, :]
                             
-                            # Duplicate to create 32-channel format [1, 32, T, H, W]
-                            # This matches VACE format but preserves original quality
-                            control_video_latent = torch.cat([overlap_latent, overlap_latent], dim=1)
+                            # Create 32-channel format: [latents, zeros] instead of [latents, latents]
+                            # This prevents signal amplification while maintaining VACE structure
+                            zeros_pad = torch.zeros_like(overlap_latent)
+                            control_video_latent = torch.cat([overlap_latent, zeros_pad], dim=1)  # [1, 32, T, H, W]
                             
                             # Create 64-channel mask: 0 = no control (use as reference/extension)
                             vae_stride = 8
