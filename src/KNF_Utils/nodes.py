@@ -3191,8 +3191,8 @@ class NV_VideoSampler:
                         print(f"    Prev chunk overlap: mean={prev_mean:.4f}, std={prev_std:.4f}")
                         print(f"    Curr chunk overlap: mean={curr_mean:.4f}, std={curr_std:.4f}")
                         
-                        # Calculate correction ratios
-                        if curr_mean > 0.001 and curr_std > 0.001:
+                        # Calculate correction ratios (latent space can have negative means)
+                        if abs(curr_mean) > 0.001 and curr_std > 0.001:
                             brightness_ratio = prev_mean / curr_mean
                             contrast_ratio = prev_std / curr_std
                             
