@@ -3259,11 +3259,11 @@ class NV_VideoSampler:
                 prev_chunk_start = chunk_start
                 prev_chunk_end = chunk_end
                 
-                # TIER 3: VACE Frame Extension with VAE cycle + inline correction
-                # Decode overlap, re-encode with dual-channel VACE, apply as extension frames
-                # Apply inline brightness/contrast correction to compensate for VAE degradation
+                # TIER 3: VACE Frame Extension with VAE cycle
+                # ENABLED ONLY FOR FIRST TRANSITION: Provides character consistency for chunk 0→1
+                # Subsequent chunks use Tier 2 only to avoid cumulative VAE degradation
                 prev_chunk_vace_control = None
-                if chunk_idx < len(chunk_conditionings) - 1:  # Not the last chunk
+                if chunk_idx == 0 and chunk_idx < len(chunk_conditionings) - 1:  # Only chunk 0 → chunk 1
                     try:
                         # Calculate overlap for NEXT chunk
                         # Extract from the END of the current chunk's RAW output
@@ -3313,7 +3313,8 @@ class NV_VideoSampler:
                             }
                             
                             print(f"    ✓ VACE extension prepared: {control_video_latent.shape}")
-                            info_lines.append(f"  → Tier 3: VACE frame extension (decode→encode only)")
+                            print(f"    ℹ️  Tier 3 only applies to first transition to avoid cumulative degradation")
+                            info_lines.append(f"  → Tier 3: VACE frame extension (first transition only)")
                     except Exception as e:
                         print(f"    ✗ Failed to prepare VACE extension: {e}")
                         import traceback
