@@ -3272,12 +3272,14 @@ class NV_VideoSampler:
                         # Store for pixel-space blending
                         if not hasattr(self, '_chunk_pixels_list'):
                             self._chunk_pixels_list = []
-                        
+
                         self._chunk_pixels_list.append({
                             'pixels': chunk_pixels.cpu(),  # Move to CPU to save VRAM
                             'chunk_idx': chunk_idx,
                             'latent_start': chunk_start,
                             'latent_end': chunk_end,
+                            'start_frame': chunk_cond.get("start_frame", 0),  # Video frame index for blending
+                            'end_frame': chunk_cond.get("end_frame", chunk_pixels.shape[0]),
                         })
                         
                         print(f"  ✓ Chunk decoded and stored: {chunk_pixels.shape}")
@@ -3371,6 +3373,20 @@ class NV_VideoSampler:
                             # OPTIONAL: Diffusion-based refinement to restore quality lost from VAE degradation
                             if hasattr(self, '_refine_enable') and self._refine_enable:
                                 try:
+                                    # Get conditioning for this chunk (needed for diffusion refinement)
+                                    # In chunked mode, global positive/negative are None, so use chunk-specific conditioning
+                                    chunk_positive = chunk_conditionings[chunk_idx].get("positive") if chunk_conditionings else None
+                                    chunk_negative = chunk_conditionings[chunk_idx].get("negative") if chunk_conditionings else None
+
+                                    # Fallback to global conditioning if chunk-specific not available
+                                    refine_positive = chunk_positive if chunk_positive is not None else self._refine_positive
+                                    refine_negative = chunk_negative if chunk_negative is not None else self._refine_negative
+
+                                    # Validate we have conditioning
+                                    if refine_positive is None or refine_negative is None:
+                                        print(f"    ⚠️  Skipping diffusion refinement: no conditioning available for chunk {chunk_idx}")
+                                        raise ValueError("No conditioning available for diffusion refinement")
+
                                     print(f"    🎨 Applying diffusion refinement ({self._refine_steps} steps @ {self._refine_denoise} denoise)...")
 
                                     # Import common_ksampler from nodes.py
@@ -3389,8 +3405,8 @@ class NV_VideoSampler:
                                         cfg=self._refine_cfg,
                                         sampler_name=self._refine_sampler_name,
                                         scheduler=self._refine_scheduler,
-                                        positive=self._refine_positive,
-                                        negative=self._refine_negative,
+                                        positive=refine_positive,
+                                        negative=refine_negative,
                                         latent={"samples": overlap_latent_for_refine},
                                         denoise=self._refine_denoise,
                                         force_full_denoise=True
@@ -3474,10 +3490,11 @@ class NV_VideoSampler:
                     first_chunk = chunk_pixels_list[0]
                     H, W, C = first_chunk['pixels'].shape[1], first_chunk['pixels'].shape[2], first_chunk['pixels'].shape[3]
 
-                    # Calculate total frames from actual decoded chunks (accounts for trimming)
-                    total_video_frames = sum(c['pixels'].shape[0] for c in chunk_pixels_list)
+                    # Calculate total frames from last chunk's end_frame (accounts for overlaps)
+                    last_chunk = chunk_pixels_list[-1]
+                    total_video_frames = last_chunk['end_frame']
 
-                    print(f"  Total video frames: {total_video_frames} (calculated from trimmed chunks)")
+                    print(f"  Total video frames: {total_video_frames} (from chunk metadata)")
                     print(f"  Video dimensions: {H}x{W}x{C}")
                     
                     # Initialize final blended video (in PIXEL space, not latent space!)
@@ -3490,30 +3507,25 @@ class NV_VideoSampler:
                         print(f"\n  Blending chunks...")
 
                         # 32-FRAME CROSSFADE BLENDING (matching KJNodes CrossFadeImages workflow)
-                        # Crossfade starts at (chunk_length - overlap) of previous chunk
-                        # and extends for blend_transition_frames total
+                        # Each chunk is placed at its actual start_frame from metadata
+                        # Overlapping regions are crossfaded smoothly
                         blend_frames_video = blend_transition_frames  # User-configurable (default: 32 frames)
 
-                        current_position = 0
                         for chunk_data in chunk_pixels_list:
                             chunk_idx = chunk_data['chunk_idx']
                             chunk_pixels = chunk_data['pixels']
                             num_frames = len(chunk_pixels)
+                            chunk_start_frame = chunk_data['start_frame']
+                            chunk_end_frame = chunk_data['end_frame']
 
                             if chunk_idx == 0:
-                                # First chunk: place entirely
-                                final_video[current_position:current_position + num_frames] = chunk_pixels
-                                current_position += num_frames
-                                print(f"  Chunk {chunk_idx}: placed {num_frames} frames at position 0-{num_frames-1}")
+                                # First chunk: place entirely at the beginning
+                                final_video[chunk_start_frame:chunk_end_frame] = chunk_pixels
+                                print(f"  Chunk {chunk_idx}: placed {num_frames} frames at {chunk_start_frame}-{chunk_end_frame-1}")
                             else:
-                                # Subsequent chunks: crossfade blend
-                                # The blend starts BEFORE current_position (in the previous chunk's tail)
-                                # and extends INTO the current chunk
-
-                                blend_frames_actual = min(blend_frames_video, num_frames, current_position)
-
-                                # Calculate how many frames from previous chunk to blend back into
-                                prev_chunk_blend_start = max(0, current_position - blend_frames_actual)
+                                # Subsequent chunks: crossfade blend over overlap region
+                                # Calculate actual blend length (limited by transition frames and available overlap)
+                                blend_frames_actual = min(blend_frames_video, num_frames)
 
                                 if blend_frames_actual > 0:
                                     # Crossfade: gradually transition from prev chunk to current chunk
@@ -3522,34 +3534,32 @@ class NV_VideoSampler:
                                         weight_new = (i + 1) / (blend_frames_actual + 1)  # 0 → 1
                                         weight_old = 1.0 - weight_new  # 1 → 0
 
-                                        # Position in final video
-                                        final_pos = prev_chunk_blend_start + i
+                                        # Position in final video (based on chunk's start_frame)
+                                        final_pos = chunk_start_frame + i
 
-                                        # Only blend if we have both old and new content
-                                        if final_pos < current_position and i < num_frames:
-                                            # Blend with existing content (from previous chunk)
+                                        # Blend this frame with existing content
+                                        if final_pos < total_video_frames and i < num_frames:
                                             final_video[final_pos] = (
                                                 final_video[final_pos] * weight_old +
                                                 chunk_pixels[i] * weight_new
                                             )
-                                        elif i < num_frames:
-                                            # No existing content, just place new frames
-                                            final_video[current_position + i] = chunk_pixels[i]
 
-                                    # Place remaining frames (after blend zone)
-                                    if num_frames > blend_frames_actual:
-                                        final_video[current_position + blend_frames_actual:current_position + num_frames] = \
-                                            chunk_pixels[blend_frames_actual:]
+                                    # Place remaining non-blended frames
+                                    remaining_start_pos = chunk_start_frame + blend_frames_actual
+                                    remaining_end_pos = min(chunk_end_frame, total_video_frames)
+                                    remaining_chunk_start = blend_frames_actual
 
-                                    current_position += num_frames
-                                    print(f"  Chunk {chunk_idx}: crossfaded {blend_frames_actual} frames, placed {num_frames - blend_frames_actual} frames")
+                                    if remaining_start_pos < remaining_end_pos:
+                                        final_video[remaining_start_pos:remaining_end_pos] = \
+                                            chunk_pixels[remaining_chunk_start:remaining_chunk_start + (remaining_end_pos - remaining_start_pos)]
+
+                                    print(f"  Chunk {chunk_idx}: crossfaded {blend_frames_actual} frames at {chunk_start_frame}, placed {num_frames - blend_frames_actual} frames")
                                 else:
-                                    # Fallback: no blend space
-                                    final_video[current_position:current_position + num_frames] = chunk_pixels
-                                    current_position += num_frames
-                                    print(f"  Chunk {chunk_idx}: placed {num_frames} frames (no blend space)")
+                                    # Fallback: no blend, just place
+                                    final_video[chunk_start_frame:chunk_end_frame] = chunk_pixels
+                                    print(f"  Chunk {chunk_idx}: placed {num_frames} frames at {chunk_start_frame}-{chunk_end_frame-1} (no blend)")
 
-                        print(f"  ✓ All {len(chunk_pixels_list)} chunks blended ({current_position} total frames)")
+                        print(f"  ✓ All {len(chunk_pixels_list)} chunks blended ({total_video_frames} total frames)")
 
                         # SINGLE-PASS COLOR MATCHING after blending
                         # This ensures uniform color matching strength across ALL frames (including transitions)
