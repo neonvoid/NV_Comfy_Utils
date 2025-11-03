@@ -3084,16 +3084,22 @@ class NV_VideoSampler:
                 start_image_latent_chunk = chunk_cond.get("start_image_latent")
                 start_image_mask_chunk = chunk_cond.get("start_image_mask")
                 if start_image_latent_chunk is not None and start_image_mask_chunk is not None:
-                    # Slice start_image to match this chunk's temporal range
-                    concat_start = start_image_latent_chunk[:, :, chunk_start:chunk_end, :, :]
+                    # Use the FIRST ENCODED FRAME for all chunks (don't slice!)
+                    # The preprocessor encodes: [start_image, gray, gray, gray...]
+                    # We want ALL chunks to reference the same start_image (frame 0)
+                    first_frame_latent = start_image_latent_chunk[:, :, 0:1, :, :]  # [B, C, 1, H, W]
                     
-                    # Create mask: Keep first frame of THIS CHUNK (0), generate rest (1)
-                    # This ensures each chunk maintains consistency with the start image
+                    # Repeat/tile to match chunk size
                     chunk_frames = chunk_end - chunk_start
+                    concat_start = first_frame_latent.repeat(1, 1, chunk_frames, 1, 1)  # [B, C, T, H, W]
+                    
+                    # Create mask for I2V concat_latent_image:
+                    # Convention: 1 = KEEP reference, 0 = GENERATE new
+                    # This ensures each chunk maintains consistency with the start image
                     B, C, _, H, W = concat_start.shape
-                    mask_start = torch.ones((B, 1, chunk_frames, H, W), 
-                                           device=concat_start.device, dtype=concat_start.dtype)
-                    mask_start[:, :, 0:1, :, :] = 0.0  # Keep first frame of chunk
+                    mask_start = torch.zeros((B, 1, chunk_frames, H, W), 
+                                            device=concat_start.device, dtype=concat_start.dtype)
+                    mask_start[:, :, 0:1, :, :] = 1.0  # KEEP first frame (reference)
                     
                     print(f"  Tier 1: Applying first frame reference")
                     print(f"    concat_start shape: {concat_start.shape}")
@@ -3134,15 +3140,16 @@ class NV_VideoSampler:
                         else:
                             concat_latent = prev_overlap
                         
-                        # Build concat_mask: [zeros_for_overlap, ones_for_new]
-                        concat_mask = torch.ones((1, 1, chunk_frames, chunk_latent.shape[3], chunk_latent.shape[4]),
-                                                  device=chunk_latent.device, dtype=chunk_latent.dtype)
-                        concat_mask[:, :, :overlap_frames, :, :] = 0.0  # 0 = KEEP overlap frames
+                        # Build concat_mask for I2V:
+                        # Convention: 1 = KEEP reference, 0 = GENERATE new
+                        concat_mask = torch.zeros((1, 1, chunk_frames, chunk_latent.shape[3], chunk_latent.shape[4]),
+                                                   device=chunk_latent.device, dtype=chunk_latent.dtype)
+                        concat_mask[:, :, :overlap_frames, :, :] = 1.0  # 1 = KEEP overlap frames
                         
                         print(f"  Tier 2: Using {overlap_frames} overlap frames from previous chunk")
                         print(f"    concat_latent shape: {concat_latent.shape}")
                         print(f"    concat_mask shape: {concat_mask.shape}")
-                        print(f"    mask values: {overlap_frames} zeros (keep), {new_noise_frames} ones (generate)")
+                        print(f"    mask values: {overlap_frames} ones (keep), {new_noise_frames} zeros (generate)")
                         info_lines.append(f"  → Temporal continuity: {overlap_frames} frames from prev chunk")
                         
                         # Merge with Tier 1 or apply directly
