@@ -3088,16 +3088,14 @@ class NV_VideoSampler:
                         # Build concat_latent_image: [overlap, new_noise]
                         new_noise_frames = chunk_frames - overlap_frames
                         if new_noise_frames > 0:
-                            # Match noise statistics to overlap latents for smooth transition
+                            # Use standard noise for new frames (don't scale to match overlap)
+                            # The overlap latents have content statistics, not noise statistics
+                            # Scaling new noise to match content causes cumulative amplification
                             new_noise = torch.randn(
                                 prev_overlap.shape[0], prev_overlap.shape[1], new_noise_frames,
                                 prev_overlap.shape[3], prev_overlap.shape[4],
                                 device=prev_overlap.device, dtype=prev_overlap.dtype
                             )
-                            # Scale noise to match overlap statistics
-                            overlap_mean = prev_overlap.mean()
-                            overlap_std = prev_overlap.std()
-                            new_noise = new_noise * overlap_std + overlap_mean
                             
                             concat_latent = torch.cat([prev_overlap, new_noise], dim=2)
                         else:
