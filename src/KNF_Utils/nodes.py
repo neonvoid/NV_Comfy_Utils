@@ -3073,6 +3073,8 @@ class NV_VideoSampler:
                     print(f"    concat_start shape: {concat_start.shape}")
                     print(f"    mask_start shape: {mask_start.shape}")
                     print(f"    mask values: min={mask_start.min():.2f}, max={mask_start.max():.2f}")
+                    print(f"    first_frame_latent stats: mean={first_frame_latent.mean():.4f}, std={first_frame_latent.std():.4f}")
+                    print(f"    Mask convention: 0 = KEEP (use concat_latent), 1 = GENERATE")
                     info_lines.append(f"  → First frame reference applied")
                     
                     # Inject into both positive and negative conditioning
@@ -3378,8 +3380,13 @@ class NV_VideoSampler:
                             matched_chunk_tensor = torch.from_numpy(matched_chunk_np)
                             
                             # Blend into final video with linear crossfade in overlap regions
+                            # Only process frames within the valid global range
                             for local_frame_idx in range(len(matched_chunk_tensor)):
                                 global_frame_idx = chunk_video_start + local_frame_idx
+                                
+                                # Skip if this frame is out of bounds
+                                if global_frame_idx >= total_video_frames:
+                                    break
                                 
                                 # Calculate blend weight based on position in chunk
                                 if chunk_idx == 0:
@@ -3411,7 +3418,15 @@ class NV_VideoSampler:
                             print(f"    ✓ Chunk {chunk_idx} blended")
                         
                         print(f"  ✓ All chunks color matched and blended")
+                        
+                        # GUARANTEE first frame matches start_image exactly
+                        if self._temp_start_image is not None:
+                            print(f"\n  Enforcing exact first frame match...")
+                            final_video[0] = self._temp_start_image.squeeze(0)
+                            print(f"    ✓ First frame replaced with original start_image")
+                        
                         info_lines.append("  → Pixel-space color matching & overlap blending applied")
+                        info_lines.append("  → First frame exactly matches start_image")
                         
                     except ImportError:
                         print(f"  ⚠️  color-matcher not installed")
