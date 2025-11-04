@@ -4152,6 +4152,187 @@ class NV_VideoSampler:
         
         return inactive_latents, reactive_latents
 
+    def _encode_vace_dual_channel(self, frames, vae, tiled=False):
+        """
+        Encode control frames using Wan VACE dual-channel format.
+
+        Implements the dual-stream architecture:
+        - Inactive stream (channels 0-15): Context preservation
+        - Reactive stream (channels 16-31): Active control
+
+        Args:
+            frames: [T, H, W, C] in range [0, 1]
+            vae: VAE model
+            tiled: Whether to use tiled encoding
+
+        Returns:
+            32-channel latent: [32, T_lat, H_lat, W_lat]
+        """
+        import torch
+
+        print(f"[VACE Dual] Encoding with dual-channel format")
+        print(f"[VACE Dual] Input frames shape: {frames.shape}")
+
+        # Default mask: all ones (full control everywhere)
+        # mask shape: [T, H, W, 1]
+        mask = torch.ones(frames.shape[0], frames.shape[1], frames.shape[2], 1)
+
+        # Step 1: Center control video around zero
+        # From guide: "control_video = control_video - 0.5"
+        frames_centered = frames - 0.5
+        print(f"[VACE Dual] Centered frames range: [{frames_centered.min():.3f}, {frames_centered.max():.3f}]")
+
+        # Step 2: Split into inactive and reactive streams
+        # inactive = (centered * (1 - mask)) + 0.5  → Preserves non-masked areas
+        # reactive = (centered * mask) + 0.5        → Applies masked areas
+        inactive = (frames_centered * (1 - mask)) + 0.5  # [T, H, W, C]
+        reactive = (frames_centered * mask) + 0.5        # [T, H, W, C]
+
+        print(f"[VACE Dual] Inactive range: [{inactive.min():.3f}, {inactive.max():.3f}]")
+        print(f"[VACE Dual] Reactive range: [{reactive.min():.3f}, {reactive.max():.3f}]")
+
+        # Step 3: Encode both streams with VAE
+        inactive_latents = self._encode_control_frames(inactive, vae, tiled)  # [16, T_lat, H_lat, W_lat]
+        reactive_latents = self._encode_control_frames(reactive, vae, tiled)  # [16, T_lat, H_lat, W_lat]
+
+        print(f"[VACE Dual] Inactive latents: {inactive_latents.shape}")
+        print(f"[VACE Dual] Reactive latents: {reactive_latents.shape}")
+
+        # Step 4: Return as separate tensors (model will concatenate internally)
+        # DO NOT concatenate here - model expects them separate for processing
+        print(f"[VACE Dual] ✓ Encoding complete (returning as separate streams)")
+
+        return inactive_latents, reactive_latents
+
+    def _encode_control_frames(self, frames, vae, tiled=False):
+        """Encode control frames with VAE (WanVACE format)"""
+        import torch
+        import comfy.utils
+
+        # frames shape: [T, H, W, C] in range [0, 1]
+        # Need to convert to VAE format: [C, T, H, W] in range [-1, 1]
+
+        device = vae.device if hasattr(vae, 'device') else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        dtype = vae.dtype if hasattr(vae, 'dtype') else torch.float32
+
+        # Move to device and convert dtype
+        frames = frames.to(device).to(dtype)
+
+        T, H, W, C = frames.shape
+
+        # CRITICAL: Resize to make dimensions divisible by 16 (required by Wan VAE)
+        if W % 16 != 0 or H % 16 != 0:
+            new_height = (H // 16) * 16
+            new_width = (W // 16) * 16
+            print(f"[Control Encode] Resizing {W}x{H} -> {new_width}x{new_height} (must be divisible by 16)")
+
+            # Use ComfyUI's upscale function: [T, H, W, C] -> [T, C, H, W] -> upscale -> [T, H, W, C]
+            frames = frames.permute(0, 3, 1, 2)  # [T, C, H, W]
+            frames = comfy.utils.common_upscale(frames, new_width, new_height, "lanczos", "disabled")
+            frames = frames.permute(0, 2, 3, 1)  # [T, H, W, C]
+            H, W = new_height, new_width
+
+        # NOTE: Empirically, very small chunks (<9 frames) may fail with temporal VAE
+        # This might be due to temporal convolution requirements, not confirmed
+        # Wan VAE *can* encode single images for I2V, but control encoding may differ
+        T, H, W, C = frames.shape  # Still [T, H, W, C]
+        MIN_FRAMES = 9  # Empirically determined safe minimum (may be reducible)
+
+        original_T = T
+        if T < MIN_FRAMES:
+            print(f"[Control Encode] ⚠️ Chunk has only {T} frames, padding to {MIN_FRAMES} (temporal VAE requirement)")
+            # Pad by repeating the last frame
+            padding_needed = MIN_FRAMES - T
+            last_frame = frames[-1:, :, :, :].repeat(padding_needed, 1, 1, 1)  # Repeat last frame
+            frames = torch.cat([frames, last_frame], dim=0)  # [MIN_FRAMES, H, W, C]
+            T = frames.shape[0]
+            print(f"[Control Encode] Padded shape: {frames.shape}")
+
+        # Keep in ComfyUI video format: [T, H, W, C] with values in [0, 1]
+        # DON'T normalize or permute - VAE wrapper handles this
+
+        # Encode with VAE
+        with torch.no_grad():
+            try:
+                print(f"[Control Encode] Attempting VAE encode...")
+                print(f"[Control Encode] VAE type: {type(vae)}")
+                print(f"[Control Encode] Input shape: {frames.shape} (format: [T, H, W, C])")
+                print(f"[Control Encode] Value range: [{frames.min():.3f}, {frames.max():.3f}]")
+
+                # ComfyUI VAE expects [T, H, W, C] format (video frames) just like LoadVideo output
+                # Ensure only RGB channels (first 3)
+                if frames.shape[-1] == 4:
+                    frames = frames[:, :, :, :3]  # Remove alpha channel if present
+
+                # Check if this is a ComfyUI VAE wrapper
+                if hasattr(vae, 'first_stage_model'):
+                    print(f"[Control Encode] Detected ComfyUI VAE wrapper")
+                    # This is the comfy VAE wrapper, call encode directly
+                    # Pass frames as [T, H, W, C] - same format as VAEEncode node
+                    latents = vae.encode(frames[:, :, :, :3])
+                elif hasattr(vae, 'model'):
+                    print(f"[Control Encode] Detected raw VAE model")
+                    latents = vae.encode(frames[:, :, :, :3])
+                else:
+                    print(f"[Control Encode] Unknown VAE type, trying direct encode")
+                    latents = vae.encode(frames[:, :, :, :3])
+
+                print(f"[Control Encode] Encode successful!")
+                print(f"[Control Encode] Latents type: {type(latents)}")
+                print(f"[Control Encode] Latents shape: {latents.shape if hasattr(latents, 'shape') else 'N/A'}")
+
+                # Handle different return types
+                if isinstance(latents, list):
+                    print(f"[Control Encode] Latents is list, getting first element")
+                    latents = latents[0]
+                elif isinstance(latents, tuple):
+                    print(f"[Control Encode] Latents is tuple, getting first element")
+                    latents = latents[0]
+
+                print(f"[Control Encode] Latents shape after unwrapping: {latents.shape}")
+
+                # Determine temporal dimension based on shape
+                # Could be [B, C, T, H, W] or [C, T, H, W]
+                if latents.dim() == 5:
+                    # Has batch dimension
+                    if latents.shape[0] == 1:
+                        latents = latents.squeeze(0)  # Remove batch: [1, C, T, H, W] -> [C, T, H, W]
+                        print(f"[Control Encode] Removed batch dim: {latents.shape}")
+
+                    # Now should be [C, T, H, W]
+                    temporal_dim_idx = 1
+                elif latents.dim() == 4:
+                    # No batch dimension, already [C, T, H, W]
+                    temporal_dim_idx = 1
+                else:
+                    print(f"[Control Encode] ⚠️ Unexpected latent dimensions: {latents.dim()}")
+                    temporal_dim_idx = 1
+
+                # Trim back to original temporal size if we padded
+                if original_T < MIN_FRAMES and latents.dim() >= 4:
+                    latent_T = latents.shape[temporal_dim_idx]
+                    # Wan VAE downsamples by 4 temporally
+                    original_latent_T = (original_T - 1) // 4 + 1
+                    if latent_T > original_latent_T:
+                        print(f"[Control Encode] Trimming latents from {latent_T} to {original_latent_T} temporal frames")
+                        latents = latents[:, :original_latent_T, :, :]
+
+                print(f"[Control Encode] ✓ Final latents shape: {latents.shape}")
+
+            except Exception as e:
+                import traceback
+                print(f"[Control Encode] ✗ ENCODE FAILED!")
+                print(f"[Control Encode] Exception: {e}")
+                print(f"[Control Encode] Traceback:")
+                traceback.print_exc()
+                raise RuntimeError(f"Failed to encode control frames with VAE: {e}\n"
+                                 f"Input shape: {frames.shape}, dtype: {frames.dtype}, device: {frames.device}\n"
+                                 f"VAE type: {type(vae)}\n\n"
+                                 f"SUGGESTION: Try setting control_mode='disabled' to test without controls first.")
+
+        # latents shape should now be [C, T_lat, H_lat, W_lat]
+        return latents
+
 
 class NV_VideoChunkAnalyzer:
     """
