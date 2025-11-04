@@ -3309,6 +3309,17 @@ class NV_VideoSampler:
                         if chunk_pixels.dim() == 5 and chunk_pixels.shape[0] == 1:
                             chunk_pixels = chunk_pixels.squeeze(0)
 
+                        # REPLACE first overlap frames with previous chunk's refined frames
+                        # This ensures pixel-perfect identity (not just latent identity)
+                        if chunk_idx > 0 and hasattr(self, '_prev_diffused_overlap') and self._prev_diffused_overlap is not None:
+                            overlap_frames = len(self._prev_diffused_overlap)
+                            if overlap_frames > 0 and len(chunk_pixels) >= overlap_frames:
+                                print(f"  Replacing first {overlap_frames} frames with previous chunk's refined pixels (ensures pixel-perfect overlap)")
+                                # Replace first N frames with the refined frames from previous chunk
+                                chunk_pixels[:overlap_frames] = self._prev_diffused_overlap.to(chunk_pixels.device)
+                            else:
+                                print(f"  ⚠️ Could not replace overlap frames: chunk has {len(chunk_pixels)} frames, need {overlap_frames}")
+
                         # PER-CHUNK COLOR MATCHING (before blending)
                         # Apply color matching to each chunk immediately after decode
                         # This ensures smooth color transitions when chunks are blended
