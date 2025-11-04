@@ -3459,30 +3459,32 @@ class NV_VideoSampler:
                                 actual_overlap_frames = len(refined_pixels)
                                 print(f"  ✓ Diffusion refinement complete: refined {target_latent_frames} latent → {actual_overlap_frames} video frames")
 
-                                # REMOVED: Second color matching to prevent accumulation
-                                # The refined frames are already color matched from the chunk generation
-                                # Double color matching was causing progressive contrast/sharpness increase
-                                # if hasattr(self, '_temp_start_image') and self._temp_start_image is not None and chunk_idx > 0:
-                                #     try:
-                                #         from color_matcher import ColorMatcher
-                                #         print(f"    Applying 2nd color match to refined frames...")
-                                #         ref_np = self._temp_start_image.cpu().numpy().squeeze()
-                                #         cm = ColorMatcher()
-                                #
-                                #         matched_refined = []
-                                #         for frame_idx in range(len(refined_pixels)):
-                                #             try:
-                                #                 frame_np = refined_pixels[frame_idx].cpu().numpy()
-                                #                 matched = cm.transfer(src=frame_np, ref=ref_np, method='mkl')
-                                #                 matched = frame_np + 0.7 * (matched - frame_np)
-                                #                 matched_refined.append(torch.from_numpy(matched))
-                                #             except:
-                                #                 matched_refined.append(refined_pixels[frame_idx])
-                                #
-                                #         refined_pixels = torch.stack(matched_refined, dim=0)
-                                #         print(f"    ✓ 2nd color match complete")
-                                #     except:
-                                #         pass
+                                # Apply color matching to refined frames using ORIGINAL reference
+                                # This ensures refined frames match the original color/contrast
+                                if hasattr(self, '_original_reference') and self._original_reference is not None:
+                                    try:
+                                        from color_matcher import ColorMatcher
+                                        print(f"    Applying color match to refined frames...")
+                                        ref_np = self._original_reference.cpu().numpy().squeeze()
+                                        cm = ColorMatcher()
+
+                                        matched_refined = []
+                                        for frame_idx in range(len(refined_pixels)):
+                                            try:
+                                                frame_np = refined_pixels[frame_idx].cpu().numpy()
+                                                # Full strength MVGD matching to original reference
+                                                matched = cm.transfer(src=frame_np, ref=ref_np, method='mvgd')
+                                                matched_refined.append(torch.from_numpy(matched))
+                                            except:
+                                                matched_refined.append(refined_pixels[frame_idx])
+
+                                        refined_pixels = torch.stack(matched_refined, dim=0)
+                                        print(f"    ✓ Color match complete for refined frames (full strength, mvgd, original ref)")
+                                    except ImportError:
+                                        print(f"    ⚠️  color-matcher not installed, skipping refined frame color matching")
+                                    except Exception as e:
+                                        print(f"    ⚠️  Color matching failed for refined frames: {e}")
+
 
                                 # DO NOT replace frames in chunk - refined frames are ONLY for VACE conditioning
                                 # The original 81 frames from chunk 1 are the actual output
@@ -3829,20 +3831,15 @@ class NV_VideoSampler:
 
                     # CROSSFADE BLENDING (matching VACE overlap region)
                     # Blends the actual VAE overlap where VACE forces identical content
-                    # With ease_in_out easing function for smooth transitions
+                    # Using linear interpolation for smooth, uniform transitions
                     # Note: These frames have same content but slight rendering variations
                     # Use actual VAE output count (typically 13 frames) to avoid ghosting
                     overlap_frames = self._actual_overlap_frames if hasattr(self, '_actual_overlap_frames') else blend_transition_frames
 
-                    # Define ease_in_out easing function (smooth S-curve)
-                    def ease_in_out(t):
-                        """Smooth S-curve easing function (same as kjnodes)"""
-                        return 3 * t * t - 2 * t * t * t
-
                     try:
                         from color_matcher import ColorMatcher
 
-                        print(f"\n  Blending chunks with {overlap_frames}-frame ease_in_out crossfade...")
+                        print(f"\n  Blending chunks with {overlap_frames}-frame linear crossfade...")
 
                         output_position = 0  # Track position in final output
 
@@ -3873,16 +3870,15 @@ class NV_VideoSampler:
                                 # Get current chunk's first overlap frames (VACE-forced identical content)
                                 current_overlap_frames = chunk_pixels[:overlap_frames]
 
-                                # Perform crossfade with ease_in_out easing
-                                print(f"  Chunk {chunk_idx}: blending {overlap_frames} frames at position {blend_start_position} (ease_in_out)...")
+                                # Perform linear crossfade blending
+                                print(f"  Chunk {chunk_idx}: blending {overlap_frames} frames at position {blend_start_position} (linear)...")
                                 for i in range(overlap_frames):
-                                    # Calculate t value and apply easing function
+                                    # Calculate linear t value (no easing)
                                     t = i / (overlap_frames - 1) if overlap_frames > 1 else 0.5
-                                    alpha = ease_in_out(t)  # Apply S-curve easing
 
-                                    # Calculate weights using eased alpha
-                                    weight_prev = 1.0 - alpha
-                                    weight_next = alpha
+                                    # Calculate weights using linear interpolation
+                                    weight_prev = 1.0 - t
+                                    weight_next = t
 
                                     # Blend the frames
                                     blended_frame = (prev_overlap_frames[i] * weight_prev +
@@ -3926,8 +3922,8 @@ class NV_VideoSampler:
                         print(f"\n  Skipping global color matching (already applied per-chunk)")
 
                         info_lines.append(f"  → Chunk concatenation applied (81 + (n-1)×{81-actual_overlap} pattern, overlap={actual_overlap})")
-                        info_lines.append(f"  → {overlap_frames}-frame ease_in_out crossfade blending (smooth S-curve)")
-                        info_lines.append("  → Per-chunk color matching (35% strength, mvgd method, original reference)")
+                        info_lines.append(f"  → {overlap_frames}-frame linear crossfade blending")
+                        info_lines.append("  → Per-chunk color matching (full strength, mvgd method, original reference)")
                         
                     except ImportError:
                         print(f"  ⚠️  color-matcher not installed")
