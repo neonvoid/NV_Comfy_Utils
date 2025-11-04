@@ -3413,7 +3413,8 @@ class NV_VideoSampler:
                                     )
 
                                     # Decode refined latent back to pixels
-                                    refined_latent = refined_output["samples"]
+                                    # common_ksampler returns (latent_dict,) tuple, so unpack it first
+                                    refined_latent = refined_output[0]["samples"]
                                     overlap_pixels_refined = self._temp_vae.decode(refined_latent.to(torch.float32))
 
                                     # Handle shape: Wan VAE returns [B, T, H, W, C]
