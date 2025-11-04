@@ -2919,11 +2919,14 @@ class NV_VideoSampler:
             
             # Extract start_image pixels for color matching (if available)
             self._temp_start_image = None
+            self._original_reference = None  # Store original to prevent accumulation
             if len(chunk_conditionings) > 0:
                 first_chunk = chunk_conditionings[0]
                 if "start_image_pixels" in first_chunk and first_chunk["start_image_pixels"] is not None:
                     self._temp_start_image = first_chunk["start_image_pixels"]
+                    self._original_reference = self._temp_start_image.clone()  # Keep pristine copy
                     print(f"✓ Start image available for color matching: {self._temp_start_image.shape}")
+                    print(f"✓ Original reference stored to prevent contrast accumulation")
                 else:
                     print(f"⚠️  WARNING: No start_image_pixels found in chunk_conditionings")
                     print(f"   Available keys: {list(first_chunk.keys())}")
@@ -3279,12 +3282,13 @@ class NV_VideoSampler:
                         # PER-CHUNK COLOR MATCHING (before blending)
                         # Apply color matching to each chunk immediately after decode
                         # This ensures smooth color transitions when chunks are blended
-                        if hasattr(self, '_temp_start_image') and self._temp_start_image is not None and chunk_idx > 0:
+                        if hasattr(self, '_original_reference') and self._original_reference is not None and chunk_idx > 0:
                             try:
                                 from color_matcher import ColorMatcher
 
                                 print(f"  Applying color matching to chunk {chunk_idx}...")
-                                ref_np = self._temp_start_image.cpu().numpy().squeeze()
+                                # Use ORIGINAL reference to prevent accumulation
+                                ref_np = self._original_reference.cpu().numpy().squeeze()
                                 cm = ColorMatcher()
 
                                 # Color match each frame
@@ -3293,15 +3297,15 @@ class NV_VideoSampler:
                                     try:
                                         frame_np = chunk_pixels[frame_idx].cpu().numpy()
                                         matched = cm.transfer(src=frame_np, ref=ref_np, method='mkl')
-                                        # Apply at 70% strength for consistent look
-                                        matched = frame_np + 0.7 * (matched - frame_np)
+                                        # Apply at 45% strength (reduced from 70% to prevent over-enhancement)
+                                        matched = frame_np + 0.45 * (matched - frame_np)
                                         matched_frames.append(torch.from_numpy(matched))
                                     except Exception as e:
                                         # Fallback: use original frame
                                         matched_frames.append(chunk_pixels[frame_idx])
 
                                 chunk_pixels = torch.stack(matched_frames, dim=0)
-                                print(f"  ✓ Color matching complete for chunk {chunk_idx}")
+                                print(f"  ✓ Color matching complete for chunk {chunk_idx} (45% strength, original ref)")
                             except ImportError:
                                 print(f"  ⚠️  color-matcher not installed, skipping per-chunk color matching")
                             except Exception as e:
@@ -3455,28 +3459,30 @@ class NV_VideoSampler:
                                 actual_overlap_frames = len(refined_pixels)
                                 print(f"  ✓ Diffusion refinement complete: refined {target_latent_frames} latent → {actual_overlap_frames} video frames")
 
-                                # Color match refined frames AGAIN with reference
-                                if hasattr(self, '_temp_start_image') and self._temp_start_image is not None and chunk_idx > 0:
-                                    try:
-                                        from color_matcher import ColorMatcher
-                                        print(f"    Applying 2nd color match to refined frames...")
-                                        ref_np = self._temp_start_image.cpu().numpy().squeeze()
-                                        cm = ColorMatcher()
-
-                                        matched_refined = []
-                                        for frame_idx in range(len(refined_pixels)):
-                                            try:
-                                                frame_np = refined_pixels[frame_idx].cpu().numpy()
-                                                matched = cm.transfer(src=frame_np, ref=ref_np, method='mkl')
-                                                matched = frame_np + 0.7 * (matched - frame_np)
-                                                matched_refined.append(torch.from_numpy(matched))
-                                            except:
-                                                matched_refined.append(refined_pixels[frame_idx])
-
-                                        refined_pixels = torch.stack(matched_refined, dim=0)
-                                        print(f"    ✓ 2nd color match complete")
-                                    except:
-                                        pass
+                                # REMOVED: Second color matching to prevent accumulation
+                                # The refined frames are already color matched from the chunk generation
+                                # Double color matching was causing progressive contrast/sharpness increase
+                                # if hasattr(self, '_temp_start_image') and self._temp_start_image is not None and chunk_idx > 0:
+                                #     try:
+                                #         from color_matcher import ColorMatcher
+                                #         print(f"    Applying 2nd color match to refined frames...")
+                                #         ref_np = self._temp_start_image.cpu().numpy().squeeze()
+                                #         cm = ColorMatcher()
+                                #
+                                #         matched_refined = []
+                                #         for frame_idx in range(len(refined_pixels)):
+                                #             try:
+                                #                 frame_np = refined_pixels[frame_idx].cpu().numpy()
+                                #                 matched = cm.transfer(src=frame_np, ref=ref_np, method='mkl')
+                                #                 matched = frame_np + 0.7 * (matched - frame_np)
+                                #                 matched_refined.append(torch.from_numpy(matched))
+                                #             except:
+                                #                 matched_refined.append(refined_pixels[frame_idx])
+                                #
+                                #         refined_pixels = torch.stack(matched_refined, dim=0)
+                                #         print(f"    ✓ 2nd color match complete")
+                                #     except:
+                                #         pass
 
                                 # DO NOT replace frames in chunk - refined frames are ONLY for VACE conditioning
                                 # The original 81 frames from chunk 1 are the actual output
@@ -3910,7 +3916,7 @@ class NV_VideoSampler:
 
                         info_lines.append(f"  → Chunk concatenation applied (81 + (n-1)×{81-actual_overlap} pattern, overlap={actual_overlap})")
                         info_lines.append(f"  → {overlap_frames}-frame linear crossfade blending applied")
-                        info_lines.append("  → Per-chunk color matching applied before refinement (70% strength)")
+                        info_lines.append("  → Per-chunk color matching (45% strength, original reference, no accumulation)")
                         
                     except ImportError:
                         print(f"  ⚠️  color-matcher not installed")
