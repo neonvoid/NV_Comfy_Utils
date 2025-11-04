@@ -3386,7 +3386,45 @@ class NV_VideoSampler:
                                 refine_negative = [[c[0], c[1].copy()] for c in refine_negative]
 
                                 # Inject VACE controls for these last N frames
-                                if chunk_control_embeds and len(chunk_control_embeds) > 0:
+                                # Extract from already-processed chunk controls (not raw full controls)
+                                if hasattr(chunk_positive[0][1], '__getitem__') and "vace_frames" in chunk_positive[0][1]:
+                                    # Get the VACE controls that were used for this chunk's sampling
+                                    chunk_vace_frames_list = chunk_positive[0][1]["vace_frames"]  # List of controls
+                                    chunk_vace_masks_list = chunk_positive[0][1]["vace_mask"]
+                                    chunk_vace_strengths = chunk_positive[0][1]["vace_strength"]
+
+                                    # Extract last N latent frames from each control
+                                    refine_vace_frames = []
+                                    refine_vace_masks = []
+
+                                    for vace_frames, vace_mask in zip(chunk_vace_frames_list, chunk_vace_masks_list):
+                                        # vace_frames shape: [1, 32, T_chunk, H, W] where T_chunk includes reference if present
+                                        # We want the last N latent frames that correspond to our refined latent
+
+                                        # Skip reference frame if it was prepended (first frame has mask=0)
+                                        if has_vace_reference:
+                                            # Remove reference frame (first frame)
+                                            vace_frames_no_ref = vace_frames[:, :, 1:, :, :]
+                                            vace_mask_no_ref = vace_mask[:, :, 1:, :, :]
+                                        else:
+                                            vace_frames_no_ref = vace_frames
+                                            vace_mask_no_ref = vace_mask
+
+                                        # Now extract last N latent frames
+                                        overlap_vace_frames = vace_frames_no_ref[:, :, -target_latent_frames:, :, :]
+                                        overlap_vace_mask = vace_mask_no_ref[:, :, -target_latent_frames:, :, :]
+
+                                        refine_vace_frames.append(overlap_vace_frames)
+                                        refine_vace_masks.append(overlap_vace_mask)
+
+                                    all_vace_frames = refine_vace_frames
+                                    all_vace_masks = refine_vace_masks
+                                    all_vace_strengths = chunk_vace_strengths
+
+                                    print(f"    ✓ Extracted VACE controls for last {target_latent_frames} latent frames (shape: {all_vace_frames[0].shape})")
+                                elif chunk_control_embeds and len(chunk_control_embeds) > 0:
+                                    # Fallback: extract from raw controls (old logic, may have dimension issues)
+                                    print(f"    ⚠️  Using fallback VACE extraction (chunk controls not in conditioning)")
                                     all_vace_frames = []
                                     all_vace_masks = []
                                     all_vace_strengths = []
@@ -3395,17 +3433,21 @@ class NV_VideoSampler:
                                         full_vace_frames = ctrl_data["vace_frames"]
                                         full_vace_mask = ctrl_data["vace_mask"]
 
-                                        # Use the LATENT frame count we extracted (target_latent_frames)
-                                        overlap_latent_frames = target_latent_frames
+                                        # Extract from chunk range, then take last N
+                                        chunk_vace_slice = full_vace_frames[:, :, chunk_start:chunk_end, :, :]
+                                        overlap_vace_frames = chunk_vace_slice[:, :, -target_latent_frames:, :, :]
 
-                                        # Extract last N latent frames from controls
-                                        # Note: controls are already sliced to this chunk's range
-                                        overlap_vace_frames = full_vace_frames[:, :, chunk_start:chunk_end, :, :][:, :, -overlap_latent_frames:, :, :]
-                                        overlap_vace_mask = full_vace_mask[:, :, chunk_start:chunk_end, :, :][:, :, -overlap_latent_frames:, :, :]
+                                        chunk_mask_slice = full_vace_mask[:, :, chunk_start:chunk_end, :, :]
+                                        overlap_vace_mask = chunk_mask_slice[:, :, -target_latent_frames:, :, :]
 
                                         all_vace_frames.append(overlap_vace_frames)
                                         all_vace_masks.append(overlap_vace_mask)
                                         all_vace_strengths.extend(ctrl_data["vace_strength"])
+                                else:
+                                    # No VACE controls available
+                                    all_vace_frames = []
+                                    all_vace_masks = []
+                                    all_vace_strengths = []
 
                                     # Inject into refinement conditioning
                                     refine_positive[0][1]["vace_frames"] = all_vace_frames
