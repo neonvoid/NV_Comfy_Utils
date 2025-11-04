@@ -3063,23 +3063,25 @@ class NV_VideoSampler:
                         # Extract control slice from FULL control latent (matches main latent logic)
                         full_vace_frames = ctrl_data["vace_frames"]  # [1, 32, T_full, H, W]
                         full_vace_mask = ctrl_data["vace_mask"]      # [1, 64, T_full, H, W]
-                        
+
                         # Slice to match this chunk's temporal range
                         chunk_vace_frames = full_vace_frames[:, :, chunk_start:chunk_end, :, :].clone()  # [1, 32, chunk_frames, H, W]
                         chunk_vace_mask = full_vace_mask[:, :, chunk_start:chunk_end, :, :].clone()      # [1, 64, chunk_frames, H, W]
-                        
-                        # TIER 3: Replace first N frames with decoded overlap from previous chunk
-                        if prev_chunk_vace_control is not None and chunk_idx > 0:
-                            overlap_vace = prev_chunk_vace_control["vace_frames"]  # [1, 32, overlap_frames, H, W]
-                            overlap_frames_count = overlap_vace.shape[2]
-                            actual_overlap = min(overlap_frames_count, chunk_vace_frames.shape[2])
-                            
-                            # Replace first N frames of this control with decoded overlap
-                            chunk_vace_frames[:, :, :actual_overlap, :, :] = overlap_vace[:, :, :actual_overlap, :, :]
-                            
-                            # Set mask to 0 for overlap frames (no control), 1 for rest (apply control)
-                            chunk_vace_mask[:, :, :actual_overlap, :, :] = 0.0
-                            # Rest already has mask = 1.0 from original
+
+                        # NEW: Replace first 16 frames with refined VACE controls from previous chunk
+                        if chunk_idx > 0 and hasattr(self, '_prev_refined_vace_controls') and self._prev_refined_vace_controls is not None:
+                            # Use refined VACE controls from previous chunk
+                            refined_controls = self._prev_refined_vace_controls  # [1, 32, ~4, H, W]
+                            refined_latent_frames = refined_controls.shape[2]
+
+                            # Replace first N latent frames with refined controls
+                            chunk_vace_frames[:, :, :refined_latent_frames, :, :] = refined_controls[:, :, :, :, :]
+
+                            # Set mask=0 for these frames (force identical, no denoising)
+                            chunk_vace_mask[:, :, :refined_latent_frames, :, :] = 0.0
+
+                            print(f"    • Replaced first {refined_latent_frames} latent frames (~16 video) with refined VACE controls")
+                            print(f"      Mask: first {refined_latent_frames} frames = 0 (force identical), rest = 1 (generate)")
                         
                         # PREPEND VACE REFERENCE (if present and first chunk)
                         # Per WAN VACE guide: reference becomes frame 0, temporally prepended
@@ -3150,51 +3152,10 @@ class NV_VideoSampler:
                     print(f"    Latent shape: {chunk_latent_for_sampling.shape}")
                     print(f"    Will trim {trim_reference_frame} frame after generation")
                     info_lines.append(f"  → VACE reference: Latent extended, will trim after gen")
-                # TIER 2: Apply previous chunk overlap (temporal continuity) for chunks 2+
-                # UPDATED: Use diffused overlap LATENT from previous chunk for EXACT frame matching
-                if chunk_idx > 0 and hasattr(self, '_prev_diffused_overlap_latent') and self._prev_diffused_overlap_latent is not None:
-                    # Use the refined latent directly (no re-encode needed!)
-                    # This avoids encode/decode asymmetry (13 video → 2 latent)
-                    prev_overlap_latent = self._prev_diffused_overlap_latent  # [1, 16, 4, H, W]
-                    overlap_frames_video = getattr(self, '_actual_overlap_frames', 13)  # Use tracked count
-
-                    print(f"  Tier 2 (ENHANCED): Forcing first {overlap_frames_video} frames to match prev chunk's diffused output")
-
-                    # Use stored refined latent directly (no VAE encode!)
-                    overlap_latent_frames = prev_overlap_latent.shape[2]  # 4 latent frames (no dimension loss!)
-                    print(f"    Using stored refined latent: {overlap_latent_frames} latent frames (avoids re-encode dimension loss)")
-
-                    # Build concat_latent_image: [diffused_overlap, new_noise]
-                    new_noise_frames = chunk_frames - overlap_latent_frames
-                    if new_noise_frames > 0:
-                        new_noise = torch.randn(
-                            prev_overlap_latent.shape[0], prev_overlap_latent.shape[1], new_noise_frames,
-                            prev_overlap_latent.shape[3], prev_overlap_latent.shape[4],
-                            device=prev_overlap_latent.device, dtype=prev_overlap_latent.dtype
-                        )
-                        concat_latent = torch.cat([prev_overlap_latent, new_noise], dim=2)
-                    else:
-                        concat_latent = prev_overlap_latent
-
-                    # Build concat_mask for I2V:
-                    # Inverted convention: 0 = KEEP (don't denoise), 1 = GENERATE (denoise)
-                    # Set first N frames to 0.0 to FORCE them to be identical to prev chunk
-                    concat_mask = torch.ones((1, 1, chunk_frames, chunk_latent.shape[3], chunk_latent.shape[4]),
-                                               device=chunk_latent.device, dtype=chunk_latent.dtype)
-                    concat_mask[:, :, :overlap_latent_frames, :, :] = 0.0  # FORCE KEEP (no denoising)
-
-                    print(f"    concat_latent shape: {concat_latent.shape}")
-                    print(f"    concat_mask: {overlap_latent_frames} frames FORCED identical (mask=0), {new_noise_frames} frames generated (mask=1)")
-                    info_lines.append(f"  → IDENTICAL OVERLAP: First {overlap_frames_video} video frames ({overlap_latent_frames} latent) forced to match prev chunk")
-
-                    # Apply Tier 2
-                    chunk_positive = [[c[0], c[1].copy()] for c in chunk_positive]
-                    chunk_negative = [[c[0], c[1].copy()] for c in chunk_negative]
-
-                    chunk_positive[0][1]["concat_latent_image"] = concat_latent
-                    chunk_positive[0][1]["concat_mask"] = concat_mask
-                    chunk_negative[0][1]["concat_latent_image"] = concat_latent
-                    chunk_negative[0][1]["concat_mask"] = concat_mask
+                # TIER 2: Now handled through VACE controls - refined frames replace control frames with mask=0
+                # The concat_mask approach is no longer needed since VACE handles the forcing
+                # if chunk_idx > 0:
+                #     print(f"  Tier 2: First 16 frames enforced through VACE controls (mask=0 for refined frames)")
 
                 # FALLBACK: If no diffused overlap available, use old Tier 2 logic
                 elif chunk_idx > 0 and 'prev_chunk_samples' in locals():
@@ -3309,16 +3270,11 @@ class NV_VideoSampler:
                         if chunk_pixels.dim() == 5 and chunk_pixels.shape[0] == 1:
                             chunk_pixels = chunk_pixels.squeeze(0)
 
-                        # REPLACE first overlap frames with previous chunk's refined frames
-                        # This ensures pixel-perfect identity (not just latent identity)
-                        if chunk_idx > 0 and hasattr(self, '_prev_diffused_overlap') and self._prev_diffused_overlap is not None:
-                            overlap_frames = len(self._prev_diffused_overlap)
-                            if overlap_frames > 0 and len(chunk_pixels) >= overlap_frames:
-                                print(f"  Replacing first {overlap_frames} frames with previous chunk's refined pixels (ensures pixel-perfect overlap)")
-                                # Replace first N frames with the refined frames from previous chunk
-                                chunk_pixels[:overlap_frames] = self._prev_diffused_overlap.to(chunk_pixels.device)
-                            else:
-                                print(f"  ⚠️ Could not replace overlap frames: chunk has {len(chunk_pixels)} frames, need {overlap_frames}")
+                        # NOTE: Pixel replacement no longer needed - VACE controls enforce the overlap
+                        # The first 16 frames are forced identical through VACE mask=0
+                        # if chunk_idx > 0 and hasattr(self, '_prev_diffused_overlap') and self._prev_diffused_overlap is not None:
+                        #     overlap_frames = 16  # Fixed 16-frame overlap
+                        #     print(f"  First {overlap_frames} frames enforced identical through VACE controls (mask=0)")
 
                         # PER-CHUNK COLOR MATCHING (before blending)
                         # Apply color matching to each chunk immediately after decode
@@ -3522,10 +3478,11 @@ class NV_VideoSampler:
                                     except:
                                         pass
 
-                                # Replace last N frames in chunk with refined versions
-                                chunk_pixels[-actual_overlap_frames:] = refined_pixels
+                                # DO NOT replace frames in chunk - refined frames are ONLY for VACE conditioning
+                                # The original 81 frames from chunk 1 are the actual output
+                                # chunk_pixels[-actual_overlap_frames:] = refined_pixels  # REMOVED - don't modify output
 
-                                # Store refined overlap for next chunk's concat_mask
+                                # Store refined overlap for next chunk
                                 # Store LATENT (not pixels) to avoid re-encoding dimension loss
                                 if not hasattr(self, '_prev_diffused_overlap_latent'):
                                     self._prev_diffused_overlap_latent = None
@@ -3533,7 +3490,35 @@ class NV_VideoSampler:
                                     self._prev_diffused_overlap = None
                                 self._prev_diffused_overlap_latent = refined_latent.clone()  # Store refined latent (4 frames)
                                 self._prev_diffused_overlap = refined_pixels.clone()  # Store pixels for reference
-                                self._actual_overlap_frames = actual_overlap_frames  # Track actual count
+                                self._actual_overlap_frames = 16  # FIXED 16-frame overlap as designed
+
+                                # ENCODE refined 16 frames as VACE controls for next chunk
+                                if chunk_idx < len(chunk_conditionings) - 1:  # Not the last chunk
+                                    print(f"  Encoding refined 16 frames as VACE controls for next chunk...")
+                                    # Extract exactly 16 frames (pad if needed)
+                                    refined_16_frames = refined_pixels[-16:] if len(refined_pixels) >= 16 else refined_pixels
+                                    if len(refined_16_frames) < 16:
+                                        # Pad with last frame if we have fewer than 16
+                                        padding_needed = 16 - len(refined_16_frames)
+                                        last_frame = refined_16_frames[-1:].repeat(padding_needed, 1, 1, 1)
+                                        refined_16_frames = torch.cat([refined_16_frames, last_frame], dim=0)
+
+                                    # Encode as VACE dual-channel format (16ch VAE + 16ch zeros)
+                                    # refined_16_frames is [16, H, W, C]
+                                    refined_16_frames_batch = refined_16_frames.unsqueeze(0)  # [1, 16, H, W, C]
+
+                                    # Encode using VAE (get 16ch latent)
+                                    vae_encoded = vae.encode(refined_16_frames_batch.to(torch.float32))  # [1, 16, ~4, H, W]
+
+                                    # Add zeros padding for VACE dual-channel format
+                                    zeros_padding = torch.zeros_like(vae_encoded)
+                                    refined_vace_controls = torch.cat([vae_encoded, zeros_padding], dim=1)  # [1, 32, ~4, H, W]
+
+                                    # Store for next chunk
+                                    if not hasattr(self, '_prev_refined_vace_controls'):
+                                        self._prev_refined_vace_controls = None
+                                    self._prev_refined_vace_controls = refined_vace_controls
+                                    print(f"    ✓ Encoded refined frames as VACE controls: {refined_vace_controls.shape}")
 
                                 # UPDATE VACE REFERENCE for next chunk (last frame of refined output)
                                 if chunk_idx < len(chunk_conditionings) - 1:  # Not the last chunk
@@ -3826,12 +3811,11 @@ class NV_VideoSampler:
 
                     # Calculate total frames using DYNAMIC FORMULA (accounts for actual VAE overlap)
                     # Chunk 0: 81 frames
-                    # Chunk 1+: Variable NEW frames (81 - actual_overlap, where overlap may be 13-17)
-                    # Use stored actual_overlap_frames if available, else assume 16
-                    actual_overlap = getattr(self, '_actual_overlap_frames', 16)
+                    # Fixed 16-frame overlap as designed
+                    actual_overlap = 16
                     num_chunks = len(chunk_pixels_list)
-                    # Formula: 81 + (n-1) × (81 - actual_overlap)
-                    total_video_frames = 81 + (num_chunks - 1) * (81 - actual_overlap)
+                    # Formula: 81 + (n-1) × 65 (where 65 = 81 - 16)
+                    total_video_frames = 81 + (num_chunks - 1) * 65
 
                     print(f"  Total video frames: {total_video_frames} (formula: 81 + {num_chunks - 1} × {81 - actual_overlap})")
                     print(f"  Video dimensions: {H}x{W}x{C}")
@@ -3860,9 +3844,9 @@ class NV_VideoSampler:
                                 output_position += frames_to_use
                                 print(f"  Chunk {chunk_idx}: placed ALL {frames_to_use} frames → position {output_position}")
                             else:
-                                # Subsequent chunks: Skip first N frames (identical to previous chunk's last N)
-                                # Take only frames N-81 (65-68 NEW frames depending on actual overlap)
-                                skip_frames = min(actual_overlap, num_frames)  # Use actual overlap count
+                                # Subsequent chunks: Skip first 16 frames (identical to previous chunk's last 16)
+                                # Take only frames 17-81 (65 NEW frames)
+                                skip_frames = 16  # Fixed 16-frame overlap
                                 new_frames_start = skip_frames
                                 new_frames_end = num_frames
                                 new_frames_count = new_frames_end - new_frames_start
