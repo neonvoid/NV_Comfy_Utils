@@ -2486,11 +2486,11 @@ class NV_VideoSampler:
                     "tooltip": "How to blend overlapping chunks (linear=ramps, pyramid=triangular weights)"
                 }),
                 "blend_transition_frames": ("INT", {
-                    "default": 32,
+                    "default": 16,
                     "min": 4,
                     "max": 64,
                     "step": 4,
-                    "tooltip": "Crossfade duration in video frames for chunk blending (32=smooth like KJNodes, 16=medium, 4=fast)"
+                    "tooltip": "Crossfade duration in frames. Should match VACE overlap (16=default overlap, 32=extended blend)"
                 }),
                 "vae": ("VAE", {
                     "tooltip": "VAE for Tier 3 VACE overlap encoding (optional, enables strong temporal consistency)"
@@ -3282,7 +3282,8 @@ class NV_VideoSampler:
                         # PER-CHUNK COLOR MATCHING (before blending)
                         # Apply color matching to each chunk immediately after decode
                         # This ensures smooth color transitions when chunks are blended
-                        if hasattr(self, '_original_reference') and self._original_reference is not None and chunk_idx > 0:
+                        # Apply to ALL chunks including chunk 0 for consistency
+                        if hasattr(self, '_original_reference') and self._original_reference is not None:
                             try:
                                 from color_matcher import ColorMatcher
 
@@ -3296,16 +3297,16 @@ class NV_VideoSampler:
                                 for frame_idx in range(len(chunk_pixels)):
                                     try:
                                         frame_np = chunk_pixels[frame_idx].cpu().numpy()
-                                        matched = cm.transfer(src=frame_np, ref=ref_np, method='mkl')
-                                        # Apply at 45% strength (reduced from 70% to prevent over-enhancement)
-                                        matched = frame_np + 0.45 * (matched - frame_np)
+                                        matched = cm.transfer(src=frame_np, ref=ref_np, method='mvgd')
+                                        # Apply at 35% strength (using mvgd method for better color preservation)
+                                        matched = frame_np + 0.35 * (matched - frame_np)
                                         matched_frames.append(torch.from_numpy(matched))
                                     except Exception as e:
                                         # Fallback: use original frame
                                         matched_frames.append(chunk_pixels[frame_idx])
 
                                 chunk_pixels = torch.stack(matched_frames, dim=0)
-                                print(f"  ✓ Color matching complete for chunk {chunk_idx} (45% strength, original ref)")
+                                print(f"  ✓ Color matching complete for chunk {chunk_idx} (35% strength, mvgd method, original ref)")
                             except ImportError:
                                 print(f"  ⚠️  color-matcher not installed, skipping per-chunk color matching")
                             except Exception as e:
@@ -3536,10 +3537,10 @@ class NV_VideoSampler:
                                     zeros_padding = torch.zeros_like(last_frame_latent)
                                     vace_reference = torch.cat([last_frame_latent, zeros_padding], dim=1)  # [1, 32, 1, H, W]
 
-                                    # Also update color matching reference (still use pixels)
-                                    self._temp_start_image = refined_pixels[-1:].clone()
+                                    # DON'T update color matching reference - use original to prevent accumulation
+                                    # self._temp_start_image = refined_pixels[-1:].clone()  # REMOVED - causes progressive enhancement
 
-                                    print(f"  ✓ Updated VACE reference and color reference for chunk {chunk_idx + 1}")
+                                    print(f"  ✓ Updated VACE reference for chunk {chunk_idx + 1} (color ref stays original)")
                                     print(f"    (actual overlap: {actual_overlap_frames} frames for next chunk)")
 
                             except Exception as e:
@@ -3753,10 +3754,11 @@ class NV_VideoSampler:
 
                                     # Update color matching reference to refined last frame
                                     # This provides temporal color continuity from chunk to chunk
-                                    # Per-chunk color matching (before blending) prevents brightness dips
-                                    refined_last_frame = overlap_pixels[-1:].clone()  # [1, H, W, C]
-                                    self._temp_start_image = refined_last_frame.squeeze(0).unsqueeze(0)  # [1, H, W, C] batch format
-                                    print(f"    ✓ Updated color matching reference to refined last frame")
+                                    # DON'T update color matching reference - causes progressive enhancement
+                                    # refined_last_frame = overlap_pixels[-1:].clone()  # [1, H, W, C]
+                                    # self._temp_start_image = refined_last_frame.squeeze(0).unsqueeze(0)  # REMOVED
+                                    # Keep using original reference for all chunks
+                                    print(f"    ✓ Keeping original color reference (prevents progressive enhancement)")
 
                                 except Exception as e:
                                     print(f"    ⚠️  Diffusion refinement failed: {e}, using filtered pixels without refinement")
@@ -3830,13 +3832,21 @@ class NV_VideoSampler:
                     # Initialize final concatenated video (in PIXEL space, not latent space!)
                     final_video = torch.zeros((total_video_frames, H, W, C), dtype=first_chunk['pixels'].dtype)
 
-                    # CROSSFADE BLENDING (16-frame linear crossfade between chunks)
-                    overlap_frames = 16  # Fixed overlap for crossfade
+                    # CROSSFADE BLENDING (matching VACE overlap region)
+                    # Blends the 16-frame overlap where VACE forces identical content
+                    # With ease_in_out easing function for smooth transitions
+                    # Note: These 16 frames have same content but slight rendering variations
+                    overlap_frames = blend_transition_frames  # Use parameter (default 16 to match VACE)
+
+                    # Define ease_in_out easing function (smooth S-curve)
+                    def ease_in_out(t):
+                        """Smooth S-curve easing function (same as kjnodes)"""
+                        return 3 * t * t - 2 * t * t * t
 
                     try:
                         from color_matcher import ColorMatcher
 
-                        print(f"\n  Blending chunks with {overlap_frames}-frame linear crossfade...")
+                        print(f"\n  Blending chunks with {overlap_frames}-frame ease_in_out crossfade...")
 
                         output_position = 0  # Track position in final output
 
@@ -3857,21 +3867,26 @@ class NV_VideoSampler:
 
                                 print(f"  Chunk {chunk_idx}: placed ALL {frames_to_use} frames → position {output_position}")
                             else:
-                                # Subsequent chunks: Crossfade first 16 frames with previous chunk's last 16
-                                # Then add the remaining new frames
+                                # Subsequent chunks: Crossfade overlap region
+                                # These frames have identical content (forced by VACE mask=0)
+                                # But may have slight rendering variations that crossfade smooths
 
-                                # First, go back to where we need to blend (overwrite last 16 frames)
+                                # First, go back to where we need to blend (overwrite last overlap frames)
                                 blend_start_position = output_position - overlap_frames
 
-                                # Get current chunk's first 16 frames
+                                # Get current chunk's first overlap frames (VACE-forced identical content)
                                 current_overlap_frames = chunk_pixels[:overlap_frames]
 
-                                # Perform linear crossfade
-                                print(f"  Chunk {chunk_idx}: blending {overlap_frames} frames at position {blend_start_position}...")
+                                # Perform crossfade with ease_in_out easing
+                                print(f"  Chunk {chunk_idx}: blending {overlap_frames} frames at position {blend_start_position} (ease_in_out)...")
                                 for i in range(overlap_frames):
-                                    # Linear interpolation weights
-                                    weight_prev = 1.0 - (i / (overlap_frames - 1)) if overlap_frames > 1 else 0.5
-                                    weight_next = i / (overlap_frames - 1) if overlap_frames > 1 else 0.5
+                                    # Calculate t value and apply easing function
+                                    t = i / (overlap_frames - 1) if overlap_frames > 1 else 0.5
+                                    alpha = ease_in_out(t)  # Apply S-curve easing
+
+                                    # Calculate weights using eased alpha
+                                    weight_prev = 1.0 - alpha
+                                    weight_next = alpha
 
                                     # Blend the frames
                                     blended_frame = (prev_overlap_frames[i] * weight_prev +
@@ -3915,8 +3930,8 @@ class NV_VideoSampler:
                         print(f"\n  Skipping global color matching (already applied per-chunk)")
 
                         info_lines.append(f"  → Chunk concatenation applied (81 + (n-1)×{81-actual_overlap} pattern, overlap={actual_overlap})")
-                        info_lines.append(f"  → {overlap_frames}-frame linear crossfade blending applied")
-                        info_lines.append("  → Per-chunk color matching (45% strength, original reference, no accumulation)")
+                        info_lines.append(f"  → {overlap_frames}-frame ease_in_out crossfade blending (smooth S-curve)")
+                        info_lines.append("  → Per-chunk color matching (35% strength, mvgd method, original reference)")
                         
                     except ImportError:
                         print(f"  ⚠️  color-matcher not installed")
