@@ -3824,30 +3824,58 @@ class NV_VideoSampler:
                     # Initialize final concatenated video (in PIXEL space, not latent space!)
                     final_video = torch.zeros((total_video_frames, H, W, C), dtype=first_chunk['pixels'].dtype)
 
-                    # CONCATENATION (overlaps are already identical from concat_mask forcing)
+                    # CROSSFADE BLENDING (16-frame linear crossfade between chunks)
+                    overlap_frames = 16  # Fixed overlap for crossfade
+
                     try:
                         from color_matcher import ColorMatcher
 
-                        print(f"\n  Concatenating chunks (overlaps are already identical)...")
+                        print(f"\n  Blending chunks with {overlap_frames}-frame linear crossfade...")
 
                         output_position = 0  # Track position in final output
 
-                        for chunk_data in chunk_pixels_list:
+                        for idx, chunk_data in enumerate(chunk_pixels_list):
                             chunk_idx = chunk_data['chunk_idx']
                             chunk_pixels = chunk_data['pixels'].to(final_video.device)  # Move to same device
                             num_frames = len(chunk_pixels)
 
                             if chunk_idx == 0:
-                                # First chunk: Take ALL 81 frames
+                                # First chunk: Take ALL frames, but save last 16 for blending
                                 frames_to_use = min(81, num_frames)  # Safety check
                                 final_video[output_position:output_position + frames_to_use] = chunk_pixels[:frames_to_use]
                                 output_position += frames_to_use
+
+                                # Store last 16 frames for blending with next chunk
+                                if idx < len(chunk_pixels_list) - 1:  # Not the last chunk
+                                    prev_overlap_frames = chunk_pixels[-overlap_frames:].clone()
+
                                 print(f"  Chunk {chunk_idx}: placed ALL {frames_to_use} frames → position {output_position}")
                             else:
-                                # Subsequent chunks: Skip first 16 frames (identical to previous chunk's last 16)
-                                # Take only frames 17-81 (65 NEW frames)
-                                skip_frames = 16  # Fixed 16-frame overlap
-                                new_frames_start = skip_frames
+                                # Subsequent chunks: Crossfade first 16 frames with previous chunk's last 16
+                                # Then add the remaining new frames
+
+                                # First, go back to where we need to blend (overwrite last 16 frames)
+                                blend_start_position = output_position - overlap_frames
+
+                                # Get current chunk's first 16 frames
+                                current_overlap_frames = chunk_pixels[:overlap_frames]
+
+                                # Perform linear crossfade
+                                print(f"  Chunk {chunk_idx}: blending {overlap_frames} frames at position {blend_start_position}...")
+                                for i in range(overlap_frames):
+                                    # Linear interpolation weights
+                                    weight_prev = 1.0 - (i / (overlap_frames - 1)) if overlap_frames > 1 else 0.5
+                                    weight_next = i / (overlap_frames - 1) if overlap_frames > 1 else 0.5
+
+                                    # Blend the frames
+                                    blended_frame = (prev_overlap_frames[i] * weight_prev +
+                                                   current_overlap_frames[i] * weight_next)
+
+                                    # Place blended frame in output
+                                    final_video[blend_start_position + i] = blended_frame
+
+                                # Now add the NEW frames (frames 17-81)
+                                new_frames_start = overlap_frames
                                 new_frames_end = num_frames
                                 new_frames_count = new_frames_end - new_frames_start
 
@@ -3855,11 +3883,16 @@ class NV_VideoSampler:
                                     final_video[output_position:output_position + new_frames_count] = \
                                         chunk_pixels[new_frames_start:new_frames_end]
                                     output_position += new_frames_count
-                                    print(f"  Chunk {chunk_idx}: skipped first {skip_frames} frames (identical), placed {new_frames_count} NEW frames → position {output_position}")
-                                else:
-                                    print(f"  Chunk {chunk_idx}: ⚠️ No new frames after skipping overlap!")
 
-                        print(f"  ✓ All {len(chunk_pixels_list)} chunks concatenated ({output_position} total frames output)")
+                                    # Store last 16 frames for next chunk (if not last chunk)
+                                    if idx < len(chunk_pixels_list) - 1:
+                                        prev_overlap_frames = chunk_pixels[-overlap_frames:].clone()
+
+                                    print(f"  Chunk {chunk_idx}: blended {overlap_frames} frames, placed {new_frames_count} NEW frames → position {output_position}")
+                                else:
+                                    print(f"  Chunk {chunk_idx}: ⚠️ No new frames after overlap!")
+
+                        print(f"  ✓ All {len(chunk_pixels_list)} chunks blended with crossfade ({output_position} total frames output)")
 
                         # Verify frame count matches expected
                         if output_position != total_video_frames:
@@ -3876,7 +3909,7 @@ class NV_VideoSampler:
                         print(f"\n  Skipping global color matching (already applied per-chunk)")
 
                         info_lines.append(f"  → Chunk concatenation applied (81 + (n-1)×{81-actual_overlap} pattern, overlap={actual_overlap})")
-                        info_lines.append("  → Identical overlaps via concat_mask (no blending needed)")
+                        info_lines.append(f"  → {overlap_frames}-frame linear crossfade blending applied")
                         info_lines.append("  → Per-chunk color matching applied before refinement (70% strength)")
                         
                     except ImportError:
