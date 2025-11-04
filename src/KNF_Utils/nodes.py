@@ -3048,87 +3048,101 @@ class NV_VideoSampler:
 
                 has_vace_reference = vace_reference is not None  # Apply to ALL chunks (not just chunk 0)
                 
-                # Inject Wan VACE controls into conditioning if present
-                chunk_control_embeds = chunk_cond.get("control_embeds")
-                if chunk_control_embeds and len(chunk_control_embeds) > 0:
-                    print(f"  Injecting {len(chunk_control_embeds)} control(s)...")
+                # NEW: Chunk-by-chunk VACE encoding with pixel-space overlap
+                chunk_control_pixels_info = chunk_cond.get("control_pixels_info")
+                if chunk_control_pixels_info and len(chunk_control_pixels_info) > 0:
+                    print(f"  Encoding {len(chunk_control_pixels_info)} control(s) for this chunk...")
                     if has_vace_reference:
                         print(f"  VACE reference will be prepended as frame 0 to each control")
-                    info_lines.append(f"  → Chunk has {len(chunk_control_embeds)} control(s)")
-                    
+                    info_lines.append(f"  → Chunk has {len(chunk_control_pixels_info)} control(s)")
+
+                    # Get VAE and tiled setting from chunk conditioning
+                    chunk_vae = chunk_cond.get("vae")
+                    chunk_tiled = chunk_cond.get("tiled_vae", False)
+
                     # Combine all control embeds for this chunk
                     # ComfyUI Wan VACE expects: vace_frames, vace_mask, vace_strength
                     all_vace_frames = []
                     all_vace_masks = []
                     all_vace_strengths = []
-                    
-                    for ctrl_name, ctrl_data in chunk_control_embeds.items():
-                        # Extract control slice from FULL control latent (matches main latent logic)
-                        full_vace_frames = ctrl_data["vace_frames"]  # [1, 32, T_full, H, W]
-                        full_vace_mask = ctrl_data["vace_mask"]      # [1, 64, T_full, H, W]
 
-                        # Slice to match this chunk's temporal range
-                        chunk_vace_frames = full_vace_frames[:, :, chunk_start:chunk_end, :, :].clone()  # [1, 32, chunk_frames, H, W]
-                        chunk_vace_mask = full_vace_mask[:, :, chunk_start:chunk_end, :, :].clone()      # [1, 64, chunk_frames, H, W]
+                    for ctrl_name, ctrl_info in chunk_control_pixels_info.items():
+                        # Extract control pixels for this chunk's frame range
+                        full_control_pixels = ctrl_info["pixels"]  # [T, H, W, C] full video
 
-                        # NEW: Replace first 16 frames with refined VACE controls from previous chunk
-                        if chunk_idx > 0 and hasattr(self, '_prev_refined_vace_controls') and self._prev_refined_vace_controls is not None:
-                            # Use refined VACE controls from previous chunk
-                            refined_controls = self._prev_refined_vace_controls  # [1, 32, ~4, H, W]
-                            refined_latent_frames = refined_controls.shape[2]
+                        # Get pixel frames for this chunk
+                        chunk_control_pixels = full_control_pixels[chunk_cond["start_frame"]:chunk_cond["end_frame"]].clone()  # [chunk_frames, H, W, C]
 
-                            # Replace first N latent frames with refined controls
-                            chunk_vace_frames[:, :, :refined_latent_frames, :, :] = refined_controls[:, :, :, :, :]
+                        # NEW: Replace first 16 VIDEO frames with color-matched pixels from previous chunk
+                        if chunk_idx > 0 and hasattr(self, '_prev_chunk_overlap_pixels'):
+                            overlap_pixels = self._prev_chunk_overlap_pixels  # [16, H, W, C] already color-matched
+                            overlap_frames = min(16, chunk_control_pixels.shape[0])
 
-                            # Set mask=0 for these frames (force identical, no denoising)
-                            chunk_vace_mask[:, :, :refined_latent_frames, :, :] = 0.0
+                            # Replace first 16 frames with overlap from previous chunk
+                            chunk_control_pixels[:overlap_frames] = overlap_pixels[-overlap_frames:]
 
-                            print(f"    • Replaced first {refined_latent_frames} latent frames (~16 video) with refined VACE controls")
-                            print(f"      Mask: first {refined_latent_frames} frames = 0 (force identical), rest = 1 (generate)")
-                        
-                        # PREPEND VACE REFERENCE (if present and first chunk)
-                        # Per WAN VACE guide: reference becomes frame 0, temporally prepended
+                            print(f"    • Replaced first {overlap_frames} frames with color-matched overlap from chunk {chunk_idx-1}")
+
+                        # Encode this chunk's control pixels to VACE dual-channel format
+                        inactive_latents, reactive_latents = self._encode_vace_dual_channel(
+                            chunk_control_pixels, chunk_vae, chunk_tiled
+                        )
+
+                        # Package in ComfyUI Wan VACE format with batch dimension
+                        inactive_batched = inactive_latents.unsqueeze(0)  # [1, 16, T_lat, H, W]
+                        reactive_batched = reactive_latents.unsqueeze(0)  # [1, 16, T_lat, H, W]
+                        chunk_vace_frames = torch.cat([inactive_batched, reactive_batched], dim=1)  # [1, 32, T_lat, H, W]
+
+                        # Create 64-channel extended mask for this chunk
+                        C, T_lat, H_lat, W_lat = inactive_latents.shape
+                        vae_stride = 8
+                        chunk_vace_mask = torch.ones(1, vae_stride * vae_stride, T_lat, H_lat, W_lat,
+                                                     device=chunk_vace_frames.device, dtype=chunk_vace_frames.dtype)
+
+                        # Set mask=0 for overlap frames (inactive stream)
+                        if chunk_idx > 0 and hasattr(self, '_prev_chunk_overlap_pixels'):
+                            # Calculate how many latent frames correspond to 16 video frames
+                            # Approximately 16 video frames → 4 latent frames
+                            overlap_latent_frames = min(4, T_lat)
+                            chunk_vace_mask[:, :, :overlap_latent_frames, :, :] = 0.0
+                            print(f"      Mask: first {overlap_latent_frames} latent frames = 0 (inactive), rest = 1 (reactive)")
+
+                        # PREPEND VACE REFERENCE (if present)
                         if has_vace_reference:
                             # Prepend reference to control frames [1, 32, 1, H, W] + [1, 32, T, H, W]
                             chunk_vace_frames = torch.cat([vace_reference, chunk_vace_frames], dim=2)
-                            
+
                             # Create zero mask for reference frame [1, 64, 1, H, W]
                             zero_mask = torch.zeros((1, 64, 1, chunk_vace_mask.shape[3], chunk_vace_mask.shape[4]),
                                                    device=chunk_vace_mask.device, dtype=chunk_vace_mask.dtype)
                             chunk_vace_mask = torch.cat([zero_mask, chunk_vace_mask], dim=2)
-                        
+
                         all_vace_frames.append(chunk_vace_frames)
                         all_vace_masks.append(chunk_vace_mask)
-                        all_vace_strengths.extend(ctrl_data["vace_strength"])
-                        
+                        all_vace_strengths.append(ctrl_info["weight"])
+
                         ref_suffix = " +ref" if has_vace_reference else ""
-                        print(f"    • {ctrl_name}: weight={ctrl_data['vace_strength'][0]:.2f}, shape={chunk_vace_frames.shape}{ref_suffix}")
-                        info_lines.append(f"    • '{ctrl_name}': weight={ctrl_data['vace_strength'][0]:.2f}, slice=[{chunk_start}:{chunk_end}]{ref_suffix}")
-                    
+                        print(f"    • {ctrl_name}: weight={ctrl_info['weight']:.2f}, shape={chunk_vace_frames.shape}{ref_suffix}")
+                        info_lines.append(f"    • '{ctrl_name}': weight={ctrl_info['weight']:.2f}, encoded for chunk{ref_suffix}")
+
                     # Inject into both positive AND negative conditioning
                     # ComfyUI conditioning format: [[cond_tensor, {"key": value}], ...]
                     if isinstance(chunk_positive, list) and len(chunk_positive) > 0:
                         # Clone the conditioning to avoid modifying original
                         chunk_positive = [[c[0], c[1].copy()] for c in chunk_positive]
                         chunk_negative = [[c[0], c[1].copy()] for c in chunk_negative]
-                        
+
                         # Add Wan VACE keys to the first conditioning entry (both positive and negative)
                         chunk_positive[0][1]["vace_frames"] = all_vace_frames
                         chunk_positive[0][1]["vace_mask"] = all_vace_masks
                         chunk_positive[0][1]["vace_strength"] = all_vace_strengths
-                        
+
                         chunk_negative[0][1]["vace_frames"] = all_vace_frames
                         chunk_negative[0][1]["vace_mask"] = all_vace_masks
                         chunk_negative[0][1]["vace_strength"] = all_vace_strengths
-                        
-                        print(f"    ✓ Controls injected into conditioning")
+
+                        print(f"    ✓ Controls encoded and injected into conditioning")
                         info_lines.append(f"    ✓ VACE controls injected: {len(all_vace_frames)} control(s)")
-                        
-                        # Log Tier 3 replacement if it happened
-                        if prev_chunk_vace_control is not None and chunk_idx > 0:
-                            overlap_count = prev_chunk_vace_control["vace_frames"].shape[2]
-                            print(f"    ✓ Tier 3: Replaced first {overlap_count} frames with prev chunk (mask=0)")
-                            info_lines.append(f"  → Tier 3: Frame extension applied ({overlap_count} frames)")
                 
                 # VACE REFERENCE: Extend latent for first chunk if reference present
                 # Per WAN VACE architecture: generate with reference, then trim
@@ -3311,6 +3325,15 @@ class NV_VideoSampler:
                             except Exception as e:
                                 print(f"  ⚠️  Color matching failed for chunk {chunk_idx}: {e}, using unmatched")
 
+                        # NEW: Store last 16 frames (color-matched) for next chunk's VACE overlap
+                        if chunk_pixels is not None and len(chunk_pixels) >= 16:
+                            self._prev_chunk_overlap_pixels = chunk_pixels[-16:].clone()
+                            print(f"  ✓ Stored last 16 color-matched frames for next chunk's VACE overlap")
+                        elif chunk_pixels is not None:
+                            # If chunk has less than 16 frames, store what we have
+                            self._prev_chunk_overlap_pixels = chunk_pixels.clone()
+                            print(f"  ✓ Stored {len(chunk_pixels)} color-matched frames for next chunk's VACE overlap")
+
                         # ==============================================================================
                         # DIFFUSION REFINEMENT OF LAST N FRAMES (NEW LOCATION - END OF CHUNK PIPELINE)
                         # ==============================================================================
@@ -3392,29 +3415,10 @@ class NV_VideoSampler:
                                     all_vace_strengths = chunk_vace_strengths
 
                                     print(f"    ✓ Extracted VACE controls for last {target_latent_frames} latent frames (shape: {all_vace_frames[0].shape})")
-                                elif chunk_control_embeds and len(chunk_control_embeds) > 0:
-                                    # Fallback: extract from raw controls (old logic, may have dimension issues)
-                                    print(f"    ⚠️  Using fallback VACE extraction (chunk controls not in conditioning)")
-                                    all_vace_frames = []
-                                    all_vace_masks = []
-                                    all_vace_strengths = []
-
-                                    for ctrl_name, ctrl_data in chunk_control_embeds.items():
-                                        full_vace_frames = ctrl_data["vace_frames"]
-                                        full_vace_mask = ctrl_data["vace_mask"]
-
-                                        # Extract from chunk range, then take last N
-                                        chunk_vace_slice = full_vace_frames[:, :, chunk_start:chunk_end, :, :]
-                                        overlap_vace_frames = chunk_vace_slice[:, :, -target_latent_frames:, :, :]
-
-                                        chunk_mask_slice = full_vace_mask[:, :, chunk_start:chunk_end, :, :]
-                                        overlap_vace_mask = chunk_mask_slice[:, :, -target_latent_frames:, :, :]
-
-                                        all_vace_frames.append(overlap_vace_frames)
-                                        all_vace_masks.append(overlap_vace_mask)
-                                        all_vace_strengths.extend(ctrl_data["vace_strength"])
                                 else:
-                                    # No VACE controls available
+                                    # With chunk-by-chunk VACE encoding, controls are already in conditioning
+                                    # This fallback is no longer needed
+                                    print(f"    ⚠️  No VACE controls found for refinement")
                                     all_vace_frames = []
                                     all_vace_masks = []
                                     all_vace_strengths = []
@@ -3684,44 +3688,10 @@ class NV_VideoSampler:
                                         raise ValueError("No conditioning available for diffusion refinement")
 
                                     # INJECT VACE CONTROLS FOR EXTENSION FRAMES
-                                    # Apply the same controls that were used during sampling to maintain pose/composition consistency
-                                    prev_chunk_control_embeds = chunk_conditionings[chunk_idx - 1].get("control_embeds") if chunk_idx > 0 else None
-                                    if prev_chunk_control_embeds and len(prev_chunk_control_embeds) > 0:
-                                        # Clone conditioning to avoid modifying original
-                                        refine_positive = [[c[0], c[1].copy()] for c in refine_positive]
-                                        refine_negative = [[c[0], c[1].copy()] for c in refine_negative]
-
-                                        # Extract controls for the overlap region (last frames of previous chunk)
-                                        all_vace_frames = []
-                                        all_vace_masks = []
-                                        all_vace_strengths = []
-
-                                        for ctrl_name, ctrl_data in prev_chunk_control_embeds.items():
-                                            full_vace_frames = ctrl_data["vace_frames"]  # [1, 32, T_full, H, W]
-                                            full_vace_mask = ctrl_data["vace_mask"]      # [1, 64, T_full, H, W]
-
-                                            # Get the overlap region (last frames)
-                                            # overlap_pixels has the number of frames we're refining
-                                            num_overlap_latent_frames = overlap_pixels.shape[0] // 4  # Video frames to latent frames
-
-                                            # Slice the control to match the overlap region
-                                            overlap_vace_frames = full_vace_frames[:, :, -num_overlap_latent_frames:, :, :]
-                                            overlap_vace_mask = full_vace_mask[:, :, -num_overlap_latent_frames:, :, :]
-
-                                            all_vace_frames.append(overlap_vace_frames)
-                                            all_vace_masks.append(overlap_vace_mask)
-                                            all_vace_strengths.extend(ctrl_data["vace_strength"])
-
-                                        # Inject VACE controls into refinement conditioning
-                                        refine_positive[0][1]["vace_frames"] = all_vace_frames
-                                        refine_positive[0][1]["vace_mask"] = all_vace_masks
-                                        refine_positive[0][1]["vace_strength"] = all_vace_strengths
-
-                                        refine_negative[0][1]["vace_frames"] = all_vace_frames
-                                        refine_negative[0][1]["vace_mask"] = all_vace_masks
-                                        refine_negative[0][1]["vace_strength"] = all_vace_strengths
-
-                                        print(f"    ✓ Injected {len(all_vace_frames)} VACE control(s) for extension frame refinement")
+                                    # With chunk-by-chunk VACE encoding, controls are already properly injected
+                                    # The overlap pixels are already being used in the next chunk's VACE encoding
+                                    # So this injection is no longer needed
+                                    print(f"    ℹ️  Using chunk-by-chunk VACE encoding (overlap controls already injected)")
 
                                     print(f"    🎨 Applying diffusion refinement ({self._refine_steps} steps @ {self._refine_denoise} denoise)...")
 
@@ -3832,7 +3802,7 @@ class NV_VideoSampler:
 
                     # Calculate total frames based on ACTUAL chunk sizes and VACE overlap
                     # Use VACE overlap (typically 5 frames) NOT refinement overlap (13 frames)
-                    actual_overlap = self._actual_vace_overlap_frames if hasattr(self, '_actual_vace_overlap_frames') else 16
+                    actual_overlap = 16  # Fixed 16-frame overlap with chunk-by-chunk VACE encoding
                     num_chunks = len(chunk_pixels_list)
 
                     # Calculate actual total from real chunk sizes
@@ -3854,9 +3824,9 @@ class NV_VideoSampler:
                     # CROSSFADE BLENDING (matching VACE-forced identical region)
                     # Blends the actual VACE-forced identical frames (latent space round-trip)
                     # Using linear interpolation for smooth, uniform transitions
-                    # CRITICAL: Use _actual_vace_overlap_frames (typically ~8) NOT _actual_overlap_frames (typically 13)
-                    # The VACE-forced region is smaller due to re-encoding: 13 video → 2 latent → 8 video
-                    overlap_frames = self._actual_vace_overlap_frames if hasattr(self, '_actual_vace_overlap_frames') else blend_transition_frames
+                    # NEW: Use fixed 16-frame overlap for crossfade (matching our chunk-by-chunk VACE overlap)
+                    # With chunk-by-chunk encoding, we control the exact overlap
+                    overlap_frames = 16  # Fixed 16-frame crossfade as requested by user
 
                     try:
                         from color_matcher import ColorMatcher
@@ -4637,46 +4607,27 @@ class NV_ChunkConditioningPreprocessor:
         
         # Encode FULL control videos ONCE (not per-chunk)
         # This matches how the main latent works and avoids temporal interpolation
-        full_control_latents = {}
+        # NEW: Store control videos in pixel space for chunk-by-chunk encoding
+        full_control_pixels = {}
         if control_mode != "disabled" and control_videos and vae:
-            info_lines.append("Encoding full control videos...")
+            info_lines.append("Loading control videos (pixel space for chunk-by-chunk encoding)...")
             for ctrl_name, ctrl_path in control_videos.items():
                 if not ctrl_path or not os.path.exists(ctrl_path):
                     info_lines.append(f"  ⚠️ Control '{ctrl_name}' path not found: {ctrl_path}")
                     continue
-                
+
                 try:
                     # Load ENTIRE control video (not chunked)
                     total_frames = metadata.get("total_frames", 81)
                     ctrl_frames = self._load_video_frames(ctrl_path, 0, total_frames)
-                    
+
                     if ctrl_frames is not None:
-                        # Encode full video with VAE using DUAL-CHANNEL Wan VACE format
-                        inactive_latents, reactive_latents = self._encode_vace_dual_channel(
-                            ctrl_frames, vae, tiled_vae
-                        )
-                        
-                        # Package in ComfyUI Wan VACE format with batch dimension
-                        inactive_batched = inactive_latents.unsqueeze(0)  # [1, 16, T, H, W]
-                        reactive_batched = reactive_latents.unsqueeze(0)  # [1, 16, T, H, W]
-                        control_video_latent = torch.cat([inactive_batched, reactive_batched], dim=1)  # [1, 32, T, H, W]
-                        
-                        C, T, H, W = inactive_latents.shape
-                        
-                        # Create 64-channel extended mask for full video
-                        vae_stride = 8
-                        mask_64ch = torch.ones(vae_stride * vae_stride, T, H, W)  # [64, T, H, W]
-                        mask_64ch = mask_64ch.unsqueeze(0)  # [1, 64, T, H, W]
-                        
-                        # Store full control latents
-                        full_control_latents[ctrl_name] = {
-                            "vace_frames": control_video_latent,  # [1, 32, T_full, H, W]
-                            "vace_mask": mask_64ch,               # [1, 64, T_full, H, W]
-                        }
-                        
-                        info_lines.append(f"  ✓ Encoded '{ctrl_name}': {control_video_latent.shape} (full video)")
+                        # Store control frames in PIXEL space for chunk-by-chunk encoding
+                        full_control_pixels[ctrl_name] = ctrl_frames  # [T, H, W, C] in range [0, 1]
+
+                        info_lines.append(f"  ✓ Loaded '{ctrl_name}': {ctrl_frames.shape} (pixel space)")
                 except Exception as e:
-                    info_lines.append(f"  ✗ Failed to encode control '{ctrl_name}': {e}")
+                    info_lines.append(f"  ✗ Failed to load control '{ctrl_name}': {e}")
             
             info_lines.append("")
         
@@ -4707,9 +4658,9 @@ class NV_ChunkConditioningPreprocessor:
             else:
                 negative_cond = global_negative if global_negative is not None else []
             
-            # Reference full control videos for this chunk
-            control_embeds = {}
-            if control_mode != "disabled" and full_control_latents:
+            # Reference control videos in PIXEL space for chunk-by-chunk encoding
+            control_pixels_info = {}
+            if control_mode != "disabled" and full_control_pixels:
                 chunk_controls = chunk.get("controls", {})
                 for ctrl_name, ctrl_settings in chunk_controls.items():
                     # Skip if this control is disabled for this chunk
@@ -4721,18 +4672,16 @@ class NV_ChunkConditioningPreprocessor:
                     if weight == 0.0:
                         continue
 
-                    # Get full control latent
-                    if ctrl_name not in full_control_latents:
-                        info_lines.append(f"  ⚠️ Control '{ctrl_name}' not found in encoded controls")
+                    # Get full control pixels
+                    if ctrl_name not in full_control_pixels:
+                        info_lines.append(f"  ⚠️ Control '{ctrl_name}' not found in loaded controls")
                         continue
-                    
-                    # Store reference to FULL control latent
-                    # Sampler will extract the appropriate slice
-                    full_ctrl = full_control_latents[ctrl_name]
-                    control_embeds[ctrl_name] = {
-                        "vace_frames": full_ctrl["vace_frames"],  # [1, 32, T_full, H, W]
-                        "vace_mask": full_ctrl["vace_mask"],      # [1, 64, T_full, H, W]
-                        "vace_strength": [ctrl_settings.get("weight", 1.0)],
+
+                    # Store reference to FULL control pixels
+                    # Sampler will encode the appropriate slice
+                    control_pixels_info[ctrl_name] = {
+                        "pixels": full_control_pixels[ctrl_name],  # [T, H, W, C] full video in pixel space
+                        "weight": ctrl_settings.get("weight", 1.0),
                         "start_percent": ctrl_settings.get("start_percent", 0.0),
                         "end_percent": ctrl_settings.get("end_percent", 1.0),
                     }
@@ -4745,11 +4694,13 @@ class NV_ChunkConditioningPreprocessor:
                 "num_frames": chunk.get("num_frames", 0),
                 "positive": positive_cond,
                 "negative": negative_cond,
-                "control_embeds": control_embeds if control_embeds else None,
+                "control_pixels_info": control_pixels_info if control_pixels_info else None,  # Pixel-space controls
                 "vace_reference": vace_reference_latent,  # VACE reference (global anchor)
                 "start_image_pixels": getattr(self, '_start_image_pixels', None),  # For pixel-space color matching
                 "is_first": chunk.get("is_first", False),
                 "is_last": chunk.get("is_last", False),
+                "vae": vae,  # Store VAE for chunk-by-chunk encoding
+                "tiled_vae": tiled_vae,  # Store tiled setting
             }
             
             chunk_conditionings.append(chunk_conditioning)
