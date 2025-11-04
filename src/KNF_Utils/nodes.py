@@ -3151,24 +3151,39 @@ class NV_VideoSampler:
                 if has_vace_reference:
                     # Extend the chunk latent and noise by 1 frame to accommodate reference
                     # The reference frame will be frame 0, actual generation starts at frame 1
+                    # BUT: Don't extend if this is the last chunk and it's shorter than normal
+                    is_last_chunk = (chunk_idx == len(chunk_conditionings) - 1)
+                    chunk_is_short = (chunk_frames < 20)  # Normal chunks have 21 frames, last might be shorter
+
                     if chunk_end + 1 <= latent.shape[2]:
+                        # Normal case: we can extend by 1 frame from the main latent
                         chunk_latent_for_sampling = latent[:, :, chunk_start:chunk_end+1, :, :]  # +1 frame
                         chunk_noise_for_sampling = noise[:, :, chunk_start:chunk_end+1, :, :] if not disable_noise else torch.zeros_like(chunk_latent_for_sampling)
+                        trim_reference_frame = 1
+                        print(f"  VACE reference: Extended latent by 1 frame for generation")
+                    elif is_last_chunk and chunk_is_short:
+                        # Last chunk is shorter - DON'T extend with zeros, use as-is
+                        # The VACE controls already include the reference, so dimensions will match
+                        chunk_latent_for_sampling = chunk_latent  # Use original chunk size
+                        chunk_noise_for_sampling = chunk_noise
+                        trim_reference_frame = 1  # Still need to trim the prepended reference
+                        print(f"  VACE reference: Last chunk is short ({chunk_frames} frames), not extending")
                     else:
-                        # At the end, just extend with zeros
-                        extra_frame = torch.zeros((1, latent.shape[1], 1, latent.shape[3], latent.shape[4]), 
+                        # Edge case: At the end but still want to extend (shouldn't normally happen)
+                        extra_frame = torch.zeros((1, latent.shape[1], 1, latent.shape[3], latent.shape[4]),
                                                   device=latent.device, dtype=latent.dtype)
                         chunk_latent_for_sampling = torch.cat([chunk_latent, extra_frame], dim=2)
                         if not disable_noise:
                             chunk_noise_for_sampling = torch.cat([chunk_noise, torch.randn_like(extra_frame)], dim=2)
                         else:
                             chunk_noise_for_sampling = torch.zeros_like(chunk_latent_for_sampling)
-                    
-                    trim_reference_frame = 1
-                    print(f"  VACE reference: Extended latent by 1 frame for generation")
+                        trim_reference_frame = 1
+                        print(f"  VACE reference: Extended with zeros (edge case)")
+
                     print(f"    Latent shape: {chunk_latent_for_sampling.shape}")
-                    print(f"    Will trim {trim_reference_frame} frame after generation")
-                    info_lines.append(f"  → VACE reference: Latent extended, will trim after gen")
+                    if trim_reference_frame > 0:
+                        print(f"    Will trim {trim_reference_frame} frame after generation")
+                    info_lines.append(f"  → VACE reference: Handled for chunk {chunk_idx}")
                 # TIER 2: Now handled through VACE controls - refined frames replace control frames with mask=0
                 # The concat_mask approach is no longer needed since VACE handles the forcing
                 # if chunk_idx > 0:
