@@ -2998,6 +2998,12 @@ class NV_VideoSampler:
                 # Per-chunk seed variation (if enabled)
                 chunk_seed = seed + chunk_idx if per_chunk_seed_offset else seed
 
+                # Handle problematic seeds (0, 1, 2 often produce brown noise in diffusion models)
+                if chunk_seed in [0, 1, 2]:
+                    safe_seed = 42422 + chunk_seed  # Use safe fallback seed with offset
+                    print(f"  ⚠️ Seed {chunk_seed} detected (problematic), using fallback seed {safe_seed}")
+                    chunk_seed = safe_seed
+
                 print(f"\n[Chunk {chunk_idx + 1}/{len(chunk_conditionings)}] Starting...")
                 print(f"  Frame range: {chunk_cond['start_frame']}-{chunk_cond['end_frame']}")
                 print(f"  Latent range: {chunk_start}-{chunk_end} ({chunk_frames} frames)")
@@ -3824,18 +3830,23 @@ class NV_VideoSampler:
                     first_chunk = chunk_pixels_list[0]
                     H, W, C = first_chunk['pixels'].shape[1], first_chunk['pixels'].shape[2], first_chunk['pixels'].shape[3]
 
-                    # Calculate total frames using DYNAMIC FORMULA (accounts for actual VAE overlap)
-                    # Chunk 0: 81 frames
-                    # Use actual VAE overlap (typically 13 frames) for accurate count
-                    actual_overlap = self._actual_overlap_frames if hasattr(self, '_actual_overlap_frames') else 16
+                    # Calculate total frames based on ACTUAL chunk sizes and VACE overlap
+                    # Use VACE overlap (typically 5 frames) NOT refinement overlap (13 frames)
+                    actual_overlap = self._actual_vace_overlap_frames if hasattr(self, '_actual_vace_overlap_frames') else 16
                     num_chunks = len(chunk_pixels_list)
-                    # Formula: 81 + (n-1) × (81 - actual_overlap)
-                    # E.g. with 13-frame overlap: 81 + (n-1) × 68
-                    total_video_frames = 81 + (num_chunks - 1) * (81 - actual_overlap)
 
-                    print(f"  Total video frames: {total_video_frames} (formula: 81 + {num_chunks - 1} × {81 - actual_overlap})")
+                    # Calculate actual total from real chunk sizes
+                    total_video_frames = 0
+                    for idx, chunk_data in enumerate(chunk_pixels_list):
+                        chunk_frames = len(chunk_data['pixels'])
+                        if idx == 0:
+                            total_video_frames += chunk_frames  # First chunk: use all frames
+                        else:
+                            total_video_frames += chunk_frames - actual_overlap  # Subsequent: subtract overlap
+
+                    print(f"  Total video frames: {total_video_frames} (calculated from actual chunk sizes)")
                     print(f"  Video dimensions: {H}x{W}x{C}")
-                    print(f"  Chunk pattern: First chunk = 81 frames, subsequent chunks = {81 - actual_overlap} NEW frames (overlap={actual_overlap})")
+                    print(f"  VACE overlap: {actual_overlap} frames (frames forced identical between chunks)")
 
                     # Initialize final concatenated video (in PIXEL space, not latent space!)
                     final_video = torch.zeros((total_video_frames, H, W, C), dtype=first_chunk['pixels'].dtype)
@@ -3932,8 +3943,8 @@ class NV_VideoSampler:
                         # This prevents brightness dips at chunk transitions
                         print(f"\n  Skipping global color matching (already applied per-chunk)")
 
-                        info_lines.append(f"  → Chunk concatenation applied (81 + (n-1)×{81-actual_overlap} pattern, overlap={actual_overlap})")
-                        info_lines.append(f"  → {overlap_frames}-frame linear crossfade blending")
+                        info_lines.append(f"  → Chunk concatenation with {actual_overlap}-frame VACE overlap")
+                        info_lines.append(f"  → {overlap_frames}-frame linear crossfade blending (VACE-forced identical region)")
                         info_lines.append("  → Per-chunk color matching (full strength, mvgd method, original reference)")
                         
                     except ImportError:
