@@ -3297,16 +3297,15 @@ class NV_VideoSampler:
                                 for frame_idx in range(len(chunk_pixels)):
                                     try:
                                         frame_np = chunk_pixels[frame_idx].cpu().numpy()
+                                        # Full strength MVGD color matching as per user preference
                                         matched = cm.transfer(src=frame_np, ref=ref_np, method='mvgd')
-                                        # Apply at 35% strength (using mvgd method for better color preservation)
-                                        matched = frame_np + 0.35 * (matched - frame_np)
                                         matched_frames.append(torch.from_numpy(matched))
                                     except Exception as e:
                                         # Fallback: use original frame
                                         matched_frames.append(chunk_pixels[frame_idx])
 
                                 chunk_pixels = torch.stack(matched_frames, dim=0)
-                                print(f"  ✓ Color matching complete for chunk {chunk_idx} (35% strength, mvgd method, original ref)")
+                                print(f"  ✓ Color matching complete for chunk {chunk_idx} (full strength, mvgd method, original ref)")
                             except ImportError:
                                 print(f"  ⚠️  color-matcher not installed, skipping per-chunk color matching")
                             except Exception as e:
@@ -3497,25 +3496,20 @@ class NV_VideoSampler:
                                     self._prev_diffused_overlap = None
                                 self._prev_diffused_overlap_latent = refined_latent.clone()  # Store refined latent (4 frames)
                                 self._prev_diffused_overlap = refined_pixels.clone()  # Store pixels for reference
-                                self._actual_overlap_frames = 16  # FIXED 16-frame overlap as designed
+                                self._actual_overlap_frames = actual_overlap_frames  # Use ACTUAL VAE output (typically 13)
 
-                                # ENCODE refined 16 frames as VACE controls for next chunk
+                                # ENCODE refined frames as VACE controls for next chunk
                                 if chunk_idx < len(chunk_conditionings) - 1:  # Not the last chunk
-                                    print(f"  Encoding refined 16 frames as VACE controls for next chunk...")
-                                    # Extract exactly 16 frames (pad if needed)
-                                    refined_16_frames = refined_pixels[-16:] if len(refined_pixels) >= 16 else refined_pixels
-                                    if len(refined_16_frames) < 16:
-                                        # Pad with last frame if we have fewer than 16
-                                        padding_needed = 16 - len(refined_16_frames)
-                                        last_frame = refined_16_frames[-1:].repeat(padding_needed, 1, 1, 1)
-                                        refined_16_frames = torch.cat([refined_16_frames, last_frame], dim=0)
+                                    print(f"  Encoding refined {actual_overlap_frames} frames as VACE controls for next chunk...")
+                                    # Use all refined frames (typically 13 from VAE decode)
+                                    refined_overlap_frames = refined_pixels  # Use all frames from VAE decode
 
                                     # Encode as VACE dual-channel format (16ch VAE + 16ch zeros)
-                                    # refined_16_frames is [16, H, W, C]
-                                    refined_16_frames_batch = refined_16_frames.unsqueeze(0)  # [1, 16, H, W, C]
+                                    # refined_overlap_frames is [actual_overlap_frames, H, W, C]
+                                    refined_overlap_frames_batch = refined_overlap_frames.unsqueeze(0)  # [1, actual_overlap_frames, H, W, C]
 
                                     # Encode using VAE (get 16ch latent)
-                                    vae_encoded = vae.encode(refined_16_frames_batch.to(torch.float32))  # [1, 16, ~4, H, W]
+                                    vae_encoded = vae.encode(refined_overlap_frames_batch.to(torch.float32))  # [1, 16, ~4, H, W]
 
                                     # Add zeros padding for VACE dual-channel format
                                     zeros_padding = torch.zeros_like(vae_encoded)
@@ -3819,11 +3813,12 @@ class NV_VideoSampler:
 
                     # Calculate total frames using DYNAMIC FORMULA (accounts for actual VAE overlap)
                     # Chunk 0: 81 frames
-                    # Fixed 16-frame overlap as designed
-                    actual_overlap = 16
+                    # Use actual VAE overlap (typically 13 frames) for accurate count
+                    actual_overlap = self._actual_overlap_frames if hasattr(self, '_actual_overlap_frames') else 16
                     num_chunks = len(chunk_pixels_list)
-                    # Formula: 81 + (n-1) × 65 (where 65 = 81 - 16)
-                    total_video_frames = 81 + (num_chunks - 1) * 65
+                    # Formula: 81 + (n-1) × (81 - actual_overlap)
+                    # E.g. with 13-frame overlap: 81 + (n-1) × 68
+                    total_video_frames = 81 + (num_chunks - 1) * (81 - actual_overlap)
 
                     print(f"  Total video frames: {total_video_frames} (formula: 81 + {num_chunks - 1} × {81 - actual_overlap})")
                     print(f"  Video dimensions: {H}x{W}x{C}")
@@ -3833,10 +3828,11 @@ class NV_VideoSampler:
                     final_video = torch.zeros((total_video_frames, H, W, C), dtype=first_chunk['pixels'].dtype)
 
                     # CROSSFADE BLENDING (matching VACE overlap region)
-                    # Blends the 16-frame overlap where VACE forces identical content
+                    # Blends the actual VAE overlap where VACE forces identical content
                     # With ease_in_out easing function for smooth transitions
-                    # Note: These 16 frames have same content but slight rendering variations
-                    overlap_frames = blend_transition_frames  # Use parameter (default 16 to match VACE)
+                    # Note: These frames have same content but slight rendering variations
+                    # Use actual VAE output count (typically 13 frames) to avoid ghosting
+                    overlap_frames = self._actual_overlap_frames if hasattr(self, '_actual_overlap_frames') else blend_transition_frames
 
                     # Define ease_in_out easing function (smooth S-curve)
                     def ease_in_out(t):
@@ -3856,12 +3852,12 @@ class NV_VideoSampler:
                             num_frames = len(chunk_pixels)
 
                             if chunk_idx == 0:
-                                # First chunk: Take ALL frames, but save last 16 for blending
+                                # First chunk: Take ALL frames, but save last overlap frames for blending
                                 frames_to_use = min(81, num_frames)  # Safety check
                                 final_video[output_position:output_position + frames_to_use] = chunk_pixels[:frames_to_use]
                                 output_position += frames_to_use
 
-                                # Store last 16 frames for blending with next chunk
+                                # Store last overlap frames for blending with next chunk
                                 if idx < len(chunk_pixels_list) - 1:  # Not the last chunk
                                     prev_overlap_frames = chunk_pixels[-overlap_frames:].clone()
 
