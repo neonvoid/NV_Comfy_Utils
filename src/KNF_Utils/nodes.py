@@ -3244,20 +3244,14 @@ class NV_VideoSampler:
                     print(f"    After trim: {chunk_samples.shape}")
                     info_lines.append(f"  → Reference frame trimmed from output")
 
-                # TIER 3 EXTENSION FRAME TRIMMING: Use most extension frames for conditioning only
-                # Keep a small overlap (1 latent frame ~4 video frames) for pixel-space feather blending
-                if chunk_idx > 0 and chunk_overlap > 0:
-                    overlap_frames_latent = min(chunk_overlap, chunk_samples.shape[2])
+                # REMOVED: Extension frame trimming (was breaking chunk sizes for crossfade blending)
+                # The full sampled chunk is needed for proper crossfade at the correct frame positions
+                # Extension frame management is handled during VACE conditioning prep, not output trimming
 
-                    # Keep 1 latent frame for blending, trim the rest
-                    blend_frames_latent = 1
-                    trim_amount = max(0, overlap_frames_latent - blend_frames_latent)
-
-                    print(f"  Trimming {trim_amount} extension frames, keeping {blend_frames_latent} for blending...")
-                    print(f"    Before trim: {chunk_samples.shape}")
-                    chunk_samples = chunk_samples[:, :, trim_amount:, :, :]
-                    print(f"    After trim: {chunk_samples.shape}")
-                    info_lines.append(f"  → {trim_amount} extension frames trimmed, {blend_frames_latent} kept for blending")
+                # if chunk_idx > 0 and chunk_overlap > 0:
+                #     # This was causing chunks to be smaller than expected (e.g., 65 instead of 81 frames)
+                #     # which broke the crossfade blending dimension calculations
+                #     pass
 
                 # Decode chunk to pixels immediately for pixel-space processing
                 if vae is not None:
@@ -3550,9 +3544,14 @@ class NV_VideoSampler:
                                     remaining_end_pos = min(chunk_end_frame, total_video_frames)
                                     remaining_chunk_start = blend_frames_actual
 
-                                    if remaining_start_pos < remaining_end_pos:
-                                        final_video[remaining_start_pos:remaining_end_pos] = \
-                                            chunk_pixels[remaining_chunk_start:remaining_chunk_start + (remaining_end_pos - remaining_start_pos)]
+                                    # Calculate how many frames we actually need and have
+                                    frames_needed = remaining_end_pos - remaining_start_pos
+                                    frames_available = num_frames - remaining_chunk_start
+                                    frames_to_copy = min(frames_needed, frames_available)
+
+                                    if frames_to_copy > 0:
+                                        final_video[remaining_start_pos:remaining_start_pos + frames_to_copy] = \
+                                            chunk_pixels[remaining_chunk_start:remaining_chunk_start + frames_to_copy]
 
                                     print(f"  Chunk {chunk_idx}: crossfaded {blend_frames_actual} frames at {chunk_start_frame}, placed {num_frames - blend_frames_actual} frames")
                                 else:
