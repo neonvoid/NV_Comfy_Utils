@@ -3358,21 +3358,11 @@ class NV_VideoSampler:
 
                                 print(f"  🎨 Diffusion refinement: Processing last {target_latent_frames} latent frames...")
 
-                                # Extract last N LATENT frames from chunk_samples (not video frames!)
+                                # Extract last N LATENT frames from chunk_samples for refinement
+                                # We refine directly in latent space (no decode→re-encode cycle)
                                 last_n_latent = chunk_samples[:, :, -target_latent_frames:, :, :]
 
-                                # Decode to get actual video frames (VAE decides the count)
-                                last_n_pixels_batched = vae.decode(last_n_latent.to(torch.float32))
-
-                                # Handle shape
-                                if last_n_pixels_batched.dim() == 5 and last_n_pixels_batched.shape[0] == 1:
-                                    last_n_frames = last_n_pixels_batched.squeeze(0)  # [N, H, W, C]
-                                else:
-                                    last_n_frames = last_n_pixels_batched
-
-                                # IMPORTANT: Use ACTUAL frame count from VAE decode (may be 13-17, not exactly 16)
-                                actual_overlap_frames = len(last_n_frames)
-                                print(f"    VAE decoded {target_latent_frames} latent → {actual_overlap_frames} video frames")
+                                print(f"    Refining last {target_latent_frames} latent frames (shape: {last_n_latent.shape})")
 
                                 # Get conditioning for diffusion
                                 refine_positive = chunk_positive if chunk_positive is not None else self._refine_positive
@@ -3460,46 +3450,9 @@ class NV_VideoSampler:
 
                                     print(f"    ✓ Injected {len(all_vace_frames)} VACE control(s) for refinement")
 
-                                # Encode to latent
+                                # Run diffusion refinement on the original latent frames
+                                # VACE controls already match (both {target_latent_frames} latent frames)
                                 from nodes import common_ksampler
-                                last_n_batched = last_n_frames.unsqueeze(0)  # [1, N, H, W, C]
-                                last_n_latent = vae.encode(last_n_batched.to(torch.float32))
-
-                                # CRITICAL: Interpolate VACE controls to match re-encoded latent temporal dimension
-                                # The re-encoded latent may have different temporal dim than original extraction
-                                refinement_temporal_frames = last_n_latent.shape[2]
-
-                                if len(all_vace_frames) > 0 and all_vace_frames[0].shape[2] != refinement_temporal_frames:
-                                    print(f"    ⚙️  Interpolating VACE controls: {all_vace_frames[0].shape[2]} → {refinement_temporal_frames} latent frames")
-
-                                    interpolated_vace_frames = []
-                                    interpolated_vace_masks = []
-
-                                    for vace_frames, vace_mask in zip(all_vace_frames, all_vace_masks):
-                                        # Interpolate temporal dimension to match refinement latent
-                                        vace_interp = F.interpolate(
-                                            vace_frames,
-                                            size=(refinement_temporal_frames, vace_frames.shape[3], vace_frames.shape[4]),
-                                            mode='nearest-exact'
-                                        )
-                                        mask_interp = F.interpolate(
-                                            vace_mask,
-                                            size=(refinement_temporal_frames, vace_mask.shape[3], vace_mask.shape[4]),
-                                            mode='nearest-exact'
-                                        )
-
-                                        interpolated_vace_frames.append(vace_interp)
-                                        interpolated_vace_masks.append(mask_interp)
-
-                                    # Update conditioning with interpolated controls
-                                    refine_positive[0][1]["vace_frames"] = interpolated_vace_frames
-                                    refine_positive[0][1]["vace_mask"] = interpolated_vace_masks
-                                    refine_negative[0][1]["vace_frames"] = interpolated_vace_frames
-                                    refine_negative[0][1]["vace_mask"] = interpolated_vace_masks
-
-                                    print(f"    ✓ VACE controls interpolated to match refinement latent")
-
-                                # Run diffusion refinement
                                 print(f"    Running {self._refine_steps} steps @ {self._refine_denoise} denoise...")
                                 refined_output = common_ksampler(
                                     model=self._refine_model,
@@ -3515,13 +3468,17 @@ class NV_VideoSampler:
                                     force_full_denoise=True
                                 )
 
-                                # Decode refined latent
+                                # Decode refined latent to pixels
                                 refined_latent = refined_output[0]["samples"]
                                 refined_pixels = vae.decode(refined_latent.to(torch.float32))
 
                                 # Handle shape
                                 if refined_pixels.dim() == 5 and refined_pixels.shape[0] == 1:
                                     refined_pixels = refined_pixels.squeeze(0)
+
+                                # Get actual frame count from decoded refined latent
+                                actual_overlap_frames = len(refined_pixels)
+                                print(f"  ✓ Diffusion refinement complete: refined {target_latent_frames} latent → {actual_overlap_frames} video frames")
 
                                 # Color match refined frames AGAIN with reference
                                 if hasattr(self, '_temp_start_image') and self._temp_start_image is not None and chunk_idx > 0:
@@ -3547,9 +3504,7 @@ class NV_VideoSampler:
                                         pass
 
                                 # Replace last N frames in chunk with refined versions
-                                # Use ACTUAL frame count to avoid dimension mismatch
                                 chunk_pixels[-actual_overlap_frames:] = refined_pixels
-                                print(f"  ✓ Diffusion refinement complete: last {actual_overlap_frames} frames updated")
 
                                 # Store refined overlap for next chunk's concat_mask
                                 if not hasattr(self, '_prev_diffused_overlap'):
