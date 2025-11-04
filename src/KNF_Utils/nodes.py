@@ -3153,8 +3153,8 @@ class NV_VideoSampler:
                 if chunk_idx > 0 and hasattr(self, '_prev_diffused_overlap') and self._prev_diffused_overlap is not None:
                     # Use the diffused overlap frames from the end of previous chunk
                     # These are the high-quality, refined frames that we want to FORCE as identical
-                    prev_overlap_pixels = self._prev_diffused_overlap  # [16, H, W, C] (or less)
-                    overlap_frames_video = len(prev_overlap_pixels)  # Should be 16
+                    prev_overlap_pixels = self._prev_diffused_overlap  # [N, H, W, C] where N is actual count
+                    overlap_frames_video = getattr(self, '_actual_overlap_frames', len(prev_overlap_pixels))  # Use tracked count
 
                     print(f"  Tier 2 (ENHANCED): Forcing first {overlap_frames_video} frames to match prev chunk's diffused output")
 
@@ -3341,21 +3341,37 @@ class NV_VideoSampler:
                                 print(f"  ⚠️  Color matching failed for chunk {chunk_idx}: {e}, using unmatched")
 
                         # ==============================================================================
-                        # DIFFUSION REFINEMENT OF LAST 16 FRAMES (NEW LOCATION - END OF CHUNK PIPELINE)
+                        # DIFFUSION REFINEMENT OF LAST N FRAMES (NEW LOCATION - END OF CHUNK PIPELINE)
                         # ==============================================================================
                         # This creates high-quality overlap frames that will be:
                         # 1. Part of current chunk's output
                         # 2. Forced as identical input for next chunk (via concat_mask)
                         # 3. Used to create VACE reference for next chunk
+                        #
+                        # KEY FIX: Work with LATENT frames first, accept whatever VIDEO frame count VAE produces
 
-                        overlap_frames_video = min(16, len(chunk_pixels))  # 16 frames or less if chunk is smaller
-
-                        if overlap_frames_video > 0 and hasattr(self, '_refine_enable') and self._refine_enable:
+                        if hasattr(self, '_refine_enable') and self._refine_enable and 'chunk_samples' in locals():
                             try:
-                                print(f"  🎨 Diffusion refinement: Processing last {overlap_frames_video} frames...")
+                                # Calculate target latent frames (aim for ~16 video frames, but accept VAE's decision)
+                                target_latent_frames = min(4, chunk_frames - 1)  # ~4 latent = ~16 video frames
 
-                                # Extract last N frames
-                                last_n_frames = chunk_pixels[-overlap_frames_video:]  # [N, H, W, C]
+                                print(f"  🎨 Diffusion refinement: Processing last {target_latent_frames} latent frames...")
+
+                                # Extract last N LATENT frames from chunk_samples (not video frames!)
+                                last_n_latent = chunk_samples[:, :, -target_latent_frames:, :, :]
+
+                                # Decode to get actual video frames (VAE decides the count)
+                                last_n_pixels_batched = vae.decode(last_n_latent.to(torch.float32))
+
+                                # Handle shape
+                                if last_n_pixels_batched.dim() == 5 and last_n_pixels_batched.shape[0] == 1:
+                                    last_n_frames = last_n_pixels_batched.squeeze(0)  # [N, H, W, C]
+                                else:
+                                    last_n_frames = last_n_pixels_batched
+
+                                # IMPORTANT: Use ACTUAL frame count from VAE decode (may be 13-17, not exactly 16)
+                                actual_overlap_frames = len(last_n_frames)
+                                print(f"    VAE decoded {target_latent_frames} latent → {actual_overlap_frames} video frames")
 
                                 # Get conditioning for diffusion
                                 refine_positive = chunk_positive if chunk_positive is not None else self._refine_positive
@@ -3379,11 +3395,11 @@ class NV_VideoSampler:
                                         full_vace_frames = ctrl_data["vace_frames"]
                                         full_vace_mask = ctrl_data["vace_mask"]
 
-                                        # Calculate latent frames for the overlap region
-                                        overlap_latent_frames = overlap_frames_video // 4
+                                        # Use the LATENT frame count we extracted (target_latent_frames)
+                                        overlap_latent_frames = target_latent_frames
 
                                         # Extract last N latent frames from controls
-                                        # Note: chunk_vace_frames already sliced to this chunk's range
+                                        # Note: controls are already sliced to this chunk's range
                                         overlap_vace_frames = full_vace_frames[:, :, chunk_start:chunk_end, :, :][:, :, -overlap_latent_frames:, :, :]
                                         overlap_vace_mask = full_vace_mask[:, :, chunk_start:chunk_end, :, :][:, :, -overlap_latent_frames:, :, :]
 
@@ -3454,13 +3470,15 @@ class NV_VideoSampler:
                                         pass
 
                                 # Replace last N frames in chunk with refined versions
-                                chunk_pixels[-overlap_frames_video:] = refined_pixels
-                                print(f"  ✓ Diffusion refinement complete: last {overlap_frames_video} frames updated")
+                                # Use ACTUAL frame count to avoid dimension mismatch
+                                chunk_pixels[-actual_overlap_frames:] = refined_pixels
+                                print(f"  ✓ Diffusion refinement complete: last {actual_overlap_frames} frames updated")
 
                                 # Store refined overlap for next chunk's concat_mask
                                 if not hasattr(self, '_prev_diffused_overlap'):
                                     self._prev_diffused_overlap = None
                                 self._prev_diffused_overlap = refined_pixels.clone()  # Store for next chunk
+                                self._actual_overlap_frames = actual_overlap_frames  # Track actual count
 
                                 # UPDATE VACE REFERENCE for next chunk (last frame of refined output)
                                 if chunk_idx < len(chunk_conditionings) - 1:  # Not the last chunk
@@ -3475,6 +3493,7 @@ class NV_VideoSampler:
                                     self._temp_start_image = refined_pixels[-1:].clone()
 
                                     print(f"  ✓ Updated VACE reference and color reference for chunk {chunk_idx + 1}")
+                                    print(f"    (actual overlap: {actual_overlap_frames} frames for next chunk)")
 
                             except Exception as e:
                                 print(f"    ⚠️  Diffusion refinement failed: {e}")
@@ -3749,16 +3768,18 @@ class NV_VideoSampler:
                     first_chunk = chunk_pixels_list[0]
                     H, W, C = first_chunk['pixels'].shape[1], first_chunk['pixels'].shape[2], first_chunk['pixels'].shape[3]
 
-                    # Calculate total frames using NEW FORMULA: 81 + (n-1) × 65
+                    # Calculate total frames using DYNAMIC FORMULA (accounts for actual VAE overlap)
                     # Chunk 0: 81 frames
-                    # Chunk 1+: 65 NEW frames (first 16 are identical to previous chunk's last 16)
-                    overlap_frames = 16  # Fixed overlap size
+                    # Chunk 1+: Variable NEW frames (81 - actual_overlap, where overlap may be 13-17)
+                    # Use stored actual_overlap_frames if available, else assume 16
+                    actual_overlap = getattr(self, '_actual_overlap_frames', 16)
                     num_chunks = len(chunk_pixels_list)
-                    total_video_frames = 81 + (num_chunks - 1) * 65  # NEW FORMULA
+                    # Formula: 81 + (n-1) × (81 - actual_overlap)
+                    total_video_frames = 81 + (num_chunks - 1) * (81 - actual_overlap)
 
-                    print(f"  Total video frames: {total_video_frames} (formula: 81 + {num_chunks - 1} × 65)")
+                    print(f"  Total video frames: {total_video_frames} (formula: 81 + {num_chunks - 1} × {81 - actual_overlap})")
                     print(f"  Video dimensions: {H}x{W}x{C}")
-                    print(f"  Chunk pattern: First chunk = 81 frames, subsequent chunks = 65 NEW frames each")
+                    print(f"  Chunk pattern: First chunk = 81 frames, subsequent chunks = {81 - actual_overlap} NEW frames (overlap={actual_overlap})")
 
                     # Initialize final concatenated video (in PIXEL space, not latent space!)
                     final_video = torch.zeros((total_video_frames, H, W, C), dtype=first_chunk['pixels'].dtype)
@@ -3783,9 +3804,9 @@ class NV_VideoSampler:
                                 output_position += frames_to_use
                                 print(f"  Chunk {chunk_idx}: placed ALL {frames_to_use} frames → position {output_position}")
                             else:
-                                # Subsequent chunks: Skip first 16 frames (identical to previous chunk's last 16)
-                                # Take only frames 16-81 (65 NEW frames)
-                                skip_frames = min(overlap_frames, num_frames)  # Usually 16
+                                # Subsequent chunks: Skip first N frames (identical to previous chunk's last N)
+                                # Take only frames N-81 (65-68 NEW frames depending on actual overlap)
+                                skip_frames = min(actual_overlap, num_frames)  # Use actual overlap count
                                 new_frames_start = skip_frames
                                 new_frames_end = num_frames
                                 new_frames_count = new_frames_end - new_frames_start
@@ -3814,7 +3835,7 @@ class NV_VideoSampler:
                         # This prevents brightness dips at chunk transitions
                         print(f"\n  Skipping global color matching (already applied per-chunk)")
 
-                        info_lines.append("  → Chunk concatenation applied (81 + (n-1)×65 pattern)")
+                        info_lines.append(f"  → Chunk concatenation applied (81 + (n-1)×{81-actual_overlap} pattern, overlap={actual_overlap})")
                         info_lines.append("  → Identical overlaps via concat_mask (no blending needed)")
                         info_lines.append("  → Per-chunk color matching applied before refinement (70% strength)")
                         
