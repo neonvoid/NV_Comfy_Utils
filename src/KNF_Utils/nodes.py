@@ -3151,20 +3151,18 @@ class NV_VideoSampler:
                     print(f"    Will trim {trim_reference_frame} frame after generation")
                     info_lines.append(f"  → VACE reference: Latent extended, will trim after gen")
                 # TIER 2: Apply previous chunk overlap (temporal continuity) for chunks 2+
-                # UPDATED: Use diffused overlap pixels from previous chunk for EXACT frame matching
-                if chunk_idx > 0 and hasattr(self, '_prev_diffused_overlap') and self._prev_diffused_overlap is not None:
-                    # Use the diffused overlap frames from the end of previous chunk
-                    # These are the high-quality, refined frames that we want to FORCE as identical
-                    prev_overlap_pixels = self._prev_diffused_overlap  # [N, H, W, C] where N is actual count
-                    overlap_frames_video = getattr(self, '_actual_overlap_frames', len(prev_overlap_pixels))  # Use tracked count
+                # UPDATED: Use diffused overlap LATENT from previous chunk for EXACT frame matching
+                if chunk_idx > 0 and hasattr(self, '_prev_diffused_overlap_latent') and self._prev_diffused_overlap_latent is not None:
+                    # Use the refined latent directly (no re-encode needed!)
+                    # This avoids encode/decode asymmetry (13 video → 2 latent)
+                    prev_overlap_latent = self._prev_diffused_overlap_latent  # [1, 16, 4, H, W]
+                    overlap_frames_video = getattr(self, '_actual_overlap_frames', 13)  # Use tracked count
 
                     print(f"  Tier 2 (ENHANCED): Forcing first {overlap_frames_video} frames to match prev chunk's diffused output")
 
-                    # Encode diffused overlap pixels to latent
-                    prev_overlap_pixels_batched = prev_overlap_pixels.unsqueeze(0).to(vae.device)  # [1, 16, H, W, C]
-                    prev_overlap_latent = vae.encode(prev_overlap_pixels_batched.to(torch.float32))  # [1, 16, T_latent, H, W]
-
-                    overlap_latent_frames = prev_overlap_latent.shape[2]  # ~4 latent frames (16 video / 4 compression)
+                    # Use stored refined latent directly (no VAE encode!)
+                    overlap_latent_frames = prev_overlap_latent.shape[2]  # 4 latent frames (no dimension loss!)
+                    print(f"    Using stored refined latent: {overlap_latent_frames} latent frames (avoids re-encode dimension loss)")
 
                     # Build concat_latent_image: [diffused_overlap, new_noise]
                     new_noise_frames = chunk_frames - overlap_latent_frames
@@ -3517,23 +3515,26 @@ class NV_VideoSampler:
                                 chunk_pixels[-actual_overlap_frames:] = refined_pixels
 
                                 # Store refined overlap for next chunk's concat_mask
+                                # Store LATENT (not pixels) to avoid re-encoding dimension loss
+                                if not hasattr(self, '_prev_diffused_overlap_latent'):
+                                    self._prev_diffused_overlap_latent = None
                                 if not hasattr(self, '_prev_diffused_overlap'):
                                     self._prev_diffused_overlap = None
-                                self._prev_diffused_overlap = refined_pixels.clone()  # Store for next chunk
+                                self._prev_diffused_overlap_latent = refined_latent.clone()  # Store refined latent (4 frames)
+                                self._prev_diffused_overlap = refined_pixels.clone()  # Store pixels for reference
                                 self._actual_overlap_frames = actual_overlap_frames  # Track actual count
 
                                 # UPDATE VACE REFERENCE for next chunk (last frame of refined output)
                                 if chunk_idx < len(chunk_conditionings) - 1:  # Not the last chunk
-                                    # Extract last frame and prepare for VAE encoding
-                                    last_frame = refined_pixels[-1:, :, :, :].unsqueeze(0)  # [1, 1, H, W, C]
-                                    last_frame_rgb = last_frame[:, :, :, :, :3]  # Ensure RGB only [1, 1, H, W, 3]
+                                    # Extract last LATENT frame directly (no VAE encode needed!)
+                                    # This avoids the single-frame VAE encode bug
+                                    last_frame_latent = refined_latent[:, :, -1:, :, :]  # [1, 16, 1, H, W]
 
-                                    # Encode as VACE reference (16ch VAE + 16ch zeros)
-                                    last_frame_latent = vae.encode(last_frame_rgb.to(torch.float32))  # [1, 16, 1, H, W]
+                                    # Add zeros padding to make VACE reference (32 channels)
                                     zeros_padding = torch.zeros_like(last_frame_latent)
                                     vace_reference = torch.cat([last_frame_latent, zeros_padding], dim=1)  # [1, 32, 1, H, W]
 
-                                    # Also update color matching reference
+                                    # Also update color matching reference (still use pixels)
                                     self._temp_start_image = refined_pixels[-1:].clone()
 
                                     print(f"  ✓ Updated VACE reference and color reference for chunk {chunk_idx + 1}")
