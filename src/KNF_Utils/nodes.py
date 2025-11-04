@@ -2987,7 +2987,10 @@ class NV_VideoSampler:
             
             # Initialize Tier 3 VACE control tracker
             prev_chunk_vace_control = None
-            
+
+            # Initialize VACE reference (will be updated per-chunk)
+            vace_reference = None  # Will be set from chunk 0, then updated from last frame of each chunk
+
             for chunk_idx, chunk_cond in enumerate(chunk_conditionings):
                 chunk_start_time = time.time()
                 
@@ -3031,9 +3034,14 @@ class NV_VideoSampler:
                     else:
                         raise ValueError(f"Chunk {chunk_idx + 1} has no negative conditioning and no global fallback provided!")
                 
-                # Get VACE reference for potential first frame conditioning
-                vace_reference = chunk_cond.get("vace_reference")  # [1, 32, 1, H, W] if present
-                has_vace_reference = vace_reference is not None and chunk_idx == 0
+                # Get VACE reference for this chunk
+                # Chunk 0: User-provided reference from preprocessor
+                # Chunk 1+: Updated from previous chunk's last frame (set at end of previous iteration)
+                if chunk_idx == 0:
+                    vace_reference = chunk_cond.get("vace_reference")  # User-provided initial reference
+                # else: use vace_reference from previous iteration (already updated)
+
+                has_vace_reference = vace_reference is not None  # Apply to ALL chunks (not just chunk 0)
                 
                 # Inject Wan VACE controls into conditioning if present
                 chunk_control_embeds = chunk_cond.get("control_embeds")
@@ -3141,47 +3149,85 @@ class NV_VideoSampler:
                     print(f"    Will trim {trim_reference_frame} frame after generation")
                     info_lines.append(f"  → VACE reference: Latent extended, will trim after gen")
                 # TIER 2: Apply previous chunk overlap (temporal continuity) for chunks 2+
-                if chunk_idx > 0 and 'prev_chunk_samples' in locals():
+                # UPDATED: Use diffused overlap pixels from previous chunk for EXACT frame matching
+                if chunk_idx > 0 and hasattr(self, '_prev_diffused_overlap') and self._prev_diffused_overlap is not None:
+                    # Use the diffused overlap frames from the end of previous chunk
+                    # These are the high-quality, refined frames that we want to FORCE as identical
+                    prev_overlap_pixels = self._prev_diffused_overlap  # [16, H, W, C] (or less)
+                    overlap_frames_video = len(prev_overlap_pixels)  # Should be 16
+
+                    print(f"  Tier 2 (ENHANCED): Forcing first {overlap_frames_video} frames to match prev chunk's diffused output")
+
+                    # Encode diffused overlap pixels to latent
+                    prev_overlap_pixels_batched = prev_overlap_pixels.unsqueeze(0).to(vae.device)  # [1, 16, H, W, C]
+                    prev_overlap_latent = vae.encode(prev_overlap_pixels_batched.to(torch.float32))  # [1, 16, T_latent, H, W]
+
+                    overlap_latent_frames = prev_overlap_latent.shape[2]  # ~4 latent frames (16 video / 4 compression)
+
+                    # Build concat_latent_image: [diffused_overlap, new_noise]
+                    new_noise_frames = chunk_frames - overlap_latent_frames
+                    if new_noise_frames > 0:
+                        new_noise = torch.randn(
+                            prev_overlap_latent.shape[0], prev_overlap_latent.shape[1], new_noise_frames,
+                            prev_overlap_latent.shape[3], prev_overlap_latent.shape[4],
+                            device=prev_overlap_latent.device, dtype=prev_overlap_latent.dtype
+                        )
+                        concat_latent = torch.cat([prev_overlap_latent, new_noise], dim=2)
+                    else:
+                        concat_latent = prev_overlap_latent
+
+                    # Build concat_mask for I2V:
+                    # Inverted convention: 0 = KEEP (don't denoise), 1 = GENERATE (denoise)
+                    # Set first N frames to 0.0 to FORCE them to be identical to prev chunk
+                    concat_mask = torch.ones((1, 1, chunk_frames, chunk_latent.shape[3], chunk_latent.shape[4]),
+                                               device=chunk_latent.device, dtype=chunk_latent.dtype)
+                    concat_mask[:, :, :overlap_latent_frames, :, :] = 0.0  # FORCE KEEP (no denoising)
+
+                    print(f"    concat_latent shape: {concat_latent.shape}")
+                    print(f"    concat_mask: {overlap_latent_frames} frames FORCED identical (mask=0), {new_noise_frames} frames generated (mask=1)")
+                    info_lines.append(f"  → IDENTICAL OVERLAP: First {overlap_frames_video} video frames ({overlap_latent_frames} latent) forced to match prev chunk")
+
+                    # Apply Tier 2
+                    chunk_positive = [[c[0], c[1].copy()] for c in chunk_positive]
+                    chunk_negative = [[c[0], c[1].copy()] for c in chunk_negative]
+
+                    chunk_positive[0][1]["concat_latent_image"] = concat_latent
+                    chunk_positive[0][1]["concat_mask"] = concat_mask
+                    chunk_negative[0][1]["concat_latent_image"] = concat_latent
+                    chunk_negative[0][1]["concat_mask"] = concat_mask
+
+                # FALLBACK: If no diffused overlap available, use old Tier 2 logic
+                elif chunk_idx > 0 and 'prev_chunk_samples' in locals():
                     # Calculate overlap region
                     overlap_frames = min(chunk_overlap, chunk_frames)
-                    
+
                     if overlap_frames > 0:
                         # Extract overlap from the END of previous chunk's RAW output
-                        # The overlap is the last N frames of prev_chunk_samples
                         prev_overlap = prev_chunk_samples[:, :, -overlap_frames:, :, :].clone()
-                        
+
                         # Build concat_latent_image: [overlap, new_noise]
                         new_noise_frames = chunk_frames - overlap_frames
                         if new_noise_frames > 0:
-                            # Use standard noise for new frames (don't scale to match overlap)
-                            # The overlap latents have content statistics, not noise statistics
-                            # Scaling new noise to match content causes cumulative amplification
                             new_noise = torch.randn(
                                 prev_overlap.shape[0], prev_overlap.shape[1], new_noise_frames,
                                 prev_overlap.shape[3], prev_overlap.shape[4],
                                 device=prev_overlap.device, dtype=prev_overlap.dtype
                             )
-                            
                             concat_latent = torch.cat([prev_overlap, new_noise], dim=2)
                         else:
                             concat_latent = prev_overlap
-                        
-                        # Build concat_mask for I2V:
-                        # Inverted convention: 0 = KEEP reference, 1 = GENERATE new
+
+                        # Build concat_mask for I2V
                         concat_mask = torch.ones((1, 1, chunk_frames, chunk_latent.shape[3], chunk_latent.shape[4]),
                                                    device=chunk_latent.device, dtype=chunk_latent.dtype)
-                        concat_mask[:, :, :overlap_frames, :, :] = 0.0  # 0 = KEEP overlap frames from concat_latent
-                        
-                        print(f"  Tier 2: Using {overlap_frames} overlap frames from previous chunk")
-                        print(f"    concat_latent shape: {concat_latent.shape}")
-                        print(f"    concat_mask shape: {concat_mask.shape}")
-                        print(f"    mask values: {overlap_frames} zeros (keep), {new_noise_frames} ones (generate)")
-                        info_lines.append(f"  → Temporal continuity: {overlap_frames} frames from prev chunk")
-                        
-                        # Apply Tier 2 (chunks 1+ only, no conflict with Tier 1)
+                        concat_mask[:, :, :overlap_frames, :, :] = 0.0
+
+                        print(f"  Tier 2 (FALLBACK): Using {overlap_frames} overlap frames from previous chunk (not diffused)")
+
+                        # Apply Tier 2
                         chunk_positive = [[c[0], c[1].copy()] for c in chunk_positive]
                         chunk_negative = [[c[0], c[1].copy()] for c in chunk_negative]
-                        
+
                         chunk_positive[0][1]["concat_latent_image"] = concat_latent
                         chunk_positive[0][1]["concat_mask"] = concat_mask
                         chunk_negative[0][1]["concat_latent_image"] = concat_latent
@@ -3294,6 +3340,151 @@ class NV_VideoSampler:
                             except Exception as e:
                                 print(f"  ⚠️  Color matching failed for chunk {chunk_idx}: {e}, using unmatched")
 
+                        # ==============================================================================
+                        # DIFFUSION REFINEMENT OF LAST 16 FRAMES (NEW LOCATION - END OF CHUNK PIPELINE)
+                        # ==============================================================================
+                        # This creates high-quality overlap frames that will be:
+                        # 1. Part of current chunk's output
+                        # 2. Forced as identical input for next chunk (via concat_mask)
+                        # 3. Used to create VACE reference for next chunk
+
+                        overlap_frames_video = min(16, len(chunk_pixels))  # 16 frames or less if chunk is smaller
+
+                        if overlap_frames_video > 0 and hasattr(self, '_refine_enable') and self._refine_enable:
+                            try:
+                                print(f"  🎨 Diffusion refinement: Processing last {overlap_frames_video} frames...")
+
+                                # Extract last N frames
+                                last_n_frames = chunk_pixels[-overlap_frames_video:]  # [N, H, W, C]
+
+                                # Get conditioning for diffusion
+                                refine_positive = chunk_positive if chunk_positive is not None else self._refine_positive
+                                refine_negative = chunk_negative if chunk_negative is not None else self._refine_negative
+
+                                if refine_positive is None or refine_negative is None:
+                                    print(f"    ⚠️  No conditioning available, skipping diffusion refinement")
+                                    raise ValueError("No conditioning for diffusion refinement")
+
+                                # Clone conditioning
+                                refine_positive = [[c[0], c[1].copy()] for c in refine_positive]
+                                refine_negative = [[c[0], c[1].copy()] for c in refine_negative]
+
+                                # Inject VACE controls for these last N frames
+                                if chunk_control_embeds and len(chunk_control_embeds) > 0:
+                                    all_vace_frames = []
+                                    all_vace_masks = []
+                                    all_vace_strengths = []
+
+                                    for ctrl_name, ctrl_data in chunk_control_embeds.items():
+                                        full_vace_frames = ctrl_data["vace_frames"]
+                                        full_vace_mask = ctrl_data["vace_mask"]
+
+                                        # Calculate latent frames for the overlap region
+                                        overlap_latent_frames = overlap_frames_video // 4
+
+                                        # Extract last N latent frames from controls
+                                        # Note: chunk_vace_frames already sliced to this chunk's range
+                                        overlap_vace_frames = full_vace_frames[:, :, chunk_start:chunk_end, :, :][:, :, -overlap_latent_frames:, :, :]
+                                        overlap_vace_mask = full_vace_mask[:, :, chunk_start:chunk_end, :, :][:, :, -overlap_latent_frames:, :, :]
+
+                                        all_vace_frames.append(overlap_vace_frames)
+                                        all_vace_masks.append(overlap_vace_mask)
+                                        all_vace_strengths.extend(ctrl_data["vace_strength"])
+
+                                    # Inject into refinement conditioning
+                                    refine_positive[0][1]["vace_frames"] = all_vace_frames
+                                    refine_positive[0][1]["vace_mask"] = all_vace_masks
+                                    refine_positive[0][1]["vace_strength"] = all_vace_strengths
+                                    refine_negative[0][1]["vace_frames"] = all_vace_frames
+                                    refine_negative[0][1]["vace_mask"] = all_vace_masks
+                                    refine_negative[0][1]["vace_strength"] = all_vace_strengths
+
+                                    print(f"    ✓ Injected {len(all_vace_frames)} VACE control(s) for refinement")
+
+                                # Encode to latent
+                                from nodes import common_ksampler
+                                last_n_batched = last_n_frames.unsqueeze(0)  # [1, N, H, W, C]
+                                last_n_latent = vae.encode(last_n_batched.to(torch.float32))
+
+                                # Run diffusion refinement
+                                print(f"    Running {self._refine_steps} steps @ {self._refine_denoise} denoise...")
+                                refined_output = common_ksampler(
+                                    model=self._refine_model,
+                                    seed=self._refine_seed,  # Consistent seed
+                                    steps=self._refine_steps,
+                                    cfg=self._refine_cfg,
+                                    sampler_name=self._refine_sampler_name,
+                                    scheduler=self._refine_scheduler,
+                                    positive=refine_positive,
+                                    negative=refine_negative,
+                                    latent={"samples": last_n_latent},
+                                    denoise=self._refine_denoise,
+                                    force_full_denoise=True
+                                )
+
+                                # Decode refined latent
+                                refined_latent = refined_output[0]["samples"]
+                                refined_pixels = vae.decode(refined_latent.to(torch.float32))
+
+                                # Handle shape
+                                if refined_pixels.dim() == 5 and refined_pixels.shape[0] == 1:
+                                    refined_pixels = refined_pixels.squeeze(0)
+
+                                # Color match refined frames AGAIN with reference
+                                if hasattr(self, '_temp_start_image') and self._temp_start_image is not None and chunk_idx > 0:
+                                    try:
+                                        from color_matcher import ColorMatcher
+                                        print(f"    Applying 2nd color match to refined frames...")
+                                        ref_np = self._temp_start_image.cpu().numpy().squeeze()
+                                        cm = ColorMatcher()
+
+                                        matched_refined = []
+                                        for frame_idx in range(len(refined_pixels)):
+                                            try:
+                                                frame_np = refined_pixels[frame_idx].cpu().numpy()
+                                                matched = cm.transfer(src=frame_np, ref=ref_np, method='mkl')
+                                                matched = frame_np + 0.7 * (matched - frame_np)
+                                                matched_refined.append(torch.from_numpy(matched))
+                                            except:
+                                                matched_refined.append(refined_pixels[frame_idx])
+
+                                        refined_pixels = torch.stack(matched_refined, dim=0)
+                                        print(f"    ✓ 2nd color match complete")
+                                    except:
+                                        pass
+
+                                # Replace last N frames in chunk with refined versions
+                                chunk_pixels[-overlap_frames_video:] = refined_pixels
+                                print(f"  ✓ Diffusion refinement complete: last {overlap_frames_video} frames updated")
+
+                                # Store refined overlap for next chunk's concat_mask
+                                if not hasattr(self, '_prev_diffused_overlap'):
+                                    self._prev_diffused_overlap = None
+                                self._prev_diffused_overlap = refined_pixels.clone()  # Store for next chunk
+
+                                # UPDATE VACE REFERENCE for next chunk (last frame of refined output)
+                                if chunk_idx < len(chunk_conditionings) - 1:  # Not the last chunk
+                                    last_frame = refined_pixels[-1:].unsqueeze(0)  # [1, 1, H, W, C]
+
+                                    # Encode as VACE reference (16ch VAE + 16ch zeros)
+                                    last_frame_latent = vae.encode(last_frame[:, :, :, :, :3].to(torch.float32))  # [1, 16, 1, H, W]
+                                    zeros_padding = torch.zeros_like(last_frame_latent)
+                                    vace_reference = torch.cat([last_frame_latent, zeros_padding], dim=1)  # [1, 32, 1, H, W]
+
+                                    # Also update color matching reference
+                                    self._temp_start_image = refined_pixels[-1:].clone()
+
+                                    print(f"  ✓ Updated VACE reference and color reference for chunk {chunk_idx + 1}")
+
+                            except Exception as e:
+                                print(f"    ⚠️  Diffusion refinement failed: {e}")
+                                import traceback
+                                traceback.print_exc()
+
+                        # ==============================================================================
+                        # END DIFFUSION REFINEMENT
+                        # ==============================================================================
+
                         # Store for pixel-space blending
                         if not hasattr(self, '_chunk_pixels_list'):
                             self._chunk_pixels_list = []
@@ -3325,11 +3516,11 @@ class NV_VideoSampler:
                 prev_chunk_start = chunk_start
                 prev_chunk_end = chunk_end
                 
-                # TIER 3: VACE Frame Extension with VAE cycle
-                # RE-ENABLED: Provides visual reference for next chunk generation
-                # Pixel-space blending will fix VAE degradation at the end
+                # TIER 3: VACE Frame Extension (OLD LOCATION - NOW DISABLED)
+                # MOVED: Diffusion refinement now happens at END of chunk pipeline (see line ~3305)
+                # This ensures diffused frames are part of chunk output AND used for next chunk's concat_mask
                 prev_chunk_vace_control = None
-                if chunk_idx < len(chunk_conditionings) - 1:  # Not the last chunk
+                if False and chunk_idx < len(chunk_conditionings) - 1:  # DISABLED - replaced by new diffusion location
                     try:
                         # Calculate overlap for NEXT chunk
                         # Extract from the END of the current chunk's RAW output
@@ -3558,89 +3749,74 @@ class NV_VideoSampler:
                     first_chunk = chunk_pixels_list[0]
                     H, W, C = first_chunk['pixels'].shape[1], first_chunk['pixels'].shape[2], first_chunk['pixels'].shape[3]
 
-                    # Calculate total frames from last chunk's end_frame (accounts for overlaps)
-                    last_chunk = chunk_pixels_list[-1]
-                    total_video_frames = last_chunk['end_frame']
+                    # Calculate total frames using NEW FORMULA: 81 + (n-1) × 65
+                    # Chunk 0: 81 frames
+                    # Chunk 1+: 65 NEW frames (first 16 are identical to previous chunk's last 16)
+                    overlap_frames = 16  # Fixed overlap size
+                    num_chunks = len(chunk_pixels_list)
+                    total_video_frames = 81 + (num_chunks - 1) * 65  # NEW FORMULA
 
-                    print(f"  Total video frames: {total_video_frames} (from chunk metadata)")
+                    print(f"  Total video frames: {total_video_frames} (formula: 81 + {num_chunks - 1} × 65)")
                     print(f"  Video dimensions: {H}x{W}x{C}")
-                    
-                    # Initialize final blended video (in PIXEL space, not latent space!)
+                    print(f"  Chunk pattern: First chunk = 81 frames, subsequent chunks = 65 NEW frames each")
+
+                    # Initialize final concatenated video (in PIXEL space, not latent space!)
                     final_video = torch.zeros((total_video_frames, H, W, C), dtype=first_chunk['pixels'].dtype)
-                    
-                    # Blend chunks first, then apply color matching to final result
+
+                    # CONCATENATION (overlaps are already identical from concat_mask forcing)
                     try:
                         from color_matcher import ColorMatcher
 
-                        print(f"\n  Blending chunks...")
+                        print(f"\n  Concatenating chunks (overlaps are already identical)...")
 
-                        # 32-FRAME CROSSFADE BLENDING (matching KJNodes CrossFadeImages workflow)
-                        # Each chunk is placed at its actual start_frame from metadata
-                        # Overlapping regions are crossfaded smoothly
-                        blend_frames_video = blend_transition_frames  # User-configurable (default: 32 frames)
+                        output_position = 0  # Track position in final output
 
                         for chunk_data in chunk_pixels_list:
                             chunk_idx = chunk_data['chunk_idx']
-                            chunk_pixels = chunk_data['pixels']
+                            chunk_pixels = chunk_data['pixels'].to(final_video.device)  # Move to same device
                             num_frames = len(chunk_pixels)
-                            chunk_start_frame = chunk_data['start_frame']
-                            chunk_end_frame = chunk_data['end_frame']
 
                             if chunk_idx == 0:
-                                # First chunk: place entirely at the beginning
-                                final_video[chunk_start_frame:chunk_end_frame] = chunk_pixels
-                                print(f"  Chunk {chunk_idx}: placed {num_frames} frames at {chunk_start_frame}-{chunk_end_frame-1}")
+                                # First chunk: Take ALL 81 frames
+                                frames_to_use = min(81, num_frames)  # Safety check
+                                final_video[output_position:output_position + frames_to_use] = chunk_pixels[:frames_to_use]
+                                output_position += frames_to_use
+                                print(f"  Chunk {chunk_idx}: placed ALL {frames_to_use} frames → position {output_position}")
                             else:
-                                # Subsequent chunks: crossfade blend over overlap region
-                                # Calculate actual blend length (limited by transition frames and available overlap)
-                                blend_frames_actual = min(blend_frames_video, num_frames)
+                                # Subsequent chunks: Skip first 16 frames (identical to previous chunk's last 16)
+                                # Take only frames 16-81 (65 NEW frames)
+                                skip_frames = min(overlap_frames, num_frames)  # Usually 16
+                                new_frames_start = skip_frames
+                                new_frames_end = num_frames
+                                new_frames_count = new_frames_end - new_frames_start
 
-                                if blend_frames_actual > 0:
-                                    # Crossfade: gradually transition from prev chunk to current chunk
-                                    for i in range(blend_frames_actual):
-                                        # Linear crossfade weights
-                                        weight_new = (i + 1) / (blend_frames_actual + 1)  # 0 → 1
-                                        weight_old = 1.0 - weight_new  # 1 → 0
-
-                                        # Position in final video (based on chunk's start_frame)
-                                        final_pos = chunk_start_frame + i
-
-                                        # Blend this frame with existing content
-                                        if final_pos < total_video_frames and i < num_frames:
-                                            final_video[final_pos] = (
-                                                final_video[final_pos] * weight_old +
-                                                chunk_pixels[i] * weight_new
-                                            )
-
-                                    # Place remaining non-blended frames
-                                    remaining_start_pos = chunk_start_frame + blend_frames_actual
-                                    remaining_end_pos = min(chunk_end_frame, total_video_frames)
-                                    remaining_chunk_start = blend_frames_actual
-
-                                    # Calculate how many frames we actually need and have
-                                    frames_needed = remaining_end_pos - remaining_start_pos
-                                    frames_available = num_frames - remaining_chunk_start
-                                    frames_to_copy = min(frames_needed, frames_available)
-
-                                    if frames_to_copy > 0:
-                                        final_video[remaining_start_pos:remaining_start_pos + frames_to_copy] = \
-                                            chunk_pixels[remaining_chunk_start:remaining_chunk_start + frames_to_copy]
-
-                                    print(f"  Chunk {chunk_idx}: crossfaded {blend_frames_actual} frames at {chunk_start_frame}, placed {num_frames - blend_frames_actual} frames")
+                                if new_frames_count > 0:
+                                    final_video[output_position:output_position + new_frames_count] = \
+                                        chunk_pixels[new_frames_start:new_frames_end]
+                                    output_position += new_frames_count
+                                    print(f"  Chunk {chunk_idx}: skipped first {skip_frames} frames (identical), placed {new_frames_count} NEW frames → position {output_position}")
                                 else:
-                                    # Fallback: no blend, just place
-                                    final_video[chunk_start_frame:chunk_end_frame] = chunk_pixels
-                                    print(f"  Chunk {chunk_idx}: placed {num_frames} frames at {chunk_start_frame}-{chunk_end_frame-1} (no blend)")
+                                    print(f"  Chunk {chunk_idx}: ⚠️ No new frames after skipping overlap!")
 
-                        print(f"  ✓ All {len(chunk_pixels_list)} chunks blended ({total_video_frames} total frames)")
+                        print(f"  ✓ All {len(chunk_pixels_list)} chunks concatenated ({output_position} total frames output)")
+
+                        # Verify frame count matches expected
+                        if output_position != total_video_frames:
+                            print(f"  ⚠️ WARNING: Output frames ({output_position}) != expected ({total_video_frames})")
+                            # Trim or pad as needed
+                            if output_position < total_video_frames:
+                                final_video = final_video[:output_position]  # Trim excess zeros
+                                total_video_frames = output_position
+                            # If output_position > total_video_frames, some frames were overwritten (should not happen)
 
                         # REMOVED: Global color matching pass
-                        # Color matching is now applied per-chunk before blending (see line ~3273)
+                        # Color matching is now applied per-chunk before diffusion refinement
                         # This prevents brightness dips at chunk transitions
                         print(f"\n  Skipping global color matching (already applied per-chunk)")
 
-                        info_lines.append("  → Pixel-space overlap blending applied")
-                        info_lines.append("  → Per-chunk color matching applied before blending (70% strength)")
+                        info_lines.append("  → Chunk concatenation applied (81 + (n-1)×65 pattern)")
+                        info_lines.append("  → Identical overlaps via concat_mask (no blending needed)")
+                        info_lines.append("  → Per-chunk color matching applied before refinement (70% strength)")
                         
                     except ImportError:
                         print(f"  ⚠️  color-matcher not installed")
