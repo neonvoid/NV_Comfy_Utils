@@ -2,6 +2,7 @@ from inspect import cleandoc
 import torch
 import torch.nn.functional as F
 import numpy as np
+import copy
 import os
 import random
 from PIL import Image
@@ -3372,10 +3373,18 @@ class NV_VideoSampler:
                                     print(f"    ⚠️  No conditioning available, skipping diffusion refinement")
                                     raise ValueError("No conditioning for diffusion refinement")
 
-                                # Create fresh conditioning dicts (don't copy - we'll inject new VACE controls)
-                                # Using empty dicts prevents shallow copy issues with nested VACE control lists
-                                refine_positive = [[c[0], {}] for c in refine_positive]
-                                refine_negative = [[c[0], {}] for c in refine_negative]
+                                # Deep copy conditioning to preserve all data (not just VACE)
+                                # Then clear VACE controls and inject new ones for refinement
+                                refine_positive = [[c[0], copy.deepcopy(c[1])] for c in refine_positive]
+                                refine_negative = [[c[0], copy.deepcopy(c[1])] for c in refine_negative]
+
+                                # Clear existing VACE controls (will inject new ones for last N frames)
+                                refine_positive[0][1].pop("vace_frames", None)
+                                refine_positive[0][1].pop("vace_mask", None)
+                                refine_positive[0][1].pop("vace_strength", None)
+                                refine_negative[0][1].pop("vace_frames", None)
+                                refine_negative[0][1].pop("vace_mask", None)
+                                refine_negative[0][1].pop("vace_strength", None)
 
                                 # Inject VACE controls for these last N frames
                                 # Extract from already-processed chunk controls (not raw full controls)
@@ -3515,10 +3524,12 @@ class NV_VideoSampler:
 
                                 # UPDATE VACE REFERENCE for next chunk (last frame of refined output)
                                 if chunk_idx < len(chunk_conditionings) - 1:  # Not the last chunk
-                                    last_frame = refined_pixels[-1:].unsqueeze(0)  # [1, 1, H, W, C]
+                                    # Extract last frame and prepare for VAE encoding
+                                    last_frame = refined_pixels[-1:, :, :, :].unsqueeze(0)  # [1, 1, H, W, C]
+                                    last_frame_rgb = last_frame[:, :, :, :, :3]  # Ensure RGB only [1, 1, H, W, 3]
 
                                     # Encode as VACE reference (16ch VAE + 16ch zeros)
-                                    last_frame_latent = vae.encode(last_frame[:, :, :, :, :3].to(torch.float32))  # [1, 16, 1, H, W]
+                                    last_frame_latent = vae.encode(last_frame_rgb.to(torch.float32))  # [1, 16, 1, H, W]
                                     zeros_padding = torch.zeros_like(last_frame_latent)
                                     vace_reference = torch.cat([last_frame_latent, zeros_padding], dim=1)  # [1, 32, 1, H, W]
 
