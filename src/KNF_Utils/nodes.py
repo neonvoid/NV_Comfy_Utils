@@ -3372,9 +3372,10 @@ class NV_VideoSampler:
                                     print(f"    ⚠️  No conditioning available, skipping diffusion refinement")
                                     raise ValueError("No conditioning for diffusion refinement")
 
-                                # Clone conditioning
-                                refine_positive = [[c[0], c[1].copy()] for c in refine_positive]
-                                refine_negative = [[c[0], c[1].copy()] for c in refine_negative]
+                                # Create fresh conditioning dicts (don't copy - we'll inject new VACE controls)
+                                # Using empty dicts prevents shallow copy issues with nested VACE control lists
+                                refine_positive = [[c[0], {}] for c in refine_positive]
+                                refine_negative = [[c[0], {}] for c in refine_negative]
 
                                 # Inject VACE controls for these last N frames
                                 # Extract from already-processed chunk controls (not raw full controls)
