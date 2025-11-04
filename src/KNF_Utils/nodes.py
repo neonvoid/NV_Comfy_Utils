@@ -3262,7 +3262,38 @@ class NV_VideoSampler:
                         # Handle shape
                         if chunk_pixels.dim() == 5 and chunk_pixels.shape[0] == 1:
                             chunk_pixels = chunk_pixels.squeeze(0)
-                        
+
+                        # PER-CHUNK COLOR MATCHING (before blending)
+                        # Apply color matching to each chunk immediately after decode
+                        # This ensures smooth color transitions when chunks are blended
+                        if hasattr(self, '_temp_start_image') and self._temp_start_image is not None and chunk_idx > 0:
+                            try:
+                                from color_matcher import ColorMatcher
+
+                                print(f"  Applying color matching to chunk {chunk_idx}...")
+                                ref_np = self._temp_start_image.cpu().numpy().squeeze()
+                                cm = ColorMatcher()
+
+                                # Color match each frame
+                                matched_frames = []
+                                for frame_idx in range(len(chunk_pixels)):
+                                    try:
+                                        frame_np = chunk_pixels[frame_idx].cpu().numpy()
+                                        matched = cm.transfer(src=frame_np, ref=ref_np, method='mkl')
+                                        # Apply at 70% strength for consistent look
+                                        matched = frame_np + 0.7 * (matched - frame_np)
+                                        matched_frames.append(torch.from_numpy(matched))
+                                    except Exception as e:
+                                        # Fallback: use original frame
+                                        matched_frames.append(chunk_pixels[frame_idx])
+
+                                chunk_pixels = torch.stack(matched_frames, dim=0)
+                                print(f"  ✓ Color matching complete for chunk {chunk_idx}")
+                            except ImportError:
+                                print(f"  ⚠️  color-matcher not installed, skipping per-chunk color matching")
+                            except Exception as e:
+                                print(f"  ⚠️  Color matching failed for chunk {chunk_idx}: {e}, using unmatched")
+
                         # Store for pixel-space blending
                         if not hasattr(self, '_chunk_pixels_list'):
                             self._chunk_pixels_list = []
@@ -3381,6 +3412,46 @@ class NV_VideoSampler:
                                         print(f"    ⚠️  Skipping diffusion refinement: no conditioning available for chunk {chunk_idx}")
                                         raise ValueError("No conditioning available for diffusion refinement")
 
+                                    # INJECT VACE CONTROLS FOR EXTENSION FRAMES
+                                    # Apply the same controls that were used during sampling to maintain pose/composition consistency
+                                    prev_chunk_control_embeds = chunk_conditionings[chunk_idx - 1].get("control_embeds") if chunk_idx > 0 else None
+                                    if prev_chunk_control_embeds and len(prev_chunk_control_embeds) > 0:
+                                        # Clone conditioning to avoid modifying original
+                                        refine_positive = [[c[0], c[1].copy()] for c in refine_positive]
+                                        refine_negative = [[c[0], c[1].copy()] for c in refine_negative]
+
+                                        # Extract controls for the overlap region (last frames of previous chunk)
+                                        all_vace_frames = []
+                                        all_vace_masks = []
+                                        all_vace_strengths = []
+
+                                        for ctrl_name, ctrl_data in prev_chunk_control_embeds.items():
+                                            full_vace_frames = ctrl_data["vace_frames"]  # [1, 32, T_full, H, W]
+                                            full_vace_mask = ctrl_data["vace_mask"]      # [1, 64, T_full, H, W]
+
+                                            # Get the overlap region (last frames)
+                                            # overlap_pixels has the number of frames we're refining
+                                            num_overlap_latent_frames = overlap_pixels.shape[0] // 4  # Video frames to latent frames
+
+                                            # Slice the control to match the overlap region
+                                            overlap_vace_frames = full_vace_frames[:, :, -num_overlap_latent_frames:, :, :]
+                                            overlap_vace_mask = full_vace_mask[:, :, -num_overlap_latent_frames:, :, :]
+
+                                            all_vace_frames.append(overlap_vace_frames)
+                                            all_vace_masks.append(overlap_vace_mask)
+                                            all_vace_strengths.extend(ctrl_data["vace_strength"])
+
+                                        # Inject VACE controls into refinement conditioning
+                                        refine_positive[0][1]["vace_frames"] = all_vace_frames
+                                        refine_positive[0][1]["vace_mask"] = all_vace_masks
+                                        refine_positive[0][1]["vace_strength"] = all_vace_strengths
+
+                                        refine_negative[0][1]["vace_frames"] = all_vace_frames
+                                        refine_negative[0][1]["vace_mask"] = all_vace_masks
+                                        refine_negative[0][1]["vace_strength"] = all_vace_strengths
+
+                                        print(f"    ✓ Injected {len(all_vace_frames)} VACE control(s) for extension frame refinement")
+
                                     print(f"    🎨 Applying diffusion refinement ({self._refine_steps} steps @ {self._refine_denoise} denoise)...")
 
                                     # Import common_ksampler from nodes.py
@@ -3392,9 +3463,10 @@ class NV_VideoSampler:
                                     overlap_latent_for_refine = self._temp_vae.encode(overlap_pixels_batched.to(torch.float32))
 
                                     # Run low-denoise diffusion pass (img2img-style quality restoration)
+                                    # Use same seed for all chunks to ensure consistent refinement style
                                     refined_output = common_ksampler(
                                         model=self._refine_model,
-                                        seed=self._refine_seed + 999 + chunk_idx,  # Unique seed per chunk
+                                        seed=self._refine_seed,  # Consistent seed across all chunks for reproducibility
                                         steps=self._refine_steps,
                                         cfg=self._refine_cfg,
                                         sampler_name=self._refine_sampler_name,
@@ -3422,11 +3494,12 @@ class NV_VideoSampler:
                                     overlap_pixels = overlap_pixels.to(original_dtype)  # Convert back to original dtype
                                     print(f"    ✓ Diffusion refinement complete: mean={overlap_pixels.mean():.4f}, std={overlap_pixels.std():.4f}")
 
-                                    # Store refined last frame as updated reference for color matching
-                                    # This ensures each chunk uses the highest-quality reference from the previous chunk
+                                    # Update color matching reference to refined last frame
+                                    # This provides temporal color continuity from chunk to chunk
+                                    # Per-chunk color matching (before blending) prevents brightness dips
                                     refined_last_frame = overlap_pixels[-1:].clone()  # [1, H, W, C]
                                     self._temp_start_image = refined_last_frame.squeeze(0).unsqueeze(0)  # [1, H, W, C] batch format
-                                    print(f"    ✓ Updated color matching reference to refined last frame (shape: {self._temp_start_image.shape})")
+                                    print(f"    ✓ Updated color matching reference to refined last frame")
 
                                 except Exception as e:
                                     print(f"    ⚠️  Diffusion refinement failed: {e}, using filtered pixels without refinement")
@@ -3561,35 +3634,13 @@ class NV_VideoSampler:
 
                         print(f"  ✓ All {len(chunk_pixels_list)} chunks blended ({total_video_frames} total frames)")
 
-                        # SINGLE-PASS COLOR MATCHING after blending
-                        # This ensures uniform color matching strength across ALL frames (including transitions)
-                        print(f"\n  Applying color matching to final video...")
-                        try:
-                            ref_np = self._temp_start_image.cpu().numpy().squeeze()
-                            cm = ColorMatcher()
-
-                            # Color match each frame in the final blended video
-                            matched_frames = []
-                            for frame_idx in range(len(final_video)):
-                                try:
-                                    frame_np = final_video[frame_idx].numpy()
-                                    matched = cm.transfer(src=frame_np, ref=ref_np, method='mkl')
-                                    # Apply at 70% strength for consistent look
-                                    matched = frame_np + 0.7 * (matched - frame_np)
-                                    matched_frames.append(torch.from_numpy(matched))
-                                except Exception as e:
-                                    # Fallback: use original frame
-                                    matched_frames.append(final_video[frame_idx])
-
-                            final_video = torch.stack(matched_frames, dim=0)
-                            print(f"  ✓ Color matching applied to {len(final_video)} frames")
-
-                        except Exception as e:
-                            print(f"  ⚠️  Color matching failed: {e}")
-                            print(f"      Continuing with raw blended video...")
+                        # REMOVED: Global color matching pass
+                        # Color matching is now applied per-chunk before blending (see line ~3273)
+                        # This prevents brightness dips at chunk transitions
+                        print(f"\n  Skipping global color matching (already applied per-chunk)")
 
                         info_lines.append("  → Pixel-space overlap blending applied")
-                        info_lines.append("  → Single-pass color matching applied to final video (70% strength)")
+                        info_lines.append("  → Per-chunk color matching applied before blending (70% strength)")
                         
                     except ImportError:
                         print(f"  ⚠️  color-matcher not installed")
