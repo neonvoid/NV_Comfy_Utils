@@ -1,5 +1,6 @@
 from inspect import cleandoc
 import torch
+import torch.nn.functional as F
 import numpy as np
 import os
 import random
@@ -3463,6 +3464,40 @@ class NV_VideoSampler:
                                 from nodes import common_ksampler
                                 last_n_batched = last_n_frames.unsqueeze(0)  # [1, N, H, W, C]
                                 last_n_latent = vae.encode(last_n_batched.to(torch.float32))
+
+                                # CRITICAL: Interpolate VACE controls to match re-encoded latent temporal dimension
+                                # The re-encoded latent may have different temporal dim than original extraction
+                                refinement_temporal_frames = last_n_latent.shape[2]
+
+                                if len(all_vace_frames) > 0 and all_vace_frames[0].shape[2] != refinement_temporal_frames:
+                                    print(f"    ⚙️  Interpolating VACE controls: {all_vace_frames[0].shape[2]} → {refinement_temporal_frames} latent frames")
+
+                                    interpolated_vace_frames = []
+                                    interpolated_vace_masks = []
+
+                                    for vace_frames, vace_mask in zip(all_vace_frames, all_vace_masks):
+                                        # Interpolate temporal dimension to match refinement latent
+                                        vace_interp = F.interpolate(
+                                            vace_frames,
+                                            size=(refinement_temporal_frames, vace_frames.shape[3], vace_frames.shape[4]),
+                                            mode='nearest-exact'
+                                        )
+                                        mask_interp = F.interpolate(
+                                            vace_mask,
+                                            size=(refinement_temporal_frames, vace_mask.shape[3], vace_mask.shape[4]),
+                                            mode='nearest-exact'
+                                        )
+
+                                        interpolated_vace_frames.append(vace_interp)
+                                        interpolated_vace_masks.append(mask_interp)
+
+                                    # Update conditioning with interpolated controls
+                                    refine_positive[0][1]["vace_frames"] = interpolated_vace_frames
+                                    refine_positive[0][1]["vace_mask"] = interpolated_vace_masks
+                                    refine_negative[0][1]["vace_frames"] = interpolated_vace_frames
+                                    refine_negative[0][1]["vace_mask"] = interpolated_vace_masks
+
+                                    print(f"    ✓ VACE controls interpolated to match refinement latent")
 
                                 # Run diffusion refinement
                                 print(f"    Running {self._refine_steps} steps @ {self._refine_denoise} denoise...")
