@@ -2436,12 +2436,6 @@ class NV_VideoSampler:
                     "max": 10000,
                     "tooltip": "End sampling at this step (-1=full sampling)"
                 }),
-                "selector": ("INT", {
-                    "default": 0,
-                    "min": 0,
-                    "max": 999,
-                    "tooltip": "Selector ID for multi-configuration automation (connect to switch nodes)"
-                }),
                 "cfg_end": ("FLOAT", {
                     "default": -1.0,
                     "min": -1.0,
@@ -2478,12 +2472,12 @@ class NV_VideoSampler:
                     "max": 0xffffffffffffffff,
                     "tooltip": "Separate seed for SDE noise (-1 = use main seed + 1)"
                 }),
+                "per_chunk_seed_offset": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Use different seed for each chunk (seed + chunk_idx). Adds variation while staying deterministic."
+                }),
                 "chunk_conditionings": ("CHUNK_CONDITIONING_LIST", {
                     "tooltip": "Optional: Enable context window sampling (from NV_ChunkConditioningPreprocessor)"
-                }),
-                "blend_mode": (["linear", "pyramid"], {
-                    "default": "linear",
-                    "tooltip": "How to blend overlapping chunks (linear=ramps, pyramid=triangular weights)"
                 }),
                 "blend_transition_frames": ("INT", {
                     "default": 16,
@@ -2543,9 +2537,9 @@ class NV_VideoSampler:
                sampler_name, scheduler, sampler_mode="standard", latent_image=None,
                positive=None, negative=None,
                denoise_strength=1.0, start_step=0, end_step=-1,
-               selector=0, cfg_end=-1.0, add_noise="enable",
+               cfg_end=-1.0, add_noise="enable",
                return_with_leftover_noise="disable", eta=0.0, noise_type="gaussian",
-               noise_mode="hard", noise_seed=-1, chunk_conditionings=None, blend_mode="linear",
+               noise_mode="hard", noise_seed=-1, per_chunk_seed_offset=False, chunk_conditionings=None,
                blend_transition_frames=32, vae=None,
                enable_diffusion_refine=False, refine_denoise=0.25, refine_steps=5):
         
@@ -2757,7 +2751,6 @@ class NV_VideoSampler:
         # Report latent source
         latent_source = "from preprocessor (auto-generated)" if has_chunk_cond and not has_global_cond else "user-provided"
         info_lines.append(f"Latent source: {latent_source}")
-        info_lines.append(f"Selector ID: {selector}")
         info_lines.append(f"Input Type: {'IMAGE (4D)' if is_image_latent else 'VIDEO (5D)'}")
         info_lines.append(f"Latent Shape: {list(latent.shape)} (B×C×F×H×W)")
         if not is_image_latent:
@@ -2936,7 +2929,6 @@ class NV_VideoSampler:
             print(f"CONTEXT WINDOW SAMPLING MODE")
             print(f"{'='*60}")
             print(f"Total chunks: {len(chunk_conditionings)}")
-            print(f"Blend mode: {blend_mode}")
             print(f"Latent shape: {latent.shape}")
             if vae is not None:
                 print(f"VAE available: Tier 3 (VACE overlap) ENABLED")
@@ -2948,7 +2940,6 @@ class NV_VideoSampler:
             info_lines.append("CONTEXT WINDOW SAMPLING ENABLED")
             info_lines.append("=" * 60)
             info_lines.append(f"Total chunks: {len(chunk_conditionings)}")
-            info_lines.append(f"Blend mode: {blend_mode}")
             info_lines.append("")
             
             # Initialize full output latent (preserve original as fallback)
@@ -3003,7 +2994,10 @@ class NV_VideoSampler:
                 chunk_start = chunk_cond.get("latent_start", chunk_cond["start_frame"] // 4)
                 chunk_end = chunk_cond.get("latent_end", (chunk_cond["end_frame"] - 1) // 4 + 1)
                 chunk_frames = chunk_end - chunk_start
-                
+
+                # Per-chunk seed variation (if enabled)
+                chunk_seed = seed + chunk_idx if per_chunk_seed_offset else seed
+
                 print(f"\n[Chunk {chunk_idx + 1}/{len(chunk_conditionings)}] Starting...")
                 print(f"  Frame range: {chunk_cond['start_frame']}-{chunk_cond['end_frame']}")
                 print(f"  Latent range: {chunk_start}-{chunk_end} ({chunk_frames} frames)")
@@ -3201,7 +3195,7 @@ class NV_VideoSampler:
                 print(f"  Starting sampling...")
                 print(f"    Sampler: {sampler_name}, Scheduler: {scheduler}")
                 print(f"    Steps: {steps}, CFG: {cfg}, Denoise: {denoise_strength}")
-                print(f"    Seed: {seed}")
+                print(f"    Seed: {chunk_seed}" + (f" (base seed {seed} + offset {chunk_idx})" if per_chunk_seed_offset else ""))
                 
                 # Create progress callback
                 sample_start_time = time.time()
@@ -3239,7 +3233,7 @@ class NV_VideoSampler:
                     noise_mask=None,
                     callback=progress_callback,
                     disable_pbar=False,  # Show progress bar
-                    seed=seed  # Use same seed for all chunks for consistency
+                    seed=chunk_seed  # Per-chunk seed if enabled, otherwise same seed for consistency
                 )
                 
                 sample_time = time.time() - sample_start_time
@@ -3522,6 +3516,23 @@ class NV_VideoSampler:
                                         self._prev_refined_vace_controls = None
                                     self._prev_refined_vace_controls = refined_vace_controls
                                     print(f"    ✓ Encoded refined frames as VACE controls: {refined_vace_controls.shape}")
+
+                                    # CRITICAL: Decode VACE controls back to get ACTUAL forced overlap frame count
+                                    # This tells us how many frames will be truly identical in the next chunk
+                                    try:
+                                        # Decode just the VAE portion (first 16 channels)
+                                        vace_decoded = vae.decode(vae_encoded.to(torch.float32))
+                                        if vace_decoded.dim() == 5 and vace_decoded.shape[0] == 1:
+                                            vace_decoded = vace_decoded.squeeze(0)
+
+                                        # Store the ACTUAL forced overlap count (typically ~8 frames from 2 latent)
+                                        self._actual_vace_overlap_frames = len(vace_decoded)
+                                        print(f"    ✓ VACE-forced overlap: {self._actual_vace_overlap_frames} frames (re-encoded from {actual_overlap_frames} refined frames)")
+                                        print(f"      → Next chunk's first {self._actual_vace_overlap_frames} frames will be IDENTICAL to this chunk's last {self._actual_vace_overlap_frames} frames")
+                                    except Exception as e:
+                                        print(f"    ⚠️  Failed to decode VACE controls for overlap count: {e}")
+                                        # Fallback to refinement frame count (may cause slight mismatch)
+                                        self._actual_vace_overlap_frames = actual_overlap_frames
 
                                 # UPDATE VACE REFERENCE for next chunk (last frame of refined output)
                                 if chunk_idx < len(chunk_conditionings) - 1:  # Not the last chunk
@@ -3829,12 +3840,12 @@ class NV_VideoSampler:
                     # Initialize final concatenated video (in PIXEL space, not latent space!)
                     final_video = torch.zeros((total_video_frames, H, W, C), dtype=first_chunk['pixels'].dtype)
 
-                    # CROSSFADE BLENDING (matching VACE overlap region)
-                    # Blends the actual VAE overlap where VACE forces identical content
+                    # CROSSFADE BLENDING (matching VACE-forced identical region)
+                    # Blends the actual VACE-forced identical frames (latent space round-trip)
                     # Using linear interpolation for smooth, uniform transitions
-                    # Note: These frames have same content but slight rendering variations
-                    # Use actual VAE output count (typically 13 frames) to avoid ghosting
-                    overlap_frames = self._actual_overlap_frames if hasattr(self, '_actual_overlap_frames') else blend_transition_frames
+                    # CRITICAL: Use _actual_vace_overlap_frames (typically ~8) NOT _actual_overlap_frames (typically 13)
+                    # The VACE-forced region is smaller due to re-encoding: 13 video → 2 latent → 8 video
+                    overlap_frames = self._actual_vace_overlap_frames if hasattr(self, '_actual_vace_overlap_frames') else blend_transition_frames
 
                     try:
                         from color_matcher import ColorMatcher
