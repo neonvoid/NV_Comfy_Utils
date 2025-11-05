@@ -3308,7 +3308,8 @@ class NV_VideoSampler:
 
                         # NEW: Replace first 16 VIDEO frames with color-matched pixels from previous chunk
                         if chunk_idx > 0 and hasattr(self, '_prev_chunk_overlap_pixels'):
-                            overlap_pixels = self._prev_chunk_overlap_pixels  # [16, H, W, C] already color-matched
+                            # Clamp to valid range before using as control input (prevents VACE corruption)
+                            overlap_pixels = torch.clamp(self._prev_chunk_overlap_pixels, 0.0, 1.0)  # [16, H, W, C] already color-matched
                             overlap_frames = min(16, chunk_control_pixels.shape[0])
 
                             # Replace first 16 frames with overlap from previous chunk
@@ -3633,6 +3634,9 @@ class NV_VideoSampler:
                                         frame_np = chunk_pixels[frame_idx].cpu().numpy()
                                         # Full strength MVGD color matching as per user preference
                                         matched = cm.transfer(src=frame_np, ref=ref_np, method='mvgd')
+                                        # Clamp to valid range [0, 1] to prevent VACE corruption
+                                        import numpy as np
+                                        matched = np.clip(matched, 0.0, 1.0)
                                         matched_frames.append(torch.from_numpy(matched))
                                     except Exception as e:
                                         # Fallback: use original frame
@@ -3647,11 +3651,13 @@ class NV_VideoSampler:
 
                         # NEW: Store last 16 frames (color-matched) for next chunk's VACE overlap
                         if chunk_pixels is not None and len(chunk_pixels) >= 16:
-                            self._prev_chunk_overlap_pixels = chunk_pixels[-16:].clone()
+                            # Clamp to [0, 1] to prevent out-of-range values from propagating
+                            self._prev_chunk_overlap_pixels = torch.clamp(chunk_pixels[-16:], 0.0, 1.0).clone()
                             print(f"  ✓ Stored last 16 color-matched frames for next chunk's VACE overlap")
                         elif chunk_pixels is not None:
                             # If chunk has less than 16 frames, store what we have
-                            self._prev_chunk_overlap_pixels = chunk_pixels.clone()
+                            # Clamp to [0, 1] to prevent out-of-range values from propagating
+                            self._prev_chunk_overlap_pixels = torch.clamp(chunk_pixels, 0.0, 1.0).clone()
                             print(f"  ✓ Stored {len(chunk_pixels)} color-matched frames for next chunk's VACE overlap")
 
                         # ==============================================================================
