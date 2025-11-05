@@ -2507,6 +2507,36 @@ class NV_VideoSampler:
                     "step": 1,
                     "tooltip": "Diffusion steps for refinement (5=fast, 10=quality, 15=overkill)"
                 }),
+
+                # Multi-model support (optional)
+                "model_2": ("MODEL", {
+                    "tooltip": "Optional second model for multi-model sampling (e.g., detail/refinement model)"
+                }),
+                "model_3": ("MODEL", {
+                    "tooltip": "Optional third model for multi-model sampling (e.g., final polish model)"
+                }),
+                "multi_model_mode": (["disabled", "sequential", "boundary"], {
+                    "default": "disabled",
+                    "tooltip": "disabled: single model (default), sequential: step-based allocation, boundary: noise-level based switching"
+                }),
+
+                # Sequential mode configuration
+                "model_steps": ("STRING", {
+                    "default": "",
+                    "tooltip": "Steps per model for sequential mode (e.g., '10,5,5' for 20 total). Leave empty for auto-split"
+                }),
+
+                # Boundary mode configuration
+                "model_boundaries": ("STRING", {
+                    "default": "0.875,0.5",
+                    "tooltip": "Noise level boundaries for model switching (e.g., '0.875,0.5' means model1>0.875, model2>0.5, model3≤0.5)"
+                }),
+
+                # Per-model CFG (optional)
+                "model_cfg_scales": ("STRING", {
+                    "default": "",
+                    "tooltip": "Optional CFG per model (e.g., '7.0,5.0,4.0'). Uses main CFG if empty"
+                }),
             }
         }
     
@@ -2532,7 +2562,156 @@ class NV_VideoSampler:
     • Chunk-specific control weights and timing
     • Video-optimized sampling parameters
     """
-    
+
+    # ============= Multi-Model Helper Methods =============
+
+    def _prepare_sequential_models(self, models, total_steps, step_allocation_str):
+        """
+        Prepare model sequence for sequential mode.
+
+        Args:
+            models: List of models [model1, model2, model3] (None entries filtered out)
+            total_steps: Total number of sampling steps
+            step_allocation_str: String like "10,5,5" or empty for auto-split
+
+        Returns:
+            List of tuples: [(model, start_step, end_step), ...]
+        """
+        # Filter out None models
+        active_models = [m for m in models if m is not None]
+        if len(active_models) <= 1:
+            return [(active_models[0], 0, total_steps)] if active_models else []
+
+        # Parse step allocation
+        if step_allocation_str.strip():
+            try:
+                allocations = [int(s.strip()) for s in step_allocation_str.split(',')]
+                # Ensure we have enough allocations for models
+                while len(allocations) < len(active_models):
+                    allocations.append(1)  # Default to 1 step if not specified
+                allocations = allocations[:len(active_models)]  # Trim excess
+
+                # Validate total steps
+                allocated_total = sum(allocations)
+                if allocated_total != total_steps:
+                    print(f"  ⚠️ Step allocation sum ({allocated_total}) != total steps ({total_steps}). Adjusting...")
+                    # Scale allocations proportionally
+                    scale = total_steps / allocated_total
+                    allocations = [int(a * scale) for a in allocations]
+                    # Adjust last model to account for rounding
+                    allocations[-1] = total_steps - sum(allocations[:-1])
+            except:
+                print(f"  ⚠️ Invalid step allocation '{step_allocation_str}'. Using auto-split.")
+                allocations = None
+        else:
+            allocations = None
+
+        # Auto-split if no valid allocation
+        if allocations is None:
+            # Split evenly with remainder going to first model
+            base_steps = total_steps // len(active_models)
+            remainder = total_steps % len(active_models)
+            allocations = [base_steps + (1 if i < remainder else 0)
+                          for i in range(len(active_models))]
+
+        # Build model sequence with step ranges
+        model_sequence = []
+        current_step = 0
+        for model, steps in zip(active_models, allocations):
+            if steps > 0:  # Only include if model has steps allocated
+                model_sequence.append((model, current_step, current_step + steps))
+                current_step += steps
+
+        return model_sequence
+
+    def _prepare_boundary_models(self, models, boundaries_str, sigmas):
+        """
+        Prepare model sequence for boundary-based switching.
+
+        Args:
+            models: List of models [model1, model2, model3] (None entries filtered out)
+            boundaries_str: String like "0.875,0.5" for noise level boundaries
+            sigmas: Sigma schedule tensor from sampler
+
+        Returns:
+            List of tuples: [(model, start_step, end_step), ...]
+        """
+        # Filter out None models
+        active_models = [m for m in models if m is not None]
+        if len(active_models) <= 1:
+            return [(active_models[0], 0, len(sigmas) - 1)] if active_models else []
+
+        # Parse boundaries
+        try:
+            boundaries = [float(b.strip()) for b in boundaries_str.split(',')]
+        except:
+            print(f"  ⚠️ Invalid boundaries '{boundaries_str}'. Using defaults.")
+            boundaries = [0.875, 0.5]
+
+        # Ensure we have n-1 boundaries for n models
+        while len(boundaries) < len(active_models) - 1:
+            # Add intermediate boundaries
+            if boundaries:
+                boundaries.append(boundaries[-1] * 0.5)
+            else:
+                boundaries.append(0.875)
+        boundaries = boundaries[:len(active_models) - 1]
+
+        # Calculate timesteps from sigmas
+        import comfy.model_management
+        sampling = models[0].get_model_object("model_sampling")
+        timesteps = [sampling.timestep(s) / 1000.0 for s in sigmas.tolist()]
+
+        # Find switching points based on boundaries
+        model_sequence = []
+        switch_points = [0]  # Start at step 0
+
+        for boundary in boundaries:
+            # Find first step where timestep falls below boundary
+            switch_step = len(timesteps) - 1  # Default to end
+            for i, t in enumerate(timesteps):
+                if t < boundary:
+                    switch_step = i
+                    break
+            switch_points.append(switch_step)
+
+        switch_points.append(len(timesteps) - 1)  # End at last step
+
+        # Build model sequence
+        for i, model in enumerate(active_models):
+            start = switch_points[i]
+            end = switch_points[i + 1]
+            if start < end:  # Only include if range is valid
+                model_sequence.append((model, start, end))
+
+        return model_sequence
+
+    def _get_model_cfg(self, model_idx, cfg_scales_str, default_cfg):
+        """
+        Get CFG scale for a specific model.
+
+        Args:
+            model_idx: Index of the model (0-based)
+            cfg_scales_str: String like "7.0,5.0,4.0" or empty
+            default_cfg: Default CFG to use if not specified
+
+        Returns:
+            Float CFG value for the model
+        """
+        if not cfg_scales_str.strip():
+            return default_cfg
+
+        try:
+            cfgs = [float(c.strip()) for c in cfg_scales_str.split(',')]
+            if model_idx < len(cfgs):
+                return cfgs[model_idx]
+        except:
+            print(f"  ⚠️ Invalid CFG scales '{cfg_scales_str}'. Using default.")
+
+        return default_cfg
+
+    # ============= End Multi-Model Helper Methods =============
+
     def sample(self, model, seed, steps, cfg,
                sampler_name, scheduler, sampler_mode="standard", latent_image=None,
                positive=None, negative=None,
@@ -2541,7 +2720,12 @@ class NV_VideoSampler:
                return_with_leftover_noise="disable", eta=0.0, noise_type="gaussian",
                noise_mode="hard", noise_seed=-1, per_chunk_seed_offset=False, chunk_conditionings=None,
                blend_transition_frames=32, vae=None,
-               enable_diffusion_refine=False, refine_denoise=0.25, refine_steps=5):
+               enable_diffusion_refine=False, refine_denoise=0.25, refine_steps=5,
+               # Multi-model parameters
+               model_2=None, model_3=None,
+               multi_model_mode="disabled",
+               model_steps="", model_boundaries="0.875,0.5",
+               model_cfg_scales=""):
         
         import comfy.sample
         import comfy.samplers
@@ -2552,7 +2736,16 @@ class NV_VideoSampler:
         start_time = time.time()
 
         # Store sampling parameters for diffusion refinement (used in Tier 3 extension frame processing)
-        self._refine_model = model
+        # For multi-model: use last model for refinement (typically the detail/polish model)
+        if multi_model_mode != "disabled" and model_2 is not None:
+            # Use the last available model for refinement
+            if model_3 is not None:
+                self._refine_model = model_3
+            else:
+                self._refine_model = model_2
+        else:
+            self._refine_model = model
+
         self._refine_sampler_name = sampler_name
         self._refine_scheduler = scheduler
         self._refine_cfg = cfg
@@ -2756,8 +2949,31 @@ class NV_VideoSampler:
         if not is_image_latent:
             info_lines.append(f"Video Frames: {(frames - 1) * 4 + 1} (latent: {frames})")
         info_lines.append(f"Resolution: {height * 8}×{width * 8} (latent: {height}×{width})")
+
+        # Report multi-model configuration if active
+        if multi_model_mode != "disabled" and model_2 is not None:
+            active_models = [m for m in [model, model_2, model_3] if m is not None]
+            info_lines.append("")
+            info_lines.append(f"🔄 Multi-Model Mode: {multi_model_mode}")
+            info_lines.append(f"  Active Models: {len(active_models)}")
+
+            if multi_model_mode == "sequential":
+                if model_steps:
+                    info_lines.append(f"  Step Allocation: {model_steps}")
+                else:
+                    info_lines.append(f"  Step Allocation: auto-split")
+            elif multi_model_mode == "boundary":
+                info_lines.append(f"  Noise Boundaries: {model_boundaries}")
+
+            if model_cfg_scales:
+                info_lines.append(f"  CFG Scales: {model_cfg_scales}")
+
+            if enable_diffusion_refine:
+                refine_model_idx = 3 if model_3 is not None else (2 if model_2 is not None else 1)
+                info_lines.append(f"  Refinement Model: Model {refine_model_idx}")
+
         info_lines.append("")
-        
+
         # ============================================================
         # STEP 2: Calculate sigma schedule (noise levels)
         # ============================================================
@@ -3249,27 +3465,96 @@ class NV_VideoSampler:
                               f"Step: {step_time:.2f}s | ETA: {eta:.1f}s")
                     
                     last_step_time = current_time
-                
-                chunk_samples = comfy.sample.sample(
-                    model,
-                    chunk_noise_for_sampling,
-                    steps,
-                    cfg,
-                    sampler_name,
-                    scheduler if scheduler != "beta57" else "normal",
-                    chunk_positive,
-                    chunk_negative,
-                    chunk_latent_for_sampling,
-                    denoise=denoise_strength,
-                    disable_noise=disable_noise,
-                    start_step=start_step if start_step > 0 else None,
-                    last_step=end_step if end_step >= 0 else None,
-                    force_full_denoise=force_full_denoise,
-                    noise_mask=None,
-                    callback=progress_callback,
-                    disable_pbar=False,  # Show progress bar
-                    seed=chunk_seed  # Per-chunk seed if enabled, otherwise same seed for consistency
-                )
+
+                # ============= Multi-Model Support =============
+                # Check if multi-model mode is enabled
+                if multi_model_mode == "disabled" or model_2 is None:
+                    # ORIGINAL SINGLE-MODEL PATH - COMPLETELY UNCHANGED
+                    chunk_samples = comfy.sample.sample(
+                        model,
+                        chunk_noise_for_sampling,
+                        steps,
+                        cfg,
+                        sampler_name,
+                        scheduler if scheduler != "beta57" else "normal",
+                        chunk_positive,
+                        chunk_negative,
+                        chunk_latent_for_sampling,
+                        denoise=denoise_strength,
+                        disable_noise=disable_noise,
+                        start_step=start_step if start_step > 0 else None,
+                        last_step=end_step if end_step >= 0 else None,
+                        force_full_denoise=force_full_denoise,
+                        noise_mask=None,
+                        callback=progress_callback,
+                        disable_pbar=False,  # Show progress bar
+                        seed=chunk_seed  # Per-chunk seed if enabled, otherwise same seed for consistency
+                    )
+                else:
+                    # NEW MULTI-MODEL PATH
+                    print(f"  🔄 Multi-model mode: {multi_model_mode}")
+
+                    # Prepare model sequence based on mode
+                    if multi_model_mode == "sequential":
+                        model_sequence = self._prepare_sequential_models(
+                            [model, model_2, model_3], steps, model_steps
+                        )
+                        print(f"    Sequential mode: {len([m for m in [model, model_2, model_3] if m is not None])} models")
+                        if model_steps:
+                            print(f"    Step allocation: {model_steps}")
+                    elif multi_model_mode == "boundary":
+                        # Calculate sigmas for boundary detection
+                        import comfy.samplers
+                        sampling = model.get_model_object("model_sampling")
+                        sigmas = comfy.samplers.calculate_sigmas(
+                            sampling,
+                            scheduler if scheduler != "beta57" else "normal",
+                            steps
+                        ).to(chunk_latent_for_sampling.device)
+
+                        model_sequence = self._prepare_boundary_models(
+                            [model, model_2, model_3], model_boundaries, sigmas
+                        )
+                        print(f"    Boundary mode: {len([m for m in [model, model_2, model_3] if m is not None])} models")
+                        print(f"    Boundaries: {model_boundaries}")
+
+                    # Multi-model sampling loop
+                    current_latent = chunk_latent_for_sampling
+
+                    for idx, (current_model, model_start, model_end) in enumerate(model_sequence):
+                        # Get model-specific CFG if provided
+                        model_cfg = self._get_model_cfg(idx, model_cfg_scales, cfg)
+
+                        print(f"    Model {idx+1}: steps {model_start}-{model_end}, CFG={model_cfg:.1f}")
+
+                        # Sample with current model
+                        current_latent = comfy.sample.sample(
+                            current_model,
+                            chunk_noise_for_sampling if idx == 0 else torch.zeros_like(chunk_noise_for_sampling),
+                            steps,
+                            model_cfg,
+                            sampler_name,
+                            scheduler if scheduler != "beta57" else "normal",
+                            chunk_positive,
+                            chunk_negative,
+                            current_latent,
+                            denoise=denoise_strength if idx == 0 else 1.0,
+                            disable_noise=disable_noise or idx > 0,  # No noise after first model
+                            start_step=model_start if model_start > 0 else None,
+                            last_step=model_end if model_end < steps else None,
+                            force_full_denoise=(idx == len(model_sequence) - 1) and force_full_denoise,
+                            noise_mask=None,
+                            callback=progress_callback,
+                            disable_pbar=False,
+                            seed=chunk_seed
+                        )
+
+                        # Log model switch
+                        if idx < len(model_sequence) - 1:
+                            print(f"    • Model switch: Model {idx+1} → Model {idx+2} at step {model_end}")
+
+                    chunk_samples = current_latent
+                # ============= End Multi-Model Support =============
                 
                 sample_time = time.time() - sample_start_time
                 print(f"  ✓ Sampling complete: {sample_time:.2f}s ({sample_time/steps:.3f}s/step)")
