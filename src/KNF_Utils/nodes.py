@@ -2502,10 +2502,10 @@ class NV_VideoSampler:
                 }),
                 "refine_steps": ("INT", {
                     "default": 5,
-                    "min": 3,
-                    "max": 15,
+                    "min": 1,
+                    "max": 200,
                     "step": 1,
-                    "tooltip": "Diffusion steps for refinement (5=fast, 10=quality, 15=overkill)"
+                    "tooltip": "Diffusion steps for refinement (5=fast, 10=quality, 20+=high quality)"
                 }),
 
                 # Multi-model support (optional)
@@ -2591,15 +2591,8 @@ class NV_VideoSampler:
                     allocations.append(1)  # Default to 1 step if not specified
                 allocations = allocations[:len(active_models)]  # Trim excess
 
-                # Validate total steps
-                allocated_total = sum(allocations)
-                if allocated_total != total_steps:
-                    print(f"  ⚠️ Step allocation sum ({allocated_total}) != total steps ({total_steps}). Adjusting...")
-                    # Scale allocations proportionally
-                    scale = total_steps / allocated_total
-                    allocations = [int(a * scale) for a in allocations]
-                    # Adjust last model to account for rounding
-                    allocations[-1] = total_steps - sum(allocations[:-1])
+                # No validation - use allocations as-is
+                # User has full control over step allocation
             except:
                 print(f"  ⚠️ Invalid step allocation '{step_allocation_str}'. Using auto-split.")
                 allocations = None
@@ -2709,6 +2702,30 @@ class NV_VideoSampler:
             print(f"  ⚠️ Invalid CFG scales '{cfg_scales_str}'. Using default.")
 
         return default_cfg
+
+    def _get_model_info(self, model):
+        """
+        Extract identifying information from a model for debug output.
+
+        Args:
+            model: The model object
+
+        Returns:
+            String with model identification info
+        """
+        try:
+            # Try to get model class name
+            model_obj = model.model
+            model_class = model_obj.__class__.__name__
+
+            # Try to get model type/version if available
+            if hasattr(model_obj, 'model_type'):
+                return f"{model_class} ({model_obj.model_type})"
+
+            return model_class
+        except:
+            # Fallback if we can't get detailed info
+            return f"Model@{hex(id(model))[-6:]}"  # Last 6 chars of memory address
 
     # ============= End Multi-Model Helper Methods =============
 
@@ -3525,7 +3542,9 @@ class NV_VideoSampler:
                         # Get model-specific CFG if provided
                         model_cfg = self._get_model_cfg(idx, model_cfg_scales, cfg)
 
-                        print(f"    Model {idx+1}: steps {model_start}-{model_end}, CFG={model_cfg:.1f}")
+                        # Get model identification info
+                        model_info = self._get_model_info(current_model)
+                        print(f"    Model {idx+1} [{model_info}]: steps {model_start}-{model_end}, CFG={model_cfg:.1f}")
 
                         # Sample with current model
                         current_latent = comfy.sample.sample(
@@ -3549,9 +3568,10 @@ class NV_VideoSampler:
                             seed=chunk_seed
                         )
 
-                        # Log model switch
+                        # Log model switch with next model info
                         if idx < len(model_sequence) - 1:
-                            print(f"    • Model switch: Model {idx+1} → Model {idx+2} at step {model_end}")
+                            next_model_info = self._get_model_info(model_sequence[idx + 1][0])
+                            print(f"    • Model switch: Model {idx+1} [{model_info}] → Model {idx+2} [{next_model_info}] at step {model_end}")
 
                     chunk_samples = current_latent
                 # ============= End Multi-Model Support =============
@@ -3589,37 +3609,63 @@ class NV_VideoSampler:
 
                         # NOTE: Pixel replacement no longer needed - VACE controls enforce the overlap
                         # The first 16 frames are forced identical through VACE mask=0
-                        # if chunk_idx > 0 and hasattr(self, '_prev_diffused_overlap') and self._prev_diffused_overlap is not None:
-                        #     overlap_frames = 16  # Fixed 16-frame overlap
-                        #     print(f"  First {overlap_frames} frames enforced identical through VACE controls (mask=0)")
+                        # Track how many frames are VACE-enforced (already color-matched through controls)
+                        vace_enforced_overlap_frames = 0
+                        if chunk_idx > 0 and hasattr(self, '_prev_chunk_overlap_pixels'):
+                            vace_enforced_overlap_frames = 16  # First 16 frames are VACE-enforced
+                            print(f"  First {vace_enforced_overlap_frames} frames enforced identical through VACE controls (mask=0, already color-matched)")
 
                         # PER-CHUNK COLOR MATCHING (before blending)
                         # Apply color matching to each chunk immediately after decode
-                        # This ensures smooth color transitions when chunks are blended
-                        # Apply to ALL chunks including chunk 0 for consistency
+                        # IMPORTANT: Skip first 16 frames in chunks 1+ (they're already color-matched via VACE controls)
+                        # This prevents double color-matching which causes harsh contrast/sharpening
                         if hasattr(self, '_original_reference') and self._original_reference is not None:
                             try:
                                 from color_matcher import ColorMatcher
 
-                                print(f"  Applying color matching to chunk {chunk_idx}...")
                                 # Use ORIGINAL reference to prevent accumulation
                                 ref_np = self._original_reference.cpu().numpy().squeeze()
                                 cm = ColorMatcher()
 
-                                # Color match each frame
-                                matched_frames = []
-                                for frame_idx in range(len(chunk_pixels)):
-                                    try:
-                                        frame_np = chunk_pixels[frame_idx].cpu().numpy()
-                                        # Full strength MVGD color matching as per user preference
-                                        matched = cm.transfer(src=frame_np, ref=ref_np, method='mvgd')
-                                        matched_frames.append(torch.from_numpy(matched))
-                                    except Exception as e:
-                                        # Fallback: use original frame
-                                        matched_frames.append(chunk_pixels[frame_idx])
+                                if vace_enforced_overlap_frames > 0:
+                                    # Chunk 1+: Keep first 16 frames as-is (VACE-enforced, already color-matched)
+                                    # Only color-match frames 17+ (new frames from this chunk)
+                                    print(f"  Applying color matching to chunk {chunk_idx} (skipping first {vace_enforced_overlap_frames} VACE-enforced frames)...")
 
-                                chunk_pixels = torch.stack(matched_frames, dim=0)
-                                print(f"  ✓ Color matching complete for chunk {chunk_idx} (full strength, mvgd method, original ref)")
+                                    matched_frames = []
+                                    for frame_idx in range(len(chunk_pixels)):
+                                        if frame_idx < vace_enforced_overlap_frames:
+                                            # Skip color matching for VACE-enforced overlap (already color-matched via controls)
+                                            matched_frames.append(chunk_pixels[frame_idx])
+                                        else:
+                                            # Color match new frames
+                                            try:
+                                                frame_np = chunk_pixels[frame_idx].cpu().numpy()
+                                                matched = cm.transfer(src=frame_np, ref=ref_np, method='mvgd')
+                                                matched_frames.append(torch.from_numpy(matched))
+                                            except Exception as e:
+                                                # Fallback: use original frame
+                                                matched_frames.append(chunk_pixels[frame_idx])
+
+                                    chunk_pixels = torch.stack(matched_frames, dim=0)
+                                    print(f"  ✓ Color matching complete: {vace_enforced_overlap_frames} frames kept as-is, {len(chunk_pixels) - vace_enforced_overlap_frames} frames matched")
+                                else:
+                                    # Chunk 0: Color match all frames normally
+                                    print(f"  Applying color matching to chunk {chunk_idx} (all frames)...")
+
+                                    matched_frames = []
+                                    for frame_idx in range(len(chunk_pixels)):
+                                        try:
+                                            frame_np = chunk_pixels[frame_idx].cpu().numpy()
+                                            # Full strength MVGD color matching as per user preference
+                                            matched = cm.transfer(src=frame_np, ref=ref_np, method='mvgd')
+                                            matched_frames.append(torch.from_numpy(matched))
+                                        except Exception as e:
+                                            # Fallback: use original frame
+                                            matched_frames.append(chunk_pixels[frame_idx])
+
+                                    chunk_pixels = torch.stack(matched_frames, dim=0)
+                                    print(f"  ✓ Color matching complete for chunk {chunk_idx} (full strength, mvgd method, original ref)")
                             except ImportError:
                                 print(f"  ⚠️  color-matcher not installed, skipping per-chunk color matching")
                             except Exception as e:
@@ -4146,38 +4192,26 @@ class NV_VideoSampler:
                                 final_video[output_position:output_position + frames_to_use] = chunk_pixels[:frames_to_use]
                                 output_position += frames_to_use
 
-                                # Store last overlap frames for blending with next chunk
-                                if idx < len(chunk_pixels_list) - 1:  # Not the last chunk
-                                    prev_overlap_frames = chunk_pixels[-overlap_frames:].clone()
+                                # No longer storing overlap frames (100% color matching - no crossfade)
 
                                 print(f"  Chunk {chunk_idx}: placed ALL {frames_to_use} frames → position {output_position}")
                             else:
-                                # Subsequent chunks: Crossfade overlap region
+                                # Subsequent chunks: Direct replacement of overlap region (100% color matching)
                                 # These frames have identical content (forced by VACE mask=0)
-                                # But may have slight rendering variations that crossfade smooths
+                                # Use current chunk's color-matched frames directly for best quality
 
-                                # First, go back to where we need to blend (overwrite last overlap frames)
-                                blend_start_position = output_position - overlap_frames
+                                # First, go back to where we need to replace (overwrite last overlap frames)
+                                replacement_start_position = output_position - overlap_frames
 
                                 # Get current chunk's first overlap frames (VACE-forced identical content)
                                 current_overlap_frames = chunk_pixels[:overlap_frames]
 
-                                # Perform linear crossfade blending
-                                print(f"  Chunk {chunk_idx}: blending {overlap_frames} frames at position {blend_start_position} (linear)...")
-                                for i in range(overlap_frames):
-                                    # Calculate linear t value (no easing)
-                                    t = i / (overlap_frames - 1) if overlap_frames > 1 else 0.5
+                                # FULL STRENGTH COLOR MATCHING: Use current chunk's frames directly (no crossfade)
+                                # Since frames are already color-matched to reference, use them as-is for best quality
+                                print(f"  Chunk {chunk_idx}: using {overlap_frames} color-matched overlap frames at position {replacement_start_position} (100% strength)...")
 
-                                    # Calculate weights using linear interpolation
-                                    weight_prev = 1.0 - t
-                                    weight_next = t
-
-                                    # Blend the frames
-                                    blended_frame = (prev_overlap_frames[i] * weight_prev +
-                                                   current_overlap_frames[i] * weight_next)
-
-                                    # Place blended frame in output
-                                    final_video[blend_start_position + i] = blended_frame
+                                # Use current chunk's color-matched frames directly (no blending)
+                                final_video[replacement_start_position:replacement_start_position + overlap_frames] = current_overlap_frames
 
                                 # Now add the NEW frames (frames 17-81)
                                 new_frames_start = overlap_frames
@@ -4189,15 +4223,13 @@ class NV_VideoSampler:
                                         chunk_pixels[new_frames_start:new_frames_end]
                                     output_position += new_frames_count
 
-                                    # Store last 16 frames for next chunk (if not last chunk)
-                                    if idx < len(chunk_pixels_list) - 1:
-                                        prev_overlap_frames = chunk_pixels[-overlap_frames:].clone()
+                                    # No longer storing overlap frames (100% color matching - no crossfade)
 
-                                    print(f"  Chunk {chunk_idx}: blended {overlap_frames} frames, placed {new_frames_count} NEW frames → position {output_position}")
+                                    print(f"  Chunk {chunk_idx}: replaced {overlap_frames} overlap frames (100% strength), placed {new_frames_count} NEW frames → position {output_position}")
                                 else:
                                     print(f"  Chunk {chunk_idx}: ⚠️ No new frames after overlap!")
 
-                        print(f"  ✓ All {len(chunk_pixels_list)} chunks blended with crossfade ({output_position} total frames output)")
+                        print(f"  ✓ All {len(chunk_pixels_list)} chunks assembled with 100% color matching ({output_position} total frames output)")
 
                         # Verify frame count matches expected
                         if output_position != total_video_frames:
@@ -4214,8 +4246,8 @@ class NV_VideoSampler:
                         print(f"\n  Skipping global color matching (already applied per-chunk)")
 
                         info_lines.append(f"  → Chunk concatenation with {actual_overlap}-frame VACE overlap")
-                        info_lines.append(f"  → {overlap_frames}-frame linear crossfade blending (VACE-forced identical region)")
-                        info_lines.append("  → Per-chunk color matching (full strength, mvgd method, original reference)")
+                        info_lines.append(f"  → {overlap_frames}-frame direct replacement (100% color matching strength)")
+                        info_lines.append("  → Per-chunk color matching (100% full strength, mvgd method, original reference)")
                         
                     except ImportError:
                         print(f"  ⚠️  color-matcher not installed")
