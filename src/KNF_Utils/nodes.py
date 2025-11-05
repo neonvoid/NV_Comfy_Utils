@@ -2537,6 +2537,15 @@ class NV_VideoSampler:
                     "default": "",
                     "tooltip": "Optional CFG per model (e.g., '7.0,5.0,4.0'). Uses main CFG if empty"
                 }),
+
+                # Chunk blending
+                "chunk_blend_strength": ("FLOAT", {
+                    "default": 0.25,
+                    "min": 0.0,
+                    "max": 1.0,
+                    "step": 0.05,
+                    "tooltip": "Blend strength for chunk transitions (0.0=old chunk only, 1.0=new chunk only, 0.25=recommended balance)"
+                }),
             }
         }
     
@@ -2736,7 +2745,7 @@ class NV_VideoSampler:
                cfg_end=-1.0, add_noise="enable",
                return_with_leftover_noise="disable", eta=0.0, noise_type="gaussian",
                noise_mode="hard", noise_seed=-1, per_chunk_seed_offset=False, chunk_conditionings=None,
-               blend_transition_frames=32, vae=None,
+               blend_transition_frames=32, chunk_blend_strength=0.25, vae=None,
                enable_diffusion_refine=False, refine_denoise=0.25, refine_steps=5,
                # Multi-model parameters
                model_2=None, model_3=None,
@@ -2772,6 +2781,7 @@ class NV_VideoSampler:
         self._refine_enable = enable_diffusion_refine
         self._refine_denoise = refine_denoise
         self._refine_steps = refine_steps
+        self._chunk_blend_strength = chunk_blend_strength
 
         # Validate inputs
         has_chunk_cond = chunk_conditionings is not None and len(chunk_conditionings) > 0
@@ -3670,7 +3680,8 @@ class NV_VideoSampler:
                         #
                         # KEY FIX: Work with LATENT frames first, accept whatever VIDEO frame count VAE produces
 
-                        if hasattr(self, '_refine_enable') and self._refine_enable and 'chunk_samples' in locals():
+                        # Skip refinement on last chunk (no next chunk to blend with)
+                        if hasattr(self, '_refine_enable') and self._refine_enable and 'chunk_samples' in locals() and chunk_idx < len(chunk_conditionings) - 1:
                             try:
                                 # Calculate target latent frames (aim for ~16 video frames, but accept VAE's decision)
                                 target_latent_frames = min(4, chunk_frames - 1)  # ~4 latent = ~16 video frames
@@ -3997,7 +4008,8 @@ class NV_VideoSampler:
                                 print(f"    ⚠️  Bilateral filter failed: {e}, continuing without filtering")
 
                             # OPTIONAL: Diffusion-based refinement to restore quality lost from VAE degradation
-                            if hasattr(self, '_refine_enable') and self._refine_enable:
+                            # Skip refinement on last chunk (no next chunk to blend with)
+                            if hasattr(self, '_refine_enable') and self._refine_enable and chunk_idx < len(chunk_conditionings) - 1:
                                 try:
                                     # Get conditioning for this chunk (needed for diffusion refinement)
                                     # In chunked mode, global positive/negative are None, so use chunk-specific conditioning
@@ -4160,6 +4172,7 @@ class NV_VideoSampler:
                         print(f"\n  Blending chunks with {overlap_frames}-frame linear crossfade...")
 
                         output_position = 0  # Track position in final output
+                        prev_overlap_frames = None  # Initialize for cross-iteration access
 
                         for idx, chunk_data in enumerate(chunk_pixels_list):
                             chunk_idx = chunk_data['chunk_idx']
@@ -4188,9 +4201,9 @@ class NV_VideoSampler:
                                 # Get current chunk's first overlap frames (VACE-forced identical content)
                                 current_overlap_frames = chunk_pixels[:overlap_frames]
 
-                                # COMPROMISE BLEND: 25% new chunk, 75% previous chunk
+                                # COMPROMISE BLEND: User-configurable blend strength (default 25%)
                                 # This reduces harsh transitions while preserving continuity
-                                blend_strength = 0.25  # Favor previous chunk (75%) over new (25%)
+                                blend_strength = self._chunk_blend_strength  # User-configured blend strength
                                 print(f"  Chunk {chunk_idx}: blending {overlap_frames} frames at position {blend_start_position} ({int(blend_strength*100)}% new, {int((1-blend_strength)*100)}% old)...")
 
                                 # Blend each overlap frame
