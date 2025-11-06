@@ -2546,6 +2546,20 @@ class NV_VideoSampler:
                     "step": 0.05,
                     "tooltip": "Blend strength for chunk transitions (0.0=old chunk only, 1.0=new chunk only, 0.25=recommended balance)"
                 }),
+
+                # Debug: Save chunks separately
+                "save_chunks_separately": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Enable debug mode: save each chunk as separate video file (skips blending)"
+                }),
+                "chunk_save_directory": ("STRING", {
+                    "default": "chunk_debug",
+                    "tooltip": "Directory for debug chunk videos (relative to ComfyUI output or absolute path)"
+                }),
+                "chunk_save_format": ("STRING", {
+                    "default": "mp4",
+                    "tooltip": "Video format for chunk debug files (mp4, mkv, webm)"
+                }),
             }
         }
     
@@ -2751,7 +2765,9 @@ class NV_VideoSampler:
                model_2=None, model_3=None,
                multi_model_mode="disabled",
                model_steps="", model_boundaries="0.875,0.5",
-               model_cfg_scales=""):
+               model_cfg_scales="",
+               # Debug parameters
+               save_chunks_separately=False, chunk_save_directory="chunk_debug", chunk_save_format="mp4"):
         
         import comfy.sample
         import comfy.samplers
@@ -2782,6 +2798,19 @@ class NV_VideoSampler:
         self._refine_denoise = refine_denoise
         self._refine_steps = refine_steps
         self._chunk_blend_strength = chunk_blend_strength
+
+        # Debug parameters
+        self._save_chunks_separately = save_chunks_separately
+        self._chunk_save_directory = chunk_save_directory
+        self._chunk_save_format = chunk_save_format
+        self._generation_params = {
+            "seed": seed,
+            "steps": steps,
+            "cfg": cfg,
+            "sampler": sampler_name,
+            "scheduler": scheduler,
+            "denoise": denoise_strength
+        }
 
         # Validate inputs
         has_chunk_cond = chunk_conditionings is not None and len(chunk_conditionings) > 0
@@ -3177,7 +3206,17 @@ class NV_VideoSampler:
                 print(f"VAE available: Tier 3 (VACE overlap) ENABLED")
             else:
                 print(f"VAE not provided: Tier 3 (VACE overlap) DISABLED")
-            print("")
+
+            # DEBUG MODE
+            self._num_chunks = len(chunk_conditionings)
+            if self._save_chunks_separately:
+                print(f"")
+                print(f"Debug Mode: Saving chunks separately")
+                print(f"  Directory: {self._chunk_save_directory}")
+                print(f"  Format: {self._chunk_save_format}, Codec: H.265, Quality: CRF 10")
+                print(f"")
+            else:
+                print("")
             
             info_lines.append("=" * 60)
             info_lines.append("CONTEXT WINDOW SAMPLING ENABLED")
@@ -3703,6 +3742,21 @@ class NV_VideoSampler:
                             self._prev_chunk_overlap_pixels = torch.clamp(chunk_pixels, 0.0, 1.0).clone()
                             print(f"  ✓ Stored {len(chunk_pixels)} color-matched frames for next chunk's VACE overlap")
 
+                        # DEBUG MODE: Save chunk as separate video file
+                        if self._save_chunks_separately and chunk_pixels is not None:
+                            # Calculate frame range for this chunk
+                            frame_start = chunk_data.get('start_frame', chunk_idx * (chunk_size - chunk_overlap))
+                            frame_end = chunk_data.get('end_frame', frame_start + len(chunk_pixels) - 1)
+
+                            # Save chunk with metadata
+                            self._save_chunk_debug(
+                                chunk_pixels,
+                                chunk_idx,
+                                frame_start,
+                                frame_end,
+                                workflow_json=None  # TODO: Extract from prompt/extra_pnginfo if needed
+                            )
+
                         # ==============================================================================
                         # DIFFUSION REFINEMENT OF LAST N FRAMES (NEW LOCATION - END OF CHUNK PIPELINE)
                         # ==============================================================================
@@ -4167,10 +4221,26 @@ class NV_VideoSampler:
                 print(f"\n{'='*60}")
                 print(f"PIXEL-SPACE OVERLAP BLENDING & COLOR MATCHING")
                 print(f"{'='*60}")
-                
-                try:
-                    chunk_pixels_list = self._chunk_pixels_list
-                    print(f"Processing {len(chunk_pixels_list)} decoded chunks...")
+
+                # DEBUG MODE: Skip blending if chunks were saved separately
+                if self._save_chunks_separately:
+                    print(f"Debug mode: {len(self._chunk_pixels_list)} chunks saved separately, skipping blending")
+                    print(f"  Returning simple concatenated latents for workflow compatibility")
+                    print("")
+
+                    # Return concatenated latents without blending
+                    # Just use the output_latent as-is from chunk processing
+                    output_latent_result = output_latent
+
+                    # Generate simple info string
+                    info_lines.append("Debug Mode: Chunks saved separately (no blending)")
+                    info_lines.append(f"  {len(self._chunk_pixels_list)} chunks saved to: {self._chunk_save_directory}")
+                    info_lines.append("")
+                else:
+                    # NORMAL MODE: Perform blending
+                    try:
+                        chunk_pixels_list = self._chunk_pixels_list
+                        print(f"Processing {len(chunk_pixels_list)} decoded chunks...")
                     
                     # Build complete video dimensions
                     first_chunk = chunk_pixels_list[0]
@@ -4312,21 +4382,28 @@ class NV_VideoSampler:
                         # Fallback: just use first chunk's pixels
                         final_video = chunk_pixels_list[0]['pixels']
                     
-                    final_video = torch.clamp(final_video, 0.0, 1.0)
-                    
-                    # Re-encode to latents
-                    print(f"\n  Encoding blended pixels back to latents...")
-                    samples = vae.encode(final_video.to(vae.device)[:,:,:,:3])
-                    print(f"  ✓ Re-encoded shape: {samples.shape}")
-                    
-                    # Clean up stored pixels
-                    delattr(self, '_chunk_pixels_list')
-                    
-                except Exception as e:
-                    print(f"  ✗ Pixel-space processing failed: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    print(f"  Continuing with latent-space result...")
+                        final_video = torch.clamp(final_video, 0.0, 1.0)
+
+                        # Re-encode to latents
+                        print(f"\n  Encoding blended pixels back to latents...")
+                        samples = vae.encode(final_video.to(vae.device)[:,:,:,:3])
+                        print(f"  ✓ Re-encoded shape: {samples.shape}")
+
+                        # Set output for normal mode
+                        output_latent_result = samples
+
+                        # Clean up stored pixels
+                        delattr(self, '_chunk_pixels_list')
+
+                    except Exception as e:
+                        print(f"  ✗ Pixel-space processing failed: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        print(f"  Continuing with latent-space result...")
+                        output_latent_result = output_latent
+
+                # After debug mode check: use the appropriate output
+                samples = output_latent_result
             
             total_time = time.time() - start_time
             print(f"\n{'='*60}")
@@ -4721,6 +4798,134 @@ class NV_VideoSampler:
 
         # latents shape should now be [C, T_lat, H_lat, W_lat]
         return latents
+
+    def _save_chunk_debug(self, chunk_pixels, chunk_idx, frame_start, frame_end, workflow_json=None):
+        """
+        Save chunk as high-quality video with metadata for debugging.
+
+        Args:
+            chunk_pixels: Tensor [T, H, W, C] in range [0, 1]
+            chunk_idx: Chunk index for filename
+            frame_start: Starting frame number in original video
+            frame_end: Ending frame number in original video
+            workflow_json: Optional workflow JSON string to embed as metadata
+
+        Returns:
+            str: Path to saved video file, or None if failed
+        """
+        import torch
+        import subprocess
+        import os
+        import json
+        import threading
+
+        try:
+            # Determine output directory
+            if os.path.isabs(self._chunk_save_directory):
+                output_dir = self._chunk_save_directory
+            else:
+                # Relative to ComfyUI output folder
+                try:
+                    import folder_paths
+                    comfy_output = folder_paths.get_output_directory()
+                    output_dir = os.path.join(comfy_output, self._chunk_save_directory)
+                except:
+                    # Fallback: use current directory
+                    output_dir = self._chunk_save_directory
+
+            # Create directory if it doesn't exist
+            os.makedirs(output_dir, exist_ok=True)
+
+            # Generate filename
+            filename = f"chunk_{chunk_idx}_frames_{frame_start}-{frame_end}.{self._chunk_save_format}"
+            output_path = os.path.join(output_dir, filename)
+
+            # Convert tensor to numpy for FFmpeg
+            # chunk_pixels shape: [T, H, W, C] in range [0, 1]
+            frames_np = chunk_pixels.cpu().numpy()
+            T, H, W, C = frames_np.shape
+
+            # Convert to uint8 [0, 255]
+            frames_uint8 = (frames_np * 255.0).clip(0, 255).astype('uint8')
+
+            # Build metadata dict
+            metadata = {
+                "title": f"Chunk {chunk_idx} - Frames {frame_start}-{frame_end}",
+                "description": f"Generated by NV_VideoSampler | Chunk {chunk_idx}/{self._num_chunks} | {T} frames",
+                "comment": json.dumps({
+                    "chunk_index": chunk_idx,
+                    "frame_range": [frame_start, frame_end],
+                    "generation_params": self._generation_params,
+                    "workflow": workflow_json if workflow_json else "Not available"
+                }, indent=2)
+            }
+
+            # Build FFmpeg command for highest quality
+            ffmpeg_cmd = [
+                "ffmpeg", "-y",  # Overwrite output
+                "-f", "rawvideo",  # Input format
+                "-vcodec", "rawvideo",
+                "-s", f"{W}x{H}",  # Video size
+                "-pix_fmt", "rgb24",  # Pixel format
+                "-r", "30",  # Framerate
+                "-i", "-",  # Read from stdin
+                "-c:v", "libx265",  # H.265/HEVC codec
+                "-crf", "10",  # Quality: 10 = near-lossless (0-51, lower is better)
+                "-preset", "slow",  # Encoding preset (slow = better compression)
+                "-movflags", "+faststart",  # Enable fast start for MP4
+                "-max_muxing_queue_size", "9999"
+            ]
+
+            # Add metadata
+            for key, value in metadata.items():
+                # Escape special characters for shell
+                escaped_value = value.replace('"', '\\"').replace("'", "\\'")
+                ffmpeg_cmd.extend(["-metadata", f"{key}={escaped_value}"])
+
+            # Output file
+            ffmpeg_cmd.append(output_path)
+
+            # Launch FFmpeg process
+            process = subprocess.Popen(
+                ffmpeg_cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=10**8
+            )
+
+            # Thread to read stderr (prevent deadlock)
+            def read_stderr():
+                while True:
+                    line = process.stderr.readline()
+                    if not line:
+                        break
+
+            stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+            stderr_thread.start()
+
+            # Write frames to FFmpeg stdin
+            for frame_idx in range(T):
+                frame_data = frames_uint8[frame_idx].tobytes()
+                process.stdin.write(frame_data)
+
+            # Close stdin and wait for FFmpeg to finish
+            process.stdin.close()
+            process.wait(timeout=300)  # 5 minute timeout
+
+            if process.returncode == 0:
+                file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+                print(f"✓ Saved chunk {chunk_idx}: {filename} ({T} frames, {file_size_mb:.1f}MB, with metadata)")
+                return output_path
+            else:
+                print(f"✗ FFmpeg failed for chunk {chunk_idx} (return code: {process.returncode})")
+                return None
+
+        except Exception as e:
+            print(f"✗ Failed to save chunk {chunk_idx}: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
 
 
 class NV_VideoChunkAnalyzer:
