@@ -2556,9 +2556,16 @@ class NV_VideoSampler:
                     "default": "chunk_debug",
                     "tooltip": "Directory for debug chunk videos (relative to ComfyUI output or absolute path)"
                 }),
-                "chunk_save_format": ("STRING", {
+                "chunk_save_format": (["mp4", "mkv", "png_sequence"], {
                     "default": "mp4",
-                    "tooltip": "Video format for chunk debug files (mp4, mkv, webm)"
+                    "tooltip": "Video format or PNG sequence for chunk debug files"
+                }),
+                "chunk_fps": ("FLOAT", {
+                    "default": 16.0,
+                    "min": 1.0,
+                    "max": 120.0,
+                    "step": 0.1,
+                    "tooltip": "Frame rate for debug chunk videos (ignored for PNG sequence)"
                 }),
             }
         }
@@ -2767,7 +2774,7 @@ class NV_VideoSampler:
                model_steps="", model_boundaries="0.875,0.5",
                model_cfg_scales="",
                # Debug parameters
-               save_chunks_separately=False, chunk_save_directory="chunk_debug", chunk_save_format="mp4"):
+               save_chunks_separately=False, chunk_save_directory="chunk_debug", chunk_save_format="mp4", chunk_fps=16.0):
         
         import comfy.sample
         import comfy.samplers
@@ -2803,6 +2810,7 @@ class NV_VideoSampler:
         self._save_chunks_separately = save_chunks_separately
         self._chunk_save_directory = chunk_save_directory
         self._chunk_save_format = chunk_save_format
+        self._chunk_fps = chunk_fps
         self._generation_params = {
             "seed": seed,
             "steps": steps,
@@ -3213,7 +3221,10 @@ class NV_VideoSampler:
                 print(f"")
                 print(f"Debug Mode: Saving chunks separately")
                 print(f"  Directory: {self._chunk_save_directory}")
-                print(f"  Format: {self._chunk_save_format}, Codec: H.265, Quality: CRF 10")
+                if self._chunk_save_format == "png_sequence":
+                    print(f"  Format: PNG sequence (lossless, per-frame)")
+                else:
+                    print(f"  Format: {self._chunk_save_format} @ {self._chunk_fps} FPS, Codec: H.265, Quality: CRF 10")
                 print(f"")
             else:
                 print("")
@@ -4840,7 +4851,7 @@ class NV_VideoSampler:
             filename = f"chunk_{chunk_idx}_frames_{frame_start}-{frame_end}.{self._chunk_save_format}"
             output_path = os.path.join(output_dir, filename)
 
-            # Convert tensor to numpy for FFmpeg
+            # Convert tensor to numpy
             # chunk_pixels shape: [T, H, W, C] in range [0, 1]
             frames_np = chunk_pixels.cpu().numpy()
             T, H, W, C = frames_np.shape
@@ -4848,6 +4859,42 @@ class NV_VideoSampler:
             # Convert to uint8 [0, 255]
             frames_uint8 = (frames_np * 255.0).clip(0, 255).astype('uint8')
 
+            # PNG SEQUENCE: Save each frame as individual PNG
+            if self._chunk_save_format == "png_sequence":
+                from PIL import Image
+
+                # Create subdirectory for this chunk
+                chunk_dir = os.path.join(output_dir, f"chunk_{chunk_idx}")
+                os.makedirs(chunk_dir, exist_ok=True)
+
+                # Save each frame
+                for frame_idx in range(T):
+                    frame_filename = f"frame_{frame_idx:04d}.png"
+                    frame_path = os.path.join(chunk_dir, frame_filename)
+
+                    # Convert numpy array to PIL Image (RGB)
+                    img = Image.fromarray(frames_uint8[frame_idx], mode='RGB')
+
+                    # Save as PNG (lossless)
+                    img.save(frame_path, format='PNG', compress_level=6)
+
+                # Save metadata as JSON
+                metadata_dict = {
+                    "chunk_index": chunk_idx,
+                    "frame_range": [frame_start, frame_end],
+                    "total_frames": T,
+                    "resolution": [W, H, C],
+                    "generation_params": self._generation_params,
+                    "workflow": workflow_json if workflow_json else "Not available"
+                }
+                metadata_path = os.path.join(chunk_dir, "metadata.json")
+                with open(metadata_path, 'w') as f:
+                    json.dump(metadata_dict, f, indent=2)
+
+                print(f"✓ Saved chunk {chunk_idx}: {T} frames as PNG sequence in {chunk_dir}")
+                return chunk_dir
+
+            # VIDEO FORMAT: Use FFmpeg
             # Build metadata dict
             metadata = {
                 "title": f"Chunk {chunk_idx} - Frames {frame_start}-{frame_end}",
@@ -4866,12 +4913,13 @@ class NV_VideoSampler:
                 "-f", "rawvideo",  # Input format
                 "-vcodec", "rawvideo",
                 "-s", f"{W}x{H}",  # Video size
-                "-pix_fmt", "rgb24",  # Pixel format
-                "-r", "30",  # Framerate
+                "-pix_fmt", "rgb24",  # Input pixel format (RGB from tensor)
+                "-r", str(self._chunk_fps),  # Framerate (user-configurable)
                 "-i", "-",  # Read from stdin
                 "-c:v", "libx265",  # H.265/HEVC codec
                 "-crf", "10",  # Quality: 10 = near-lossless (0-51, lower is better)
                 "-preset", "slow",  # Encoding preset (slow = better compression)
+                "-pix_fmt", "yuv420p",  # Output pixel format (YUV for H.265 compatibility)
                 "-movflags", "+faststart",  # Enable fast start for MP4
                 "-max_muxing_queue_size", "9999"
             ]
