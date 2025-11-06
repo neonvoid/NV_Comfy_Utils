@@ -4232,21 +4232,22 @@ class NV_VideoSampler:
                                 print(f"  Chunk {chunk_idx}: placed ALL {frames_to_use} frames → position {output_position}")
                             else:
                                 # Subsequent chunks: Crossfade matching CrossFadeImages node behavior
-                                # Blend last 16 frames of prev chunk with first 16 NEW frames of current chunk
-                                # This creates smooth transitions matching user's manual workflow
+                                # Blends last 16 frames of prev chunk with VACE overlap (after color matching)
+                                # Then places all remaining frames from current chunk
+                                # This matches user's manual workflow with CrossFadeImages
 
                                 # Calculate blend start position (where the overlap begins)
                                 blend_start_position = output_position - overlap_frames
 
-                                # Extract the two 16-frame sequences to blend:
-                                # Source A: Last 16 frames of previous chunk (stored in prev_overlap_frames)
-                                # Source B: First 16 NEW frames of current chunk (after VACE overlap)
-                                new_frames_for_blend = chunk_pixels[overlap_frames:overlap_frames * 2]  # Frames 16-31
+                                # Extract VACE overlap frames (0-15) for blending
+                                # These were pixel-identical to prev chunk before color matching,
+                                # but color matching may have introduced slight differences
+                                vace_overlap_frames = chunk_pixels[:overlap_frames]  # Frames 0-15
 
                                 # Report what's happening
                                 print(f"  Chunk {chunk_idx}: Applying {overlap_frames}-frame crossfade")
                                 print(f"    • Crossfade position: frames {blend_start_position} to {blend_start_position + overlap_frames - 1}")
-                                print(f"    • Blending: prev chunk frames {blend_start_position}-{blend_start_position+overlap_frames-1} with current chunk NEW frames 16-31")
+                                print(f"    • Blending: prev chunk frames {blend_start_position}-{blend_start_position+overlap_frames-1} with current chunk VACE overlap 0-15")
 
                                 # Create linear blend weights over 16 frames
                                 # At frame 0: 100% previous chunk (weight = 0.0)
@@ -4255,19 +4256,20 @@ class NV_VideoSampler:
                                 blend_weights = torch.linspace(0, 1, overlap_frames).to(chunk_pixels.device)
 
                                 # Apply the crossfade by blending frame pairs
-                                # This matches CrossFadeImages behavior: blend source_a[i] with source_b[i]
+                                # This matches CrossFadeImages: images_1[start+i] with images_2[i]
                                 for i in range(overlap_frames):
                                     weight = blend_weights[i]
                                     prev_frame = prev_overlap_frames[i]       # Last 16 of prev chunk
-                                    curr_frame = new_frames_for_blend[i]      # First 16 NEW of current chunk
+                                    curr_frame = vace_overlap_frames[i]       # VACE overlap (color-matched)
                                     blended_frame = (1.0 - weight) * prev_frame + weight * curr_frame
                                     final_video[blend_start_position + i] = blended_frame
 
-                                # Update output position to account for the crossfade frames we just placed
-                                output_position = blend_start_position + overlap_frames
+                                # Crossfade REPLACES existing frames, doesn't change output position
+                                # output_position stays at its current value
 
-                                # Now add the remaining NEW frames (frames 32+)
-                                new_frames_start = overlap_frames * 2  # Start after the 16 NEW frames used in crossfade
+                                # Now add ALL remaining frames from current chunk (frames 16+)
+                                # This matches CrossFadeImages: remaining_images_2 = images_2[transitioning_frames:]
+                                new_frames_start = overlap_frames  # Frame 16 (after VACE overlap)
                                 new_frames_end = num_frames
                                 new_frames_count = new_frames_end - new_frames_start
 
@@ -4280,7 +4282,7 @@ class NV_VideoSampler:
                                     if idx < len(chunk_pixels_list) - 1:
                                         prev_overlap_frames = chunk_pixels[-overlap_frames:].clone()  # Last 16 frames
 
-                                    print(f"  Chunk {chunk_idx}: crossfade complete, placed {new_frames_count} additional frames → position {output_position}")
+                                    print(f"  Chunk {chunk_idx}: crossfade complete, placed {new_frames_count} remaining frames → position {output_position}")
                                 else:
                                     print(f"  Chunk {chunk_idx}: ⚠️ No new frames after overlap!")
 
