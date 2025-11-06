@@ -4240,15 +4240,6 @@ class NV_VideoSampler:
                                 # Calculate blend start position (where the overlap begins)
                                 blend_start_position = output_position - overlap_frames
 
-                                # Extract the first 32 frames from current chunk for crossfade
-                                # Frames 0-15: VACE overlap (identical to prev chunk's last 16)
-                                # Frames 16-31: First 16 NEW frames
-                                crossfade_current = chunk_pixels[:crossfade_frames]  # 32 frames from current chunk
-
-                                # Create the source for crossfade (from previous chunk)
-                                # We need 32 frames: repeat the last 16 frames to create proper blend source
-                                crossfade_previous = torch.cat([prev_overlap_frames, prev_overlap_frames], dim=0)  # 32 frames
-
                                 # Report what's happening
                                 print(f"  Chunk {chunk_idx}: Applying 32-frame crossfade")
                                 print(f"    • Crossfade window: frames {blend_start_position} to {blend_start_position + crossfade_frames - 1}")
@@ -4261,9 +4252,23 @@ class NV_VideoSampler:
                                 blend_weights = torch.linspace(0, 1, crossfade_frames).to(chunk_pixels.device)
 
                                 # Apply the 32-frame crossfade
+                                # First 16 frames: Blend VACE overlap (identical frames, smooth transition)
+                                # Next 16 frames: Fade from last overlap frame to NEW content
                                 for i in range(crossfade_frames):
                                     weight = blend_weights[i]
-                                    blended_frame = (1.0 - weight) * crossfade_previous[i] + weight * crossfade_current[i]
+
+                                    if i < overlap_frames:
+                                        # Positions 0-15: Blend the VACE overlap frames
+                                        # These are identical between chunks, but blending creates smooth transition
+                                        prev_frame = prev_overlap_frames[i]
+                                        curr_frame = chunk_pixels[i]  # VACE overlap from current chunk
+                                    else:
+                                        # Positions 16-31: Fade from last overlap frame to NEW content
+                                        # This avoids ghosting by holding on the last frame before fading to new
+                                        prev_frame = prev_overlap_frames[-1]  # Last frame of prev chunk's overlap
+                                        curr_frame = chunk_pixels[i]  # NEW frames from current chunk
+
+                                    blended_frame = (1.0 - weight) * prev_frame + weight * curr_frame
                                     final_video[blend_start_position + i] = blended_frame
 
                                 # Update output position to account for the crossfade frames we just placed
