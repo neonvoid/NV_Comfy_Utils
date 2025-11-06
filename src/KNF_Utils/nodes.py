@@ -4266,6 +4266,9 @@ class NV_VideoSampler:
                                     blended_frame = (1.0 - weight) * crossfade_previous[i] + weight * crossfade_current[i]
                                     final_video[blend_start_position + i] = blended_frame
 
+                                # Update output position to account for the crossfade frames we just placed
+                                output_position = blend_start_position + crossfade_frames
+
                                 # Now add the remaining NEW frames (frames 32+)
                                 new_frames_start = overlap_frames * 2  # Start after the 16 NEW frames used in crossfade
                                 new_frames_end = num_frames
