@@ -3745,8 +3745,8 @@ class NV_VideoSampler:
                         # DEBUG MODE: Save chunk as separate video file
                         if self._save_chunks_separately and chunk_pixels is not None:
                             # Calculate frame range for this chunk
-                            frame_start = chunk_data.get('start_frame', chunk_idx * (chunk_size - chunk_overlap))
-                            frame_end = chunk_data.get('end_frame', frame_start + len(chunk_pixels) - 1)
+                            frame_start = chunk_cond['start_frame']
+                            frame_end = chunk_cond['end_frame']
 
                             # Save chunk with metadata
                             self._save_chunk_debug(
