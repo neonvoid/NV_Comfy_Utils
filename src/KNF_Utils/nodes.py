@@ -4241,147 +4241,147 @@ class NV_VideoSampler:
                     try:
                         chunk_pixels_list = self._chunk_pixels_list
                         print(f"Processing {len(chunk_pixels_list)} decoded chunks...")
-                    
-                    # Build complete video dimensions
-                    first_chunk = chunk_pixels_list[0]
-                    H, W, C = first_chunk['pixels'].shape[1], first_chunk['pixels'].shape[2], first_chunk['pixels'].shape[3]
 
-                    # Calculate total frames based on ACTUAL chunk sizes and VACE overlap
-                    # Use VACE overlap (typically 5 frames) NOT refinement overlap (13 frames)
-                    actual_overlap = 16  # Fixed 16-frame overlap with chunk-by-chunk VACE encoding
-                    num_chunks = len(chunk_pixels_list)
+                        # Build complete video dimensions
+                        first_chunk = chunk_pixels_list[0]
+                        H, W, C = first_chunk['pixels'].shape[1], first_chunk['pixels'].shape[2], first_chunk['pixels'].shape[3]
 
-                    # Calculate actual total from real chunk sizes
-                    total_video_frames = 0
-                    for idx, chunk_data in enumerate(chunk_pixels_list):
-                        chunk_frames = len(chunk_data['pixels'])
-                        if idx == 0:
-                            total_video_frames += chunk_frames  # First chunk: use all frames
-                        else:
-                            total_video_frames += chunk_frames - actual_overlap  # Subsequent: subtract overlap
+                        # Calculate total frames based on ACTUAL chunk sizes and VACE overlap
+                        # Use VACE overlap (typically 5 frames) NOT refinement overlap (13 frames)
+                        actual_overlap = 16  # Fixed 16-frame overlap with chunk-by-chunk VACE encoding
+                        num_chunks = len(chunk_pixels_list)
 
-                    print(f"  Total video frames: {total_video_frames} (calculated from actual chunk sizes)")
-                    print(f"  Video dimensions: {H}x{W}x{C}")
-                    print(f"  VACE overlap: {actual_overlap} frames (frames forced identical between chunks)")
-
-                    # Initialize final concatenated video (in PIXEL space, not latent space!)
-                    final_video = torch.zeros((total_video_frames, H, W, C), dtype=first_chunk['pixels'].dtype)
-
-                    # CROSSFADE BLENDING (32-frame transition matching user's manual workflow)
-                    # The 32-frame crossfade window consists of:
-                    # - Last 16 frames of previous chunk (VACE overlap frames that will be in next chunk)
-                    # - First 16 NEW frames of current chunk (after VACE overlap)
-                    # This creates smooth transitions between unique content of adjacent chunks
-                    overlap_frames = 16  # VACE-forced identical overlap
-                    crossfade_frames = 32  # Total crossfade window (16 overlap + 16 new)
-
-                    try:
-                        from color_matcher import ColorMatcher
-
-                        print(f"\n  Blending chunks with {crossfade_frames}-frame linear crossfade...")
-
-                        output_position = 0  # Track position in final output
-                        prev_overlap_frames = None  # Initialize for cross-iteration access (16 overlap frames)
-
+                        # Calculate actual total from real chunk sizes
+                        total_video_frames = 0
                         for idx, chunk_data in enumerate(chunk_pixels_list):
-                            chunk_idx = chunk_data['chunk_idx']
-                            chunk_pixels = chunk_data['pixels'].to(final_video.device)  # Move to same device
-                            num_frames = len(chunk_pixels)
-
-                            if chunk_idx == 0:
-                                # First chunk: Take ALL frames, store last 16 frames for crossfade
-                                frames_to_use = min(81, num_frames)  # Safety check
-                                final_video[output_position:output_position + frames_to_use] = chunk_pixels[:frames_to_use]
-                                output_position += frames_to_use
-
-                                # Store last 16 frames (VACE overlap) for crossfade with next chunk
-                                # These frames will appear as the first 16 frames of the next chunk
-                                if idx < len(chunk_pixels_list) - 1:  # Not the last chunk
-                                    prev_overlap_frames = chunk_pixels[-overlap_frames:].clone()  # Last 16 frames
-
-                                print(f"  Chunk {chunk_idx}: placed ALL {frames_to_use} frames → position {output_position}")
+                            chunk_frames = len(chunk_data['pixels'])
+                            if idx == 0:
+                                total_video_frames += chunk_frames  # First chunk: use all frames
                             else:
-                                # Subsequent chunks: Crossfade matching CrossFadeImages node behavior
-                                # Blends last 16 frames of prev chunk with VACE overlap (after color matching)
-                                # Then places all remaining frames from current chunk
-                                # This matches user's manual workflow with CrossFadeImages
+                                total_video_frames += chunk_frames - actual_overlap  # Subsequent: subtract overlap
 
-                                # Calculate blend start position (where the overlap begins)
-                                blend_start_position = output_position - overlap_frames
+                        print(f"  Total video frames: {total_video_frames} (calculated from actual chunk sizes)")
+                        print(f"  Video dimensions: {H}x{W}x{C}")
+                        print(f"  VACE overlap: {actual_overlap} frames (frames forced identical between chunks)")
 
-                                # Extract VACE overlap frames (0-15) for blending
-                                # These were pixel-identical to prev chunk before color matching,
-                                # but color matching may have introduced slight differences
-                                vace_overlap_frames = chunk_pixels[:overlap_frames]  # Frames 0-15
+                        # Initialize final concatenated video (in PIXEL space, not latent space!)
+                        final_video = torch.zeros((total_video_frames, H, W, C), dtype=first_chunk['pixels'].dtype)
 
-                                # Report what's happening
-                                print(f"  Chunk {chunk_idx}: Applying {overlap_frames}-frame crossfade")
-                                print(f"    • Crossfade position: frames {blend_start_position} to {blend_start_position + overlap_frames - 1}")
-                                print(f"    • Blending: prev chunk frames {blend_start_position}-{blend_start_position+overlap_frames-1} with current chunk VACE overlap 0-15")
+                        # CROSSFADE BLENDING (32-frame transition matching user's manual workflow)
+                        # The 32-frame crossfade window consists of:
+                        # - Last 16 frames of previous chunk (VACE overlap frames that will be in next chunk)
+                        # - First 16 NEW frames of current chunk (after VACE overlap)
+                        # This creates smooth transitions between unique content of adjacent chunks
+                        overlap_frames = 16  # VACE-forced identical overlap
+                        crossfade_frames = 32  # Total crossfade window (16 overlap + 16 new)
 
-                                # Create linear blend weights over 16 frames
-                                # At frame 0: 100% previous chunk (weight = 0.0)
-                                # At frame 8: 50% blend at midpoint
-                                # At frame 15: 100% current chunk (weight = 1.0)
-                                blend_weights = torch.linspace(0, 1, overlap_frames).to(chunk_pixels.device)
+                        try:
+                            from color_matcher import ColorMatcher
 
-                                # Apply the crossfade by blending frame pairs
-                                # This matches CrossFadeImages: images_1[start+i] with images_2[i]
-                                for i in range(overlap_frames):
-                                    weight = blend_weights[i]
-                                    prev_frame = prev_overlap_frames[i]       # Last 16 of prev chunk
-                                    curr_frame = vace_overlap_frames[i]       # VACE overlap (color-matched)
-                                    blended_frame = (1.0 - weight) * prev_frame + weight * curr_frame
-                                    final_video[blend_start_position + i] = blended_frame
+                            print(f"\n  Blending chunks with {crossfade_frames}-frame linear crossfade...")
 
-                                # Crossfade REPLACES existing frames, doesn't change output position
-                                # output_position stays at its current value
+                            output_position = 0  # Track position in final output
+                            prev_overlap_frames = None  # Initialize for cross-iteration access (16 overlap frames)
 
-                                # Now add ALL remaining frames from current chunk (frames 16+)
-                                # This matches CrossFadeImages: remaining_images_2 = images_2[transitioning_frames:]
-                                new_frames_start = overlap_frames  # Frame 16 (after VACE overlap)
-                                new_frames_end = num_frames
-                                new_frames_count = new_frames_end - new_frames_start
+                            for idx, chunk_data in enumerate(chunk_pixels_list):
+                                chunk_idx = chunk_data['chunk_idx']
+                                chunk_pixels = chunk_data['pixels'].to(final_video.device)  # Move to same device
+                                num_frames = len(chunk_pixels)
 
-                                if new_frames_count > 0:
-                                    final_video[output_position:output_position + new_frames_count] = \
-                                        chunk_pixels[new_frames_start:new_frames_end]
-                                    output_position += new_frames_count
+                                if chunk_idx == 0:
+                                    # First chunk: Take ALL frames, store last 16 frames for crossfade
+                                    frames_to_use = min(81, num_frames)  # Safety check
+                                    final_video[output_position:output_position + frames_to_use] = chunk_pixels[:frames_to_use]
+                                    output_position += frames_to_use
 
-                                    # Store last 16 frames (VACE overlap) for next chunk's crossfade (if not last chunk)
-                                    if idx < len(chunk_pixels_list) - 1:
+                                    # Store last 16 frames (VACE overlap) for crossfade with next chunk
+                                    # These frames will appear as the first 16 frames of the next chunk
+                                    if idx < len(chunk_pixels_list) - 1:  # Not the last chunk
                                         prev_overlap_frames = chunk_pixels[-overlap_frames:].clone()  # Last 16 frames
 
-                                    print(f"  Chunk {chunk_idx}: crossfade complete, placed {new_frames_count} remaining frames → position {output_position}")
+                                    print(f"  Chunk {chunk_idx}: placed ALL {frames_to_use} frames → position {output_position}")
                                 else:
-                                    print(f"  Chunk {chunk_idx}: ⚠️ No new frames after overlap!")
+                                    # Subsequent chunks: Crossfade matching CrossFadeImages node behavior
+                                    # Blends last 16 frames of prev chunk with VACE overlap (after color matching)
+                                    # Then places all remaining frames from current chunk
+                                    # This matches user's manual workflow with CrossFadeImages
 
-                        print(f"  ✓ All {len(chunk_pixels_list)} chunks assembled with {overlap_frames}-frame linear crossfade ({output_position} total frames output)")
+                                    # Calculate blend start position (where the overlap begins)
+                                    blend_start_position = output_position - overlap_frames
 
-                        # Verify frame count matches expected
-                        if output_position != total_video_frames:
-                            print(f"  ⚠️ WARNING: Output frames ({output_position}) != expected ({total_video_frames})")
-                            # Trim or pad as needed
-                            if output_position < total_video_frames:
-                                final_video = final_video[:output_position]  # Trim excess zeros
-                                total_video_frames = output_position
-                            # If output_position > total_video_frames, some frames were overwritten (should not happen)
+                                    # Extract VACE overlap frames (0-15) for blending
+                                    # These were pixel-identical to prev chunk before color matching,
+                                    # but color matching may have introduced slight differences
+                                    vace_overlap_frames = chunk_pixels[:overlap_frames]  # Frames 0-15
 
-                        # REMOVED: Global color matching pass
-                        # Color matching is now applied per-chunk before diffusion refinement
-                        # This prevents brightness dips at chunk transitions
-                        print(f"\n  Skipping global color matching (already applied per-chunk)")
+                                    # Report what's happening
+                                    print(f"  Chunk {chunk_idx}: Applying {overlap_frames}-frame crossfade")
+                                    print(f"    • Crossfade position: frames {blend_start_position} to {blend_start_position + overlap_frames - 1}")
+                                    print(f"    • Blending: prev chunk frames {blend_start_position}-{blend_start_position+overlap_frames-1} with current chunk VACE overlap 0-15")
 
-                        info_lines.append(f"  → Chunk concatenation with {actual_overlap}-frame VACE overlap")
-                        info_lines.append(f"  → {overlap_frames}-frame blend (25% new chunk, 75% previous chunk)")
-                        info_lines.append("  → Per-chunk color matching (full strength, mvgd method, original reference)")
-                        
-                    except ImportError:
-                        print(f"  ⚠️  color-matcher not installed")
-                        print(f"      Install with: pip install color-matcher")
-                        # Fallback: just use first chunk's pixels
-                        final_video = chunk_pixels_list[0]['pixels']
-                    
+                                    # Create linear blend weights over 16 frames
+                                    # At frame 0: 100% previous chunk (weight = 0.0)
+                                    # At frame 8: 50% blend at midpoint
+                                    # At frame 15: 100% current chunk (weight = 1.0)
+                                    blend_weights = torch.linspace(0, 1, overlap_frames).to(chunk_pixels.device)
+
+                                    # Apply the crossfade by blending frame pairs
+                                    # This matches CrossFadeImages: images_1[start+i] with images_2[i]
+                                    for i in range(overlap_frames):
+                                        weight = blend_weights[i]
+                                        prev_frame = prev_overlap_frames[i]       # Last 16 of prev chunk
+                                        curr_frame = vace_overlap_frames[i]       # VACE overlap (color-matched)
+                                        blended_frame = (1.0 - weight) * prev_frame + weight * curr_frame
+                                        final_video[blend_start_position + i] = blended_frame
+
+                                    # Crossfade REPLACES existing frames, doesn't change output position
+                                    # output_position stays at its current value
+
+                                    # Now add ALL remaining frames from current chunk (frames 16+)
+                                    # This matches CrossFadeImages: remaining_images_2 = images_2[transitioning_frames:]
+                                    new_frames_start = overlap_frames  # Frame 16 (after VACE overlap)
+                                    new_frames_end = num_frames
+                                    new_frames_count = new_frames_end - new_frames_start
+
+                                    if new_frames_count > 0:
+                                        final_video[output_position:output_position + new_frames_count] = \
+                                            chunk_pixels[new_frames_start:new_frames_end]
+                                        output_position += new_frames_count
+
+                                        # Store last 16 frames (VACE overlap) for next chunk's crossfade (if not last chunk)
+                                        if idx < len(chunk_pixels_list) - 1:
+                                            prev_overlap_frames = chunk_pixels[-overlap_frames:].clone()  # Last 16 frames
+
+                                        print(f"  Chunk {chunk_idx}: crossfade complete, placed {new_frames_count} remaining frames → position {output_position}")
+                                    else:
+                                        print(f"  Chunk {chunk_idx}: ⚠️ No new frames after overlap!")
+
+                            print(f"  ✓ All {len(chunk_pixels_list)} chunks assembled with {overlap_frames}-frame linear crossfade ({output_position} total frames output)")
+
+                            # Verify frame count matches expected
+                            if output_position != total_video_frames:
+                                print(f"  ⚠️ WARNING: Output frames ({output_position}) != expected ({total_video_frames})")
+                                # Trim or pad as needed
+                                if output_position < total_video_frames:
+                                    final_video = final_video[:output_position]  # Trim excess zeros
+                                    total_video_frames = output_position
+                                # If output_position > total_video_frames, some frames were overwritten (should not happen)
+
+                            # REMOVED: Global color matching pass
+                            # Color matching is now applied per-chunk before diffusion refinement
+                            # This prevents brightness dips at chunk transitions
+                            print(f"\n  Skipping global color matching (already applied per-chunk)")
+
+                            info_lines.append(f"  → Chunk concatenation with {actual_overlap}-frame VACE overlap")
+                            info_lines.append(f"  → {overlap_frames}-frame blend (25% new chunk, 75% previous chunk)")
+                            info_lines.append("  → Per-chunk color matching (full strength, mvgd method, original reference)")
+
+                        except ImportError:
+                            print(f"  ⚠️  color-matcher not installed")
+                            print(f"      Install with: pip install color-matcher")
+                            # Fallback: just use first chunk's pixels
+                            final_video = chunk_pixels_list[0]['pixels']
+
                         final_video = torch.clamp(final_video, 0.0, 1.0)
 
                         # Re-encode to latents
