@@ -2567,6 +2567,19 @@ class NV_VideoSampler:
                     "step": 0.1,
                     "tooltip": "Frame rate for debug chunk videos (ignored for PNG sequence)"
                 }),
+
+                # Color matching control
+                "color_match_threshold": ("FLOAT", {
+                    "default": 5.0,
+                    "min": 0.0,
+                    "max": 50.0,
+                    "step": 0.1,
+                    "tooltip": "Only color match if degradation exceeds this % (0 = always match, 5-10 = recommended)"
+                }),
+                "color_match_adaptive_strength": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Use adaptive strength based on degradation level (prevents over-correction)"
+                }),
             }
         }
     
@@ -2774,7 +2787,9 @@ class NV_VideoSampler:
                model_steps="", model_boundaries="0.875,0.5",
                model_cfg_scales="",
                # Debug parameters
-               save_chunks_separately=False, chunk_save_directory="chunk_debug", chunk_save_format="mp4", chunk_fps=16.0):
+               save_chunks_separately=False, chunk_save_directory="chunk_debug", chunk_save_format="mp4", chunk_fps=16.0,
+               # Color matching control
+               color_match_threshold=5.0, color_match_adaptive_strength=True):
         
         import comfy.sample
         import comfy.samplers
@@ -2811,6 +2826,11 @@ class NV_VideoSampler:
         self._chunk_save_directory = chunk_save_directory
         self._chunk_save_format = chunk_save_format
         self._chunk_fps = chunk_fps
+
+        # Color matching control
+        self._color_match_threshold = color_match_threshold
+        self._color_match_adaptive = color_match_adaptive_strength
+
         self._generation_params = {
             "seed": seed,
             "steps": steps,
@@ -3697,9 +3717,11 @@ class NV_VideoSampler:
                                 vace_overlap_frames = 16  # First 16 frames are VACE-forced identical to previous chunk
 
                                 # Track statistics for better logging
-                                skipped_count = 0
-                                matched_count = 0
+                                skipped_count = 0  # VACE overlap frames
+                                matched_count = 0  # Frames that were color-matched
+                                threshold_skipped_count = 0  # Frames skipped due to threshold
                                 error_count = 0
+                                degradation_details = []  # For detailed per-frame logging
 
                                 for frame_idx in range(len(chunk_pixels)):
                                     try:
@@ -3713,17 +3735,68 @@ class NV_VideoSampler:
                                             skipped_count += 1
                                             continue
 
-                                        # For non-overlap frames, apply color matching
+                                        # For non-overlap frames, measure degradation and apply color matching if needed
                                         frame_np = chunk_pixels[frame_idx].cpu().numpy()
 
-                                        # Full strength MVGD color matching for all non-overlap frames
-                                        matched = cm.transfer(src=frame_np, ref=ref_np, method='mvgd')
-
-                                        # Clamp to valid range [0, 1] to prevent VACE corruption
+                                        # === DEGRADATION MEASUREMENT (VAE_LUT_Generator style) ===
                                         import numpy as np
-                                        matched = np.clip(matched, 0.0, 1.0)
-                                        matched_frames.append(torch.from_numpy(matched))
-                                        matched_count += 1
+                                        mean_frame = float(frame_np.mean())
+                                        mean_ref = float(ref_np.mean())
+                                        degradation_abs = abs(mean_frame - mean_ref)
+                                        degradation_pct = (degradation_abs / mean_ref) * 100 if mean_ref > 0 else 0
+
+                                        # Detailed RGB degradation
+                                        mean_frame_rgb = frame_np.mean(axis=(0, 1))  # [R, G, B]
+                                        mean_ref_rgb = ref_np.mean(axis=(0, 1))
+                                        rgb_distance = float(np.linalg.norm(mean_frame_rgb - mean_ref_rgb))
+
+                                        # Decide if color matching is needed
+                                        needs_matching = degradation_pct > self._color_match_threshold
+
+                                        if needs_matching:
+                                            # Apply color matching
+                                            matched = cm.transfer(src=frame_np, ref=ref_np, method='mvgd')
+
+                                            # Adaptive strength based on degradation severity
+                                            if self._color_match_adaptive:
+                                                # Scale 0-100% based on 0-10% degradation
+                                                blend_strength = min(1.0, degradation_pct / 10.0)
+                                                matched = (1.0 - blend_strength) * frame_np + blend_strength * matched
+                                                strength_used = blend_strength * 100
+                                            else:
+                                                strength_used = 100.0
+
+                                            # Clamp to valid range [0, 1]
+                                            matched = np.clip(matched, 0.0, 1.0)
+                                            mean_after = float(matched.mean())
+
+                                            matched_frames.append(torch.from_numpy(matched))
+                                            matched_count += 1
+
+                                            # Log this frame
+                                            degradation_details.append({
+                                                "frame": frame_idx,
+                                                "action": "MATCHED",
+                                                "degradation_pct": degradation_pct,
+                                                "rgb_distance": rgb_distance,
+                                                "strength": strength_used,
+                                                "mean_before": mean_frame,
+                                                "mean_after": mean_after
+                                            })
+                                        else:
+                                            # Skip color matching - frame is already close to reference
+                                            matched_frames.append(chunk_pixels[frame_idx])
+                                            threshold_skipped_count += 1
+
+                                            # Log this frame
+                                            degradation_details.append({
+                                                "frame": frame_idx,
+                                                "action": "SKIPPED",
+                                                "degradation_pct": degradation_pct,
+                                                "rgb_distance": rgb_distance,
+                                                "reason": f"within {self._color_match_threshold:.1f}% threshold"
+                                            })
+
                                     except Exception as e:
                                         # Fallback: use original frame
                                         matched_frames.append(chunk_pixels[frame_idx])
@@ -3732,21 +3805,60 @@ class NV_VideoSampler:
                                 chunk_pixels = torch.stack(matched_frames, dim=0)
 
                                 # Detailed reporting of color matching results
+                                print(f"  🎨 Color matching complete for chunk {chunk_idx}:")
+                                print(f"    • Threshold: {self._color_match_threshold:.1f}% degradation")
+                                print(f"    • Matched: {matched_count} frames")
+                                print(f"    • Threshold-skipped: {threshold_skipped_count} frames (below threshold)")
                                 if chunk_idx > 0:
-                                    print(f"  🎨 Color matching complete for chunk {chunk_idx}:")
-                                    print(f"    • Skipped: {skipped_count} VACE-overlap frames (replaced with color-matched versions)")
-                                    print(f"    • Processed: {matched_count} new frames (100% MVGD)")
-                                    if error_count > 0:
-                                        print(f"    • Errors: {error_count} frames (used original)")
-                                else:
-                                    print(f"  🎨 Color matching complete for chunk {chunk_idx}:")
-                                    print(f"    • Processed: {matched_count} frames (100% MVGD)")
-                                    if error_count > 0:
-                                        print(f"    • Errors: {error_count} frames (used original)")
+                                    print(f"    • VACE-overlap: {skipped_count} frames (reused from chunk {chunk_idx-1})")
+                                if error_count > 0:
+                                    print(f"    • Errors: {error_count} frames (used original)")
+
+                                # Detailed frame-by-frame log
+                                print(f"\n  📊 Frame-by-frame color matching decisions:")
+                                print(f"     Frame | Action  | Degradation | RGB Distance | Strength | Notes")
+                                print(f"     ------|---------|-------------|--------------|----------|------")
+
+                                for detail in degradation_details:
+                                    frame = detail["frame"]
+                                    action = detail["action"]
+                                    deg = detail["degradation_pct"]
+                                    rgb = detail["rgb_distance"]
+
+                                    if action == "MATCHED":
+                                        strength = detail["strength"]
+                                        mean_before = detail["mean_before"]
+                                        mean_after = detail["mean_after"]
+                                        change = mean_after - mean_before
+                                        print(f"     {frame:5d} | MATCHED | {deg:10.2f}% | {rgb:11.4f} | {strength:7.1f}% | Δ={change:+.4f}")
+                                    else:
+                                        reason = detail["reason"]
+                                        print(f"     {frame:5d} | SKIPPED | {deg:10.2f}% | {rgb:11.4f} |      N/A | {reason}")
+
+                                print(f"")
+
+                                # Summary statistics
+                                if matched_count > 0:
+                                    avg_degradation = sum(d["degradation_pct"] for d in degradation_details if d["action"] == "MATCHED") / matched_count
+                                    avg_strength = sum(d["strength"] for d in degradation_details if d["action"] == "MATCHED") / matched_count
+                                    print(f"  📈 Matched frames avg degradation: {avg_degradation:.2f}%")
+                                    print(f"  📈 Matched frames avg strength: {avg_strength:.1f}%")
+                                    print(f"")
+
+                                # Store color matching details for this chunk (for debug metadata)
+                                self._last_chunk_color_match_details = {
+                                    "matched_count": matched_count,
+                                    "threshold_skipped_count": threshold_skipped_count,
+                                    "vace_skipped_count": skipped_count,
+                                    "error_count": error_count,
+                                    "frame_details": degradation_details
+                                }
                             except ImportError:
                                 print(f"  ⚠️  color-matcher not installed, skipping per-chunk color matching")
+                                self._last_chunk_color_match_details = None
                             except Exception as e:
                                 print(f"  ⚠️  Color matching failed for chunk {chunk_idx}: {e}, using unmatched")
+                                self._last_chunk_color_match_details = None
 
                         # NEW: Store last 16 frames (color-matched) for next chunk's VACE overlap
                         if chunk_pixels is not None and len(chunk_pixels) >= 16:
@@ -4893,6 +5005,19 @@ class NV_VideoSampler:
                     "generation_params": self._generation_params,
                     "workflow": workflow_json if workflow_json else "Not available"
                 }
+
+                # Add color matching details if available
+                if hasattr(self, '_last_chunk_color_match_details') and self._last_chunk_color_match_details is not None:
+                    metadata_dict["color_matching"] = {
+                        "threshold_pct": self._color_match_threshold,
+                        "adaptive_strength": self._color_match_adaptive,
+                        "matched_count": self._last_chunk_color_match_details["matched_count"],
+                        "threshold_skipped_count": self._last_chunk_color_match_details["threshold_skipped_count"],
+                        "vace_skipped_count": self._last_chunk_color_match_details["vace_skipped_count"],
+                        "error_count": self._last_chunk_color_match_details["error_count"],
+                        "frame_details": self._last_chunk_color_match_details["frame_details"]
+                    }
+
                 metadata_path = os.path.join(chunk_dir, "metadata.json")
                 with open(metadata_path, 'w') as f:
                     json.dump(metadata_dict, f, indent=2)
@@ -4902,15 +5027,29 @@ class NV_VideoSampler:
 
             # VIDEO FORMAT: Use FFmpeg
             # Build metadata dict
+            comment_dict = {
+                "chunk_index": chunk_idx,
+                "frame_range": [frame_start, frame_end],
+                "generation_params": self._generation_params,
+                "workflow": workflow_json if workflow_json else "Not available"
+            }
+
+            # Add color matching details if available
+            if hasattr(self, '_last_chunk_color_match_details') and self._last_chunk_color_match_details is not None:
+                comment_dict["color_matching"] = {
+                    "threshold_pct": self._color_match_threshold,
+                    "adaptive_strength": self._color_match_adaptive,
+                    "matched_count": self._last_chunk_color_match_details["matched_count"],
+                    "threshold_skipped_count": self._last_chunk_color_match_details["threshold_skipped_count"],
+                    "vace_skipped_count": self._last_chunk_color_match_details["vace_skipped_count"],
+                    "error_count": self._last_chunk_color_match_details["error_count"],
+                    "frame_details": self._last_chunk_color_match_details["frame_details"]
+                }
+
             metadata = {
                 "title": f"Chunk {chunk_idx} - Frames {frame_start}-{frame_end}",
                 "description": f"Generated by NV_VideoSampler | Chunk {chunk_idx}/{self._num_chunks} | {T} frames",
-                "comment": json.dumps({
-                    "chunk_index": chunk_idx,
-                    "frame_range": [frame_start, frame_end],
-                    "generation_params": self._generation_params,
-                    "workflow": workflow_json if workflow_json else "Not available"
-                }, indent=2)
+                "comment": json.dumps(comment_dict, indent=2)
             }
 
             # Build FFmpeg command for highest quality
