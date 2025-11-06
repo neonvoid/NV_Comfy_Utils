@@ -3668,11 +3668,16 @@ class NV_VideoSampler:
                         if chunk_pixels.dim() == 5 and chunk_pixels.shape[0] == 1:
                             chunk_pixels = chunk_pixels.squeeze(0)
 
-                        # NOTE: Pixel replacement no longer needed - VACE controls enforce the overlap
-                        # The first 16 frames are forced identical through VACE mask=0
-                        # if chunk_idx > 0 and hasattr(self, '_prev_diffused_overlap') and self._prev_diffused_overlap is not None:
-                        #     overlap_frames = 16  # Fixed 16-frame overlap
-                        #     print(f"  First {overlap_frames} frames enforced identical through VACE controls (mask=0)")
+                        # VACE OVERLAP: Replace decoded overlap frames with stored color-matched versions
+                        # This fixes VAE encode/decode degradation that loses color matching
+                        # The color-matched overlap frames are used as controls, but VAE round-trip
+                        # introduces color shifts. By replacing with stored versions, we preserve color matching.
+                        if chunk_idx > 0 and hasattr(self, '_prev_chunk_overlap_pixels') and self._prev_chunk_overlap_pixels is not None:
+                            overlap_frames_to_replace = min(16, len(chunk_pixels), len(self._prev_chunk_overlap_pixels))
+                            # Replace decoded frames 0-15 with exact color-matched versions from previous chunk
+                            chunk_pixels[:overlap_frames_to_replace] = self._prev_chunk_overlap_pixels[:overlap_frames_to_replace].to(chunk_pixels.device)
+                            print(f"  ✓ Replaced first {overlap_frames_to_replace} decoded frames with color-matched overlap from chunk {chunk_idx-1}")
+                            print(f"    (Preserves color matching through VAE round-trip)")
 
                         # PER-CHUNK COLOR MATCHING (before blending)
                         # Apply color matching to each chunk immediately after decode
@@ -3698,11 +3703,12 @@ class NV_VideoSampler:
 
                                 for frame_idx in range(len(chunk_pixels)):
                                     try:
-                                        # CRITICAL: Skip color matching for VACE-forced overlap frames
-                                        # These are pixel-identical to the last 16 frames of previous chunk
-                                        # which were already color-matched when that chunk was processed
+                                        # CRITICAL: Skip color matching for VACE overlap frames
+                                        # These frames were REPLACED with stored color-matched versions (after decode)
+                                        # They are exact copies of the last 16 frames of previous chunk (post-matching)
+                                        # No need to re-match them
                                         if chunk_idx > 0 and frame_idx < vace_overlap_frames:
-                                            # Use frame AS-IS - it's already color-matched from previous chunk
+                                            # Use frame AS-IS - already replaced with color-matched version
                                             matched_frames.append(chunk_pixels[frame_idx])
                                             skipped_count += 1
                                             continue
@@ -3728,7 +3734,7 @@ class NV_VideoSampler:
                                 # Detailed reporting of color matching results
                                 if chunk_idx > 0:
                                     print(f"  🎨 Color matching complete for chunk {chunk_idx}:")
-                                    print(f"    • Skipped: {skipped_count} VACE-overlap frames (already matched)")
+                                    print(f"    • Skipped: {skipped_count} VACE-overlap frames (replaced with color-matched versions)")
                                     print(f"    • Processed: {matched_count} new frames (100% MVGD)")
                                     if error_count > 0:
                                         print(f"    • Errors: {error_count} frames (used original)")
@@ -5287,6 +5293,313 @@ class NV_VideoChunkAnalyzer:
             import shutil
             if os.path.exists(result[0]):
                 shutil.move(result[0], output_path)
+
+
+class NV_ChunkColorAnalyzer:
+    """
+    Diagnostic node for analyzing color consistency in saved chunk PNG sequences.
+    Measures color statistics, identifies color shifts, and generates visual reports.
+
+    Inspired by VAE_LUT_Generator's degradation analysis approach.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "chunk_directory": ("STRING", {
+                    "default": "chunk_debug",
+                    "multiline": False,
+                    "tooltip": "Directory containing chunk subdirectories (chunk_0, chunk_1, etc.)"
+                }),
+                "reference_frame": ("IMAGE", {
+                    "tooltip": "Original reference frame for color comparison"
+                }),
+            },
+            "optional": {
+                "overlap_frames": ("INT", {
+                    "default": 16,
+                    "min": 0,
+                    "max": 100,
+                    "step": 1,
+                    "tooltip": "Number of VACE overlap frames to analyze separately"
+                }),
+                "generate_graphs": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Generate visual graphs (requires matplotlib)"
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "IMAGE")
+    RETURN_NAMES = ("analysis_report", "diagnostic_json", "color_graph")
+    FUNCTION = "analyze_chunks"
+    CATEGORY = "NV_Utils/Diagnostic"
+
+    def analyze_chunks(self, chunk_directory, reference_frame, overlap_frames=16, generate_graphs=True):
+        """
+        Analyze color statistics from saved chunk PNG sequences.
+
+        Returns:
+            - analysis_report: Text summary of findings
+            - diagnostic_json: Detailed JSON data
+            - color_graph: Visual plot of color drift (if enabled)
+        """
+        import os
+        import json
+        import numpy as np
+        from PIL import Image
+        import torch
+
+        print(f"\n{'='*60}")
+        print(f"CHUNK COLOR ANALYSIS")
+        print(f"{'='*60}")
+
+        # Determine full path to chunk directory
+        if not os.path.isabs(chunk_directory):
+            try:
+                import folder_paths
+                comfy_output = folder_paths.get_output_directory()
+                chunk_dir_full = os.path.join(comfy_output, chunk_directory)
+            except:
+                chunk_dir_full = chunk_directory
+        else:
+            chunk_dir_full = chunk_directory
+
+        print(f"Analyzing chunks in: {chunk_dir_full}")
+
+        if not os.path.exists(chunk_dir_full):
+            error_msg = f"ERROR: Chunk directory does not exist: {chunk_dir_full}"
+            print(error_msg)
+            return (error_msg, "{}", None)
+
+        # Find all chunk subdirectories
+        chunk_dirs = []
+        for item in sorted(os.listdir(chunk_dir_full)):
+            item_path = os.path.join(chunk_dir_full, item)
+            if os.path.isdir(item_path) and item.startswith("chunk_"):
+                chunk_dirs.append(item_path)
+
+        if not chunk_dirs:
+            error_msg = f"ERROR: No chunk subdirectories found in {chunk_dir_full}"
+            print(error_msg)
+            return (error_msg, "{}", None)
+
+        print(f"Found {len(chunk_dirs)} chunk directories")
+
+        # Convert reference frame to numpy
+        if reference_frame.dim() == 4:
+            ref_np = reference_frame[0].cpu().numpy()  # Take first frame if batch
+        else:
+            ref_np = reference_frame.cpu().numpy()
+
+        ref_mean_rgb = ref_np.mean(axis=(0, 1))  # Mean RGB
+        print(f"Reference mean RGB: R={ref_mean_rgb[0]:.4f}, G={ref_mean_rgb[1]:.4f}, B={ref_mean_rgb[2]:.4f}")
+
+        # Analyze each chunk
+        all_chunk_data = []
+
+        for chunk_idx, chunk_dir in enumerate(chunk_dirs):
+            chunk_name = os.path.basename(chunk_dir)
+            print(f"\nAnalyzing {chunk_name}...")
+
+            # Load metadata if available
+            metadata_path = os.path.join(chunk_dir, "metadata.json")
+            metadata = {}
+            if os.path.exists(metadata_path):
+                with open(metadata_path, 'r') as f:
+                    metadata = json.load(f)
+
+            # Load all PNG frames
+            frame_files = sorted([f for f in os.listdir(chunk_dir) if f.endswith('.png')])
+
+            if not frame_files:
+                print(f"  WARNING: No PNG frames found in {chunk_name}")
+                continue
+
+            print(f"  Found {len(frame_files)} frames")
+
+            # Analyze each frame
+            frame_stats = []
+
+            for frame_idx, frame_file in enumerate(frame_files):
+                frame_path = os.path.join(chunk_dir, frame_file)
+                frame_img = Image.open(frame_path)
+                frame_np = np.array(frame_img).astype(np.float32) / 255.0
+
+                # Calculate statistics
+                mean_rgb = frame_np.mean(axis=(0, 1))
+                std_rgb = frame_np.std(axis=(0, 1))
+
+                # Color distance from reference (Euclidean distance in RGB space)
+                color_distance = np.linalg.norm(mean_rgb - ref_mean_rgb)
+
+                # Classify frame type
+                if chunk_idx > 0 and frame_idx < overlap_frames:
+                    frame_type = "vace_overlap"
+                else:
+                    frame_type = "new_content"
+
+                frame_stats.append({
+                    "frame_index": frame_idx,
+                    "frame_type": frame_type,
+                    "mean_r": float(mean_rgb[0]),
+                    "mean_g": float(mean_rgb[1]),
+                    "mean_b": float(mean_rgb[2]),
+                    "std_r": float(std_rgb[0]),
+                    "std_g": float(std_rgb[1]),
+                    "std_b": float(std_rgb[2]),
+                    "color_distance_from_ref": float(color_distance)
+                })
+
+            # Calculate chunk summary statistics
+            overlap_frames_data = [f for f in frame_stats if f["frame_type"] == "vace_overlap"]
+            new_frames_data = [f for f in frame_stats if f["frame_type"] == "new_content"]
+
+            chunk_summary = {
+                "chunk_index": chunk_idx,
+                "chunk_name": chunk_name,
+                "total_frames": len(frame_stats),
+                "overlap_frames_count": len(overlap_frames_data),
+                "new_frames_count": len(new_frames_data),
+                "metadata": metadata,
+                "frame_stats": frame_stats
+            }
+
+            # Add average color distance stats
+            if overlap_frames_data:
+                avg_overlap_distance = np.mean([f["color_distance_from_ref"] for f in overlap_frames_data])
+                chunk_summary["avg_overlap_color_distance"] = float(avg_overlap_distance)
+
+            if new_frames_data:
+                avg_new_distance = np.mean([f["color_distance_from_ref"] for f in new_frames_data])
+                chunk_summary["avg_new_color_distance"] = float(avg_new_distance)
+
+            all_chunk_data.append(chunk_summary)
+
+            print(f"  Average color distance from reference:")
+            if overlap_frames_data:
+                print(f"    Overlap frames: {chunk_summary['avg_overlap_color_distance']:.6f}")
+            if new_frames_data:
+                print(f"    New frames: {chunk_summary['avg_new_color_distance']:.6f}")
+
+        # Generate analysis report
+        report_lines = []
+        report_lines.append("=" * 60)
+        report_lines.append("CHUNK COLOR ANALYSIS REPORT")
+        report_lines.append("=" * 60)
+        report_lines.append(f"Analyzed {len(all_chunk_data)} chunks")
+        report_lines.append(f"Reference mean RGB: R={ref_mean_rgb[0]:.4f}, G={ref_mean_rgb[1]:.4f}, B={ref_mean_rgb[2]:.4f}")
+        report_lines.append("")
+
+        # Per-chunk summary
+        for chunk_data in all_chunk_data:
+            report_lines.append(f"Chunk {chunk_data['chunk_index']} ({chunk_data['chunk_name']}):")
+            report_lines.append(f"  Total frames: {chunk_data['total_frames']}")
+
+            if "avg_overlap_color_distance" in chunk_data:
+                report_lines.append(f"  Overlap frames avg distance: {chunk_data['avg_overlap_color_distance']:.6f}")
+
+            if "avg_new_color_distance" in chunk_data:
+                report_lines.append(f"  New frames avg distance: {chunk_data['avg_new_color_distance']:.6f}")
+
+            report_lines.append("")
+
+        # Identify anomalies
+        report_lines.append("ANOMALY DETECTION:")
+
+        # Check for large color shifts at chunk boundaries
+        for i in range(1, len(all_chunk_data)):
+            prev_chunk = all_chunk_data[i-1]
+            curr_chunk = all_chunk_data[i]
+
+            if "avg_new_color_distance" in prev_chunk and "avg_overlap_color_distance" in curr_chunk:
+                prev_avg = prev_chunk["avg_new_color_distance"]
+                curr_overlap_avg = curr_chunk["avg_overlap_color_distance"]
+
+                diff = abs(curr_overlap_avg - prev_avg)
+
+                if diff > 0.01:  # Threshold for significant shift
+                    report_lines.append(f"  ⚠️ Large color shift at chunk {i} boundary: {diff:.6f}")
+                    report_lines.append(f"     Prev chunk new frames: {prev_avg:.6f}")
+                    report_lines.append(f"     Curr chunk overlap: {curr_overlap_avg:.6f}")
+
+        report_lines.append("=" * 60)
+
+        analysis_report = "\n".join(report_lines)
+        print("\n" + analysis_report)
+
+        # Generate diagnostic JSON
+        diagnostic_data = {
+            "reference_mean_rgb": ref_mean_rgb.tolist(),
+            "chunks": all_chunk_data
+        }
+        diagnostic_json = json.dumps(diagnostic_data, indent=2)
+
+        # Generate color graph (if requested)
+        color_graph = None
+        if generate_graphs:
+            try:
+                import matplotlib
+                matplotlib.use('Agg')  # Non-interactive backend
+                import matplotlib.pyplot as plt
+
+                fig, axes = plt.subplots(2, 1, figsize=(12, 8))
+
+                # Plot 1: Mean RGB over all frames
+                all_frames = []
+                for chunk_data in all_chunk_data:
+                    all_frames.extend(chunk_data["frame_stats"])
+
+                frame_indices = [f["frame_index"] + chunk_data["chunk_index"] * 100 for chunk_data in all_chunk_data for f in chunk_data["frame_stats"]]
+                mean_r = [f["mean_r"] for chunk_data in all_chunk_data for f in chunk_data["frame_stats"]]
+                mean_g = [f["mean_g"] for chunk_data in all_chunk_data for f in chunk_data["frame_stats"]]
+                mean_b = [f["mean_b"] for chunk_data in all_chunk_data for f in chunk_data["frame_stats"]]
+
+                axes[0].plot(frame_indices, mean_r, 'r-', alpha=0.7, label='Red')
+                axes[0].plot(frame_indices, mean_g, 'g-', alpha=0.7, label='Green')
+                axes[0].plot(frame_indices, mean_b, 'b-', alpha=0.7, label='Blue')
+                axes[0].axhline(ref_mean_rgb[0], color='r', linestyle='--', alpha=0.3, label='Ref R')
+                axes[0].axhline(ref_mean_rgb[1], color='g', linestyle='--', alpha=0.3, label='Ref G')
+                axes[0].axhline(ref_mean_rgb[2], color='b', linestyle='--', alpha=0.3, label='Ref B')
+                axes[0].set_xlabel('Frame Index (grouped by chunk)')
+                axes[0].set_ylabel('Mean RGB Value')
+                axes[0].set_title('Mean RGB Values Across All Chunks')
+                axes[0].legend()
+                axes[0].grid(True, alpha=0.3)
+
+                # Plot 2: Color distance from reference
+                color_distances = [f["color_distance_from_ref"] for chunk_data in all_chunk_data for f in chunk_data["frame_stats"]]
+                axes[1].plot(frame_indices, color_distances, 'k-', alpha=0.7)
+                axes[1].set_xlabel('Frame Index (grouped by chunk)')
+                axes[1].set_ylabel('Color Distance from Reference')
+                axes[1].set_title('Color Distance from Reference Frame')
+                axes[1].grid(True, alpha=0.3)
+
+                # Mark chunk boundaries
+                for i in range(1, len(all_chunk_data)):
+                    boundary_x = i * 100
+                    axes[0].axvline(boundary_x, color='gray', linestyle=':', alpha=0.5)
+                    axes[1].axvline(boundary_x, color='gray', linestyle=':', alpha=0.5)
+
+                plt.tight_layout()
+
+                # Convert plot to tensor
+                fig.canvas.draw()
+                graph_np = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+                graph_np = graph_np.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+                graph_tensor = torch.from_numpy(graph_np).float() / 255.0
+                color_graph = graph_tensor.unsqueeze(0)  # Add batch dimension
+
+                plt.close(fig)
+
+                print("✓ Generated color analysis graph")
+
+            except Exception as e:
+                print(f"⚠️ Failed to generate graph: {e}")
+                color_graph = None
+
+        return (analysis_report, diagnostic_json, color_graph)
 
 
 class NV_ChunkConditioningPreprocessor:
