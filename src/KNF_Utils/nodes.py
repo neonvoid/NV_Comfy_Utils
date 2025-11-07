@@ -3757,11 +3757,10 @@ class NV_VideoSampler:
 
                                 for frame_idx in range(len(chunk_pixels)):
                                     try:
-                                        # CRITICAL: Skip color matching for VACE overlap frames
-                                        # These frames were REPLACED with stored color-matched versions (after decode)
-                                        # They are exact copies of the last 16 frames of previous chunk (post-matching)
-                                        # No need to re-match them
-                                        if chunk_idx > 0 and frame_idx < vace_overlap_frames:
+                                        # CRITICAL: Skip color matching for VACE overlap frames UNLESS in debug mode
+                                        # Normally these frames were REPLACED with stored color-matched versions (after decode)
+                                        # In debug mode, they're VAE-decoded and need color matching
+                                        if chunk_idx > 0 and frame_idx < vace_overlap_frames and not self._debug_keep_vace_decoded:
                                             # Use frame AS-IS - already replaced with color-matched version
                                             matched_frames.append(chunk_pixels[frame_idx])
                                             skipped_count += 1
@@ -3789,14 +3788,23 @@ class NV_VideoSampler:
                                             # Apply color matching
                                             matched = cm.transfer(src=frame_np, ref=ref_np, method='mvgd')
 
-                                            # Adaptive strength based on degradation severity
+                                            # Calculate position-based strength (frame 0=100%, last frame=0%)
+                                            total_frames = len(chunk_pixels)
+                                            position_strength = max(0.0, 1.0 - (frame_idx / (total_frames - 1))) if total_frames > 1 else 1.0
+
+                                            # Combine position strength with adaptive strength if enabled
                                             if self._color_match_adaptive:
                                                 # Scale 0-100% based on 0-10% degradation
-                                                blend_strength = min(1.0, degradation_pct / 10.0)
-                                                matched = (1.0 - blend_strength) * frame_np + blend_strength * matched
-                                                strength_used = blend_strength * 100
+                                                degradation_strength = min(1.0, degradation_pct / 10.0)
+                                                # Multiply position and degradation strengths
+                                                blend_strength = position_strength * degradation_strength
                                             else:
-                                                strength_used = 100.0
+                                                # Use only position-based strength
+                                                blend_strength = position_strength
+
+                                            # Blend matched result with original
+                                            matched = (1.0 - blend_strength) * frame_np + blend_strength * matched
+                                            strength_used = blend_strength * 100
 
                                             # Clamp to valid range [0, 1]
                                             matched = np.clip(matched, 0.0, 1.0)
@@ -3812,6 +3820,7 @@ class NV_VideoSampler:
                                                 "degradation_pct": degradation_pct,
                                                 "rgb_distance": rgb_distance,
                                                 "strength": strength_used,
+                                                "position_strength_pct": position_strength * 100,
                                                 "mean_before": mean_frame,
                                                 "mean_after": mean_after
                                             })
@@ -3838,20 +3847,24 @@ class NV_VideoSampler:
 
                                 # Detailed reporting of color matching results
                                 print(f"  🎨 Color matching complete for chunk {chunk_idx}:")
-                                print(f"    • Frame range: 16-{len(chunk_pixels)-1} (new content only)")
+                                if self._debug_keep_vace_decoded:
+                                    print(f"    • Frame range: 0-{len(chunk_pixels)-1} (ALL frames, debug mode)")
+                                    print(f"    • Position gradient: Frame 0=100% → Frame {len(chunk_pixels)-1}=0%")
+                                else:
+                                    print(f"    • Frame range: 16-{len(chunk_pixels)-1} (new content only)")
                                 print(f"    • Reference: Global reference image (absolute baseline)")
                                 print(f"    • Threshold: {self._color_match_threshold:.1f}% degradation")
                                 print(f"    • Matched: {matched_count} frames")
                                 print(f"    • Threshold-skipped: {threshold_skipped_count} frames (below threshold)")
-                                if chunk_idx > 0:
+                                if chunk_idx > 0 and not self._debug_keep_vace_decoded:
                                     print(f"    • VACE-overlap: {skipped_count} frames (frames 0-15, preserved from chunk {chunk_idx-1})")
                                 if error_count > 0:
                                     print(f"    • Errors: {error_count} frames (used original)")
 
                                 # Detailed frame-by-frame log
                                 print(f"\n  📊 Frame-by-frame color matching decisions:")
-                                print(f"     Frame | Action  | Degradation | RGB Distance | Strength | Notes")
-                                print(f"     ------|---------|-------------|--------------|----------|------")
+                                print(f"     Frame | Action  | Degradation | RGB Distance | Pos% | Final% | Notes")
+                                print(f"     ------|---------|-------------|--------------|------|--------|------")
 
                                 for detail in degradation_details:
                                     frame = detail["frame"]
@@ -3861,13 +3874,14 @@ class NV_VideoSampler:
 
                                     if action == "MATCHED":
                                         strength = detail["strength"]
+                                        pos_strength = detail.get("position_strength_pct", 0)
                                         mean_before = detail["mean_before"]
                                         mean_after = detail["mean_after"]
                                         change = mean_after - mean_before
-                                        print(f"     {frame:5d} | MATCHED | {deg:10.2f}% | {rgb:11.4f} | {strength:7.1f}% | Δ={change:+.4f}")
+                                        print(f"     {frame:5d} | MATCHED | {deg:10.2f}% | {rgb:11.4f} | {pos_strength:4.0f}% | {strength:5.1f}% | Δ={change:+.4f}")
                                     else:
                                         reason = detail["reason"]
-                                        print(f"     {frame:5d} | SKIPPED | {deg:10.2f}% | {rgb:11.4f} |      N/A | {reason}")
+                                        print(f"     {frame:5d} | SKIPPED | {deg:10.2f}% | {rgb:11.4f} |  N/A |   N/A | {reason}")
 
                                 print(f"")
 
