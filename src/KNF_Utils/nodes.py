@@ -2580,6 +2580,12 @@ class NV_VideoSampler:
                     "default": True,
                     "tooltip": "Use adaptive strength based on degradation level (prevents over-correction)"
                 }),
+
+                # Debug options
+                "debug_keep_vace_decoded": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Debug: Keep VAE-decoded VACE overlap frames instead of replacing with previous chunk"
+                }),
             }
         }
     
@@ -2789,7 +2795,9 @@ class NV_VideoSampler:
                # Debug parameters
                save_chunks_separately=False, chunk_save_directory="chunk_debug", chunk_save_format="mp4", chunk_fps=16.0,
                # Color matching control
-               color_match_threshold=5.0, color_match_adaptive_strength=True):
+               color_match_threshold=5.0, color_match_adaptive_strength=True,
+               # Debug options
+               debug_keep_vace_decoded=False):
         
         import comfy.sample
         import comfy.samplers
@@ -2830,6 +2838,9 @@ class NV_VideoSampler:
         # Color matching control
         self._color_match_threshold = color_match_threshold
         self._color_match_adaptive = color_match_adaptive_strength
+
+        # Debug options
+        self._debug_keep_vace_decoded = debug_keep_vace_decoded
 
         self._generation_params = {
             "seed": seed,
@@ -3692,12 +3703,15 @@ class NV_VideoSampler:
                         # This fixes VAE encode/decode degradation that loses color matching
                         # The color-matched overlap frames are used as controls, but VAE round-trip
                         # introduces color shifts. By replacing with stored versions, we preserve color matching.
-                        if chunk_idx > 0 and hasattr(self, '_prev_chunk_overlap_pixels') and self._prev_chunk_overlap_pixels is not None:
+                        if chunk_idx > 0 and hasattr(self, '_prev_chunk_overlap_pixels') and self._prev_chunk_overlap_pixels is not None and not self._debug_keep_vace_decoded:
                             overlap_frames_to_replace = min(16, len(chunk_pixels), len(self._prev_chunk_overlap_pixels))
                             # Replace decoded frames 0-15 with exact color-matched versions from previous chunk
                             chunk_pixels[:overlap_frames_to_replace] = self._prev_chunk_overlap_pixels[:overlap_frames_to_replace].to(chunk_pixels.device)
                             print(f"  ✓ Replaced first {overlap_frames_to_replace} decoded frames with color-matched overlap from chunk {chunk_idx-1}")
                             print(f"    (Preserves color matching through VAE round-trip)")
+                        elif chunk_idx > 0 and self._debug_keep_vace_decoded:
+                            print(f"  🔍 DEBUG: Keeping VAE-decoded VACE overlap frames (first 16 frames) instead of replacing")
+                            print(f"    (Debug mode active - may see VAE-induced color shifts in overlap frames)")
 
                         # PER-CHUNK COLOR MATCHING (before blending)
                         # Apply color matching to each chunk immediately after decode
