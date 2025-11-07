@@ -3718,18 +3718,17 @@ class NV_VideoSampler:
                                 "frame_details": []
                             }
 
-                        # CHUNKS 1+: Color match frames 16+ using frame 15 as reference
-                        elif chunk_idx > 0 and len(chunk_pixels) > 15:
+                        # CHUNKS 1+: Color match frames 16+ using global reference
+                        elif chunk_idx > 0 and hasattr(self, '_original_reference') and self._original_reference is not None:
                             try:
                                 from color_matcher import ColorMatcher
 
                                 print(f"  Applying color matching to chunk {chunk_idx}...")
-                                # Use FRAME 15 (VACE overlap) as reference for this chunk's new content
-                                # Frame 15 is pixel-identical to previous chunk's last frame, so it provides
-                                # the correct color baseline to prevent cascading degradation
-                                ref_np = chunk_pixels[15].cpu().numpy()
+                                # Use GLOBAL reference (original input image) as absolute color baseline
+                                # This measures absolute color correctness, not relative drift
+                                ref_np = self._original_reference.cpu().numpy().squeeze()
                                 cm = ColorMatcher()
-                                print(f"    Reference: Frame 15 (from VACE overlap, matches previous chunk's color)")
+                                print(f"    Reference: Global reference image (absolute color baseline)")
 
                                 # Color match each frame, skipping VACE-forced overlap frames
                                 matched_frames = []
@@ -3826,7 +3825,7 @@ class NV_VideoSampler:
                                 # Detailed reporting of color matching results
                                 print(f"  🎨 Color matching complete for chunk {chunk_idx}:")
                                 print(f"    • Frame range: 16-{len(chunk_pixels)-1} (new content only)")
-                                print(f"    • Reference: Frame 15 (VACE overlap from previous chunk)")
+                                print(f"    • Reference: Global reference image (absolute baseline)")
                                 print(f"    • Threshold: {self._color_match_threshold:.1f}% degradation")
                                 print(f"    • Matched: {matched_count} frames")
                                 print(f"    • Threshold-skipped: {threshold_skipped_count} frames (below threshold)")
@@ -3872,8 +3871,7 @@ class NV_VideoSampler:
                                     "threshold_skipped_count": threshold_skipped_count,
                                     "vace_skipped_count": skipped_count,
                                     "error_count": error_count,
-                                    "reference_frame_index": 15,
-                                    "reference_source": "vace_overlap",
+                                    "reference_source": "global_reference",
                                     "frame_details": degradation_details
                                 }
                             except ImportError:
@@ -5040,12 +5038,11 @@ class NV_VideoSampler:
                         "error_count": self._last_chunk_color_match_details["error_count"],
                         "frame_details": self._last_chunk_color_match_details["frame_details"]
                     }
-                    # Add new fields if present (chunk skip info, reference frame)
+                    # Add new fields if present (chunk skip info, reference source)
                     if "chunk_skipped" in self._last_chunk_color_match_details:
                         metadata_dict["color_matching"]["chunk_skipped"] = self._last_chunk_color_match_details["chunk_skipped"]
                         metadata_dict["color_matching"]["skip_reason"] = self._last_chunk_color_match_details["skip_reason"]
-                    if "reference_frame_index" in self._last_chunk_color_match_details:
-                        metadata_dict["color_matching"]["reference_frame_index"] = self._last_chunk_color_match_details["reference_frame_index"]
+                    if "reference_source" in self._last_chunk_color_match_details:
                         metadata_dict["color_matching"]["reference_source"] = self._last_chunk_color_match_details["reference_source"]
 
                 metadata_path = os.path.join(chunk_dir, "metadata.json")
@@ -5075,12 +5072,11 @@ class NV_VideoSampler:
                     "error_count": self._last_chunk_color_match_details["error_count"],
                     "frame_details": self._last_chunk_color_match_details["frame_details"]
                 }
-                # Add new fields if present (chunk skip info, reference frame)
+                # Add new fields if present (chunk skip info, reference source)
                 if "chunk_skipped" in self._last_chunk_color_match_details:
                     comment_dict["color_matching"]["chunk_skipped"] = self._last_chunk_color_match_details["chunk_skipped"]
                     comment_dict["color_matching"]["skip_reason"] = self._last_chunk_color_match_details["skip_reason"]
-                if "reference_frame_index" in self._last_chunk_color_match_details:
-                    comment_dict["color_matching"]["reference_frame_index"] = self._last_chunk_color_match_details["reference_frame_index"]
+                if "reference_source" in self._last_chunk_color_match_details:
                     comment_dict["color_matching"]["reference_source"] = self._last_chunk_color_match_details["reference_source"]
 
             metadata = {
