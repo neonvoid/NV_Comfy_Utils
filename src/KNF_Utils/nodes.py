@@ -3397,16 +3397,23 @@ class NV_VideoSampler:
                         # Get pixel frames for this chunk
                         chunk_control_pixels = full_control_pixels[chunk_cond["start_frame"]:chunk_cond["end_frame"]].clone()  # [chunk_frames, H, W, C]
 
-                        # NEW: Replace first 16 VIDEO frames with color-matched pixels from previous chunk
-                        if chunk_idx > 0 and hasattr(self, '_prev_chunk_overlap_pixels'):
-                            # Clamp to valid range before using as control input (prevents VACE corruption)
-                            overlap_pixels = torch.clamp(self._prev_chunk_overlap_pixels, 0.0, 1.0)  # [16, H, W, C] already color-matched
+                        # NEW: Replace first 16 VIDEO frames with DEDICATED VACE control frames from previous chunk
+                        # Use the separately color-matched frames that are ONLY for VACE controls
+                        if chunk_idx > 0 and hasattr(self, '_prev_chunk_vace_controls'):
+                            # Use dedicated VACE control frames (always color-matched for consistent guidance)
+                            overlap_pixels = torch.clamp(self._prev_chunk_vace_controls, 0.0, 1.0)  # [16, H, W, C] color-matched
                             overlap_frames = min(16, chunk_control_pixels.shape[0])
 
-                            # Replace first 16 frames with overlap from previous chunk
+                            # Replace first 16 frames with VACE control frames from previous chunk
                             chunk_control_pixels[:overlap_frames] = overlap_pixels[-overlap_frames:]
 
-                            print(f"    • Replaced first {overlap_frames} frames with color-matched overlap from chunk {chunk_idx-1}")
+                            print(f"    • Replaced first {overlap_frames} frames with dedicated VACE control frames from chunk {chunk_idx-1}")
+                        elif chunk_idx > 0 and hasattr(self, '_prev_chunk_overlap_pixels'):
+                            # Fallback: use overlap pixels if VACE controls not available
+                            overlap_pixels = torch.clamp(self._prev_chunk_overlap_pixels, 0.0, 1.0)
+                            overlap_frames = min(16, chunk_control_pixels.shape[0])
+                            chunk_control_pixels[:overlap_frames] = overlap_pixels[-overlap_frames:]
+                            print(f"    • ⚠️  Using overlap frames as fallback for VACE controls")
 
                         # Encode this chunk's control pixels to VACE dual-channel format
                         inactive_latents, reactive_latents = self._encode_vace_dual_channel(
@@ -3919,6 +3926,43 @@ class NV_VideoSampler:
                             # Clamp to [0, 1] to prevent out-of-range values from propagating
                             self._prev_chunk_overlap_pixels = torch.clamp(chunk_pixels, 0.0, 1.0).clone()
                             print(f"  ✓ Stored {len(chunk_pixels)} color-matched frames for next chunk's VACE overlap")
+
+                        # SEPARATE: Create dedicated color-matched frames for VACE controls ONLY
+                        # These frames are used ONLY for VACE encoding input (NOT for overlap replacement)
+                        # Always color match these to ensure consistent color guidance across chunks
+                        if chunk_pixels is not None and len(chunk_pixels) >= 16:
+                            try:
+                                from color_matcher import ColorMatcher
+                                import numpy as np
+
+                                print(f"  🎨 Creating dedicated color-matched frames for VACE controls...")
+                                vace_control_frames = chunk_pixels[-16:].clone()
+
+                                # Color match these 16 frames against global reference
+                                if hasattr(self, '_original_reference') and self._original_reference is not None:
+                                    matched_vace = []
+                                    ref_np = self._original_reference.cpu().numpy().squeeze()
+                                    cm = ColorMatcher()
+
+                                    for frame in vace_control_frames:
+                                        frame_np = frame.cpu().numpy()
+                                        matched = cm.transfer(src=frame_np, ref=ref_np, method='mvgd')
+                                        matched = np.clip(matched, 0.0, 1.0)
+                                        matched_vace.append(torch.from_numpy(matched))
+
+                                    self._prev_chunk_vace_controls = torch.stack(matched_vace).to(chunk_pixels.device)
+                                    print(f"  ✓ Stored 16 color-matched frames for chunk {chunk_idx+1} VACE controls")
+                                else:
+                                    # Fallback: use frames as-is if no reference available
+                                    self._prev_chunk_vace_controls = torch.clamp(vace_control_frames, 0.0, 1.0)
+                                    print(f"  ⚠️  No reference available, using unmatched frames for VACE controls")
+                            except Exception as e:
+                                print(f"  ⚠️  Failed to create VACE control frames: {e}, using overlap frames")
+                                self._prev_chunk_vace_controls = self._prev_chunk_overlap_pixels.clone()
+                        elif chunk_pixels is not None:
+                            # If chunk has less than 16 frames, store what we have
+                            self._prev_chunk_vace_controls = torch.clamp(chunk_pixels, 0.0, 1.0).clone()
+                            print(f"  ✓ Stored {len(chunk_pixels)} frames for VACE controls")
 
                         # DEBUG MODE: Save chunk as separate video file
                         if self._save_chunks_separately and chunk_pixels is not None:
