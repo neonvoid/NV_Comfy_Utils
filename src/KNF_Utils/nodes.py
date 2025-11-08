@@ -3723,7 +3723,7 @@ class NV_VideoSampler:
                         # PER-CHUNK COLOR MATCHING (before blending)
                         # Apply color matching to each chunk immediately after decode
                         # This ensures smooth color transitions when chunks are blended
-                        # Strategy: Rolling reference - chunk 0 uses global ref, chunks 1+ use previous chunk's last frame
+                        # Strategy: Rolling reference - chunk 0 uses global ref, chunks 1+ use previous chunk's first frame
 
                         # ALL CHUNKS: Color match using rolling reference
                         if hasattr(self, '_original_reference') and self._original_reference is not None:
@@ -3731,7 +3731,7 @@ class NV_VideoSampler:
                                 from color_matcher import ColorMatcher
 
                                 print(f"  Applying color matching to chunk {chunk_idx}...")
-                                # Use rolling reference: chunk 0 uses global, chunks 1+ use previous chunk's last frame
+                                # Use rolling reference: chunk 0 uses global, chunks 1+ use previous chunk's first frame
                                 ref_np = self._original_reference.cpu().numpy().squeeze()
                                 cm = ColorMatcher()
 
@@ -3739,7 +3739,7 @@ class NV_VideoSampler:
                                 if chunk_idx == 0:
                                     print(f"    Reference: Global reference image (base reference)")
                                 else:
-                                    print(f"    Reference: Chunk {chunk_idx-1}'s last frame (rolling reference)")
+                                    print(f"    Reference: Chunk {chunk_idx-1}'s first frame (rolling reference)")
 
                                 # Color match each frame, skipping VACE-forced overlap frames
                                 matched_frames = []
@@ -3857,7 +3857,7 @@ class NV_VideoSampler:
                                 if chunk_idx == 0:
                                     print(f"    • Reference: Global reference image (base reference)")
                                 else:
-                                    print(f"    • Reference: Chunk {chunk_idx-1}'s last frame (rolling reference)")
+                                    print(f"    • Reference: Chunk {chunk_idx-1}'s first frame (rolling reference)")
                                 print(f"    • Threshold: {self._color_match_threshold:.1f}% degradation")
                                 print(f"    • Matched: {matched_count} frames")
                                 print(f"    • Threshold-skipped: {threshold_skipped_count} frames (below threshold)")
@@ -3899,7 +3899,7 @@ class NV_VideoSampler:
                                     print(f"")
 
                                 # Store color matching details for this chunk (for debug metadata)
-                                reference_source = "global_reference" if chunk_idx == 0 else f"chunk_{chunk_idx-1}_last_frame"
+                                reference_source = "global_reference" if chunk_idx == 0 else f"chunk_{chunk_idx-1}_first_frame"
                                 self._last_chunk_color_match_details = {
                                     "matched_count": matched_count,
                                     "threshold_skipped_count": threshold_skipped_count,
@@ -3915,12 +3915,13 @@ class NV_VideoSampler:
                                 print(f"  ⚠️  Color matching failed for chunk {chunk_idx}: {e}, using unmatched")
                                 self._last_chunk_color_match_details = None
 
-                        # ROLLING REFERENCE UPDATE: Update reference to this chunk's last frame for next chunk
+                        # ROLLING REFERENCE UPDATE: Update reference to this chunk's first frame for next chunk
                         if chunk_pixels is not None and len(chunk_pixels) > 0:
-                            # Update the reference to be the last frame of the current chunk
-                            # This creates a chain: chunk 0 → global, chunk 1 → chunk 0's last, chunk 2 → chunk 1's last, etc.
-                            self._original_reference = chunk_pixels[-1].clone()
-                            print(f"  🔄 Updated reference to chunk {chunk_idx}'s last frame for next chunk")
+                            # Update the reference to be the first frame of the current chunk
+                            # Frame 0 has 100% correction strength, ensuring a fully-corrected reference
+                            # This creates a chain: chunk 0 → global, chunk 1 → chunk 0's first, chunk 2 → chunk 1's first, etc.
+                            self._original_reference = chunk_pixels[0].clone()
+                            print(f"  🔄 Updated reference to chunk {chunk_idx}'s first frame for next chunk")
 
                         # NEW: Store last 16 frames (color-matched) for next chunk's VACE overlap
                         if chunk_pixels is not None and len(chunk_pixels) >= 16:
