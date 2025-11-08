@@ -3706,19 +3706,18 @@ class NV_VideoSampler:
                         if chunk_pixels.dim() == 5 and chunk_pixels.shape[0] == 1:
                             chunk_pixels = chunk_pixels.squeeze(0)
 
-                        # VACE OVERLAP: Replace decoded overlap frames with stored color-matched versions
-                        # This fixes VAE encode/decode degradation that loses color matching
-                        # The color-matched overlap frames are used as controls, but VAE round-trip
-                        # introduces color shifts. By replacing with stored versions, we preserve color matching.
-                        if chunk_idx > 0 and hasattr(self, '_prev_chunk_overlap_pixels') and self._prev_chunk_overlap_pixels is not None and not self._debug_keep_vace_decoded:
-                            overlap_frames_to_replace = min(16, len(chunk_pixels), len(self._prev_chunk_overlap_pixels))
-                            # Replace decoded frames 0-15 with exact color-matched versions from previous chunk
-                            chunk_pixels[:overlap_frames_to_replace] = self._prev_chunk_overlap_pixels[:overlap_frames_to_replace].to(chunk_pixels.device)
-                            print(f"  ✓ Replaced first {overlap_frames_to_replace} decoded frames with color-matched overlap from chunk {chunk_idx-1}")
-                            print(f"    (Preserves color matching through VAE round-trip)")
-                        elif chunk_idx > 0 and self._debug_keep_vace_decoded:
-                            print(f"  🔍 DEBUG: Keeping VAE-decoded VACE overlap frames (first 16 frames) instead of replacing")
-                            print(f"    (Debug mode active - may see VAE-induced color shifts in overlap frames)")
+                        # VACE OVERLAP: Use generated frames instead of replacing
+                        # VACE conditioning ensures frames 0-15 are similar to previous chunk
+                        # Color matching will smooth any remaining differences
+                        # DISABLED: Replacement logic that was causing harsh transitions at frame 16
+                        # if chunk_idx > 0 and hasattr(self, '_prev_chunk_overlap_pixels') and self._prev_chunk_overlap_pixels is not None and not self._debug_keep_vace_decoded:
+                        #     overlap_frames_to_replace = min(16, len(chunk_pixels), len(self._prev_chunk_overlap_pixels))
+                        #     chunk_pixels[:overlap_frames_to_replace] = self._prev_chunk_overlap_pixels[:overlap_frames_to_replace].to(chunk_pixels.device)
+                        #     print(f"  ✓ Replaced first {overlap_frames_to_replace} decoded frames with color-matched overlap from chunk {chunk_idx-1}")
+                        #     print(f"    (Preserves color matching through VAE round-trip)")
+                        if chunk_idx > 0:
+                            print(f"  ✓ Using VACE-generated overlap frames (frames 0-15) for natural transitions")
+                            print(f"    (VACE conditioning + color matching will smooth the transition)")
 
                         # PER-CHUNK COLOR MATCHING (before blending)
                         # Apply color matching to each chunk immediately after decode
@@ -3754,16 +3753,12 @@ class NV_VideoSampler:
 
                                 for frame_idx in range(len(chunk_pixels)):
                                     try:
-                                        # CRITICAL: Skip color matching for VACE overlap frames UNLESS in debug mode
-                                        # Normally these frames were REPLACED with stored color-matched versions (after decode)
-                                        # In debug mode, they're VAE-decoded and need color matching
-                                        if chunk_idx > 0 and frame_idx < vace_overlap_frames and not self._debug_keep_vace_decoded:
-                                            # Use frame AS-IS - already replaced with color-matched version
-                                            matched_frames.append(chunk_pixels[frame_idx])
-                                            skipped_count += 1
-                                            continue
+                                        # REMOVED: Skip logic for VACE overlap frames
+                                        # Now we color match ALL frames (0-80) to ensure smooth transitions
+                                        # VACE conditioning ensures frames 0-15 are similar to previous chunk,
+                                        # and color matching will smooth any remaining differences
 
-                                        # For non-overlap frames, measure degradation and apply color matching if needed
+                                        # Measure degradation and apply color matching if needed
                                         frame_np = chunk_pixels[frame_idx].cpu().numpy()
 
                                         # === DEGRADATION MEASUREMENT (VAE_LUT_Generator style) ===
@@ -3844,14 +3839,8 @@ class NV_VideoSampler:
 
                                 # Detailed reporting of color matching results
                                 print(f"  🎨 Color matching complete for chunk {chunk_idx}:")
-                                if self._debug_keep_vace_decoded:
-                                    print(f"    • Frame range: 0-{len(chunk_pixels)-1} (ALL frames, debug mode)")
-                                    print(f"    • Position gradient: Frame 0=100% → Frame {len(chunk_pixels)-1}=0%")
-                                else:
-                                    if chunk_idx == 0:
-                                        print(f"    • Frame range: 0-{len(chunk_pixels)-1} (all frames)")
-                                    else:
-                                        print(f"    • Frame range: 16-{len(chunk_pixels)-1} (new content only)")
+                                print(f"    • Frame range: 0-{len(chunk_pixels)-1} (ALL frames)")
+                                print(f"    • Position gradient: Frame 0=100% → Frame {len(chunk_pixels)-1}=0%")
 
                                 # Show which reference is being used
                                 if chunk_idx == 0:
@@ -3861,8 +3850,6 @@ class NV_VideoSampler:
                                 print(f"    • Threshold: {self._color_match_threshold:.1f}% degradation")
                                 print(f"    • Matched: {matched_count} frames")
                                 print(f"    • Threshold-skipped: {threshold_skipped_count} frames (below threshold)")
-                                if chunk_idx > 0 and not self._debug_keep_vace_decoded:
-                                    print(f"    • VACE-overlap: {skipped_count} frames (frames 0-15, preserved from chunk {chunk_idx-1})")
                                 if error_count > 0:
                                     print(f"    • Errors: {error_count} frames (used original)")
 
