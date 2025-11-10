@@ -3412,6 +3412,20 @@ class NV_VideoSampler:
                         # Get pixel frames for this chunk
                         chunk_control_pixels = full_control_pixels[chunk_cond["start_frame"]:chunk_cond["end_frame"]].clone()  # [chunk_frames, H, W, C]
 
+                        # PADDING: Ensure chunk has standard 81 frames for VACE encoding
+                        chunk_pixel_frames = chunk_control_pixels.shape[0]
+                        STANDARD_CHUNK_FRAMES = 81
+
+                        if chunk_pixel_frames < STANDARD_CHUNK_FRAMES:
+                            padding_needed = STANDARD_CHUNK_FRAMES - chunk_pixel_frames
+
+                            print(f"    • Chunk has {chunk_pixel_frames} frames, padding to {STANDARD_CHUNK_FRAMES}")
+                            print(f"    • Repeating last frame {padding_needed} times for VACE compatibility")
+
+                            # Repeat last frame to reach 81 frames
+                            last_frame = chunk_control_pixels[-1:, :, :, :].repeat(padding_needed, 1, 1, 1)
+                            chunk_control_pixels = torch.cat([chunk_control_pixels, last_frame], dim=0)
+
                         # NEW: Replace first 16 VIDEO frames with DEDICATED VACE control frames from previous chunk
                         # Use the separately color-matched frames that are ONLY for VACE controls
                         if chunk_idx > 0 and hasattr(self, '_prev_chunk_vace_controls'):
@@ -4598,6 +4612,13 @@ class NV_VideoSampler:
                                     final_video = final_video[:output_position]  # Trim excess zeros
                                     total_video_frames = output_position
                                 # If output_position > total_video_frames, some frames were overwritten (should not happen)
+
+                            # Trim to actual requested frame count (removes padding from last chunk)
+                            actual_total_frames = chunk_conditionings[-1]["end_frame"]
+                            if total_video_frames > actual_total_frames:
+                                print(f"  Trimming final output from {total_video_frames} to {actual_total_frames} frames (removing padding)")
+                                final_video = final_video[:actual_total_frames]
+                                total_video_frames = actual_total_frames
 
                             # REMOVED: Global color matching pass
                             # Color matching is now applied per-chunk before diffusion refinement
