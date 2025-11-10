@@ -3536,8 +3536,8 @@ class NV_VideoSampler:
                 # if chunk_idx > 0:
                 #     print(f"  Tier 2: First 16 frames enforced through VACE controls (mask=0 for refined frames)")
 
-                # FALLBACK: If no diffused overlap available, use old Tier 2 logic
-                elif chunk_idx > 0 and 'prev_chunk_samples' in locals():
+                # FALLBACK: If no diffused overlap available AND not using VACE controls, use old Tier 2 logic
+                elif chunk_idx > 0 and 'prev_chunk_samples' in locals() and not (chunk_control_pixels_info and len(chunk_control_pixels_info) > 0):
                     # Calculate overlap region
                     overlap_frames = min(chunk_overlap, chunk_frames)
 
