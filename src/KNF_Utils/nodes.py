@@ -2581,6 +2581,12 @@ class NV_VideoSampler:
                     "tooltip": "Use adaptive strength based on degradation level (prevents over-correction)"
                 }),
 
+                # VACE reference options
+                "vace_use_start_image_chunk0_only": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Use start_image for VACE conditioning only in chunk 0 (chunks 1+ rely solely on previous 16 frames)"
+                }),
+
                 # Debug options
                 "debug_keep_vace_decoded": ("BOOLEAN", {
                     "default": False,
@@ -2796,6 +2802,8 @@ class NV_VideoSampler:
                save_chunks_separately=False, chunk_save_directory="chunk_debug", chunk_save_format="mp4", chunk_fps=16.0,
                # Color matching control
                color_match_threshold=5.0, color_match_adaptive_strength=True,
+               # VACE reference options
+               vace_use_start_image_chunk0_only=True,
                # Debug options
                debug_keep_vace_decoded=False):
         
@@ -2838,6 +2846,9 @@ class NV_VideoSampler:
         # Color matching control
         self._color_match_threshold = color_match_threshold
         self._color_match_adaptive = color_match_adaptive_strength
+
+        # VACE reference options
+        self._vace_use_start_image_chunk0_only = vace_use_start_image_chunk0_only
 
         # Debug options
         self._debug_keep_vace_decoded = debug_keep_vace_decoded
@@ -3365,9 +3376,13 @@ class NV_VideoSampler:
                 
                 # Get VACE reference for this chunk
                 # Chunk 0: User-provided reference from preprocessor
-                # Chunk 1+: Updated from previous chunk's last frame (set at end of previous iteration)
+                # Chunk 1+: Conditionally use previous chunk's last frame OR disable based on setting
                 if chunk_idx == 0:
                     vace_reference = chunk_cond.get("vace_reference")  # User-provided initial reference
+                elif chunk_idx > 0 and self._vace_use_start_image_chunk0_only:
+                    # Disable VACE reference for chunks 1+ (rely solely on 16 previous frames)
+                    vace_reference = None
+                    print(f"  ✓ VACE start_image reference disabled for chunk {chunk_idx} (using only previous 16 frames)")
                 # else: use vace_reference from previous iteration (already updated)
 
                 has_vace_reference = vace_reference is not None  # Apply to ALL chunks (not just chunk 0)
@@ -3722,7 +3737,7 @@ class NV_VideoSampler:
                         # PER-CHUNK COLOR MATCHING (before blending)
                         # Apply color matching to each chunk immediately after decode
                         # This ensures smooth color transitions when chunks are blended
-                        # Strategy: Rolling reference - chunk 0 uses global ref, chunks 1+ use previous chunk's first frame
+                        # Strategy: Rolling reference - chunk 0 uses global ref, chunks 1+ use previous chunk's VACE overlap start frame
 
                         # ALL CHUNKS: Color match using rolling reference
                         if hasattr(self, '_original_reference') and self._original_reference is not None:
@@ -3730,7 +3745,7 @@ class NV_VideoSampler:
                                 from color_matcher import ColorMatcher
 
                                 print(f"  Applying color matching to chunk {chunk_idx}...")
-                                # Use rolling reference: chunk 0 uses global, chunks 1+ use previous chunk's first frame
+                                # Use rolling reference: chunk 0 uses global, chunks 1+ use previous chunk's VACE overlap start frame
                                 ref_np = self._original_reference.cpu().numpy().squeeze()
                                 cm = ColorMatcher()
 
@@ -3738,7 +3753,7 @@ class NV_VideoSampler:
                                 if chunk_idx == 0:
                                     print(f"    Reference: Global reference image (base reference)")
                                 else:
-                                    print(f"    Reference: Chunk {chunk_idx-1}'s first frame (rolling reference)")
+                                    print(f"    Reference: Chunk {chunk_idx-1}'s VACE overlap start frame (rolling reference)")
 
                                 # Color match each frame, skipping VACE-forced overlap frames
                                 matched_frames = []
@@ -3846,7 +3861,7 @@ class NV_VideoSampler:
                                 if chunk_idx == 0:
                                     print(f"    • Reference: Global reference image (base reference)")
                                 else:
-                                    print(f"    • Reference: Chunk {chunk_idx-1}'s first frame (rolling reference)")
+                                    print(f"    • Reference: Chunk {chunk_idx-1}'s VACE overlap start frame (rolling reference)")
                                 print(f"    • Threshold: {self._color_match_threshold:.1f}% degradation")
                                 print(f"    • Matched: {matched_count} frames")
                                 print(f"    • Threshold-skipped: {threshold_skipped_count} frames (below threshold)")
@@ -3886,7 +3901,7 @@ class NV_VideoSampler:
                                     print(f"")
 
                                 # Store color matching details for this chunk (for debug metadata)
-                                reference_source = "global_reference" if chunk_idx == 0 else f"chunk_{chunk_idx-1}_first_frame"
+                                reference_source = "global_reference" if chunk_idx == 0 else f"chunk_{chunk_idx-1}_vace_overlap_start"
                                 self._last_chunk_color_match_details = {
                                     "matched_count": matched_count,
                                     "threshold_skipped_count": threshold_skipped_count,
@@ -3902,13 +3917,14 @@ class NV_VideoSampler:
                                 print(f"  ⚠️  Color matching failed for chunk {chunk_idx}: {e}, using unmatched")
                                 self._last_chunk_color_match_details = None
 
-                        # ROLLING REFERENCE UPDATE: Update reference to this chunk's first frame for next chunk
-                        if chunk_pixels is not None and len(chunk_pixels) > 0:
-                            # Update the reference to be the first frame of the current chunk
-                            # Frame 0 has 100% correction strength, ensuring a fully-corrected reference
-                            # This creates a chain: chunk 0 → global, chunk 1 → chunk 0's first, chunk 2 → chunk 1's first, etc.
-                            self._original_reference = chunk_pixels[0].clone()
-                            print(f"  🔄 Updated reference to chunk {chunk_idx}'s first frame for next chunk")
+                        # ROLLING REFERENCE UPDATE: Update reference to this chunk's VACE overlap start frame
+                        if chunk_pixels is not None and len(chunk_pixels) >= 16:
+                            # Update reference to first frame of last 16 frames (VACE overlap window)
+                            # For 81-frame chunk: chunk_pixels[-16] = frame 65 (18.75% correction strength)
+                            # This matches the frame used for VACE conditioning of next chunk
+                            # Less aggressive than frame 0 (100% strength), reduces color drift
+                            self._original_reference = chunk_pixels[-16].clone()
+                            print(f"  🔄 Updated reference to chunk {chunk_idx}'s frame {len(chunk_pixels)-16} (VACE overlap start) for next chunk")
 
                         # NEW: Store last 16 frames (color-matched) for next chunk's VACE overlap
                         if chunk_pixels is not None and len(chunk_pixels) >= 16:
