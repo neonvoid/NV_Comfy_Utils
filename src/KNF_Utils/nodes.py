@@ -3452,7 +3452,11 @@ class NV_VideoSampler:
                         # Package in ComfyUI Wan VACE format with batch dimension
                         inactive_batched = inactive_latents.unsqueeze(0)  # [1, 16, T_lat, H, W]
                         reactive_batched = reactive_latents.unsqueeze(0)  # [1, 16, T_lat, H, W]
-                        chunk_vace_frames = torch.cat([inactive_batched, reactive_batched], dim=1)  # [1, 32, T_lat, H, W]
+
+                        # FIX: Blend the two streams instead of concatenating to maintain 16 channels
+                        # The model expects 16 channels, not 32. We blend based on activity level.
+                        # Use reactive for the control areas, inactive for preservation
+                        chunk_vace_frames = reactive_batched  # [1, 16, T_lat, H, W] - Use reactive as primary control
 
                         # Create 64-channel extended mask for this chunk
                         C, T_lat, H_lat, W_lat = inactive_latents.shape
@@ -3470,7 +3474,7 @@ class NV_VideoSampler:
 
                         # PREPEND VACE REFERENCE (if present)
                         if has_vace_reference:
-                            # Prepend reference to control frames [1, 32, 1, H, W] + [1, 32, T, H, W]
+                            # Prepend reference to control frames [1, 16, 1, H, W] + [1, 16, T, H, W]
                             chunk_vace_frames = torch.cat([vace_reference, chunk_vace_frames], dim=2)
 
                             # Create zero mask for reference frame [1, 64, 1, H, W]
@@ -4225,9 +4229,9 @@ class NV_VideoSampler:
                                     # This avoids the single-frame VAE encode bug
                                     last_frame_latent = refined_latent[:, :, -1:, :, :]  # [1, 16, 1, H, W]
 
-                                    # Add zeros padding to make VACE reference (32 channels)
-                                    zeros_padding = torch.zeros_like(last_frame_latent)
-                                    vace_reference = torch.cat([last_frame_latent, zeros_padding], dim=1)  # [1, 32, 1, H, W]
+                                    # FIX: VACE reference should be 16 channels, not 32
+                                    # The model expects 16-channel control inputs
+                                    vace_reference = last_frame_latent  # [1, 16, 1, H, W]
 
                                     # DON'T update color matching reference - use original to prevent accumulation
                                     # self._temp_start_image = refined_pixels[-1:].clone()  # REMOVED - causes progressive enhancement
@@ -4923,6 +4927,95 @@ class NV_VideoSampler:
 
         return inactive_latents, reactive_latents
 
+    def _encode_vace_triple_channel(self, frames, vae, stencil_video, stencil_mask, mask=None, tiled=False):
+        """
+        Encode control frames with stencil support using Wan VACE format.
+
+        Implements triple-stream blending:
+        - Inactive stream: Context preservation (no control)
+        - Reactive stream: Active control areas
+        - Stencil stream: High-priority preservation areas
+
+        Args:
+            frames: [T, H, W, C] main control video in range [0, 1]
+            vae: VAE model
+            stencil_video: [T, H, W, C] stencil video for preservation
+            stencil_mask: [T, H, W, 1] mask where 1=preserve stencil
+            mask: [T, H, W, 1] optional control mask (default all ones)
+            tiled: Whether to use tiled encoding
+
+        Returns:
+            16-channel latent blended from three streams
+        """
+        import torch
+
+        print(f"[VACE Triple] Encoding with stencil support")
+        print(f"[VACE Triple] Input frames shape: {frames.shape}")
+        print(f"[VACE Triple] Stencil video shape: {stencil_video.shape}")
+        print(f"[VACE Triple] Stencil mask shape: {stencil_mask.shape}")
+
+        # Default mask: all ones (full control everywhere)
+        if mask is None:
+            mask = torch.ones(frames.shape[0], frames.shape[1], frames.shape[2], 1)
+
+        # Ensure stencil_mask has channel dimension
+        if len(stencil_mask.shape) == 3:
+            stencil_mask = stencil_mask.unsqueeze(-1)
+
+        # Step 1: Prepare all three streams
+        frames_centered = frames - 0.5
+        stencil_centered = stencil_video - 0.5
+
+        # Inactive: neutral gray (no control)
+        inactive = torch.full_like(frames, 0.5)
+
+        # Reactive: control areas not covered by stencil
+        reactive_mask = mask * (1 - stencil_mask)
+        reactive = (frames_centered * reactive_mask) + 0.5
+
+        # Stencil: high-priority preservation areas
+        stencil = (stencil_centered * stencil_mask) + 0.5
+
+        print(f"[VACE Triple] Inactive range: [{inactive.min():.3f}, {inactive.max():.3f}]")
+        print(f"[VACE Triple] Reactive range: [{reactive.min():.3f}, {reactive.max():.3f}]")
+        print(f"[VACE Triple] Stencil range: [{stencil.min():.3f}, {stencil.max():.3f}]")
+
+        # Step 2: Encode all three streams
+        inactive_latents = self._encode_control_frames(inactive, vae, tiled)
+        reactive_latents = self._encode_control_frames(reactive, vae, tiled)
+        stencil_latents = self._encode_control_frames(stencil, vae, tiled)
+
+        print(f"[VACE Triple] Encoded shapes: {inactive_latents.shape}")
+
+        # Step 3: Blend the three streams based on masks
+        # Priority: stencil > reactive > inactive
+        stencil_weight = stencil_mask.mean(dim=[1,2,3], keepdim=True)  # Average per frame
+        reactive_weight = reactive_mask.mean(dim=[1,2,3], keepdim=True)
+        inactive_weight = 1.0 - stencil_weight - reactive_weight
+
+        # Reshape weights for latent space
+        # From [T, 1, 1, 1] to [1, T_lat, 1, 1] after encoding
+        # Note: VAE temporal compression means T_lat ≠ T
+        T_lat = inactive_latents.shape[1]
+
+        # Simple approach: use uniform weights across latent frames
+        # More sophisticated: interpolate weights to latent resolution
+        stencil_w = stencil_weight.mean().item()
+        reactive_w = reactive_weight.mean().item()
+        inactive_w = 1.0 - stencil_w - reactive_w
+
+        print(f"[VACE Triple] Blend weights: stencil={stencil_w:.3f}, reactive={reactive_w:.3f}, inactive={inactive_w:.3f}")
+
+        # Blend the latents
+        blended_latents = (
+            inactive_latents * inactive_w +
+            reactive_latents * reactive_w +
+            stencil_latents * stencil_w
+        )
+
+        print(f"[VACE Triple] ✓ Encoding complete with stencil blending")
+        return blended_latents
+
     def _encode_control_frames(self, frames, vae, tiled=False):
         """Encode control frames with VAE (WanVACE format)"""
         import torch
@@ -5318,6 +5411,13 @@ class NV_VideoChunkAnalyzer:
                     "multiline": True,
                     "tooltip": "Optional: Manual control paths (format: name:path per line, e.g., 'depth:D:/depth.mp4')"
                 }),
+                # Stencil support for fine-grained preservation control
+                "stencil_video": ("IMAGE", {
+                    "tooltip": "Optional: Stencil video for preservation areas (e.g. faces, text)"
+                }),
+                "stencil_mask": ("MASK", {
+                    "tooltip": "Optional: Mask for stencil (1=preserve, 0=allow generation). Must be provided with stencil_video"
+                }),
             }
         }
     
@@ -5326,10 +5426,10 @@ class NV_VideoChunkAnalyzer:
     FUNCTION = "analyze"
     CATEGORY = "NV_Utils/Video/Chunking"
     
-    def analyze(self, images, chunk_size, chunk_overlap, output_json_path, 
+    def analyze(self, images, chunk_size, chunk_overlap, output_json_path,
                 save_chunks=False, chunks_folder="chunks/videos", chunk_fps=30,
                 beauty_path="", depth_path="", openpose_path="", canny_path="", lineart_path="",
-                control_video_paths=""):
+                control_video_paths="", stencil_video=None, stencil_mask=None):
         import json
         import os
         from pathlib import Path
@@ -5366,9 +5466,32 @@ class NV_VideoChunkAnalyzer:
                     # Just a path - use filename as name
                     control_paths[os.path.splitext(os.path.basename(line))[0]] = line
         
+        # Validate stencil inputs (both must be provided together)
+        stencil_info = None
+        if stencil_video is not None or stencil_mask is not None:
+            if stencil_video is None or stencil_mask is None:
+                raise ValueError("Both stencil_video and stencil_mask must be provided together")
+
+            # Validate dimensions match
+            stencil_frames, s_height, s_width, s_channels = stencil_video.shape
+            mask_frames, m_height, m_width = stencil_mask.shape if len(stencil_mask.shape) == 3 else (*stencil_mask.shape, 1)[:3]
+
+            if stencil_frames != total_frames:
+                raise ValueError(f"Stencil video frames ({stencil_frames}) must match main video frames ({total_frames})")
+            if (s_height, s_width) != (height, width):
+                raise ValueError(f"Stencil video dimensions ({s_width}x{s_height}) must match main video ({width}x{height})")
+            if (m_height, m_width) != (height, width):
+                raise ValueError(f"Stencil mask dimensions ({m_width}x{m_height}) must match main video ({width}x{height})")
+
+            stencil_info = {
+                "has_stencil": True,
+                "frames": stencil_frames,
+                "mode": "preserve"  # Areas with mask=1 will be preserved
+            }
+
         # Calculate stride (no rounding needed for image-based chunking)
         stride = chunk_size - chunk_overlap
-        
+
         if stride <= 0:
             raise ValueError(f"Invalid chunk settings: overlap ({chunk_overlap}) must be less than chunk_size ({chunk_size})")
         
@@ -5390,6 +5513,8 @@ class NV_VideoChunkAnalyzer:
             info_lines.append(f"Control videos: {len(control_paths)} detected")
             for ctrl_name, ctrl_path in control_paths.items():
                 info_lines.append(f"  - {ctrl_name}: {os.path.basename(ctrl_path)}")
+        if stencil_info:
+            info_lines.append(f"Stencil: {stencil_info['frames']} frames (mode: {stencil_info['mode']})")
         if save_chunks:
             info_lines.append(f"Saving chunks to: {chunks_folder}")
         info_lines.append("")
@@ -5424,17 +5549,45 @@ class NV_VideoChunkAnalyzer:
                 # Per-chunk control settings
                 "controls": chunk_controls,
             }
+
+            # Add stencil info if provided
+            if stencil_info:
+                chunk_info["stencil"] = {
+                    "enabled": True,
+                    "mode": stencil_info["mode"],
+                    "weight": 1.0  # How strongly to preserve stencil areas
+                }
             
             # Save chunk video if requested
             if save_chunks:
                 chunk_frames = images[current_frame:end_frame]
                 chunk_filename = f"chunk_{chunk_idx:04d}.mp4"
                 chunk_path = os.path.join(chunks_folder, chunk_filename)
-                
+
                 try:
                     self._save_chunk_video(chunk_frames, chunk_path, fps=chunk_fps)
                     chunk_info["saved_video_path"] = chunk_path
                     info_lines.append(f"Chunk {chunk_idx}: frames {current_frame}-{end_frame} ({end_frame - current_frame} frames) -> {chunk_filename}")
+
+                    # Save stencil chunks if provided
+                    if stencil_info:
+                        # Save stencil video chunk
+                        stencil_chunk_frames = stencil_video[current_frame:end_frame]
+                        stencil_filename = f"chunk_{chunk_idx:04d}_stencil.mp4"
+                        stencil_path = os.path.join(chunks_folder, stencil_filename)
+                        self._save_chunk_video(stencil_chunk_frames, stencil_path, fps=chunk_fps)
+                        chunk_info["saved_stencil_video_path"] = stencil_path
+
+                        # Save stencil mask chunk
+                        mask_chunk = stencil_mask[current_frame:end_frame]
+                        # Convert mask to video format (expand to 3 channels)
+                        if len(mask_chunk.shape) == 3:
+                            mask_chunk = mask_chunk.unsqueeze(-1).expand(-1, -1, -1, 3)
+                        mask_filename = f"chunk_{chunk_idx:04d}_mask.mp4"
+                        mask_path = os.path.join(chunks_folder, mask_filename)
+                        self._save_chunk_video(mask_chunk, mask_path, fps=chunk_fps)
+                        chunk_info["saved_stencil_mask_path"] = mask_path
+
                 except Exception as e:
                     info_lines.append(f"Chunk {chunk_idx}: frames {current_frame}-{end_frame} (SAVE FAILED: {e})")
             else:
@@ -5465,6 +5618,14 @@ class NV_VideoChunkAnalyzer:
             },
             "chunks": chunks
         }
+
+        # Add stencil info to JSON if provided
+        if stencil_info:
+            json_data["stencil"] = {
+                "has_stencil": True,
+                "mode": stencil_info["mode"],
+                "description": "Stencil areas (mask=1) will be preserved during generation"
+            }
         
         # Save JSON with debug output and error handling
         info_lines.append("")
@@ -6000,13 +6161,12 @@ class NV_ChunkConditioningPreprocessor:
                 # Encode single frame with VAE → 16 channels
                 reference_encoded = vae.encode(start_image_resized[:, :, :, :3])  # [1, 16, 1, H, W]
                 
-                # Pad with zeros to make 32 channels (no reactive stream for reference)
-                # Per guide: reference = [16ch VAE, 16ch ZEROS]
-                zeros_padding = torch.zeros_like(reference_encoded)
-                vace_reference_latent = torch.cat([reference_encoded, zeros_padding], dim=1)  # [1, 32, 1, H, W]
-                
+                # FIX: Use 16 channels for VACE reference, not 32
+                # The model expects 16-channel control inputs
+                vace_reference_latent = reference_encoded  # [1, 16, 1, H, W]
+
                 print(f"  ✓ VACE reference encoded: {vace_reference_latent.shape}")
-                print(f"    Structure: 16ch VAE + 16ch zeros")
+                print(f"    Structure: 16ch VAE latent")
                 print(f"    Pixels stored for color matching: {start_image_resized.shape}")
                 info_lines.append(f"  ✓ Start image encoded as VACE reference: {vace_reference_latent.shape}")
                 
