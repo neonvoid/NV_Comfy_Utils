@@ -5411,12 +5411,14 @@ class NV_VideoChunkAnalyzer:
                     "multiline": True,
                     "tooltip": "Optional: Manual control paths (format: name:path per line, e.g., 'depth:D:/depth.mp4')"
                 }),
-                # Stencil support for fine-grained preservation control
-                "stencil_video": ("IMAGE", {
-                    "tooltip": "Optional: Stencil video for preservation areas (e.g. faces, text)"
+                # Stencil support for fine-grained preservation control (path-based like other controls)
+                "stencil_video_path": ("STRING", {
+                    "default": "",
+                    "tooltip": "Optional: Path to stencil video for preservation areas (e.g. faces, text)"
                 }),
-                "stencil_mask": ("MASK", {
-                    "tooltip": "Optional: Mask for stencil (1=preserve, 0=allow generation). Must be provided with stencil_video"
+                "stencil_mask_path": ("STRING", {
+                    "default": "",
+                    "tooltip": "Optional: Path to stencil mask video (1=preserve, 0=generate). Must be provided with stencil_video_path"
                 }),
             }
         }
@@ -5429,7 +5431,7 @@ class NV_VideoChunkAnalyzer:
     def analyze(self, images, chunk_size, chunk_overlap, output_json_path,
                 save_chunks=False, chunks_folder="chunks/videos", chunk_fps=30,
                 beauty_path="", depth_path="", openpose_path="", canny_path="", lineart_path="",
-                control_video_paths="", stencil_video=None, stencil_mask=None):
+                control_video_paths="", stencil_video_path="", stencil_mask_path=""):
         import json
         import os
         from pathlib import Path
@@ -5466,26 +5468,22 @@ class NV_VideoChunkAnalyzer:
                     # Just a path - use filename as name
                     control_paths[os.path.splitext(os.path.basename(line))[0]] = line
         
-        # Validate stencil inputs (both must be provided together)
+        # Validate stencil inputs (both paths must be provided together)
         stencil_info = None
-        if stencil_video is not None or stencil_mask is not None:
-            if stencil_video is None or stencil_mask is None:
-                raise ValueError("Both stencil_video and stencil_mask must be provided together")
+        if stencil_video_path.strip() or stencil_mask_path.strip():
+            if not (stencil_video_path.strip() and stencil_mask_path.strip()):
+                raise ValueError("Both stencil_video_path and stencil_mask_path must be provided together")
 
-            # Validate dimensions match
-            stencil_frames, s_height, s_width, s_channels = stencil_video.shape
-            mask_frames, m_height, m_width = stencil_mask.shape if len(stencil_mask.shape) == 3 else (*stencil_mask.shape, 1)[:3]
-
-            if stencil_frames != total_frames:
-                raise ValueError(f"Stencil video frames ({stencil_frames}) must match main video frames ({total_frames})")
-            if (s_height, s_width) != (height, width):
-                raise ValueError(f"Stencil video dimensions ({s_width}x{s_height}) must match main video ({width}x{height})")
-            if (m_height, m_width) != (height, width):
-                raise ValueError(f"Stencil mask dimensions ({m_width}x{m_height}) must match main video ({width}x{height})")
+            # Validate paths exist
+            if not os.path.exists(stencil_video_path):
+                raise ValueError(f"Stencil video path does not exist: {stencil_video_path}")
+            if not os.path.exists(stencil_mask_path):
+                raise ValueError(f"Stencil mask path does not exist: {stencil_mask_path}")
 
             stencil_info = {
                 "has_stencil": True,
-                "frames": stencil_frames,
+                "video_path": stencil_video_path,
+                "mask_path": stencil_mask_path,
                 "mode": "preserve"  # Areas with mask=1 will be preserved
             }
 
@@ -5514,7 +5512,8 @@ class NV_VideoChunkAnalyzer:
             for ctrl_name, ctrl_path in control_paths.items():
                 info_lines.append(f"  - {ctrl_name}: {os.path.basename(ctrl_path)}")
         if stencil_info:
-            info_lines.append(f"Stencil: {stencil_info['frames']} frames (mode: {stencil_info['mode']})")
+            info_lines.append(f"Stencil: {os.path.basename(stencil_info['video_path'])} (mode: {stencil_info['mode']})")
+            info_lines.append(f"  Mask: {os.path.basename(stencil_info['mask_path'])}")
         if save_chunks:
             info_lines.append(f"Saving chunks to: {chunks_folder}")
         info_lines.append("")
@@ -5569,25 +5568,6 @@ class NV_VideoChunkAnalyzer:
                     chunk_info["saved_video_path"] = chunk_path
                     info_lines.append(f"Chunk {chunk_idx}: frames {current_frame}-{end_frame} ({end_frame - current_frame} frames) -> {chunk_filename}")
 
-                    # Save stencil chunks if provided
-                    if stencil_info:
-                        # Save stencil video chunk
-                        stencil_chunk_frames = stencil_video[current_frame:end_frame]
-                        stencil_filename = f"chunk_{chunk_idx:04d}_stencil.mp4"
-                        stencil_path = os.path.join(chunks_folder, stencil_filename)
-                        self._save_chunk_video(stencil_chunk_frames, stencil_path, fps=chunk_fps)
-                        chunk_info["saved_stencil_video_path"] = stencil_path
-
-                        # Save stencil mask chunk
-                        mask_chunk = stencil_mask[current_frame:end_frame]
-                        # Convert mask to video format (expand to 3 channels)
-                        if len(mask_chunk.shape) == 3:
-                            mask_chunk = mask_chunk.unsqueeze(-1).expand(-1, -1, -1, 3)
-                        mask_filename = f"chunk_{chunk_idx:04d}_mask.mp4"
-                        mask_path = os.path.join(chunks_folder, mask_filename)
-                        self._save_chunk_video(mask_chunk, mask_path, fps=chunk_fps)
-                        chunk_info["saved_stencil_mask_path"] = mask_path
-
                 except Exception as e:
                     info_lines.append(f"Chunk {chunk_idx}: frames {current_frame}-{end_frame} (SAVE FAILED: {e})")
             else:
@@ -5623,6 +5603,8 @@ class NV_VideoChunkAnalyzer:
         if stencil_info:
             json_data["stencil"] = {
                 "has_stencil": True,
+                "video_path": stencil_info["video_path"],
+                "mask_path": stencil_info["mask_path"],
                 "mode": stencil_info["mode"],
                 "description": "Stencil areas (mask=1) will be preserved during generation"
             }
