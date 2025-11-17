@@ -3328,7 +3328,12 @@ class NV_VideoSampler:
                 # Calculate latent frame indices (with fallback for image-based chunks)
                 chunk_start = chunk_cond.get("latent_start", chunk_cond["start_frame"] // 4)
                 chunk_end = chunk_cond.get("latent_end", (chunk_cond["end_frame"] - 1) // 4 + 1)
-                chunk_frames = chunk_end - chunk_start
+
+                # Calculate chunk_frames from ACTUAL chunk's video frame count, not latent range
+                # This ensures it matches the actual VAE encoding output, especially for short last chunks
+                # where latent range (chunk_end - chunk_start) may not equal encoded size
+                actual_chunk_video_frames = chunk_cond["end_frame"] - chunk_cond["start_frame"]
+                chunk_frames = (actual_chunk_video_frames - 1) // 4 + 1  # Match VAE temporal compression formula
 
                 # Per-chunk seed variation (if enabled)
                 chunk_seed = seed + chunk_idx if per_chunk_seed_offset else seed
