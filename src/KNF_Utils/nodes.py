@@ -3413,10 +3413,15 @@ class NV_VideoSampler:
                         chunk_control_pixels = full_control_pixels[chunk_cond["start_frame"]:chunk_cond["end_frame"]].clone()  # [chunk_frames, H, W, C]
 
                         # PADDING: Ensure chunk has standard 81 frames for VACE encoding
+                        # BUT: Skip padding for short last chunks to avoid temporal dimension mismatch
                         chunk_pixel_frames = chunk_control_pixels.shape[0]
                         STANDARD_CHUNK_FRAMES = 81
 
-                        if chunk_pixel_frames < STANDARD_CHUNK_FRAMES:
+                        # Check if this is a short last chunk (to match latent extension logic)
+                        is_last_chunk = (chunk_idx == len(chunk_conditionings) - 1)
+                        chunk_is_short = (chunk_frames < 20)  # Normal chunks have 21 latent frames
+
+                        if chunk_pixel_frames < STANDARD_CHUNK_FRAMES and not (is_last_chunk and chunk_is_short):
                             padding_needed = STANDARD_CHUNK_FRAMES - chunk_pixel_frames
 
                             print(f"    • Chunk has {chunk_pixel_frames} frames, padding to {STANDARD_CHUNK_FRAMES}")
@@ -3425,6 +3430,9 @@ class NV_VideoSampler:
                             # Repeat last frame to reach 81 frames
                             last_frame = chunk_control_pixels[-1:, :, :, :].repeat(padding_needed, 1, 1, 1)
                             chunk_control_pixels = torch.cat([chunk_control_pixels, last_frame], dim=0)
+                        elif is_last_chunk and chunk_is_short:
+                            print(f"    • Last chunk is short ({chunk_pixel_frames} frames), NOT padding to avoid dimension mismatch")
+                            print(f"    • Control will match latent temporal dimension ({chunk_frames} latent frames)")
 
                         # NEW: Replace first 16 VIDEO frames with DEDICATED VACE control frames from previous chunk
                         # Use the separately color-matched frames that are ONLY for VACE controls
@@ -3507,7 +3515,49 @@ class NV_VideoSampler:
 
                         print(f"    ✓ Controls encoded and injected into conditioning")
                         info_lines.append(f"    ✓ VACE controls injected: {len(all_vace_frames)} control(s)")
-                
+
+                        # VALIDATION: Verify control and latent temporal dimensions will match
+                        # This catches bugs in padding/extension logic before they cause errors in the model
+                        if len(all_vace_frames) > 0:
+                            control_temporal_dim = all_vace_frames[0].shape[2]  # [1, 32, T, H, W]
+                            expected_latent_temporal_dim = chunk_frames  # Base chunk size in latent frames
+
+                            # If VACE reference is present, control will have +1 frame (for reference)
+                            # Latent may or may not be extended (depends on short chunk logic)
+                            if has_vace_reference:
+                                # For normal chunks: latent will be extended to chunk_frames + 1
+                                # For short last chunks: latent stays at chunk_frames
+                                is_last_chunk = (chunk_idx == len(chunk_conditionings) - 1)
+                                chunk_is_short = (chunk_frames < 20)
+
+                                if is_last_chunk and chunk_is_short:
+                                    # Short last chunk: control should have chunk_frames + 1 ref, latent has chunk_frames
+                                    # After trimming reference: control will be chunk_frames - 1, but we trim before generation
+                                    expected_control_dim = chunk_frames + 1  # With reference prepended
+                                else:
+                                    # Normal chunk: both extended by 1, will be trimmed after generation
+                                    expected_control_dim = chunk_frames + 1  # With reference prepended
+
+                                if control_temporal_dim != expected_control_dim:
+                                    raise RuntimeError(
+                                        f"❌ VACE Control/Latent temporal dimension mismatch detected!\n"
+                                        f"  Chunk {chunk_idx + 1}/{len(chunk_conditionings)}: {chunk_frames} latent frames\n"
+                                        f"  Control temporal dim: {control_temporal_dim} frames\n"
+                                        f"  Expected control dim: {expected_control_dim} frames (chunk_frames + 1 ref)\n"
+                                        f"  Is last chunk: {is_last_chunk}, Is short: {chunk_is_short}\n"
+                                        f"  This indicates a bug in control padding or VACE encoding logic."
+                                    )
+                            else:
+                                # No VACE reference: control and latent should match exactly
+                                if control_temporal_dim != expected_latent_temporal_dim:
+                                    raise RuntimeError(
+                                        f"❌ VACE Control/Latent temporal dimension mismatch detected!\n"
+                                        f"  Chunk {chunk_idx + 1}/{len(chunk_conditionings)}: {chunk_frames} latent frames\n"
+                                        f"  Control temporal dim: {control_temporal_dim} frames\n"
+                                        f"  Expected: {expected_latent_temporal_dim} frames\n"
+                                        f"  This indicates a bug in control padding or VACE encoding logic."
+                                    )
+
                 # VACE REFERENCE: Extend latent for first chunk if reference present
                 # Per WAN VACE architecture: generate with reference, then trim
                 trim_reference_frame = 0
@@ -3527,7 +3577,8 @@ class NV_VideoSampler:
                         print(f"  VACE reference: Extended latent by 1 frame for generation")
                     elif is_last_chunk and chunk_is_short:
                         # Last chunk is shorter - DON'T extend with zeros, use as-is
-                        # The VACE controls already include the reference, so dimensions will match
+                        # Control videos are NOT padded for short last chunks (see padding logic above)
+                        # Both control and latent use actual chunk size to avoid temporal dimension mismatch
                         chunk_latent_for_sampling = chunk_latent  # Use original chunk size
                         chunk_noise_for_sampling = chunk_noise
                         trim_reference_frame = 1  # Still need to trim the prepended reference
