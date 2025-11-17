@@ -3453,10 +3453,9 @@ class NV_VideoSampler:
                         inactive_batched = inactive_latents.unsqueeze(0)  # [1, 16, T_lat, H, W]
                         reactive_batched = reactive_latents.unsqueeze(0)  # [1, 16, T_lat, H, W]
 
-                        # FIX: Blend the two streams instead of concatenating to maintain 16 channels
-                        # The model expects 16 channels, not 32. We blend based on activity level.
-                        # Use reactive for the control areas, inactive for preservation
-                        chunk_vace_frames = reactive_batched  # [1, 16, T_lat, H, W] - Use reactive as primary control
+                        # Concatenate inactive and reactive to create 32-channel VACE control
+                        # This is the trained model architecture: 32 control + 64 mask = 96 total channels
+                        chunk_vace_frames = torch.cat([inactive_batched, reactive_batched], dim=1)  # [1, 32, T_lat, H, W]
 
                         # Create 64-channel extended mask for this chunk
                         C, T_lat, H_lat, W_lat = inactive_latents.shape
@@ -4229,9 +4228,10 @@ class NV_VideoSampler:
                                     # This avoids the single-frame VAE encode bug
                                     last_frame_latent = refined_latent[:, :, -1:, :, :]  # [1, 16, 1, H, W]
 
-                                    # FIX: VACE reference should be 16 channels, not 32
-                                    # The model expects 16-channel control inputs
-                                    vace_reference = last_frame_latent  # [1, 16, 1, H, W]
+                                    # Add zeros padding to make 32-channel VACE reference
+                                    # Model architecture requires 32 control channels (inactive 16 + reactive 16)
+                                    zeros_padding = torch.zeros_like(last_frame_latent)
+                                    vace_reference = torch.cat([last_frame_latent, zeros_padding], dim=1)  # [1, 32, 1, H, W]
 
                                     # DON'T update color matching reference - use original to prevent accumulation
                                     # self._temp_start_image = refined_pixels[-1:].clone()  # REMOVED - causes progressive enhancement
@@ -6142,13 +6142,14 @@ class NV_ChunkConditioningPreprocessor:
                 
                 # Encode single frame with VAE → 16 channels
                 reference_encoded = vae.encode(start_image_resized[:, :, :, :3])  # [1, 16, 1, H, W]
-                
-                # FIX: Use 16 channels for VACE reference, not 32
-                # The model expects 16-channel control inputs
-                vace_reference_latent = reference_encoded  # [1, 16, 1, H, W]
+
+                # Pad with zeros to make 32-channel VACE reference
+                # Model architecture requires 32 control channels (inactive 16 + reactive 16) + 64 mask = 96 total
+                zeros_padding = torch.zeros_like(reference_encoded)
+                vace_reference_latent = torch.cat([reference_encoded, zeros_padding], dim=1)  # [1, 32, 1, H, W]
 
                 print(f"  ✓ VACE reference encoded: {vace_reference_latent.shape}")
-                print(f"    Structure: 16ch VAE latent")
+                print(f"    Structure: 16ch VAE + 16ch zeros = 32ch control")
                 print(f"    Pixels stored for color matching: {start_image_resized.shape}")
                 info_lines.append(f"  ✓ Start image encoded as VACE reference: {vace_reference_latent.shape}")
                 
