@@ -5573,6 +5573,9 @@ class NV_VideoChunkAnalyzer:
             if not os.path.exists(stencil_mask_path):
                 raise ValueError(f"Stencil mask path does not exist: {stencil_mask_path}")
 
+            # Add stencil as a control video (treated like depth, pose, etc.)
+            control_paths["stencil"] = stencil_video_path.strip()
+
             stencil_info = {
                 "has_stencil": True,
                 "video_path": stencil_video_path,
@@ -5642,14 +5645,14 @@ class NV_VideoChunkAnalyzer:
                 "controls": chunk_controls,
             }
 
-            # Add stencil info if provided
+            # Add stencil control settings if provided (same as other controls)
             if stencil_info:
                 chunk_info["stencil"] = {
                     "enabled": True,
                     "mode": stencil_info["mode"],
                     "weight": 1.0  # How strongly to preserve stencil areas
                 }
-            
+
             # Save chunk video if requested
             if save_chunks:
                 chunk_frames = images[current_frame:end_frame]
@@ -5684,7 +5687,8 @@ class NV_VideoChunkAnalyzer:
                 "resolution": [width, height],  # Keep for compatibility
                 "fps": chunk_fps,
             },
-            "control_videos": control_paths,  # Dict of {name: path}
+            "control_videos": control_paths,  # Dict of {name: path} - includes stencil if provided
+            "stencil_masks": {},  # Dict of {control_name: mask_path} - populated below
             "global_settings": {
                 "default_negative": "blurry, low quality, distorted",
                 "notes": "Edit this JSON to customize prompts and control settings per chunk",
@@ -5692,15 +5696,9 @@ class NV_VideoChunkAnalyzer:
             "chunks": chunks
         }
 
-        # Add stencil info to JSON if provided
+        # Add stencil mask to stencil_masks dict if provided
         if stencil_info:
-            json_data["stencil"] = {
-                "has_stencil": True,
-                "video_path": stencil_info["video_path"],
-                "mask_path": stencil_info["mask_path"],
-                "mode": stencil_info["mode"],
-                "description": "Stencil areas (mask=1) will be preserved during generation"
-            }
+            json_data["stencil_masks"]["stencil"] = stencil_info["mask_path"]
         
         # Save JSON with debug output and error handling
         info_lines.append("")
@@ -6194,7 +6192,17 @@ class NV_ChunkConditioningPreprocessor:
         metadata = json_data.get("metadata", {})
         global_settings = json_data.get("global_settings", {})
         control_videos = json_data.get("control_videos", {})
-        stencil_data = json_data.get("stencil", {})
+        stencil_masks = json_data.get("stencil_masks", {})
+
+        # Backward compatibility: Convert old stencil format to new format
+        old_stencil = json_data.get("stencil", {})
+        if old_stencil.get("has_stencil"):
+            # Add stencil video to control_videos if not already there
+            if "stencil" not in control_videos:
+                control_videos["stencil"] = old_stencil.get("video_path")
+            # Add stencil mask to stencil_masks if not already there
+            if "stencil" not in stencil_masks:
+                stencil_masks["stencil"] = old_stencil.get("mask_path")
 
         info_lines = []
         info_lines.append("=" * 60)
@@ -6274,48 +6282,25 @@ class NV_ChunkConditioningPreprocessor:
                         full_control_pixels[ctrl_name] = ctrl_frames  # [T, H, W, C] in range [0, 1]
 
                         info_lines.append(f"  ✓ Loaded '{ctrl_name}': {ctrl_frames.shape} (pixel space)")
+
+                        # Check if this control has an associated mask in stencil_masks
+                        if ctrl_name in stencil_masks:
+                            mask_path = stencil_masks[ctrl_name]
+                            if mask_path and os.path.exists(mask_path):
+                                try:
+                                    mask_frames = self._load_video_frames(mask_path, 0, total_frames)
+                                    if mask_frames is not None:
+                                        full_control_pixels[f"{ctrl_name}_mask"] = mask_frames
+                                        info_lines.append(f"  ✓ Loaded mask for '{ctrl_name}': {mask_frames.shape}")
+                                    else:
+                                        info_lines.append(f"  ⚠️ Failed to load mask from: {mask_path}")
+                                except Exception as e:
+                                    info_lines.append(f"  ⚠️ Failed to load mask for '{ctrl_name}': {e}")
+                            else:
+                                info_lines.append(f"  ⚠️ Mask path not found for '{ctrl_name}': {mask_path}")
+
                 except Exception as e:
                     info_lines.append(f"  ✗ Failed to load control '{ctrl_name}': {e}")
-
-            # Load stencil video and mask if provided
-            if stencil_data.get("has_stencil"):
-                stencil_video_path = stencil_data.get("video_path")
-                stencil_mask_path = stencil_data.get("mask_path")
-
-                info_lines.append("Loading stencil control...")
-
-                # Load stencil video
-                if stencil_video_path and os.path.exists(stencil_video_path):
-                    try:
-                        total_frames = metadata.get("total_frames", 81)
-                        stencil_frames = self._load_video_frames(stencil_video_path, 0, total_frames)
-
-                        if stencil_frames is not None:
-                            full_control_pixels["stencil"] = stencil_frames
-                            info_lines.append(f"  ✓ Loaded stencil video: {stencil_frames.shape}")
-                        else:
-                            info_lines.append(f"  ✗ Failed to load stencil video from: {stencil_video_path}")
-                    except Exception as e:
-                        info_lines.append(f"  ✗ Failed to load stencil video: {e}")
-                else:
-                    info_lines.append(f"  ✗ Stencil video path not found: {stencil_video_path}")
-
-                # Load stencil mask
-                if stencil_mask_path and os.path.exists(stencil_mask_path):
-                    try:
-                        total_frames = metadata.get("total_frames", 81)
-                        stencil_mask_frames = self._load_video_frames(stencil_mask_path, 0, total_frames)
-
-                        if stencil_mask_frames is not None:
-                            # Store mask separately with "_mask" suffix
-                            full_control_pixels["stencil_mask"] = stencil_mask_frames
-                            info_lines.append(f"  ✓ Loaded stencil mask: {stencil_mask_frames.shape}")
-                        else:
-                            info_lines.append(f"  ✗ Failed to load stencil mask from: {stencil_mask_path}")
-                    except Exception as e:
-                        info_lines.append(f"  ✗ Failed to load stencil mask: {e}")
-                else:
-                    info_lines.append(f"  ✗ Stencil mask path not found: {stencil_mask_path}")
 
             info_lines.append("")
         
