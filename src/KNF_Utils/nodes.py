@@ -3457,9 +3457,23 @@ class NV_VideoSampler:
                             chunk_control_pixels[:overlap_frames] = overlap_pixels[-overlap_frames:]
                             print(f"    • ⚠️  Using overlap frames as fallback for VACE controls")
 
+                        # Extract mask for this chunk if present (for stencil controls)
+                        chunk_mask = None
+                        if "mask" in ctrl_info:
+                            full_mask_pixels = ctrl_info["mask"]  # [T, H, W, C] full mask video
+                            chunk_mask = full_mask_pixels[chunk_cond["start_frame"]:chunk_cond["end_frame"]].clone()
+
+                            # Apply same padding as control pixels
+                            if chunk_mask.shape[0] < STANDARD_CHUNK_FRAMES and not (is_last_chunk and chunk_is_short):
+                                padding_needed = STANDARD_CHUNK_FRAMES - chunk_mask.shape[0]
+                                last_mask_frame = chunk_mask[-1:, :, :, :].repeat(padding_needed, 1, 1, 1)
+                                chunk_mask = torch.cat([chunk_mask, last_mask_frame], dim=0)
+
+                            print(f"    • Using mask for '{ctrl_name}' (stencil control)")
+
                         # Encode this chunk's control pixels to VACE dual-channel format
                         inactive_latents, reactive_latents = self._encode_vace_dual_channel(
-                            chunk_control_pixels, chunk_vae, chunk_tiled
+                            chunk_control_pixels, chunk_vae, chunk_tiled, mask=chunk_mask
                         )
 
                         # Package in ComfyUI Wan VACE format with batch dimension
@@ -4940,7 +4954,7 @@ class NV_VideoSampler:
         
         return inactive_latents, reactive_latents
 
-    def _encode_vace_dual_channel(self, frames, vae, tiled=False):
+    def _encode_vace_dual_channel(self, frames, vae, tiled=False, mask=None):
         """
         Encode control frames using Wan VACE dual-channel format.
 
@@ -4952,6 +4966,9 @@ class NV_VideoSampler:
             frames: [T, H, W, C] in range [0, 1]
             vae: VAE model
             tiled: Whether to use tiled encoding
+            mask: Optional [T, H, W, C] mask (for stencil controls)
+                  If provided: mask=1 means preserve (reactive), mask=0 means generate (inactive)
+                  If None: defaults to all ones (full control everywhere)
 
         Returns:
             32-channel latent: [32, T_lat, H_lat, W_lat]
@@ -4963,7 +4980,18 @@ class NV_VideoSampler:
 
         # Default mask: all ones (full control everywhere)
         # mask shape: [T, H, W, 1]
-        mask = torch.ones(frames.shape[0], frames.shape[1], frames.shape[2], 1)
+        if mask is None:
+            mask = torch.ones(frames.shape[0], frames.shape[1], frames.shape[2], 1, device=frames.device)
+        else:
+            # Ensure mask is on same device as frames
+            mask = mask.to(device=frames.device)
+            # Ensure mask has channel dimension
+            if mask.ndim == 3:
+                mask = mask.unsqueeze(-1)  # [T, H, W] -> [T, H, W, 1]
+            # Convert to grayscale if RGB (take first channel)
+            if mask.shape[-1] > 1:
+                mask = mask[:, :, :, :1]
+            print(f"[VACE Dual] Using provided mask: {mask.shape}, range [{mask.min():.3f}, {mask.max():.3f}]")
 
         # Step 1: Center control video around zero
         # From guide: "control_video = control_video - 0.5"
@@ -6166,7 +6194,8 @@ class NV_ChunkConditioningPreprocessor:
         metadata = json_data.get("metadata", {})
         global_settings = json_data.get("global_settings", {})
         control_videos = json_data.get("control_videos", {})
-        
+        stencil_data = json_data.get("stencil", {})
+
         info_lines = []
         info_lines.append("=" * 60)
         info_lines.append("NV CHUNK CONDITIONING PREPROCESSOR")
@@ -6247,7 +6276,47 @@ class NV_ChunkConditioningPreprocessor:
                         info_lines.append(f"  ✓ Loaded '{ctrl_name}': {ctrl_frames.shape} (pixel space)")
                 except Exception as e:
                     info_lines.append(f"  ✗ Failed to load control '{ctrl_name}': {e}")
-            
+
+            # Load stencil video and mask if provided
+            if stencil_data.get("has_stencil"):
+                stencil_video_path = stencil_data.get("video_path")
+                stencil_mask_path = stencil_data.get("mask_path")
+
+                info_lines.append("Loading stencil control...")
+
+                # Load stencil video
+                if stencil_video_path and os.path.exists(stencil_video_path):
+                    try:
+                        total_frames = metadata.get("total_frames", 81)
+                        stencil_frames = self._load_video_frames(stencil_video_path, 0, total_frames)
+
+                        if stencil_frames is not None:
+                            full_control_pixels["stencil"] = stencil_frames
+                            info_lines.append(f"  ✓ Loaded stencil video: {stencil_frames.shape}")
+                        else:
+                            info_lines.append(f"  ✗ Failed to load stencil video from: {stencil_video_path}")
+                    except Exception as e:
+                        info_lines.append(f"  ✗ Failed to load stencil video: {e}")
+                else:
+                    info_lines.append(f"  ✗ Stencil video path not found: {stencil_video_path}")
+
+                # Load stencil mask
+                if stencil_mask_path and os.path.exists(stencil_mask_path):
+                    try:
+                        total_frames = metadata.get("total_frames", 81)
+                        stencil_mask_frames = self._load_video_frames(stencil_mask_path, 0, total_frames)
+
+                        if stencil_mask_frames is not None:
+                            # Store mask separately with "_mask" suffix
+                            full_control_pixels["stencil_mask"] = stencil_mask_frames
+                            info_lines.append(f"  ✓ Loaded stencil mask: {stencil_mask_frames.shape}")
+                        else:
+                            info_lines.append(f"  ✗ Failed to load stencil mask from: {stencil_mask_path}")
+                    except Exception as e:
+                        info_lines.append(f"  ✗ Failed to load stencil mask: {e}")
+                else:
+                    info_lines.append(f"  ✗ Stencil mask path not found: {stencil_mask_path}")
+
             info_lines.append("")
         
         # Process each chunk
@@ -6281,6 +6350,13 @@ class NV_ChunkConditioningPreprocessor:
             control_pixels_info = {}
             if control_mode != "disabled" and full_control_pixels:
                 chunk_controls = chunk.get("controls", {})
+
+                # Add stencil from chunk-level stencil settings if present
+                chunk_stencil = chunk.get("stencil", {})
+                if chunk_stencil.get("enabled", False) and "stencil" in full_control_pixels:
+                    if "stencil" not in chunk_controls:
+                        chunk_controls["stencil"] = chunk_stencil
+
                 for ctrl_name, ctrl_settings in chunk_controls.items():
                     # Skip if this control is disabled for this chunk
                     if not ctrl_settings.get("enabled", True):
@@ -6298,12 +6374,19 @@ class NV_ChunkConditioningPreprocessor:
 
                     # Store reference to FULL control pixels
                     # Sampler will encode the appropriate slice
-                    control_pixels_info[ctrl_name] = {
+                    control_info = {
                         "pixels": full_control_pixels[ctrl_name],  # [T, H, W, C] full video in pixel space
                         "weight": ctrl_settings.get("weight", 1.0),
                         "start_percent": ctrl_settings.get("start_percent", 0.0),
                         "end_percent": ctrl_settings.get("end_percent", 1.0),
                     }
+
+                    # Add mask for stencil controls
+                    if ctrl_name == "stencil" and "stencil_mask" in full_control_pixels:
+                        control_info["mask"] = full_control_pixels["stencil_mask"]  # [T, H, W, C] mask in pixel space
+                        info_lines.append(f"  ✓ Stencil control with mask for chunk {chunk_idx}")
+
+                    control_pixels_info[ctrl_name] = control_info
             
             # Package conditioning for this chunk
             chunk_conditioning = {
@@ -6403,30 +6486,44 @@ class NV_ChunkConditioningPreprocessor:
         frames_tensor = torch.from_numpy(np.stack(frames, axis=0))
         return frames_tensor
     
-    def _encode_vace_dual_channel(self, frames, vae, tiled=False):
+    def _encode_vace_dual_channel(self, frames, vae, tiled=False, mask=None):
         """
         Encode control frames using Wan VACE dual-channel format.
-        
+
         Implements the dual-stream architecture:
         - Inactive stream (channels 0-15): Context preservation
         - Reactive stream (channels 16-31): Active control
-        
+
         Args:
             frames: [T, H, W, C] in range [0, 1]
             vae: VAE model
             tiled: Whether to use tiled encoding
-            
+            mask: Optional [T, H, W, C] mask (for stencil controls)
+                  If provided: mask=1 means preserve (reactive), mask=0 means generate (inactive)
+                  If None: defaults to all ones (full control everywhere)
+
         Returns:
             32-channel latent: [32, T_lat, H_lat, W_lat]
         """
         import torch
-        
+
         print(f"[VACE Dual] Encoding with dual-channel format")
         print(f"[VACE Dual] Input frames shape: {frames.shape}")
-        
+
         # Default mask: all ones (full control everywhere)
         # mask shape: [T, H, W, 1]
-        mask = torch.ones(frames.shape[0], frames.shape[1], frames.shape[2], 1)
+        if mask is None:
+            mask = torch.ones(frames.shape[0], frames.shape[1], frames.shape[2], 1, device=frames.device)
+        else:
+            # Ensure mask is on same device as frames
+            mask = mask.to(device=frames.device)
+            # Ensure mask has channel dimension
+            if mask.ndim == 3:
+                mask = mask.unsqueeze(-1)  # [T, H, W] -> [T, H, W, 1]
+            # Convert to grayscale if RGB (take first channel)
+            if mask.shape[-1] > 1:
+                mask = mask[:, :, :, :1]
+            print(f"[VACE Dual] Using provided mask: {mask.shape}, range [{mask.min():.3f}, {mask.max():.3f}]")
         
         # Step 1: Center control video around zero
         # From guide: "control_video = control_video - 0.5"
