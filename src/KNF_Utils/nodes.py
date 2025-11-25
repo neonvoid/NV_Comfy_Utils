@@ -3352,9 +3352,10 @@ class NV_VideoSampler:
                 info_lines.append(f"  Latent frames: {chunk_start}-{chunk_end} ({chunk_frames} frames)")
                 
                 # Extract chunk from latent and noise
-                # Will be extended later if VACE reference is present
-                chunk_latent = latent[:, :, chunk_start:chunk_end, :, :]
-                chunk_noise = noise[:, :, chunk_start:chunk_end, :, :] if not disable_noise else torch.zeros_like(chunk_latent)
+                # Use chunk_frames (not chunk_end) to ensure dimensions match actual encoded size
+                # This is critical for short last chunks where chunk_end - chunk_start may differ from encoded frames
+                chunk_latent = latent[:, :, chunk_start:chunk_start+chunk_frames, :, :]
+                chunk_noise = noise[:, :, chunk_start:chunk_start+chunk_frames, :, :] if not disable_noise else torch.zeros_like(chunk_latent)
                 
                 # Store for later potential extension
                 chunk_latent_for_sampling = chunk_latent
