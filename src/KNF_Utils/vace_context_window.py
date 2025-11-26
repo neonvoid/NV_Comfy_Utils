@@ -98,6 +98,26 @@ def slice_vace_conditioning(handler, model, x_in, conds, timestep, model_options
                 # Replace the list in-place
                 cond_dict[key] = sliced_list
 
+            # Also slice model_conds['vace_context'] which is a CONDRegular
+            # After extra_conds(), vace_context has shape [B, num_vace, 96, T, H, W]
+            # where temporal dimension is at index 3 (not 2!)
+            model_conds = cond_dict.get("model_conds", {})
+            if "vace_context" in model_conds:
+                vace_context = model_conds["vace_context"]
+                # CONDRegular objects have a .cond attribute with the tensor
+                if hasattr(vace_context, "cond") and isinstance(vace_context.cond, torch.Tensor):
+                    vace_tensor = vace_context.cond
+                    # vace_context tensor shape: [B, num_vace, 96, T, H, W]
+                    # Temporal dimension is at index 3
+                    vace_temporal_dim = 3
+                    if vace_tensor.ndim > vace_temporal_dim and vace_tensor.size(vace_temporal_dim) == x_in.size(dim):
+                        # Slice at the correct dimension (dim=3 for vace_context)
+                        sliced_vace_context = window.get_tensor(vace_tensor, device, dim=vace_temporal_dim)
+                        # Create new COND object with sliced tensor
+                        model_conds["vace_context"] = vace_context._copy_with(sliced_vace_context)
+                        if window_idx == 0:
+                            print(f"[VACE Slicer] Sliced vace_context: {vace_tensor.shape} -> {sliced_vace_context.shape}")
+
 
 class NV_VACEContextWindowPatcher:
     """
