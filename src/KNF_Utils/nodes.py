@@ -22,6 +22,8 @@ import platform
 
 # Import VACE context window support
 from .vace_context_window import NV_VACEContextWindowPatcher
+# Import multi-model sampler
+from .multi_model_sampler import NV_MultiModelSampler
 import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend for server-side rendering
 import matplotlib.pyplot as plt
@@ -6719,6 +6721,7 @@ NODE_CLASS_MAPPINGS = {
     "NV_VideoChunkAnalyzer": NV_VideoChunkAnalyzer,
     "NV_ChunkConditioningPreprocessor": NV_ChunkConditioningPreprocessor,
     "NV_VACEContextWindowPatcher": NV_VACEContextWindowPatcher,
+    "NV_MultiModelSampler": NV_MultiModelSampler,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -6734,6 +6737,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NV_VideoChunkAnalyzer": "NV Video Chunk Analyzer",
     "NV_ChunkConditioningPreprocessor": "NV Chunk Conditioning Preprocessor",
     "NV_VACEContextWindowPatcher": "NV VACE Context Window Patcher",
+    "NV_MultiModelSampler": "NV Multi-Model Sampler",
 }
 
 # Conditionally add NV_Video_Loader_Path if it imported successfully
