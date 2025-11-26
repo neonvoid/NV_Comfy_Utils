@@ -17,6 +17,11 @@ from comfy.context_windows import IndexListCallbacks, IndexListContextWindow
 # Keys in conditioning that contain list-wrapped tensors needing slicing
 VACE_TENSOR_KEYS = ["vace_frames", "vace_mask"]
 
+# Cache for original full-length tensors, keyed by cond_dict uuid
+# This is necessary because we modify conds in-place, and need to preserve
+# originals for subsequent windows within the same timestep
+_VACE_ORIGINALS_CACHE = {}
+
 
 def slice_vace_conditioning(handler, model, x_in, conds, timestep, model_options,
                             window_idx, window: IndexListContextWindow,
@@ -26,6 +31,11 @@ def slice_vace_conditioning(handler, model, x_in, conds, timestep, model_options
 
     Called before each context window evaluation via EVALUATE_CONTEXT_WINDOWS callback.
     Modifies `conds` in-place to slice VACE tensors on the temporal dimension.
+
+    IMPORTANT: We cache original tensors because in-place modifications persist
+    across windows within the same timestep. Without caching, window 0 would slice
+    the tensors, then windows 1, 2, 3... would see already-sliced tensors and fail
+    to slice to their correct indices.
 
     Parameters:
         handler: The IndexListContextHandler instance
@@ -40,7 +50,10 @@ def slice_vace_conditioning(handler, model, x_in, conds, timestep, model_options
         device: Target device
         first_device: First device for multi-GPU
     """
+    global _VACE_ORIGINALS_CACHE
+
     dim = handler.dim  # dim=2 for WAN models (temporal dimension)
+    full_temporal_size = x_in.size(dim)  # Full video length (e.g., 48 frames)
 
     # Debug: Log callback invocation
     if window_idx == 0:  # Only log first window to reduce noise
@@ -58,45 +71,52 @@ def slice_vace_conditioning(handler, model, x_in, conds, timestep, model_options
             if not isinstance(cond_dict, dict):
                 continue
 
+            # Get unique identifier for this cond_dict
+            cond_uuid = cond_dict.get("uuid", None)
+            if cond_uuid is None:
+                continue
+
+            cache_key = str(cond_uuid)
+
+            # Initialize cache entry if needed
+            if cache_key not in _VACE_ORIGINALS_CACHE:
+                _VACE_ORIGINALS_CACHE[cache_key] = {}
+            cache = _VACE_ORIGINALS_CACHE[cache_key]
+
             # Debug: Print all keys in the first cond_dict of first window
             if window_idx == 0 and cond_idx == 0:
                 print(f"[VACE Slicer] cond_dict keys: {list(cond_dict.keys())}")
-                for key in VACE_TENSOR_KEYS:
-                    if key in cond_dict:
-                        val = cond_dict[key]
-                        print(f"[VACE Slicer] Found {key}: type={type(val).__name__}, len={len(val) if isinstance(val, list) else 'N/A'}")
-                        if isinstance(val, list) and len(val) > 0 and isinstance(val[0], torch.Tensor):
-                            print(f"[VACE Slicer]   First tensor shape: {val[0].shape}")
 
+            # Process vace_frames and vace_mask
             for key in VACE_TENSOR_KEYS:
                 if key not in cond_dict:
                     continue
 
-                tensor_list = cond_dict[key]
-                if not isinstance(tensor_list, list):
-                    continue
+                # Cache original if not already cached (check by matching full temporal size)
+                if key not in cache:
+                    tensor_list = cond_dict[key]
+                    if isinstance(tensor_list, list) and len(tensor_list) > 0:
+                        first_tensor = tensor_list[0]
+                        if isinstance(first_tensor, torch.Tensor) and first_tensor.ndim > dim:
+                            if first_tensor.size(dim) == full_temporal_size:
+                                # This is the original full-length tensor, cache it
+                                cache[key] = [t.clone() if isinstance(t, torch.Tensor) else t for t in tensor_list]
+                                if window_idx == 0 and cond_idx == 0:
+                                    print(f"[VACE Slicer] Cached original {key}: shape {first_tensor.shape}")
 
-                sliced_list = []
-                for tensor in tensor_list:
-                    if isinstance(tensor, torch.Tensor):
-                        # Check if tensor has the temporal dimension matching full input
-                        if tensor.ndim > dim and tensor.size(dim) == x_in.size(dim):
-                            # Use window.get_tensor to slice with correct indices
+                # Slice from cached original
+                if key in cache:
+                    original_list = cache[key]
+                    sliced_list = []
+                    for tensor in original_list:
+                        if isinstance(tensor, torch.Tensor):
                             sliced_tensor = window.get_tensor(tensor, device, dim=dim)
-                            if window_idx == 0:  # Debug log
-                                print(f"[VACE Slicer] Sliced {key}: {tensor.shape} -> {sliced_tensor.shape}")
                             sliced_list.append(sliced_tensor)
+                            if window_idx == 0 and cond_idx == 0:
+                                print(f"[VACE Slicer] Sliced {key}: {tensor.shape} -> {sliced_tensor.shape}")
                         else:
-                            # Tensor doesn't need slicing (already correct size or different dim)
-                            if window_idx == 0:  # Debug log
-                                print(f"[VACE Slicer] {key} tensor size {tensor.size(dim) if tensor.ndim > dim else 'N/A'} != x_in size {x_in.size(dim)}, not slicing")
-                            sliced_list.append(tensor if device is None else tensor.to(device))
-                    else:
-                        # Not a tensor (e.g., strength floats), keep as-is
-                        sliced_list.append(tensor)
-
-                # Replace the list in-place
-                cond_dict[key] = sliced_list
+                            sliced_list.append(tensor)
+                    cond_dict[key] = sliced_list
 
             # Also slice model_conds['vace_context'] which is a CONDRegular
             # After extra_conds(), vace_context has shape [B, num_vace, 96, T, H, W]
@@ -104,19 +124,28 @@ def slice_vace_conditioning(handler, model, x_in, conds, timestep, model_options
             model_conds = cond_dict.get("model_conds", {})
             if "vace_context" in model_conds:
                 vace_context = model_conds["vace_context"]
+                vace_context_key = "vace_context"
+                vace_temporal_dim = 3
+
                 # CONDRegular objects have a .cond attribute with the tensor
                 if hasattr(vace_context, "cond") and isinstance(vace_context.cond, torch.Tensor):
                     vace_tensor = vace_context.cond
-                    # vace_context tensor shape: [B, num_vace, 96, T, H, W]
-                    # Temporal dimension is at index 3
-                    vace_temporal_dim = 3
-                    if vace_tensor.ndim > vace_temporal_dim and vace_tensor.size(vace_temporal_dim) == x_in.size(dim):
-                        # Slice at the correct dimension (dim=3 for vace_context)
-                        sliced_vace_context = window.get_tensor(vace_tensor, device, dim=vace_temporal_dim)
-                        # Create new COND object with sliced tensor
-                        model_conds["vace_context"] = vace_context._copy_with(sliced_vace_context)
-                        if window_idx == 0:
-                            print(f"[VACE Slicer] Sliced vace_context: {vace_tensor.shape} -> {sliced_vace_context.shape}")
+
+                    # Cache original vace_context if not already cached
+                    if vace_context_key not in cache:
+                        if vace_tensor.ndim > vace_temporal_dim and vace_tensor.size(vace_temporal_dim) == full_temporal_size:
+                            cache[vace_context_key] = vace_context._copy_with(vace_tensor.clone())
+                            if window_idx == 0 and cond_idx == 0:
+                                print(f"[VACE Slicer] Cached original vace_context: shape {vace_tensor.shape}")
+
+                    # Slice from cached original
+                    if vace_context_key in cache:
+                        original_vace_context = cache[vace_context_key]
+                        original_tensor = original_vace_context.cond
+                        sliced_tensor = window.get_tensor(original_tensor, device, dim=vace_temporal_dim)
+                        model_conds["vace_context"] = original_vace_context._copy_with(sliced_tensor)
+                        if window_idx == 0 and cond_idx == 0:
+                            print(f"[VACE Slicer] Sliced vace_context: {original_tensor.shape} -> {sliced_tensor.shape}")
 
 
 class NV_VACEContextWindowPatcher:
