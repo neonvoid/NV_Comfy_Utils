@@ -42,6 +42,12 @@ def slice_vace_conditioning(handler, model, x_in, conds, timestep, model_options
     """
     dim = handler.dim  # dim=2 for WAN models (temporal dimension)
 
+    # Debug: Log callback invocation
+    if window_idx == 0:  # Only log first window to reduce noise
+        print(f"[VACE Slicer] Callback invoked for window {window_idx}")
+        print(f"[VACE Slicer] x_in shape: {x_in.shape}, dim={dim}")
+        print(f"[VACE Slicer] Window indices: {window.index_list[:5]}...{window.index_list[-5:] if len(window.index_list) > 5 else ''}")
+
     for cond_list in conds:
         if cond_list is None:
             continue
@@ -67,9 +73,13 @@ def slice_vace_conditioning(handler, model, x_in, conds, timestep, model_options
                         if tensor.ndim > dim and tensor.size(dim) == x_in.size(dim):
                             # Use window.get_tensor to slice with correct indices
                             sliced_tensor = window.get_tensor(tensor, device, dim=dim)
+                            if window_idx == 0:  # Debug log
+                                print(f"[VACE Slicer] Sliced {key}: {tensor.shape} -> {sliced_tensor.shape}")
                             sliced_list.append(sliced_tensor)
                         else:
                             # Tensor doesn't need slicing (already correct size or different dim)
+                            if window_idx == 0:  # Debug log
+                                print(f"[VACE Slicer] {key} tensor size {tensor.size(dim) if tensor.ndim > dim else 'N/A'} != x_in size {x_in.size(dim)}, not slicing")
                             sliced_list.append(tensor if device is None else tensor.to(device))
                     else:
                         # Not a tensor (e.g., strength floats), keep as-is
@@ -109,22 +119,25 @@ class NV_VACEContextWindowPatcher:
     DESCRIPTION = "Enables VACE conditioning to work with context windows by slicing VACE tensors per-window."
 
     def patch(self, model):
+        import comfy.patcher_extension
+
         model = model.clone()
 
         # Get the context handler if it exists
         context_handler = model.model_options.get("context_handler", None)
 
         if context_handler is not None:
-            # Register callback directly on the context handler's callbacks dict
-            # This follows the pattern used by IndexListContextHandler
-            callbacks = context_handler.callbacks
-            cb_dict = callbacks.setdefault(IndexListCallbacks.EVALUATE_CONTEXT_WINDOWS, {})
-            cb_list = cb_dict.setdefault("nv_vace_slicer", [])
-
-            # Only add if not already present (avoid duplicates)
-            if slice_vace_conditioning not in cb_list:
-                cb_list.append(slice_vace_conditioning)
-                print("[NV_VACEContextWindowPatcher] Registered VACE slicing callback on context handler")
+            # Register callback using ComfyUI's official API
+            # get_all_callbacks expects: callbacks_dict["callbacks"][call_type][key] = [funcs]
+            # So we need to nest under "callbacks" key
+            comfy.patcher_extension.add_callback_with_key(
+                IndexListCallbacks.EVALUATE_CONTEXT_WINDOWS,
+                "nv_vace_slicer",
+                slice_vace_conditioning,
+                context_handler.callbacks,
+                is_model_options=False
+            )
+            print("[NV_VACEContextWindowPatcher] Registered VACE slicing callback on context handler")
         else:
             # Context handler not yet attached - store callback in model_options
             # It will be picked up if context handler is attached later
@@ -132,13 +145,14 @@ class NV_VACEContextWindowPatcher:
             print("  Make sure to connect WAN Context Windows node before this patcher.")
             print("  The patcher will still work if context handler is added later in the workflow.")
 
-            # Store in transformer_options for potential later use
-            transformer_options = model.model_options.setdefault("transformer_options", {})
-            callbacks = transformer_options.setdefault("callbacks", {})
-            cb_dict = callbacks.setdefault(IndexListCallbacks.EVALUATE_CONTEXT_WINDOWS, {})
-            cb_list = cb_dict.setdefault("nv_vace_slicer", [])
-            if slice_vace_conditioning not in cb_list:
-                cb_list.append(slice_vace_conditioning)
+            # Store in model_options using the official API
+            comfy.patcher_extension.add_callback_with_key(
+                IndexListCallbacks.EVALUATE_CONTEXT_WINDOWS,
+                "nv_vace_slicer",
+                slice_vace_conditioning,
+                model.model_options,
+                is_model_options=True
+            )
 
         return (model,)
 
