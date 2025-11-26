@@ -47,16 +47,26 @@ def slice_vace_conditioning(handler, model, x_in, conds, timestep, model_options
         print(f"[VACE Slicer] Callback invoked for window {window_idx}")
         print(f"[VACE Slicer] x_in shape: {x_in.shape}, dim={dim}")
         print(f"[VACE Slicer] Window indices: {window.index_list[:5]}...{window.index_list[-5:] if len(window.index_list) > 5 else ''}")
+        print(f"[VACE Slicer] Number of cond lists: {len(conds)}")
 
     for cond_list in conds:
         if cond_list is None:
             continue
-        for cond in cond_list:
-            if not isinstance(cond, (list, tuple)) or len(cond) < 2:
-                continue
-            cond_dict = cond[1]
+        for cond_idx, cond_dict in enumerate(cond_list):
+            # At callback time, conds have already been converted from [(tensor, dict), ...]
+            # to [dict, ...] by convert_cond in sampler_helpers.py
             if not isinstance(cond_dict, dict):
                 continue
+
+            # Debug: Print all keys in the first cond_dict of first window
+            if window_idx == 0 and cond_idx == 0:
+                print(f"[VACE Slicer] cond_dict keys: {list(cond_dict.keys())}")
+                for key in VACE_TENSOR_KEYS:
+                    if key in cond_dict:
+                        val = cond_dict[key]
+                        print(f"[VACE Slicer] Found {key}: type={type(val).__name__}, len={len(val) if isinstance(val, list) else 'N/A'}")
+                        if isinstance(val, list) and len(val) > 0 and isinstance(val[0], torch.Tensor):
+                            print(f"[VACE Slicer]   First tensor shape: {val[0].shape}")
 
             for key in VACE_TENSOR_KEYS:
                 if key not in cond_dict:
