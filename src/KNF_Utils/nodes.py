@@ -19,6 +19,9 @@ from datetime import datetime
 import cv2
 import sys
 import platform
+
+# Import VACE context window support
+from .vace_context_window import NV_VACEContextWindowPatcher
 import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend for server-side rendering
 import matplotlib.pyplot as plt
@@ -6715,6 +6718,7 @@ NODE_CLASS_MAPPINGS = {
     "NV_VideoSampler": NV_VideoSampler,
     "NV_VideoChunkAnalyzer": NV_VideoChunkAnalyzer,
     "NV_ChunkConditioningPreprocessor": NV_ChunkConditioningPreprocessor,
+    "NV_VACEContextWindowPatcher": NV_VACEContextWindowPatcher,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -6729,6 +6733,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NV_VideoSampler": "NV Video Sampler",
     "NV_VideoChunkAnalyzer": "NV Video Chunk Analyzer",
     "NV_ChunkConditioningPreprocessor": "NV Chunk Conditioning Preprocessor",
+    "NV_VACEContextWindowPatcher": "NV VACE Context Window Patcher",
 }
 
 # Conditionally add NV_Video_Loader_Path if it imported successfully
