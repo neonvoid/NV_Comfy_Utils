@@ -6707,6 +6707,553 @@ class NV_ChunkConditioningPreprocessor:
         return inactive_latents, reactive_latents
 
 
+# =============================================================================
+# MASK UTILITIES
+# =============================================================================
+
+class NV_MaskPresenceFilter:
+    """
+    Detects which frames in a mask batch contain actual mask content (subject present).
+    Filters masks and provides frame indices for use with batch extraction nodes.
+
+    Use Case: Video subject tracking where subject enters/exits frame.
+    Outputs frame ranges and filtered batches for downstream processing.
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "masks": ("MASK", {
+                    "tooltip": "Batch of masks from segmentation (shape: batch, height, width)"
+                }),
+                "threshold_mode": (["coverage_percent", "pixel_count"], {
+                    "default": "coverage_percent",
+                    "tooltip": "How to measure mask presence"
+                }),
+                "threshold_value": ("FLOAT", {
+                    "default": 0.1,
+                    "min": 0.0,
+                    "max": 100.0,
+                    "step": 0.01,
+                    "tooltip": "Minimum value to consider mask present (percentage or pixels based on mode)"
+                }),
+                "mask_value_threshold": ("FLOAT", {
+                    "default": 0.5,
+                    "min": 0.0,
+                    "max": 1.0,
+                    "step": 0.01,
+                    "tooltip": "Pixel values above this count as 'masked' (filters noise in segmentation)"
+                }),
+            },
+            "optional": {
+                "images": ("IMAGE", {
+                    "tooltip": "Optional: Pass images to filter in sync with masks"
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("MASK", "IMAGE", "STRING", "STRING", "INT", "INT", "INT")
+    RETURN_NAMES = ("filtered_masks", "filtered_images", "frame_indices_csv",
+                    "presence_info", "first_present_frame", "last_present_frame",
+                    "present_count")
+    FUNCTION = "filter_by_presence"
+    CATEGORY = "NV_Utils/Mask"
+
+    def filter_by_presence(self, masks, threshold_mode, threshold_value,
+                           mask_value_threshold, images=None):
+        """
+        Analyze mask batch and filter frames where mask is present.
+        """
+        import torch
+
+        # Ensure mask is 3D: (batch, height, width)
+        if masks.ndim == 2:
+            masks = masks.unsqueeze(0)
+        elif masks.ndim == 4:
+            # Handle (batch, 1, height, width) format
+            masks = masks.squeeze(1)
+
+        batch_size, height, width = masks.shape
+        total_pixels = height * width
+
+        present_indices = []
+        frame_stats = []
+
+        # Analyze each frame
+        for i in range(batch_size):
+            frame_mask = masks[i]
+
+            # Count pixels above threshold
+            mask_pixels = (frame_mask > mask_value_threshold).float().sum().item()
+            coverage_percent = (mask_pixels / total_pixels) * 100.0
+
+            # Determine if mask is present based on mode
+            if threshold_mode == "pixel_count":
+                is_present = mask_pixels >= threshold_value
+            else:  # coverage_percent
+                is_present = coverage_percent >= threshold_value
+
+            frame_stats.append({
+                "frame": i,
+                "mask_pixels": int(mask_pixels),
+                "coverage_percent": round(coverage_percent, 3),
+                "present": is_present
+            })
+
+            if is_present:
+                present_indices.append(i)
+
+        # Build outputs
+        if len(present_indices) == 0:
+            # No frames with mask - return empty tensors
+            print("[NV_MaskPresenceFilter] WARNING: No frames detected with mask present!")
+            filtered_masks = torch.zeros((0, height, width), dtype=masks.dtype, device=masks.device)
+            filtered_images = torch.zeros((0,) + images.shape[1:], dtype=images.dtype, device=images.device) if images is not None else None
+            first_frame = -1
+            last_frame = -1
+        else:
+            # Index and stack filtered frames
+            indices_tensor = torch.tensor(present_indices, dtype=torch.long, device=masks.device)
+            filtered_masks = torch.index_select(masks, 0, indices_tensor)
+
+            if images is not None:
+                indices_tensor_img = indices_tensor.to(images.device)
+                filtered_images = torch.index_select(images, 0, indices_tensor_img)
+            else:
+                filtered_images = None
+
+            first_frame = present_indices[0]
+            last_frame = present_indices[-1]
+
+        # Build CSV string for downstream nodes
+        frame_indices_csv = ",".join(str(i) for i in present_indices)
+
+        # Build detailed info string
+        info_lines = self._build_info_report(
+            batch_size, present_indices, frame_stats,
+            threshold_mode, threshold_value, mask_value_threshold,
+            height, width
+        )
+        presence_info = "\n".join(info_lines)
+
+        # Console logging
+        print(presence_info)
+
+        return (filtered_masks, filtered_images, frame_indices_csv, presence_info,
+                first_frame, last_frame, len(present_indices))
+
+    def _build_info_report(self, total_frames, present_indices, frame_stats,
+                           threshold_mode, threshold_value, mask_value_threshold,
+                           height, width):
+        """Generate human-readable analysis report."""
+        lines = []
+        lines.append("=" * 60)
+        lines.append("NV_MASK PRESENCE FILTER RESULTS")
+        lines.append("=" * 60)
+        lines.append(f"Input: {total_frames} frames @ {width}x{height}")
+        lines.append(f"Frames with mask present: {len(present_indices)}/{total_frames}")
+        lines.append(f"Frames filtered out: {total_frames - len(present_indices)}")
+        lines.append("")
+        lines.append("Settings:")
+        lines.append(f"  Threshold mode: {threshold_mode}")
+        if threshold_mode == "coverage_percent":
+            lines.append(f"  Minimum coverage: {threshold_value}%")
+        else:
+            lines.append(f"  Minimum pixels: {threshold_value}")
+        lines.append(f"  Mask value threshold: {mask_value_threshold}")
+        lines.append("")
+
+        if present_indices:
+            lines.append("Frame ranges with mask present:")
+            ranges = self._find_contiguous_ranges(present_indices)
+            for start, end in ranges:
+                if start == end:
+                    lines.append(f"  Frame {start}")
+                else:
+                    lines.append(f"  Frames {start}-{end} ({end - start + 1} frames)")
+            lines.append("")
+            lines.append(f"First present: frame {present_indices[0]}")
+            lines.append(f"Last present: frame {present_indices[-1]}")
+            lines.append(f"Output batch size: {len(present_indices)}")
+        else:
+            lines.append("WARNING: No frames with mask detected!")
+            lines.append("Try lowering the threshold values.")
+
+        lines.append("=" * 60)
+        return lines
+
+    def _find_contiguous_ranges(self, indices):
+        """Convert list of indices into (start, end) tuples for contiguous ranges."""
+        if not indices:
+            return []
+
+        ranges = []
+        start = indices[0]
+        end = indices[0]
+
+        for idx in indices[1:]:
+            if idx == end + 1:
+                end = idx
+            else:
+                ranges.append((start, end))
+                start = idx
+                end = idx
+        ranges.append((start, end))
+        return ranges
+
+
+# =============================================================================
+# METADATA UTILITIES
+# =============================================================================
+
+class NV_PathParser:
+    """
+    Parse a file path into its components.
+    Useful for extracting source video names from VideoHelperSuite paths,
+    since VHS_VIDEOINFO doesn't include the filename.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "file_path": ("STRING", {"forceInput": True}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("full_path", "directory", "filename", "basename", "extension")
+    FUNCTION = "parse_path"
+    CATEGORY = "NV_Utils/Metadata"
+
+    def parse_path(self, file_path):
+        """
+        Parse file path into components.
+
+        Example: "D:/videos/source/my_video.mp4"
+        Returns:
+            full_path: "D:/videos/source/my_video.mp4"
+            directory: "D:/videos/source"
+            filename: "my_video.mp4"
+            basename: "my_video"
+            extension: ".mp4"
+        """
+        from pathlib import Path
+
+        # Handle empty or None input
+        if not file_path:
+            return ("", "", "", "", "")
+
+        path = Path(file_path)
+
+        full_path = str(path)
+        directory = str(path.parent)
+        filename = path.name
+        basename = path.stem
+        extension = path.suffix
+
+        print(f"[NV_PathParser] Parsed: {filename} (basename: {basename})")
+
+        return (full_path, directory, filename, basename, extension)
+
+
+class NV_MetadataCollector:
+    """
+    Collects and aggregates workflow metadata from multiple optional inputs.
+    Outputs a unified NV_METADATA dictionary for embedding in videos or saving as sidecar JSON.
+
+    Use Case: Collect prompts, sampling parameters, LoRAs, source video names, etc.
+    into a single metadata object for archival and reproducibility.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {},
+            "optional": {
+                # Text/Prompts
+                "positive_prompt": ("STRING", {"forceInput": True}),
+                "negative_prompt": ("STRING", {"forceInput": True}),
+                "video_prompt": ("STRING", {"forceInput": True}),
+
+                # Source video info
+                "source_video_name": ("STRING", {"forceInput": True}),
+                "source_video_path": ("STRING", {"forceInput": True}),
+
+                # LoRA info (comma-separated string)
+                "loras_used": ("STRING", {"forceInput": True}),
+
+                # Sampling parameters
+                "steps": ("INT", {"forceInput": True}),
+                "cfg": ("FLOAT", {"forceInput": True}),
+                "denoise": ("FLOAT", {"forceInput": True}),
+                "seed": ("INT", {"forceInput": True}),
+                "sampler_name": ("STRING", {"forceInput": True}),
+                "scheduler": ("STRING", {"forceInput": True}),
+
+                # Model info
+                "model_name": ("STRING", {"forceInput": True}),
+                "vae_name": ("STRING", {"forceInput": True}),
+
+                # Video parameters
+                "fps": ("FLOAT", {"forceInput": True}),
+                "frame_count": ("INT", {"forceInput": True}),
+                "width": ("INT", {"forceInput": True}),
+                "height": ("INT", {"forceInput": True}),
+
+                # Custom fields (user-defined key-value pairs)
+                "custom_field_1_name": ("STRING", {"default": ""}),
+                "custom_field_1_value": ("STRING", {"forceInput": True}),
+                "custom_field_2_name": ("STRING", {"default": ""}),
+                "custom_field_2_value": ("STRING", {"forceInput": True}),
+                "custom_field_3_name": ("STRING", {"default": ""}),
+                "custom_field_3_value": ("STRING", {"forceInput": True}),
+
+                # Additional notes
+                "notes": ("STRING", {"multiline": True, "default": ""}),
+            }
+        }
+
+    RETURN_TYPES = ("NV_METADATA",)
+    RETURN_NAMES = ("metadata",)
+    FUNCTION = "collect_metadata"
+    CATEGORY = "NV_Utils/Metadata"
+
+    def collect_metadata(self, **kwargs):
+        """Aggregate all provided inputs into a metadata dictionary."""
+        from datetime import datetime
+
+        metadata = {
+            "version": "1.0",
+            "generated_at": datetime.now().isoformat(),
+            "generator": "NV_Comfy_Utils",
+        }
+
+        # Process prompts
+        prompts = {}
+        if kwargs.get("positive_prompt"):
+            prompts["positive"] = kwargs["positive_prompt"]
+        if kwargs.get("negative_prompt"):
+            prompts["negative"] = kwargs["negative_prompt"]
+        if kwargs.get("video_prompt"):
+            prompts["video"] = kwargs["video_prompt"]
+        if prompts:
+            metadata["prompts"] = prompts
+
+        # Process source video info
+        source_info = {}
+        if kwargs.get("source_video_name"):
+            source_info["filename"] = kwargs["source_video_name"]
+        if kwargs.get("source_video_path"):
+            source_info["path"] = kwargs["source_video_path"]
+        if source_info:
+            metadata["source"] = source_info
+
+        # Process LoRAs
+        if kwargs.get("loras_used"):
+            loras = [l.strip() for l in kwargs["loras_used"].split(",") if l.strip()]
+            if loras:
+                metadata["loras"] = loras
+
+        # Process sampling parameters
+        sampling = {}
+        sampling_keys = ["steps", "cfg", "denoise", "seed", "sampler_name", "scheduler"]
+        for key in sampling_keys:
+            if kwargs.get(key) is not None:
+                sampling[key] = kwargs[key]
+        if sampling:
+            metadata["sampling"] = sampling
+
+        # Process model info
+        models = {}
+        if kwargs.get("model_name"):
+            models["checkpoint"] = kwargs["model_name"]
+        if kwargs.get("vae_name"):
+            models["vae"] = kwargs["vae_name"]
+        if models:
+            metadata["models"] = models
+
+        # Process video parameters
+        video_params = {}
+        video_keys = ["fps", "frame_count", "width", "height"]
+        for key in video_keys:
+            if kwargs.get(key) is not None:
+                video_params[key] = kwargs[key]
+        if video_params:
+            metadata["video"] = video_params
+
+        # Process custom fields
+        custom = {}
+        for i in range(1, 4):
+            name_key = f"custom_field_{i}_name"
+            value_key = f"custom_field_{i}_value"
+            if kwargs.get(name_key) and kwargs.get(value_key) is not None:
+                custom[kwargs[name_key]] = kwargs[value_key]
+        if custom:
+            metadata["custom"] = custom
+
+        # Process notes
+        if kwargs.get("notes"):
+            metadata["notes"] = kwargs["notes"]
+
+        # Log summary
+        field_count = sum(1 for v in metadata.values() if v and v != "1.0" and v != "NV_Comfy_Utils")
+        print(f"[NV_MetadataCollector] Collected {field_count} metadata sections")
+
+        return (metadata,)
+
+
+class NV_MetadataSaver:
+    """
+    Saves metadata as a sidecar JSON file and optionally embeds it in video container.
+
+    The sidecar JSON is named: {video_basename}_metadata.json
+    Video embedding uses FFmpeg to write metadata to container comment field.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video_path": ("STRING", {"forceInput": True}),
+                "metadata": ("NV_METADATA",),
+                "save_sidecar": ("BOOLEAN", {"default": True}),
+                "embed_in_video": ("BOOLEAN", {"default": True}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("json_path", "info")
+    FUNCTION = "save_metadata"
+    CATEGORY = "NV_Utils/Metadata"
+    OUTPUT_NODE = True
+
+    def save_metadata(self, video_path, metadata, save_sidecar, embed_in_video):
+        """Save metadata as sidecar JSON and/or embed in video."""
+        import json
+        import subprocess
+        import shutil
+        from pathlib import Path
+
+        if not video_path or not os.path.exists(video_path):
+            return ("", f"Error: Video path not found: {video_path}")
+
+        video_path_obj = Path(video_path)
+        video_dir = video_path_obj.parent
+        video_basename = video_path_obj.stem
+
+        json_path = ""
+        info_parts = []
+
+        # Add output filename to metadata
+        metadata_copy = metadata.copy() if metadata else {}
+        metadata_copy["output_file"] = video_path_obj.name
+
+        # Save sidecar JSON
+        if save_sidecar:
+            json_filename = f"{video_basename}_metadata.json"
+            json_path = str(video_dir / json_filename)
+
+            try:
+                with open(json_path, 'w', encoding='utf-8') as f:
+                    json.dump(metadata_copy, f, indent=2, ensure_ascii=False)
+                info_parts.append(f"Sidecar saved: {json_filename}")
+                print(f"[NV_MetadataSaver] Saved sidecar: {json_path}")
+            except Exception as e:
+                info_parts.append(f"Sidecar error: {str(e)}")
+                print(f"[NV_MetadataSaver] Error saving sidecar: {e}")
+
+        # Embed in video using FFmpeg
+        if embed_in_video:
+            success = self._embed_metadata_ffmpeg(video_path, metadata_copy)
+            if success:
+                info_parts.append("Metadata embedded in video")
+            else:
+                info_parts.append("Embedding skipped (FFmpeg not available or error)")
+
+        info = " | ".join(info_parts) if info_parts else "No actions taken"
+        return (json_path, info)
+
+    def _embed_metadata_ffmpeg(self, video_path, metadata):
+        """Embed metadata in video container using FFmpeg."""
+        import json
+        import subprocess
+        import shutil
+        import tempfile
+        from pathlib import Path
+
+        # Check if FFmpeg is available
+        ffmpeg_path = shutil.which("ffmpeg")
+        if not ffmpeg_path:
+            print("[NV_MetadataSaver] FFmpeg not found, skipping video embedding")
+            return False
+
+        try:
+            # Convert metadata to JSON string
+            metadata_json = json.dumps(metadata, ensure_ascii=False)
+
+            # Create temporary metadata file in FFMETADATA1 format
+            temp_dir = tempfile.gettempdir()
+            metadata_file = os.path.join(temp_dir, "nv_metadata_temp.txt")
+
+            # Escape special characters for FFmpeg metadata
+            # FFmpeg requires escaping: = ; # \ and newline
+            escaped_json = metadata_json.replace("\\", "\\\\")
+            escaped_json = escaped_json.replace("=", "\\=")
+            escaped_json = escaped_json.replace(";", "\\;")
+            escaped_json = escaped_json.replace("#", "\\#")
+            escaped_json = escaped_json.replace("\n", " ")
+
+            with open(metadata_file, "w", encoding="utf-8") as f:
+                f.write(";FFMETADATA1\n")
+                f.write(f"comment={escaped_json}\n")
+                f.write("title=Generated by NV_Comfy_Utils\n")
+
+            # Create temporary output file
+            video_path_obj = Path(video_path)
+            temp_output = str(video_path_obj.parent / f"_temp_{video_path_obj.name}")
+
+            # Run FFmpeg to copy video with new metadata
+            cmd = [
+                ffmpeg_path, '-y',
+                '-i', video_path,
+                '-i', metadata_file,
+                '-map', '0',
+                '-map_metadata', '1',
+                '-c', 'copy',
+                temp_output
+            ]
+
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+
+            if result.returncode == 0:
+                # Replace original with new file
+                os.replace(temp_output, video_path)
+                print(f"[NV_MetadataSaver] Embedded metadata in video: {video_path_obj.name}")
+                return True
+            else:
+                print(f"[NV_MetadataSaver] FFmpeg error: {result.stderr}")
+                # Clean up temp file if it exists
+                if os.path.exists(temp_output):
+                    os.remove(temp_output)
+                return False
+
+        except subprocess.TimeoutExpired:
+            print("[NV_MetadataSaver] FFmpeg timeout")
+            return False
+        except Exception as e:
+            print(f"[NV_MetadataSaver] Embedding error: {e}")
+            return False
+        finally:
+            # Clean up metadata file
+            if os.path.exists(metadata_file):
+                try:
+                    os.remove(metadata_file)
+                except:
+                    pass
+
+
 # Register the nodes (NodeBypasser is frontend-only, no Python registration needed)
 NODE_CLASS_MAPPINGS = {
     "KNF_Organizer": KNF_Organizer,
@@ -6722,6 +7269,10 @@ NODE_CLASS_MAPPINGS = {
     "NV_ChunkConditioningPreprocessor": NV_ChunkConditioningPreprocessor,
     "NV_VACEContextWindowPatcher": NV_VACEContextWindowPatcher,
     "NV_MultiModelSampler": NV_MultiModelSampler,
+    "NV_MaskPresenceFilter": NV_MaskPresenceFilter,
+    "NV_PathParser": NV_PathParser,
+    "NV_MetadataCollector": NV_MetadataCollector,
+    "NV_MetadataSaver": NV_MetadataSaver,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -6738,6 +7289,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NV_ChunkConditioningPreprocessor": "NV Chunk Conditioning Preprocessor",
     "NV_VACEContextWindowPatcher": "NV VACE Context Window Patcher",
     "NV_MultiModelSampler": "NV Multi-Model Sampler",
+    "NV_MaskPresenceFilter": "NV Mask Presence Filter",
+    "NV_PathParser": "NV Path Parser",
+    "NV_MetadataCollector": "NV Metadata Collector",
+    "NV_MetadataSaver": "NV Metadata Saver",
 }
 
 # Conditionally add NV_Video_Loader_Path if it imported successfully
