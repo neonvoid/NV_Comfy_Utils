@@ -17,6 +17,11 @@ from comfy.context_windows import IndexListCallbacks, IndexListContextWindow
 # Keys in conditioning that contain list-wrapped tensors needing slicing
 VACE_TENSOR_KEYS = ["vace_frames", "vace_mask"]
 
+# Threshold for CPU offload: videos longer than this cache to CPU to avoid OOM
+# 100 latent frames ≈ 400 pixel frames. Below this, GPU cache is fast and fits.
+# Above this, we offload to CPU and transfer one window at a time.
+LONG_VIDEO_THRESHOLD = 100
+
 # Cache for original full-length tensors, keyed by cond_dict uuid
 # This is necessary because we modify conds in-place, and need to preserve
 # originals for subsequent windows within the same timestep
@@ -55,12 +60,17 @@ def slice_vace_conditioning(handler, model, x_in, conds, timestep, model_options
     dim = handler.dim  # dim=2 for WAN models (temporal dimension)
     full_temporal_size = x_in.size(dim)  # Full video length (e.g., 48 frames)
 
+    # Adaptive CPU offload: for long videos, cache on CPU to avoid OOM
+    use_cpu_cache = full_temporal_size > LONG_VIDEO_THRESHOLD
+
     # Debug: Log callback invocation
     if window_idx == 0:  # Only log first window to reduce noise
         print(f"[VACE Slicer] Callback invoked for window {window_idx}")
         print(f"[VACE Slicer] x_in shape: {x_in.shape}, dim={dim}")
         print(f"[VACE Slicer] Window indices: {window.index_list[:5]}...{window.index_list[-5:] if len(window.index_list) > 5 else ''}")
         print(f"[VACE Slicer] Number of cond lists: {len(conds)}")
+        if use_cpu_cache:
+            print(f"[VACE Slicer] Long video detected ({full_temporal_size} frames > {LONG_VIDEO_THRESHOLD}), using CPU cache")
 
     for cond_list in conds:
         if cond_list is None:
@@ -100,9 +110,15 @@ def slice_vace_conditioning(handler, model, x_in, conds, timestep, model_options
                         if isinstance(first_tensor, torch.Tensor) and first_tensor.ndim > dim:
                             if first_tensor.size(dim) == full_temporal_size:
                                 # This is the original full-length tensor, cache it
-                                cache[key] = [t.clone() if isinstance(t, torch.Tensor) else t for t in tensor_list]
+                                if use_cpu_cache:
+                                    # Long video: cache on CPU to avoid OOM
+                                    cache[key] = [t.cpu().clone() if isinstance(t, torch.Tensor) else t for t in tensor_list]
+                                else:
+                                    # Short video: cache on GPU for speed
+                                    cache[key] = [t.clone() if isinstance(t, torch.Tensor) else t for t in tensor_list]
                                 if window_idx == 0 and cond_idx == 0:
-                                    print(f"[VACE Slicer] Cached original {key}: shape {first_tensor.shape}")
+                                    cache_loc = "CPU" if use_cpu_cache else "GPU"
+                                    print(f"[VACE Slicer] Cached original {key}: shape {first_tensor.shape} ({cache_loc})")
 
                 # Slice from cached original
                 if key in cache:
@@ -110,7 +126,9 @@ def slice_vace_conditioning(handler, model, x_in, conds, timestep, model_options
                     sliced_list = []
                     for tensor in original_list:
                         if isinstance(tensor, torch.Tensor):
-                            sliced_tensor = window.get_tensor(tensor, device, dim=dim)
+                            # If cached on CPU, move to GPU before slicing
+                            tensor_for_slice = tensor.to(device) if use_cpu_cache else tensor
+                            sliced_tensor = window.get_tensor(tensor_for_slice, device, dim=dim)
                             sliced_list.append(sliced_tensor)
                             if window_idx == 0 and cond_idx == 0:
                                 print(f"[VACE Slicer] Sliced {key}: {tensor.shape} -> {sliced_tensor.shape}")
@@ -134,15 +152,23 @@ def slice_vace_conditioning(handler, model, x_in, conds, timestep, model_options
                     # Cache original vace_context if not already cached
                     if vace_context_key not in cache:
                         if vace_tensor.ndim > vace_temporal_dim and vace_tensor.size(vace_temporal_dim) == full_temporal_size:
-                            cache[vace_context_key] = vace_context._copy_with(vace_tensor.clone())
+                            if use_cpu_cache:
+                                # Long video: cache on CPU to avoid OOM
+                                cache[vace_context_key] = vace_context._copy_with(vace_tensor.cpu().clone())
+                            else:
+                                # Short video: cache on GPU for speed
+                                cache[vace_context_key] = vace_context._copy_with(vace_tensor.clone())
                             if window_idx == 0 and cond_idx == 0:
-                                print(f"[VACE Slicer] Cached original vace_context: shape {vace_tensor.shape}")
+                                cache_loc = "CPU" if use_cpu_cache else "GPU"
+                                print(f"[VACE Slicer] Cached original vace_context: shape {vace_tensor.shape} ({cache_loc})")
 
                     # Slice from cached original
                     if vace_context_key in cache:
                         original_vace_context = cache[vace_context_key]
                         original_tensor = original_vace_context.cond
-                        sliced_tensor = window.get_tensor(original_tensor, device, dim=vace_temporal_dim)
+                        # If cached on CPU, move to GPU before slicing
+                        tensor_for_slice = original_tensor.to(device) if use_cpu_cache else original_tensor
+                        sliced_tensor = window.get_tensor(tensor_for_slice, device, dim=vace_temporal_dim)
                         model_conds["vace_context"] = original_vace_context._copy_with(sliced_tensor)
                         if window_idx == 0 and cond_idx == 0:
                             print(f"[VACE Slicer] Sliced vace_context: {original_tensor.shape} -> {sliced_tensor.shape}")
