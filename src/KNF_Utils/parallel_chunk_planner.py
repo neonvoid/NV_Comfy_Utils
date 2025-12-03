@@ -35,11 +35,8 @@ class NV_ParallelChunkPlanner:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "total_frames": ("INT", {
-                    "default": 200,
-                    "min": 1,
-                    "max": 100000,
-                    "tooltip": "Total number of frames in the input video"
+                "video": ("IMAGE", {
+                    "tooltip": "Input video frames [T, H, W, C] - used to get total frame count and resolution"
                 }),
                 "num_workers": ("INT", {
                     "default": 2,
@@ -117,12 +114,21 @@ class NV_ParallelChunkPlanner:
     CATEGORY = "NV_Utils"
     DESCRIPTION = "Plans video chunk splits for parallel processing. Exports JSON config for multiple workers."
 
-    def plan_chunks(self, total_frames, num_workers, overlap_frames, output_json_path,
+    def plan_chunks(self, video, num_workers, overlap_frames, output_json_path,
                     seed=0, steps=20, cfg=5.0, sampler_name="euler", scheduler="sgm_uniform",
                     denoise=0.75, context_window_size=81, context_overlap=16):
         """
         Calculate chunk boundaries and export plan to JSON.
         """
+
+        # Extract video metadata from tensor shape [T, H, W, C]
+        total_frames = video.shape[0]
+        height = video.shape[1]
+        width = video.shape[2]
+
+        print(f"[NV_ParallelChunkPlanner] Video metadata:")
+        print(f"  Total frames: {total_frames}")
+        print(f"  Resolution: {width}x{height}")
 
         # Validate inputs
         if overlap_frames >= total_frames // num_workers:
@@ -182,7 +188,11 @@ class NV_ParallelChunkPlanner:
         # Build the plan
         plan = {
             "version": "1.0",
-            "total_frames": total_frames,
+            "video_metadata": {
+                "total_frames": total_frames,
+                "height": height,
+                "width": width,
+            },
             "num_workers": num_workers,
             "overlap_frames": overlap_frames,
             "chunks": chunks,
@@ -216,7 +226,7 @@ class NV_ParallelChunkPlanner:
             "=" * 50,
             "PARALLEL CHUNK PLAN",
             "=" * 50,
-            f"Total frames: {total_frames}",
+            f"Video: {total_frames} frames @ {width}x{height}",
             f"Workers: {num_workers}",
             f"Overlap: {overlap_frames} frames",
             "",

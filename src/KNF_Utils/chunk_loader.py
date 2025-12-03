@@ -86,8 +86,32 @@ class NV_ChunkLoader:
         start_frame = chunk["start_frame"]
         end_frame = chunk["end_frame"]
 
-        # Validate video length
+        # Validate video dimensions match plan
         total_video_frames = video.shape[0]
+        video_height = video.shape[1]
+        video_width = video.shape[2]
+
+        # Check against video_metadata if present (new format)
+        video_metadata = plan.get("video_metadata", {})
+        expected_frames = video_metadata.get("total_frames", plan.get("total_frames"))
+        expected_height = video_metadata.get("height")
+        expected_width = video_metadata.get("width")
+
+        if expected_frames and total_video_frames != expected_frames:
+            raise ValueError(
+                f"Video frame count mismatch! Plan expects {expected_frames} frames, "
+                f"but input video has {total_video_frames} frames.\n"
+                f"Make sure you're using the same video that was planned for."
+            )
+
+        if expected_height and expected_width:
+            if video_height != expected_height or video_width != expected_width:
+                raise ValueError(
+                    f"Video resolution mismatch! Plan expects {expected_width}x{expected_height}, "
+                    f"but input video is {video_width}x{video_height}.\n"
+                    f"Make sure you're using the same video that was planned for."
+                )
+
         if end_frame > total_video_frames:
             raise ValueError(
                 f"Chunk {chunk_index} requires frames {start_frame}-{end_frame-1}, "
@@ -183,6 +207,29 @@ class NV_ChunkLoaderAdvanced:
         chunk = plan["chunks"][chunk_index]
         start_frame = chunk["start_frame"]
         end_frame = chunk["end_frame"]
+
+        # Validate video dimensions match plan
+        total_video_frames = video.shape[0]
+        video_height = video.shape[1]
+        video_width = video.shape[2]
+
+        video_metadata = plan.get("video_metadata", {})
+        expected_frames = video_metadata.get("total_frames", plan.get("total_frames"))
+        expected_height = video_metadata.get("height")
+        expected_width = video_metadata.get("width")
+
+        if expected_frames and total_video_frames != expected_frames:
+            raise ValueError(
+                f"Video frame count mismatch! Plan expects {expected_frames} frames, "
+                f"but input video has {total_video_frames} frames."
+            )
+
+        if expected_height and expected_width:
+            if video_height != expected_height or video_width != expected_width:
+                raise ValueError(
+                    f"Video resolution mismatch! Plan expects {expected_width}x{expected_height}, "
+                    f"but input video is {video_width}x{video_height}."
+                )
 
         # Extract chunk frames
         chunk_video = video[start_frame:end_frame].clone()
