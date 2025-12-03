@@ -30,6 +30,10 @@ from .streaming_vae_decode import NV_StreamingVAEDecode
 from .streaming_vae_encode import NV_StreamingVAEEncode
 # Import WAN memory estimator
 from .wan_memory_estimator import NV_WANMemoryEstimator
+# Import parallel chunk processing nodes
+from .parallel_chunk_planner import NV_ParallelChunkPlanner
+from .chunk_loader import NV_ChunkLoader, NV_ChunkLoaderAdvanced
+from .chunk_stitcher import NV_ChunkStitcher, NV_ChunkStitcherFromImages
 import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend for server-side rendering
 import matplotlib.pyplot as plt
@@ -7278,6 +7282,11 @@ NODE_CLASS_MAPPINGS = {
     "NV_StreamingVAEDecode": NV_StreamingVAEDecode,
     "NV_StreamingVAEEncode": NV_StreamingVAEEncode,
     "NV_WANMemoryEstimator": NV_WANMemoryEstimator,
+    "NV_ParallelChunkPlanner": NV_ParallelChunkPlanner,
+    "NV_ChunkLoader": NV_ChunkLoader,
+    "NV_ChunkLoaderAdvanced": NV_ChunkLoaderAdvanced,
+    "NV_ChunkStitcher": NV_ChunkStitcher,
+    "NV_ChunkStitcherFromImages": NV_ChunkStitcherFromImages,
     "NV_MaskPresenceFilter": NV_MaskPresenceFilter,
     "NV_PathParser": NV_PathParser,
     "NV_MetadataCollector": NV_MetadataCollector,
@@ -7301,6 +7310,11 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NV_StreamingVAEDecode": "NV Streaming VAE Decode",
     "NV_StreamingVAEEncode": "NV Streaming VAE Encode",
     "NV_WANMemoryEstimator": "NV WAN Memory Estimator",
+    "NV_ParallelChunkPlanner": "NV Parallel Chunk Planner",
+    "NV_ChunkLoader": "NV Chunk Loader",
+    "NV_ChunkLoaderAdvanced": "NV Chunk Loader (Advanced)",
+    "NV_ChunkStitcher": "NV Chunk Stitcher (From Files)",
+    "NV_ChunkStitcherFromImages": "NV Chunk Stitcher (From Images)",
     "NV_MaskPresenceFilter": "NV Mask Presence Filter",
     "NV_PathParser": "NV Path Parser",
     "NV_MetadataCollector": "NV Metadata Collector",
