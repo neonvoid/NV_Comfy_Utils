@@ -26,6 +26,8 @@ from .vace_context_window import NV_VACEContextWindowPatcher
 from .multi_model_sampler import NV_MultiModelSampler
 # Import streaming VAE decode for long videos
 from .streaming_vae_decode import NV_StreamingVAEDecode
+# Import streaming VAE encode for long videos (frees GPU before WAN model loading)
+from .streaming_vae_encode import NV_StreamingVAEEncode
 # Import WAN memory estimator
 from .wan_memory_estimator import NV_WANMemoryEstimator
 import matplotlib
@@ -7274,6 +7276,7 @@ NODE_CLASS_MAPPINGS = {
     "NV_VACEContextWindowPatcher": NV_VACEContextWindowPatcher,
     "NV_MultiModelSampler": NV_MultiModelSampler,
     "NV_StreamingVAEDecode": NV_StreamingVAEDecode,
+    "NV_StreamingVAEEncode": NV_StreamingVAEEncode,
     "NV_WANMemoryEstimator": NV_WANMemoryEstimator,
     "NV_MaskPresenceFilter": NV_MaskPresenceFilter,
     "NV_PathParser": NV_PathParser,
@@ -7296,6 +7299,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NV_VACEContextWindowPatcher": "NV VACE Context Window Patcher",
     "NV_MultiModelSampler": "NV Multi-Model Sampler",
     "NV_StreamingVAEDecode": "NV Streaming VAE Decode",
+    "NV_StreamingVAEEncode": "NV Streaming VAE Encode",
     "NV_WANMemoryEstimator": "NV WAN Memory Estimator",
     "NV_MaskPresenceFilter": "NV Mask Presence Filter",
     "NV_PathParser": "NV Path Parser",
