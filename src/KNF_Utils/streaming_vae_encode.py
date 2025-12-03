@@ -166,7 +166,10 @@ class NV_StreamingVAEEncode:
 
         # Concatenate latent chunks on CPU
         print(f"[NV_StreamingVAEEncode] Concatenating {num_chunks} latent chunks on CPU...")
-        output = torch.cat(encoded_chunks, dim=2)
+        # IMPORTANT: Convert to float32 to match ComfyUI's standard VAE.encode() behavior
+        # ComfyUI's sd.py line 782 calls .float() on encoder output
+        # Without this, downstream nodes (sampler sigmas) get dtype mismatches
+        output = torch.cat(encoded_chunks, dim=2).float()
 
         # Clean up
         del encoded_chunks
