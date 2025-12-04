@@ -32,7 +32,7 @@ from .streaming_vae_encode import NV_StreamingVAEEncode
 from .wan_memory_estimator import NV_WANMemoryEstimator
 # Import parallel chunk processing nodes
 from .parallel_chunk_planner import NV_ParallelChunkPlanner
-from .chunk_loader import NV_ChunkLoader, NV_ChunkLoaderAdvanced
+from .chunk_loader import NV_ChunkLoader, NV_ChunkLoaderAdvanced, NV_ChunkLoaderVACE
 from .chunk_stitcher import NV_ChunkStitcher, NV_ChunkStitcherFromImages
 import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend for server-side rendering
@@ -7285,6 +7285,7 @@ NODE_CLASS_MAPPINGS = {
     "NV_ParallelChunkPlanner": NV_ParallelChunkPlanner,
     "NV_ChunkLoader": NV_ChunkLoader,
     "NV_ChunkLoaderAdvanced": NV_ChunkLoaderAdvanced,
+    "NV_ChunkLoaderVACE": NV_ChunkLoaderVACE,
     "NV_ChunkStitcher": NV_ChunkStitcher,
     "NV_ChunkStitcherFromImages": NV_ChunkStitcherFromImages,
     "NV_MaskPresenceFilter": NV_MaskPresenceFilter,
@@ -7313,6 +7314,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NV_ParallelChunkPlanner": "NV Parallel Chunk Planner",
     "NV_ChunkLoader": "NV Chunk Loader",
     "NV_ChunkLoaderAdvanced": "NV Chunk Loader (Advanced)",
+    "NV_ChunkLoaderVACE": "NV Chunk Loader (VACE)",
     "NV_ChunkStitcher": "NV Chunk Stitcher (From Files)",
     "NV_ChunkStitcherFromImages": "NV Chunk Stitcher (From Images)",
     "NV_MaskPresenceFilter": "NV Mask Presence Filter",
