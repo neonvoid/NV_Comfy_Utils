@@ -309,9 +309,10 @@ class NV_ChunkLoaderVACE:
         }
 
     RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "IMAGE", "IMAGE",
-                    "INT", "INT", "FLOAT", "FLOAT", "STRING",)
+                    "INT", "INT", "INT", "FLOAT", "FLOAT", "STRING", "STRING", "INT", "INT", "STRING",)
     RETURN_NAMES = ("chunk_video", "chunk_ctrl_1", "chunk_ctrl_2", "chunk_ctrl_3", "chunk_ctrl_4",
-                    "seed", "steps", "cfg", "denoise", "chunk_info",)
+                    "chunk_index", "seed", "steps", "cfg", "denoise", "sampler_name", "scheduler",
+                    "context_window_size", "context_overlap", "chunk_info",)
     FUNCTION = "load_chunk"
     CATEGORY = "NV_Utils"
     DESCRIPTION = "Loads video chunk AND control videos for VACE parallel processing. Controls are sliced in sync."
@@ -385,12 +386,16 @@ class NV_ChunkLoaderVACE:
             else:
                 chunk_controls.append(None)
 
-        # Get shared parameters
+        # Get all shared parameters
         params = plan.get("shared_params", {})
         seed = params.get("seed", 0)
         steps = params.get("steps", 20)
         cfg = params.get("cfg", 5.0)
         denoise = params.get("denoise", 0.75)
+        sampler_name = params.get("sampler_name", "euler")
+        scheduler = params.get("scheduler", "sgm_uniform")
+        context_window_size = params.get("context_window_size", 81)
+        context_overlap = params.get("context_overlap", 16)
 
         # Build info string
         num_controls = sum(1 for c in chunk_controls if c is not None)
@@ -402,6 +407,10 @@ class NV_ChunkLoaderVACE:
             f"Steps: {steps}",
             f"CFG: {cfg}",
             f"Denoise: {denoise}",
+            f"Sampler: {sampler_name}",
+            f"Scheduler: {scheduler}",
+            f"Context Window: {context_window_size}",
+            f"Context Overlap: {context_overlap}",
         ]
 
         chunk_info = "\n".join(info_lines)
@@ -411,7 +420,8 @@ class NV_ChunkLoaderVACE:
         print(f"  Controls sliced: {num_controls}")
 
         return (chunk_video, chunk_controls[0], chunk_controls[1], chunk_controls[2], chunk_controls[3],
-                seed, steps, cfg, denoise, chunk_info)
+                chunk_index, seed, steps, cfg, denoise, sampler_name, scheduler,
+                context_window_size, context_overlap, chunk_info)
 
 
 # Node registration
