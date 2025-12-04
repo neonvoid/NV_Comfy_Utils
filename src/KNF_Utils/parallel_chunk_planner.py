@@ -154,23 +154,24 @@ class NV_ParallelChunkPlanner:
         extra_frames = unique_frames_total % num_workers
 
         chunks = []
-        current_frame = 0
 
         for i in range(num_workers):
             # This worker gets base + 1 extra frame if there are remainders
             unique_frames = base_unique_per_worker + (1 if i < extra_frames else 0)
 
-            # First chunk starts at 0, subsequent chunks start overlap_frames before their unique section
+            # Calculate chunk boundaries
             if i == 0:
+                # First chunk starts at 0
                 start_frame = 0
-            else:
-                start_frame = current_frame - overlap_frames
-
-            # End frame is start + unique + overlap (except last chunk has no trailing overlap)
-            if i < num_workers - 1:
+                end_frame = unique_frames + overlap_frames
+            elif i < num_workers - 1:
+                # Middle chunks: start where previous chunk's overlap begins
+                start_frame = chunks[i-1]["end_frame"] - overlap_frames
                 end_frame = start_frame + unique_frames + overlap_frames
             else:
-                end_frame = total_frames  # Last chunk goes to the end
+                # Last chunk: starts at overlap, ends at total_frames
+                start_frame = chunks[i-1]["end_frame"] - overlap_frames
+                end_frame = total_frames
 
             chunks.append({
                 "chunk_idx": i,
@@ -181,9 +182,6 @@ class NV_ParallelChunkPlanner:
                 "vace_start": start_frame,
                 "vace_end": end_frame,
             })
-
-            # Move to next unique section
-            current_frame += unique_frames
 
         # Build the plan
         plan = {

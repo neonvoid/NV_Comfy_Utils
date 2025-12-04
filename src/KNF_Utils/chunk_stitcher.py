@@ -224,6 +224,10 @@ class NV_ChunkStitcherFromImages:
 
     Use this when chunks are already loaded in ComfyUI rather than on disk.
     Supports up to 4 chunk inputs.
+
+    IMPORTANT: crossfade_frames MUST match overlap_frames from NV_ParallelChunkPlanner!
+    If they don't match, you'll get visible ghosting at chunk boundaries because
+    the crossfade will blend non-matching frame content.
     """
 
     @classmethod
@@ -235,7 +239,7 @@ class NV_ChunkStitcherFromImages:
                     "default": 32,
                     "min": 0,
                     "max": 128,
-                    "tooltip": "Number of frames to crossfade between chunks"
+                    "tooltip": "MUST match overlap_frames from NV_ParallelChunkPlanner! Mismatched values cause ghosting."
                 }),
             },
             "optional": {
@@ -249,7 +253,7 @@ class NV_ChunkStitcherFromImages:
     RETURN_NAMES = ("stitched_video", "stitch_info",)
     FUNCTION = "stitch_chunks"
     CATEGORY = "NV_Utils"
-    DESCRIPTION = "Stitches video chunks from IMAGE inputs with crossfade blending."
+    DESCRIPTION = "Stitches video chunks from IMAGE inputs. IMPORTANT: crossfade_frames must match overlap_frames from planner!"
 
     def stitch_chunks(self, chunk_0, crossfade_frames,
                       chunk_1=None, chunk_2=None, chunk_3=None):

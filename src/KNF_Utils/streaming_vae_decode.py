@@ -69,7 +69,25 @@ class NV_StreamingVAEDecode:
         but move each frame to CPU immediately.
         """
         z = samples["samples"]
+
+        # Validate input latent shape
+        if len(z.shape) != 5:
+            raise ValueError(
+                f"[NV_StreamingVAEDecode] Expected 5D latent [B, C, T, H, W], "
+                f"but got shape: {z.shape}. "
+                f"Check that the upstream sampler produced valid WAN video latents."
+            )
+
         total_frames = z.shape[2]
+
+        # Validate temporal dimension
+        if total_frames == 0:
+            raise ValueError(
+                f"[NV_StreamingVAEDecode] Input latent has 0 temporal frames! "
+                f"Shape: {z.shape}. "
+                f"The upstream sampler produced empty output. "
+                f"This may indicate a context window or sampling issue."
+            )
 
         print(f"[NV_StreamingVAEDecode] Starting decode of {total_frames} latent frames")
         print(f"[NV_StreamingVAEDecode] Input shape: {z.shape}")
