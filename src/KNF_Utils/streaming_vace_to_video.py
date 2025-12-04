@@ -126,7 +126,11 @@ def streaming_vae_encode(vae, pixels, cache_clear_interval=4):
     # Clean up
     del encoded_chunks
 
-    return output
+    # Move to VAE's output_device to match native VAE.encode() behavior
+    # Native VAE.encode() uses: out.to(self.output_device).float()
+    # Without this, VACE conditioning contains CPU tensors which causes hangs
+    # when used with context windows (device mismatch during sampling)
+    return output.to(vae.output_device)
 
 
 class NV_WanVaceToVideoStreaming:

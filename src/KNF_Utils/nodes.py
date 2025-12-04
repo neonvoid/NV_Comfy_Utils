@@ -36,6 +36,8 @@ from .chunk_loader import NV_ChunkLoader, NV_ChunkLoaderAdvanced, NV_ChunkLoader
 from .chunk_stitcher import NV_ChunkStitcher, NV_ChunkStitcherFromImages
 # Import streaming VACE to video for long video VACE conditioning
 from .streaming_vace_to_video import NV_WanVaceToVideoStreaming
+# Import B2 output sync for cloud storage
+from .b2_output_sync import NV_B2OutputSync
 import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend for server-side rendering
 import matplotlib.pyplot as plt
@@ -7295,6 +7297,7 @@ NODE_CLASS_MAPPINGS = {
     "NV_PathParser": NV_PathParser,
     "NV_MetadataCollector": NV_MetadataCollector,
     "NV_MetadataSaver": NV_MetadataSaver,
+    "NV_B2OutputSync": NV_B2OutputSync,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -7325,6 +7328,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NV_PathParser": "NV Path Parser",
     "NV_MetadataCollector": "NV Metadata Collector",
     "NV_MetadataSaver": "NV Metadata Saver",
+    "NV_B2OutputSync": "NV B2 Output Sync",
 }
 
 # Conditionally add NV_Video_Loader_Path if it imported successfully

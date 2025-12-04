@@ -174,6 +174,10 @@ class NV_StreamingVAEEncode:
         # Clean up
         del encoded_chunks
 
+        # Move to VAE's output_device to match native VAE.encode() behavior
+        # Native VAE.encode() uses: out.to(self.output_device).float()
+        output = output.to(vae.output_device)
+
         print(f"[NV_StreamingVAEEncode] Done. Output latent shape: {output.shape}")
 
         # Calculate memory savings
