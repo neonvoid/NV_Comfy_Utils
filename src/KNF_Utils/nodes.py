@@ -34,6 +34,8 @@ from .wan_memory_estimator import NV_WANMemoryEstimator
 from .parallel_chunk_planner import NV_ParallelChunkPlanner
 from .chunk_loader import NV_ChunkLoader, NV_ChunkLoaderAdvanced, NV_ChunkLoaderVACE
 from .chunk_stitcher import NV_ChunkStitcher, NV_ChunkStitcherFromImages
+# Import streaming VACE to video for long video VACE conditioning
+from .streaming_vace_to_video import NV_WanVaceToVideoStreaming
 import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend for server-side rendering
 import matplotlib.pyplot as plt
@@ -7288,6 +7290,7 @@ NODE_CLASS_MAPPINGS = {
     "NV_ChunkLoaderVACE": NV_ChunkLoaderVACE,
     "NV_ChunkStitcher": NV_ChunkStitcher,
     "NV_ChunkStitcherFromImages": NV_ChunkStitcherFromImages,
+    "NV_WanVaceToVideoStreaming": NV_WanVaceToVideoStreaming,
     "NV_MaskPresenceFilter": NV_MaskPresenceFilter,
     "NV_PathParser": NV_PathParser,
     "NV_MetadataCollector": NV_MetadataCollector,
@@ -7317,6 +7320,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NV_ChunkLoaderVACE": "NV Chunk Loader (VACE)",
     "NV_ChunkStitcher": "NV Chunk Stitcher (From Files)",
     "NV_ChunkStitcherFromImages": "NV Chunk Stitcher (From Images)",
+    "NV_WanVaceToVideoStreaming": "NV VACE To Video (Streaming)",
     "NV_MaskPresenceFilter": "NV Mask Presence Filter",
     "NV_PathParser": "NV Path Parser",
     "NV_MetadataCollector": "NV Metadata Collector",
