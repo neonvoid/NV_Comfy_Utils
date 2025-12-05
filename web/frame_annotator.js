@@ -52,9 +52,6 @@ app.registerExtension({
                 multiline: false
             }], app).widget;
             frameCounterWidget.name = "Frame Display";
-            frameCounterWidget.inputEl.readOnly = true;
-            frameCounterWidget.inputEl.style.textAlign = "center";
-            frameCounterWidget.inputEl.style.fontWeight = "bold";
 
             // === Frame Scrubber Slider ===
             const scrubberWidget = node.addWidget("slider", "frame_scrubber", 0, (value) => {
@@ -93,8 +90,6 @@ app.registerExtension({
                 multiline: true
             }], app).widget;
             markedDisplayWidget.name = "Marked Frames";
-            markedDisplayWidget.inputEl.readOnly = true;
-            markedDisplayWidget.inputEl.style.fontSize = "11px";
 
             // Store widget references
             node._frameCounterWidget = frameCounterWidget;
