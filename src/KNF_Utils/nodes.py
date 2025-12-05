@@ -38,6 +38,8 @@ from .chunk_stitcher import NV_ChunkStitcher, NV_ChunkStitcherFromImages
 from .streaming_vace_to_video import NV_WanVaceToVideoStreaming
 # Import B2 output sync for cloud storage
 from .b2_output_sync import NV_B2OutputSync
+# Import VACE benchmark logger for memory analysis
+from .vace_benchmark import NV_VACEBenchmarkLogger
 import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend for server-side rendering
 import matplotlib.pyplot as plt
@@ -7399,6 +7401,7 @@ NODE_CLASS_MAPPINGS = {
     "NV_MetadataSaver": NV_MetadataSaver,
     "NV_B2OutputSync": NV_B2OutputSync,
     "NV_FrameAnnotator": NV_FrameAnnotator,
+    "NV_VACEBenchmarkLogger": NV_VACEBenchmarkLogger,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -7431,6 +7434,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NV_MetadataSaver": "NV Metadata Saver",
     "NV_B2OutputSync": "NV B2 Output Sync",
     "NV_FrameAnnotator": "NV Frame Annotator",
+    "NV_VACEBenchmarkLogger": "NV VACE Benchmark Logger",
 }
 
 # Conditionally add NV_Video_Loader_Path if it imported successfully
