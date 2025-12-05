@@ -7268,6 +7268,106 @@ class NV_MetadataSaver:
                     pass
 
 
+class NV_FrameAnnotator:
+    """
+    Frame-by-frame video annotation node.
+    Allows scrubbing through video frames and marking specific frames for selection.
+    Exports marked frame indices to JSON.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),  # [B, H, W, C] video frames
+                "marked_frames": ("STRING", {
+                    "default": "",
+                    "multiline": False,
+                    "tooltip": "Comma-separated list of marked frame indices (managed by frontend widget)"
+                }),
+                "output_filename": ("STRING", {
+                    "default": "frame_annotations",
+                    "tooltip": "Base filename for JSON export (without extension)"
+                }),
+            },
+            "optional": {
+                "custom_output_dir": ("STRING", {
+                    "default": "",
+                    "forceInput": True,
+                    "tooltip": "Optional custom output directory path"
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "IMAGE", "INT")
+    RETURN_NAMES = ("json_path", "marked_frames_csv", "marked_images", "frame_count")
+    FUNCTION = "annotate_frames"
+    CATEGORY = "NV_Utils/Video"
+    OUTPUT_NODE = True
+
+    def annotate_frames(self, images, marked_frames, output_filename, custom_output_dir=""):
+        # Get frame count from tensor
+        total_frames = images.shape[0]
+        height = images.shape[1]
+        width = images.shape[2]
+        channels = images.shape[3] if len(images.shape) > 3 else 3
+
+        # Parse marked frames from comma-separated string
+        marked_indices = []
+        if marked_frames.strip():
+            for x in marked_frames.split(","):
+                x = x.strip()
+                if x.isdigit():
+                    idx = int(x)
+                    if 0 <= idx < total_frames:
+                        marked_indices.append(idx)
+
+        # Remove duplicates and sort
+        marked_indices = sorted(list(set(marked_indices)))
+
+        # Determine output directory
+        if custom_output_dir and os.path.isdir(custom_output_dir):
+            output_dir = custom_output_dir
+        else:
+            output_dir = folder_paths.get_output_directory()
+
+        # Build annotation data
+        annotation_data = {
+            "version": "1.0",
+            "total_frames": total_frames,
+            "marked_frames": marked_indices,
+            "marked_count": len(marked_indices),
+            "frame_dimensions": {
+                "height": height,
+                "width": width,
+                "channels": channels
+            },
+            "timestamp": datetime.now().isoformat()
+        }
+
+        # Export JSON
+        json_filename = f"{output_filename}.json"
+        json_path = os.path.join(output_dir, json_filename)
+
+        with open(json_path, 'w') as f:
+            json.dump(annotation_data, f, indent=2)
+
+        print(f"[NV_FrameAnnotator] Exported {len(marked_indices)} marked frames to {json_path}")
+
+        # Extract marked images as separate tensor
+        if marked_indices:
+            indices_tensor = torch.tensor(marked_indices, dtype=torch.long, device=images.device)
+            marked_images = torch.index_select(images, 0, indices_tensor)
+        else:
+            # Return empty tensor with same spatial dimensions
+            marked_images = torch.zeros((0, height, width, channels), dtype=images.dtype, device=images.device)
+
+        # Return CSV of marked frames for downstream use
+        marked_frames_csv = ",".join(str(i) for i in marked_indices)
+
+        return (json_path, marked_frames_csv, marked_images, total_frames)
+
+
 # Register the nodes (NodeBypasser is frontend-only, no Python registration needed)
 NODE_CLASS_MAPPINGS = {
     "KNF_Organizer": KNF_Organizer,
@@ -7298,6 +7398,7 @@ NODE_CLASS_MAPPINGS = {
     "NV_MetadataCollector": NV_MetadataCollector,
     "NV_MetadataSaver": NV_MetadataSaver,
     "NV_B2OutputSync": NV_B2OutputSync,
+    "NV_FrameAnnotator": NV_FrameAnnotator,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -7329,6 +7430,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NV_MetadataCollector": "NV Metadata Collector",
     "NV_MetadataSaver": "NV Metadata Saver",
     "NV_B2OutputSync": "NV B2 Output Sync",
+    "NV_FrameAnnotator": "NV Frame Annotator",
 }
 
 # Conditionally add NV_Video_Loader_Path if it imported successfully
