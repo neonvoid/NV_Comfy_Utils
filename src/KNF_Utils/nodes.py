@@ -2339,6 +2339,243 @@ class VAE_Correction_Applier:
         return (corrected_tensor, report_text)
 
 
+class NV_AdaptiveShiftApplier:
+    """
+    Adaptive Shift Calculator and Applier for WAN Video Models.
+
+    Calculates optimal shift value based on workflow parameters and patches the model.
+
+    Key insight: Shift affects WHERE denoising power is concentrated:
+    - High shift (6-9): More power in early steps → better structure/motion
+    - Low shift (3-5): More power in late steps → better details/textures
+
+    For denoise < 1.0 (vid2vid), structure already exists from source,
+    so LOWER shift is optimal to focus on detail preservation.
+
+    Based on research from:
+    - WAN 2.2 MOE architecture (t_moe boundary at 0.875 for t2v, 0.9 for i2v)
+    - WanVideoWrapper shift formula: shifted_sigmas = shift * sigmas / (1 + (shift - 1) * sigmas)
+    - ComfyUI ModelSamplingDiscreteFlow implementation
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("MODEL", {
+                    "tooltip": "The WAN model to patch with calculated shift"
+                }),
+                "num_frames": ("INT", {
+                    "default": 81,
+                    "min": 1,
+                    "max": 10000,
+                    "tooltip": "Total video frames (used to estimate chunk count)"
+                }),
+                "width": ("INT", {
+                    "default": 1280,
+                    "min": 64,
+                    "max": 4096,
+                    "tooltip": "Video width in pixels"
+                }),
+                "height": ("INT", {
+                    "default": 720,
+                    "min": 64,
+                    "max": 4096,
+                    "tooltip": "Video height in pixels"
+                }),
+                "denoise": ("FLOAT", {
+                    "default": 1.0,
+                    "min": 0.0,
+                    "max": 1.0,
+                    "step": 0.01,
+                    "tooltip": "Denoise strength (1.0=full generation, <1.0=vid2vid refinement)"
+                }),
+                "mode": (["auto", "manual"], {
+                    "default": "auto",
+                    "tooltip": "auto=calculate optimal shift, manual=use manual_shift value"
+                }),
+            },
+            "optional": {
+                "chunk_conditionings": ("CHUNK_CONDITIONING_LIST", {
+                    "tooltip": "Optional: chunk conditionings to count VACE controls"
+                }),
+                "manual_shift": ("FLOAT", {
+                    "default": 5.0,
+                    "min": 1.0,
+                    "max": 15.0,
+                    "step": 0.1,
+                    "tooltip": "Manual shift value (only used when mode=manual)"
+                }),
+                "content_type": (["balanced", "action", "static", "portrait", "landscape"], {
+                    "default": "balanced",
+                    "tooltip": "Content type for fine-tuning shift"
+                }),
+                "is_i2v": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Image-to-Video workflow (adds +1.0 to shift for anchoring)"
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("MODEL", "FLOAT")
+    RETURN_NAMES = ("model", "calculated_shift")
+    FUNCTION = "apply_shift"
+    CATEGORY = "NV_Utils/Sampling"
+    DESCRIPTION = "Calculates optimal shift for WAN models based on workflow parameters and applies it to the model."
+
+    def calculate_adaptive_shift(
+        self,
+        num_frames: int,
+        width: int,
+        height: int,
+        denoise: float,
+        num_controls: int = 0,
+        avg_control_strength: float = 1.0,
+        is_i2v: bool = False,
+        content_type: str = "balanced"
+    ) -> float:
+        """
+        Calculate optimal shift based on workflow parameters.
+
+        Key insight: Shift affects WHERE denoising power is concentrated.
+        - High shift → early steps (structure/motion)
+        - Low shift → late steps (details/textures)
+
+        For denoise < 1.0, we skip early steps, so we need LESS shift
+        since structure already exists from source.
+        """
+        # Base shift for standard generation
+        base = 5.0
+
+        # === VIDEO LENGTH ADJUSTMENT ===
+        # Longer videos need higher shift to prevent drift
+        num_chunks = max(1, num_frames // 81)
+        if num_chunks > 6:
+            base += 2.0
+        elif num_chunks > 3:
+            base += 1.0
+        elif num_chunks > 1:
+            base += 0.5
+
+        # === RESOLUTION ADJUSTMENT ===
+        # Higher resolution benefits from slightly higher shift
+        resolution_factor = (width * height) / (1920 * 1080)
+        base += 0.3 * max(0, resolution_factor - 1.0)
+
+        # === DENOISE ADJUSTMENT (Critical for vid2vid) ===
+        # Lower denoise = skip early steps = structure exists = need LESS shift
+        if denoise < 1.0:
+            # Scale: denoise 0.3 → -1.4, denoise 0.7 → -0.6
+            denoise_adjustment = -2.0 * (1.0 - denoise)
+            base += denoise_adjustment
+
+        # === CONTROL ADJUSTMENT ===
+        # More/stronger controls provide structure → need less shift
+        if num_controls > 0:
+            control_adjustment = -0.4 * num_controls * avg_control_strength
+            base += max(-2.0, control_adjustment)  # Cap reduction
+
+        # === I2V ADJUSTMENT ===
+        # I2V needs more structural anchoring to first frame
+        if is_i2v:
+            base += 1.0
+
+        # === CONTENT TYPE ADJUSTMENT ===
+        content_adjustments = {
+            "balanced": 0.0,
+            "action": 1.0,      # Fast motion needs more temporal coherence
+            "static": -0.5,     # Static scenes can use more detail
+            "portrait": 0.5,    # Faces need stability
+            "landscape": 0.5,   # Architecture needs structural coherence
+        }
+        base += content_adjustments.get(content_type, 0)
+
+        # Clamp to safe range
+        return round(max(3.0, min(base, 10.0)), 1)
+
+    def apply_shift(
+        self,
+        model,
+        num_frames: int,
+        width: int,
+        height: int,
+        denoise: float,
+        mode: str,
+        chunk_conditionings=None,
+        manual_shift: float = 5.0,
+        content_type: str = "balanced",
+        is_i2v: bool = False
+    ):
+        """Apply calculated or manual shift to model's sampling configuration."""
+        import comfy.model_sampling
+
+        # Count controls from chunk_conditionings if provided
+        num_controls = 0
+        avg_control_strength = 1.0
+        if chunk_conditionings and len(chunk_conditionings) > 0:
+            first_chunk = chunk_conditionings[0]
+            if "control_embeds" in first_chunk:
+                num_controls = len(first_chunk["control_embeds"])
+            elif "control_pixels_info" in first_chunk:
+                num_controls = len(first_chunk["control_pixels_info"])
+
+        # Calculate or use manual shift
+        if mode == "auto":
+            shift = self.calculate_adaptive_shift(
+                num_frames, width, height, denoise,
+                num_controls, avg_control_strength,
+                is_i2v, content_type
+            )
+        else:
+            shift = manual_shift
+
+        # Clone model to avoid modifying original
+        model = model.clone()
+
+        # Get existing model_sampling or create new one
+        model_sampling = model.get_model_object("model_sampling")
+
+        if model_sampling is not None and hasattr(model_sampling, 'set_parameters'):
+            # Existing model sampling - update shift
+            model_sampling.set_parameters(shift=shift, multiplier=1000)
+            model.add_object_patch("model_sampling", model_sampling)
+        else:
+            # Create new ModelSamplingDiscreteFlow with shift
+            sampling_base = comfy.model_sampling.ModelSamplingDiscreteFlow
+            sampling_type = comfy.model_sampling.CONST
+
+            class ModelSamplingAdvanced(sampling_base, sampling_type):
+                pass
+
+            # Get model config for initialization
+            model_config = getattr(model.model, 'model_config', None)
+            new_model_sampling = ModelSamplingAdvanced(model_config)
+            new_model_sampling.set_parameters(shift=shift, multiplier=1000)
+            model.add_object_patch("model_sampling", new_model_sampling)
+
+        # Log the shift calculation
+        adjustment_details = []
+        if mode == "auto":
+            num_chunks = max(1, num_frames // 81)
+            if num_chunks > 1:
+                adjustment_details.append(f"chunks={num_chunks}")
+            if denoise < 1.0:
+                adjustment_details.append(f"denoise={denoise:.2f}")
+            if num_controls > 0:
+                adjustment_details.append(f"controls={num_controls}")
+            if is_i2v:
+                adjustment_details.append("i2v")
+            if content_type != "balanced":
+                adjustment_details.append(f"type={content_type}")
+
+            details_str = f" ({', '.join(adjustment_details)})" if adjustment_details else ""
+            print(f"[NV_AdaptiveShiftApplier] Applied shift={shift}{details_str}")
+        else:
+            print(f"[NV_AdaptiveShiftApplier] Applied manual shift={shift}")
+
+        return (model, shift)
+
+
 class NV_VideoSampler:
     """
     Custom video sampler with automation-friendly features + SDE support.
@@ -7381,6 +7618,7 @@ NODE_CLASS_MAPPINGS = {
     "VAE_LUT_Generator": VAE_LUT_Generator,
     "VAE_Correction_Applier": VAE_Correction_Applier,
     "NV_VideoSampler": NV_VideoSampler,
+    "NV_AdaptiveShiftApplier": NV_AdaptiveShiftApplier,
     "NV_VideoChunkAnalyzer": NV_VideoChunkAnalyzer,
     "NV_ChunkConditioningPreprocessor": NV_ChunkConditioningPreprocessor,
     "NV_VACEContextWindowPatcher": NV_VACEContextWindowPatcher,
@@ -7414,6 +7652,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "VAE_LUT_Generator": "VAE LUT Generator",
     "VAE_Correction_Applier": "VAE Correction Applier",
     "NV_VideoSampler": "NV Video Sampler",
+    "NV_AdaptiveShiftApplier": "NV Adaptive Shift Applier",
     "NV_VideoChunkAnalyzer": "NV Video Chunk Analyzer",
     "NV_ChunkConditioningPreprocessor": "NV Chunk Conditioning Preprocessor",
     "NV_VACEContextWindowPatcher": "NV VACE Context Window Patcher",
