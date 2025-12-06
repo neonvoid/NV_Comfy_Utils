@@ -117,7 +117,10 @@ class NV_StreamingVAEEncode:
         # Initialize feat_cache for encoder's causal convolutions
         feat_map = [None] * count_conv3d_encoder(wan_vae.encoder)
 
-        encoded_chunks = []  # Store latent chunks on CPU
+        # Store ENCODER outputs (not latents!) on CPU
+        # We must apply conv1 to the FULL accumulated tensor, not per-chunk
+        # conv1 is CausalConv3d which needs temporal context for correct color
+        encoder_outputs = []
 
         for i in range(num_chunks):
             conv_idx = [0]
@@ -140,15 +143,11 @@ class NV_StreamingVAEEncode:
                 feat_idx=conv_idx
             )
 
-            # Apply conv1 to get mu (latent mean) - works per-chunk since conv1 is typically 1x1
-            chunk_latent, _ = wan_vae.conv1(chunk_out).chunk(2, dim=1)
-
-            # Move to CPU immediately - this is the key memory savings
-            encoded_chunks.append(chunk_latent.cpu())
+            # Move encoder output to CPU (NOT latent - we apply conv1 later)
+            encoder_outputs.append(chunk_out.cpu())
 
             # Free GPU memory from this chunk
             del chunk_out
-            del chunk_latent
             del chunk_input
 
             # Periodic cache clear
@@ -164,15 +163,28 @@ class NV_StreamingVAEEncode:
         del x
         torch.cuda.empty_cache()
 
-        # Concatenate latent chunks on CPU
-        print(f"[NV_StreamingVAEEncode] Concatenating {num_chunks} latent chunks on CPU...")
+        # Concatenate encoder outputs on CPU
+        print(f"[NV_StreamingVAEEncode] Concatenating {num_chunks} encoder outputs on CPU...")
+        full_encoder_out = torch.cat(encoder_outputs, dim=2)
+        del encoder_outputs
+
+        # Move back to GPU for conv1 (must apply to full temporal tensor for correct color)
+        print(f"[NV_StreamingVAEEncode] Applying conv1 to full tensor...")
+        full_encoder_out = full_encoder_out.to(vae_dtype).to(device)
+
+        # Apply conv1 ONCE to full tensor (matches native WAN VAE behavior)
+        # This is critical - conv1 is CausalConv3d which needs full temporal context
+        mu, _ = wan_vae.conv1(full_encoder_out).chunk(2, dim=1)
+        del full_encoder_out
+        torch.cuda.empty_cache()
+
         # IMPORTANT: Convert to float32 to match ComfyUI's standard VAE.encode() behavior
         # ComfyUI's sd.py line 782 calls .float() on encoder output
         # Without this, downstream nodes (sampler sigmas) get dtype mismatches
-        output = torch.cat(encoded_chunks, dim=2).float()
+        output = mu.cpu().float()
+        del mu
 
-        # Clean up
-        del encoded_chunks
+        # Clean up already done above
 
         # Move to VAE's output_device to match native VAE.encode() behavior
         # Native VAE.encode() uses: out.to(self.output_device).float()
