@@ -21,8 +21,12 @@ import torch
 import comfy.model_management as model_management
 
 
-def count_conv3d_encoder(model):
-    """Count CausalConv3d modules in encoder for feat_cache initialization."""
+def count_conv3d(model):
+    """Count CausalConv3d modules in model for feat_cache initialization.
+
+    Note: Native WAN VAE uses decoder count for BOTH encode and decode operations.
+    This matches the behavior in comfy/ldm/wan/vae.py line 472.
+    """
     from comfy.ldm.wan.vae import CausalConv3d
     count = 0
     for m in model.modules():
@@ -106,6 +110,12 @@ class NV_StreamingVAEEncode:
         x = pixels.movedim(-1, 1)  # [T, H, W, C] -> [T, C, H, W]
         x = x.movedim(1, 0).unsqueeze(0)  # [T, C, H, W] -> [1, C, T, H, W]
 
+        # CRITICAL: Apply process_input to scale pixels from [0,1] to [-1,1]
+        # Native encode (comfy/sd.py line 781) does: self.process_input(pixel_samples)
+        # Default process_input is: image * 2.0 - 1.0
+        # Without this, colors are completely wrong (washed out)!
+        x = vae.process_input(x)
+
         # Move to VAE device and dtype
         x = x.to(vae_dtype).to(device)
 
@@ -114,8 +124,10 @@ class NV_StreamingVAEEncode:
 
         print(f"[NV_StreamingVAEEncode] Processing in {num_chunks} chunks (WAN temporal pattern)")
 
-        # Initialize feat_cache for encoder's causal convolutions
-        feat_map = [None] * count_conv3d_encoder(wan_vae.encoder)
+        # Initialize feat_cache for causal convolutions
+        # IMPORTANT: Native WAN VAE uses DECODER count for both encode and decode!
+        # See comfy/ldm/wan/vae.py line 472: feat_map = [None] * count_conv3d(self.decoder)
+        feat_map = [None] * count_conv3d(wan_vae.decoder)
 
         # Store ENCODER outputs (not latents!) on CPU
         # We must apply conv1 to the FULL accumulated tensor, not per-chunk
