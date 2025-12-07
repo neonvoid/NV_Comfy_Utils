@@ -136,11 +136,15 @@ class GeminiVideoCaptioner:
                 "api_key": ("STRING", {"default": ""}),
                 "provider": (["Gemini", "OpenRouter"], {"default": "Gemini"}),
                 "model": ([
-                    # Gemini models
-                    "gemini-1.5-flash", 
-                    "gemini-1.5-pro", 
+                    # Gemini models (direct API)
+                    "gemini-1.5-flash",
+                    "gemini-1.5-pro",
                     "gemini-2.5-pro",
-                    # OpenRouter models (popular vision models)
+                    "gemini-3-pro-preview",
+                    # OpenRouter models - video capable
+                    "google/gemini-2.5-flash",
+                    "google/gemini-2.5-pro",
+                    # OpenRouter models - image/vision only
                     "qwen/qwen2.5-vl-72b-instruct",
                     "qwen/qwen3-vl-235b-a22b-instruct",
                     "meta-llama/llama-3.2-90b-vision-instruct",
@@ -513,6 +517,26 @@ class GeminiVideoCaptioner:
                 "X-Title": "ComfyUI Video Captioner"
             }
             
+            # Determine content type based on MIME type (video vs image)
+            is_video = mime_type.startswith('video/')
+
+            if is_video:
+                media_content = {
+                    "type": "video_url",
+                    "video_url": {
+                        "url": f"data:{mime_type};base64,{base64_data}"
+                    }
+                }
+                print(f"Using video_url content type for {mime_type}")
+            else:
+                media_content = {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{mime_type};base64,{base64_data}"
+                    }
+                }
+                print(f"Using image_url content type for {mime_type}")
+
             # OpenRouter payload
             payload = {
                 "model": model,
@@ -524,12 +548,7 @@ class GeminiVideoCaptioner:
                                 "type": "text",
                                 "text": prompt_text
                             },
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:{mime_type};base64,{base64_data}"
-                                }
-                            }
+                            media_content
                         ]
                     }
                 ],
@@ -634,9 +653,8 @@ class CustomVideoSaver:
             },
             "optional": {
                 "subfolder": ("STRING", {"default": ""}),
-                "prompt": ("PROMPT",),
-                "extra_pnginfo": ("EXTRA_PNGINFO",),
-            }
+            },
+            "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"}
         }
     
     RETURN_TYPES = ("STRING", "STRING", "STRING")
@@ -719,16 +737,18 @@ class CustomVideoSaver:
             if use_ffmpeg_encoding:
                 # Try FFmpeg first
                 print(f"[CustomVideoSaver] Attempting FFmpeg encoding with {codec}...")
-                success = self._tensor_to_video_ffmpeg(video_tensor, video_path, fps, quality, codec, 
-                                                       encoding_preset, preserve_colors)
+                success = self._tensor_to_video_ffmpeg(video_tensor, video_path, fps, quality, codec,
+                                                       encoding_preset, preserve_colors,
+                                                       prompt=prompt, extra_pnginfo=extra_pnginfo)
                 encoding_method = "FFmpeg"
-                
+
                 # If H.265 fails, automatically try H.264
                 if not success and codec == "H.265/HEVC":
                     print(f"[CustomVideoSaver] H.265/HEVC failed, trying H.264/AVC as fallback...")
                     codec = "H.264/AVC"
-                    success = self._tensor_to_video_ffmpeg(video_tensor, video_path, fps, quality, codec, 
-                                                           encoding_preset, preserve_colors)
+                    success = self._tensor_to_video_ffmpeg(video_tensor, video_path, fps, quality, codec,
+                                                           encoding_preset, preserve_colors,
+                                                           prompt=prompt, extra_pnginfo=extra_pnginfo)
                     if success:
                         encoding_method = "FFmpeg (H.264 fallback)"
                 
@@ -746,14 +766,28 @@ class CustomVideoSaver:
             
             if not success:
                 return ("", "", f"Error: All encoding methods failed for video {video_path}. Check logs for details.")
-            
+
+            # Save first frame as PNG with workflow metadata (like VHS Video Combine)
+            metadata_png = None
+            try:
+                # Extract counter from video filename (format: prefix_00001.mp4)
+                basename = os.path.splitext(video_filename)[0]  # Remove extension
+                counter = int(basename.split('_')[-1])  # Get last part as counter
+                metadata_png = self._save_metadata_image(
+                    video_tensor, output_dir, filename_prefix, counter, prompt, extra_pnginfo
+                )
+            except Exception as e:
+                print(f"[CustomVideoSaver] Warning: Failed to save metadata image: {e}")
+
             # Create info string
             color_mode = "Color Preserved" if preserve_colors else "Standard"
             quality_desc = "Lossless" if quality == 0 else f"CRF {quality}"
             info = f"Video saved: {video_filename} | Codec: {codec} | {quality_desc} | Preset: {encoding_preset} | FPS: {fps} | Format: {video_format.upper()} | {color_mode} | Encoder: {encoding_method}"
+            if metadata_png:
+                info += f" | Workflow: {os.path.basename(metadata_png)}"
             if custom_directory:
                 info += f" | Custom dir: {custom_directory}"
-            
+
             return (video_path, video_filename, info)
             
         except Exception as e:
@@ -761,11 +795,11 @@ class CustomVideoSaver:
             print(f"[CustomVideoSaver] {error_msg}")
             return ("", "", error_msg)
     
-    def _tensor_to_video_ffmpeg(self, video_tensor, output_path, fps, quality, codec, preset, preserve_colors=True):
+    def _tensor_to_video_ffmpeg(self, video_tensor, output_path, fps, quality, codec, preset, preserve_colors=True, prompt=None, extra_pnginfo=None):
         """
         Convert video tensor to video file using FFmpeg subprocess.
         This bypasses Windows COM issues and provides professional-grade encoding.
-        
+
         Args:
             video_tensor: Video tensor (batch, frames, height, width, channels)
             output_path: Output file path
@@ -774,7 +808,9 @@ class CustomVideoSaver:
             codec: Video codec to use (H.265/HEVC, H.264/AVC, VP9, ProRes)
             preset: Encoding preset (ultrafast to veryslow)
             preserve_colors: Enable color preservation mode
-            
+            prompt: Optional prompt metadata to embed in video
+            extra_pnginfo: Optional extra metadata (workflow JSON) to embed in video
+
         Returns:
             bool: True if successful, False otherwise
         """
@@ -846,7 +882,7 @@ class CustomVideoSaver:
                 '-r', str(fps),
                 '-i', '-',  # Read from stdin
                 '-c:v', ffmpeg_codec,
-                '-movflags', '+faststart',  # Enable fast start for MP4
+                '-movflags', '+faststart+use_metadata_tags',  # Enable fast start and custom metadata for MP4
                 '-max_muxing_queue_size', '9999',  # Prevent muxing queue overflow
             ]
             
@@ -875,8 +911,10 @@ class CustomVideoSaver:
                     '-profile:v', '3',  # ProRes HQ
                     '-pix_fmt', 'yuv422p10le',
                 ])
-            
+
             # Add output file
+            # Note: Workflow metadata is saved as PNG thumbnail instead of in video container
+            # (avoids Windows command line length limits with large workflows)
             cmd.append(output_path)
             
             print(f"[CustomVideoSaver] FFmpeg command: {' '.join(cmd[:12])}...")
@@ -1269,7 +1307,103 @@ class CustomVideoSaver:
                 video_filename = f"{filename_prefix}_{timestamp}.{video_format}"
                 video_path = os.path.join(output_dir, video_filename)
                 return video_filename, video_path
-    
+
+    def _escape_metadata_value(self, value: str) -> str:
+        """
+        Escape metadata value for FFmpeg -metadata flag.
+        When using subprocess with list args, minimal escaping is needed.
+        """
+        if value is None:
+            return ""
+        # Replace newlines (metadata is single-line) and null bytes
+        return value.replace('\n', ' ').replace('\r', '').replace('\x00', '')
+
+    def _serialize_metadata(self, prompt, extra_pnginfo) -> dict:
+        """
+        Serialize prompt and extra_pnginfo to metadata dictionary.
+        Follows the same convention as native ComfyUI SaveVideo.
+        """
+        metadata = {}
+        if prompt is not None:
+            metadata['prompt'] = json.dumps(prompt)
+        if extra_pnginfo is not None:
+            for key in extra_pnginfo:
+                metadata[key] = json.dumps(extra_pnginfo[key])
+        return metadata
+
+    def _build_metadata_args(self, prompt, extra_pnginfo) -> list:
+        """
+        Build FFmpeg metadata arguments automatically.
+        Respects ComfyUI's --disable-metadata CLI flag.
+        """
+        # Respect ComfyUI's disable_metadata flag
+        try:
+            from comfy.cli_args import args as comfy_args
+            if comfy_args.disable_metadata:
+                return []
+        except ImportError:
+            pass
+
+        metadata = self._serialize_metadata(prompt, extra_pnginfo)
+        if not metadata:
+            return []
+
+        # Build metadata args
+        args = []
+        for key, value in metadata.items():
+            escaped = self._escape_metadata_value(value)
+            args.extend(['-metadata', f'{key}={escaped}'])
+        return args
+
+    def _save_metadata_image(self, video_tensor, output_dir, filename_prefix, counter, prompt, extra_pnginfo):
+        """
+        Save first frame as PNG with embedded workflow metadata (like VHS Video Combine).
+        This allows dragging the PNG into ComfyUI to load the workflow.
+        """
+        from PIL import Image
+        from PIL.PngImagePlugin import PngInfo
+        import datetime
+
+        # Respect disable_metadata flag
+        try:
+            from comfy.cli_args import args as comfy_args
+            if comfy_args.disable_metadata:
+                return None
+        except ImportError:
+            pass
+
+        if prompt is None and extra_pnginfo is None:
+            return None
+
+        # Build metadata
+        metadata = PngInfo()
+        if prompt is not None:
+            metadata.add_text("prompt", json.dumps(prompt))
+        if extra_pnginfo is not None:
+            for key in extra_pnginfo:
+                metadata.add_text(key, json.dumps(extra_pnginfo[key]))
+        metadata.add_text("CreationTime", datetime.datetime.now().isoformat(" ")[:19])
+
+        # Extract first frame
+        if len(video_tensor.shape) == 5:
+            first_frame = video_tensor[0, 0].cpu().numpy()  # (batch, frames, H, W, C) -> (H, W, C)
+        else:
+            first_frame = video_tensor[0].cpu().numpy()  # (frames, H, W, C) -> (H, W, C)
+
+        # Convert to uint8
+        if first_frame.max() <= 1.0:
+            first_frame = (first_frame * 255).clip(0, 255).astype(np.uint8)
+        else:
+            first_frame = first_frame.clip(0, 255).astype(np.uint8)
+
+        # Save PNG with metadata (same filename as video but .png)
+        png_filename = f"{filename_prefix}_{counter:05d}.png"
+        png_path = os.path.join(output_dir, png_filename)
+        Image.fromarray(first_frame).save(png_path, pnginfo=metadata, compress_level=4)
+
+        print(f"[CustomVideoSaver] Saved metadata image: {png_filename}")
+        return png_path
+
     def _check_ffmpeg_available(self):
         """Check if FFmpeg is available in the system."""
         try:
