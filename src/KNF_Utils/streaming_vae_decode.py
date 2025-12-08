@@ -51,6 +51,10 @@ class NV_StreamingVAEDecode:
                     "max": 100,
                     "tooltip": "Clear CUDA cache every N frames. Lower = more cache clears, higher = faster but uses more transient memory."
                 }),
+                "use_tiled_decode": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Use spatial tiling for high resolutions. Slower but handles large resolutions (e.g., 960x1440+) that OOM with standard decode. Enable if you get OOM errors."
+                }),
             }
         }
 
@@ -60,13 +64,17 @@ class NV_StreamingVAEDecode:
     CATEGORY = "NV_Utils"
     DESCRIPTION = "Decodes video latents frame-by-frame with streaming to CPU. Use for long videos that OOM with standard VAEDecode."
 
-    def decode_streaming(self, vae, samples, cache_clear_interval=16):
+    def decode_streaming(self, vae, samples, cache_clear_interval=16, use_tiled_decode=False):
         """
         Decode latents frame-by-frame, streaming to CPU.
 
         The key insight: WAN VAE already processes frame-by-frame internally,
         but accumulates output on GPU with torch.cat. We replicate the loop
         but move each frame to CPU immediately.
+
+        When use_tiled_decode=True, uses spatial tiling per-frame for high
+        resolutions that OOM with standard decode. Tiled decode is slower but
+        can handle any resolution.
         """
         z = samples["samples"]
 
@@ -105,6 +113,16 @@ class NV_StreamingVAEDecode:
 
         # Load the VAE model to GPU
         model_management.load_model_gpu(vae.patcher)
+
+        # ============================================================
+        # TILED DECODE PATH (for high resolutions that OOM)
+        # ============================================================
+        if use_tiled_decode:
+            return self._decode_tiled_streaming(vae, z, total_frames, cache_clear_interval)
+
+        # ============================================================
+        # STANDARD PATH (faster, uses manual conv2 + decoder with feat_cache)
+        # ============================================================
 
         # Initialize the causal convolution cache
         # This is critical for temporal coherence - each CausalConv3d needs cache state
@@ -189,6 +207,74 @@ class NV_StreamingVAEDecode:
 
         # Convert to ComfyUI image format: [B, C, T, H, W] -> [B, T, H, W, C]
         # Standard VAEDecode does .movedim(1, -1) which moves C to the end
+        output = output.movedim(1, -1)
+
+        # If batch dim exists with temporal, reshape to [B*T, H, W, C]
+        if len(output.shape) == 5:
+            output = output.reshape(-1, output.shape[-3], output.shape[-2], output.shape[-1])
+
+        print(f"[NV_StreamingVAEDecode] Done. Output shape: {output.shape}")
+
+        # Clean up
+        del decoded_frames
+        torch.cuda.empty_cache()
+
+        return (output,)
+
+    def _decode_tiled_streaming(self, vae, z, total_frames, cache_clear_interval):
+        """
+        Decode latents using spatial tiling per-frame.
+
+        This method uses ComfyUI's native decode_tiled_3d() for each frame,
+        which handles high resolutions by splitting the frame into tiles.
+
+        Key insight: For VAE DECODING, temporal caching (feat_cache) is NOT
+        essential because:
+        1. Each latent frame is self-contained - contains all info to reconstruct
+        2. Temporal coherence was already established during sampling/diffusion
+        3. The decoder just upsamples/reconstructs pixels from latent
+
+        This is different from ENCODING where temporal caching IS essential
+        for proper compression.
+        """
+        print(f"[NV_StreamingVAEDecode] Using TILED decode for high resolution...")
+
+        decoded_frames = []
+
+        for i in range(total_frames):
+            # Extract single frame latent: [1, C, 1, H, W]
+            z_frame = z[:, :, i:i+1, :, :]
+
+            # Use native tiled decode for this frame
+            # decode_tiled_3d handles spatial tiling automatically
+            # tile_x/tile_y = 32 is the WAN VAE default (256 // 8 spatial compression)
+            # overlap = (1, 8, 8) for temporal, spatial_y, spatial_x
+            frame = vae.decode_tiled_3d(
+                z_frame,
+                tile_x=32,
+                tile_y=32,
+                overlap=(1, 8, 8)
+            )
+
+            # Move to CPU immediately - key memory savings
+            decoded_frames.append(frame.cpu())
+            del frame
+
+            # Periodic cache clear
+            if (i + 1) % cache_clear_interval == 0:
+                torch.cuda.empty_cache()
+                print(f"[NV_StreamingVAEDecode] Tiled decode: {i+1}/{total_frames} frames")
+
+        # Final progress message
+        if total_frames % cache_clear_interval != 0:
+            print(f"[NV_StreamingVAEDecode] Tiled decode: {total_frames}/{total_frames} frames")
+
+        # Concatenate on CPU
+        print(f"[NV_StreamingVAEDecode] Concatenating {total_frames} frames on CPU...")
+        output = torch.cat(decoded_frames, dim=2)
+
+        # decode_tiled_3d already calls process_output internally, so output is [0,1]
+        # Just need to convert to ComfyUI format: [B, C, T, H, W] -> [B*T, H, W, C]
         output = output.movedim(1, -1)
 
         # If batch dim exists with temporal, reshape to [B*T, H, W, C]
