@@ -40,6 +40,16 @@ from .streaming_vace_to_video import NV_WanVaceToVideoStreaming
 from .b2_output_sync import NV_B2OutputSync
 # Import VACE benchmark logger for memory analysis
 from .vace_benchmark import NV_VACEBenchmarkLogger
+# Import workflow logger for memory analysis dataset collection
+from .workflow_logger import NV_WorkflowLogger, NV_WorkflowLoggerStart
+
+# Import Slack notifier (optional dependency - requires slack-sdk)
+try:
+    from .slack_notifier import NV_SlackNotifier
+    SLACK_NOTIFIER_AVAILABLE = True
+except ImportError:
+    SLACK_NOTIFIER_AVAILABLE = False
+    print("[NV_Comfy_Utils] slack-sdk not installed, NV_SlackNotifier disabled")
 import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend for server-side rendering
 import matplotlib.pyplot as plt
@@ -131,7 +141,6 @@ class GeminiVideoCaptioner:
         files = folder_paths.filter_files_content_types(files, ["video"])
         return {
             "required": {
-                "video_file": (sorted(files), {"video_upload": True}),
                 "prompt_text": ("STRING", {"multiline": True, "default": "Describe this video in detail."}),
                 "api_key": ("STRING", {"default": ""}),
                 "provider": (["Gemini", "OpenRouter"], {"default": "Gemini"}),
@@ -152,10 +161,11 @@ class GeminiVideoCaptioner:
                 "fps": ("FLOAT", {"default": 30.0, "min": 1.0, "max": 120.0, "step": 0.1}),
             },
             "optional": {
+                "video_file": (sorted(files), {"video_upload": True}),
                 "video_tensor": ("IMAGE",),
-                "image_tensor": ("IMAGE",),  # For single image captioning (OpenRouter compatible)
-                "max_tokens": ("INT", {"default": 1000, "min": 100, "max": 4000, "step": 100}),  # For OpenRouter
-                "temperature": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 2.0, "step": 0.1}),  # For OpenRouter
+                "image_tensor": ("IMAGE",),
+                "max_tokens": ("INT", {"default": 1000, "min": 100, "max": 4000, "step": 100}),
+                "temperature": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 2.0, "step": 0.1}),
             }
         }
 
@@ -7820,6 +7830,8 @@ NODE_CLASS_MAPPINGS = {
     "NV_B2OutputSync": NV_B2OutputSync,
     "NV_FrameAnnotator": NV_FrameAnnotator,
     "NV_VACEBenchmarkLogger": NV_VACEBenchmarkLogger,
+    "NV_WorkflowLogger": NV_WorkflowLogger,
+    "NV_WorkflowLoggerStart": NV_WorkflowLoggerStart,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -7854,6 +7866,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NV_B2OutputSync": "NV B2 Output Sync",
     "NV_FrameAnnotator": "NV Frame Annotator",
     "NV_VACEBenchmarkLogger": "NV VACE Benchmark Logger",
+    "NV_WorkflowLogger": "NV Workflow Logger",
+    "NV_WorkflowLoggerStart": "NV Workflow Logger (Start)",
 }
 
 # Conditionally add NV_Video_Loader_Path if it imported successfully
@@ -7863,3 +7877,9 @@ if NV_VIDEO_LOADER_AVAILABLE:
     print("[NV_Comfy_Utils] NV_Video_Loader_Path registered successfully")
 else:
     print("[NV_Comfy_Utils] NV_Video_Loader_Path NOT registered (import failed)")
+
+# Conditionally add NV_SlackNotifier if slack-sdk is available
+if SLACK_NOTIFIER_AVAILABLE:
+    NODE_CLASS_MAPPINGS["NV_SlackNotifier"] = NV_SlackNotifier
+    NODE_DISPLAY_NAME_MAPPINGS["NV_SlackNotifier"] = "NV Slack Notifier"
+    print("[NV_Comfy_Utils] NV_SlackNotifier registered successfully")
