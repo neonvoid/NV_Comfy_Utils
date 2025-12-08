@@ -196,7 +196,13 @@ class NV_StreamingVAEEncode:
         output = mu.cpu().float()
         del mu
 
-        # Clean up already done above
+        # CRITICAL: Clean up feat_map to free GPU memory from CausalConv3d caching
+        # Without this, cached tensors accumulate across multiple encode calls
+        for i in range(len(feat_map)):
+            if feat_map[i] is not None:
+                del feat_map[i]
+        del feat_map
+        torch.cuda.empty_cache()
 
         # Move to VAE's output_device to match native VAE.encode() behavior
         # Native VAE.encode() uses: out.to(self.output_device).float()

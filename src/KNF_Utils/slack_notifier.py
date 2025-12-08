@@ -31,7 +31,7 @@ class NV_SlackNotifier:
                 "trigger": (IO.ANY, {"tooltip": "Connect to any output to trigger notification after that node"}),
                 "output_path": ("STRING", {"default": "", "tooltip": "Directory where output is saved"}),
                 "filename": ("STRING", {"default": "", "tooltip": "Name of the output file"}),
-                "channel": ("STRING", {"default": "#comfyui", "tooltip": "Slack channel (e.g., #channel or channel ID)"}),
+                "channel_or_user": ("STRING", {"default": "#comfyui", "tooltip": "Channel (#name or ID) or user ID (U...) for DMs"}),
             },
             "optional": {
                 "slack_token": ("STRING", {"default": "", "tooltip": "Bot token (leave empty to use SLACK_BOT_TOKEN env var)"}),
@@ -46,7 +46,7 @@ class NV_SlackNotifier:
     OUTPUT_NODE = True
     DESCRIPTION = "Sends a Slack notification with output file path when executed"
 
-    def notify(self, trigger, output_path, filename, channel,
+    def notify(self, trigger, output_path, filename, channel_or_user,
                slack_token="", message_prefix=""):
         """Send Slack notification and pass through trigger."""
 
@@ -75,11 +75,11 @@ class NV_SlackNotifier:
         prefix = f"[{message_prefix}] " if message_prefix.strip() else ""
         message = f"{prefix}ComfyUI Complete\nOutput: {full_path}"
 
-        # Send to Slack
+        # Send to Slack (channel_or_user can be #channel, channel ID, or user ID for DMs)
         try:
             client = WebClient(token=token)
-            response = client.chat_postMessage(channel=channel, text=message)
-            print(f"[NV_SlackNotifier] Sent notification to {channel}")
+            response = client.chat_postMessage(channel=channel_or_user, text=message)
+            print(f"[NV_SlackNotifier] Sent notification to {channel_or_user}")
         except SlackApiError as e:
             error_msg = e.response.get('error', str(e)) if hasattr(e, 'response') else str(e)
             print(f"[NV_SlackNotifier] Slack API error: {error_msg}")

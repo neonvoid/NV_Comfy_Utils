@@ -2637,15 +2637,10 @@ class NV_AdaptiveShiftApplier:
         # Base shift for standard generation
         base = 5.0
 
-        # === VIDEO LENGTH ADJUSTMENT ===
-        # Longer videos need higher shift to prevent drift
-        num_chunks = max(1, num_frames // 81)
-        if num_chunks > 6:
-            base += 2.0
-        elif num_chunks > 3:
-            base += 1.0
-        elif num_chunks > 1:
-            base += 0.5
+        # NOTE: Video length adjustment was removed.
+        # With context windows, each window only processes ~81 frames regardless of total video length.
+        # Frame count doesn't affect the model's denoising needs - only fusion seam count.
+        # Shift should be based on: resolution, denoise, controls, content type.
 
         # === RESOLUTION ADJUSTMENT ===
         # Higher resolution benefits from slightly higher shift
@@ -2746,9 +2741,8 @@ class NV_AdaptiveShiftApplier:
         # Log the shift calculation
         adjustment_details = []
         if mode == "auto":
-            num_chunks = max(1, num_frames // 81)
-            if num_chunks > 1:
-                adjustment_details.append(f"chunks={num_chunks}")
+            # Note: num_frames logged for info only - doesn't affect shift calculation
+            adjustment_details.append(f"frames={num_frames}")
             if denoise < 1.0:
                 adjustment_details.append(f"denoise={denoise:.2f}")
             if num_controls > 0:
