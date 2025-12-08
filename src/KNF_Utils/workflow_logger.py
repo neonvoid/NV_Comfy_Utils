@@ -22,6 +22,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import torch
+from comfy.comfy_types.node_typing import IO
 
 
 class LogCaptureHandler(logging.Handler):
@@ -287,11 +288,16 @@ class NV_WorkflowLogger:
                     "default": "workflow",
                     "tooltip": "Prefix for log filename. Output: {timestamp}_{log_name}.json"
                 }),
-                "any_input": ("*", {
+                "any_input": (IO.ANY, {
                     "tooltip": "Connect to a late-executing node to ensure logger captures full workflow."
                 }),
             },
         }
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, **kwargs):
+        # Accept any input type for 'any_input' wildcard parameter
+        return True
 
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("log_path",)

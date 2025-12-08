@@ -52,12 +52,16 @@ if SLACK_BOT_TOKEN and SLACK_ERROR_CHANNEL:
         def _send_slack_error(error_details: dict):
             """Send error notification to Slack."""
             try:
+                import socket
+                computer_name = socket.gethostname()
+
                 node_id = error_details.get("node_id", "unknown")
                 node_type = error_details.get("node_type", "unknown")
                 exception_message = error_details.get("exception_message", "No message")
 
-                # Build simple error message
+                # Build simple error message with machine name
                 message = (
+                    f"{computer_name}\n"
                     f"ComfyUI Error\n"
                     f"Node: {node_type} (id: {node_id})\n"
                     f"Error: {exception_message}"

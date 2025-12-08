@@ -130,6 +130,9 @@ class KNF_Organizer:
 
     CATEGORY = "Example"
 
+# Global cache for last valid caption (persists across ComfyUI executions)
+_LAST_VALID_CAPTION = ""
+
 class GeminiVideoCaptioner:
     def __init__(self):
         pass
@@ -161,6 +164,7 @@ class GeminiVideoCaptioner:
                 "fps": ("FLOAT", {"default": 30.0, "min": 1.0, "max": 120.0, "step": 0.1}),
             },
             "optional": {
+                "use_cached_prompt": ("BOOLEAN", {"default": False}),
                 "video_file": (sorted(files), {"video_upload": True}),
                 "video_tensor": ("IMAGE",),
                 "image_tensor": ("IMAGE",),
@@ -169,8 +173,8 @@ class GeminiVideoCaptioner:
             }
         }
 
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("caption",)
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("caption", "latest_prompt")
     FUNCTION = "caption_video"
     CATEGORY = "KNF_Utils"
     OUTPUT_NODE = True
@@ -320,10 +324,21 @@ class GeminiVideoCaptioner:
             print(f"Error converting tensor to image: {e}")
             return None
     
-    def caption_video(self, video_file=None, prompt_text="Describe this video in detail.", api_key="", 
-                     provider="Gemini", model="gemini-2.5-pro", fps=30.0, video_tensor=None, 
-                     image_tensor=None, max_tokens=1000, temperature=0.7):
+    def caption_video(self, video_file=None, prompt_text="Describe this video in detail.", api_key="",
+                     provider="Gemini", model="gemini-2.5-pro", fps=30.0, video_tensor=None,
+                     image_tensor=None, max_tokens=1000, temperature=0.7, use_cached_prompt=False):
         """Main function to caption video/image using selected API provider."""
+        global _LAST_VALID_CAPTION
+
+        # If using cached prompt and we have one, return it immediately
+        if use_cached_prompt and _LAST_VALID_CAPTION:
+            print(f"Using cached prompt ({len(_LAST_VALID_CAPTION)} chars)")
+            return (_LAST_VALID_CAPTION, _LAST_VALID_CAPTION)
+
+        # If user wants cached but none exists, warn and continue to API
+        if use_cached_prompt and not _LAST_VALID_CAPTION:
+            print("No cached prompt available, calling API...")
+
         if not api_key:
             raise RuntimeError("API key is required")
         
@@ -363,12 +378,15 @@ class GeminiVideoCaptioner:
             if provider == "Gemini":
                 result = self._call_gemini_api(file_path, prompt_text, api_key, model, is_temp_file)
             elif provider == "OpenRouter":
-                result = self._call_openrouter_api(file_path, prompt_text, api_key, model, 
+                result = self._call_openrouter_api(file_path, prompt_text, api_key, model,
                                                    max_tokens, temperature, is_temp_file)
             else:
                 raise RuntimeError(f"Unknown provider: {provider}")
 
-            return result
+            # Cache the successful result and return 2-tuple
+            caption = result[0]  # API methods return (caption,) tuple
+            _LAST_VALID_CAPTION = caption
+            return (caption, _LAST_VALID_CAPTION)
                 
         except Exception as e:
             # Clean up temporary file if it was created from tensor
