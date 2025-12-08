@@ -95,10 +95,13 @@ class NV_StreamingVAEDecode:
         # Get the actual WAN VAE model from ComfyUI's wrapper
         wan_vae = vae.first_stage_model
 
-        # Move latent to VAE device and dtype
+        # Get device and dtype
         device = vae.device
         vae_dtype = vae.vae_dtype
-        z = z.to(vae_dtype).to(device)
+
+        # CRITICAL: Clear GPU memory before starting
+        # After sampling, there may be residual memory that needs to be freed
+        torch.cuda.empty_cache()
 
         # Load the VAE model to GPU
         model_management.load_model_gpu(vae.patcher)
@@ -107,21 +110,54 @@ class NV_StreamingVAEDecode:
         # This is critical for temporal coherence - each CausalConv3d needs cache state
         feat_map = [None] * count_conv3d(wan_vae.decoder)
 
-        # Pre-process with conv2 (same as original)
-        x = wan_vae.conv2(z)
+        # ============================================================
+        # MEMORY-EFFICIENT conv2 PREPROCESSING
+        # ============================================================
+        # conv2 is CausalConv3d(z_dim, z_dim, 1) with kernel size 1.
+        # Kernel size 1 means _padding[4] = 0, so NO temporal cache is used.
+        # Therefore, we can safely apply conv2 per-frame for memory efficiency.
+        # This produces mathematically identical results to all-at-once.
+        # ============================================================
+
+        print(f"[NV_StreamingVAEDecode] Applying conv2 per-frame...")
+        conv2_outputs = []  # Store on CPU
+
+        for i in range(total_frames):
+            # Load single latent frame to GPU
+            z_frame = z[:, :, i:i+1, :, :].to(vae_dtype).to(device)
+
+            # Apply conv2 (1x1 conv, no temporal dependencies)
+            x_frame = wan_vae.conv2(z_frame)
+
+            # Store on CPU immediately
+            conv2_outputs.append(x_frame.cpu())
+
+            # Free GPU memory
+            del z_frame, x_frame
+
+            # Periodic cache clear
+            if (i + 1) % cache_clear_interval == 0:
+                torch.cuda.empty_cache()
+
+        print(f"[NV_StreamingVAEDecode] conv2 complete. Decoding frames...")
+
+        # ============================================================
+        # FRAME-BY-FRAME DECODING
+        # ============================================================
 
         decoded_frames = []  # Store on CPU
-
-        print(f"[NV_StreamingVAEDecode] Decoding frames...")
 
         for i in range(total_frames):
             # Reset conv index for each frame (same as original)
             conv_idx = [0]
 
+            # Load conv2 output for this frame
+            x_frame = conv2_outputs[i].to(device)
+
             # Decode single frame with causal cache
             # The feat_cache maintains temporal context between frames
             frame = wan_vae.decoder(
-                x[:, :, i:i+1, :, :],
+                x_frame,
                 feat_cache=feat_map,
                 feat_idx=conv_idx
             )
@@ -130,7 +166,7 @@ class NV_StreamingVAEDecode:
             decoded_frames.append(frame.cpu())
 
             # Free GPU memory from this frame
-            del frame
+            del frame, x_frame
 
             # Periodic cache clear to prevent memory fragmentation
             if (i + 1) % cache_clear_interval == 0:
@@ -140,6 +176,9 @@ class NV_StreamingVAEDecode:
         # Final progress message
         if total_frames % cache_clear_interval != 0:
             print(f"[NV_StreamingVAEDecode] Decoded {total_frames}/{total_frames} frames")
+
+        # Clean up conv2 outputs
+        del conv2_outputs
 
         # Concatenate on CPU (RAM is typically much larger than VRAM)
         print(f"[NV_StreamingVAEDecode] Concatenating {total_frames} frames on CPU...")
@@ -160,7 +199,6 @@ class NV_StreamingVAEDecode:
 
         # Clean up
         del decoded_frames
-        del x
         torch.cuda.empty_cache()
 
         return (output,)
