@@ -198,9 +198,10 @@ class NV_StreamingVAEEncode:
 
         # CRITICAL: Clean up feat_map to free GPU memory from CausalConv3d caching
         # Without this, cached tensors accumulate across multiple encode calls
+        # Note: Set to None first (deleting by index shifts list), then clear
         for i in range(len(feat_map)):
-            if feat_map[i] is not None:
-                del feat_map[i]
+            feat_map[i] = None
+        feat_map.clear()
         del feat_map
         torch.cuda.empty_cache()
 

@@ -1,0 +1,7 @@
+# NV_Comfy_Utils Dependencies
+
+# Slack notifications
+slack-sdk>=3.0.0
+
+# .env file support (optional but recommended)
+python-dotenv>=1.0.0

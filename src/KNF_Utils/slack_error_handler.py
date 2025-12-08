@@ -7,11 +7,27 @@ Automatically activates if these env vars are set:
 - SLACK_ERROR_CHANNEL: Channel or user ID for error notifications
 
 If either is missing, this module does nothing (graceful degradation).
+
+Supports loading from .env file in NV_Comfy_Utils directory (requires python-dotenv).
 """
 
 import os
+from pathlib import Path
 
-# Check environment variables first - if not set, skip everything
+# Try to load .env file from NV_Comfy_Utils directory
+try:
+    from dotenv import load_dotenv
+    # This file is at: NV_Comfy_Utils/src/KNF_Utils/slack_error_handler.py
+    # .env file is at: NV_Comfy_Utils/.env
+    env_file = Path(__file__).parent.parent.parent / ".env"
+    if env_file.exists():
+        load_dotenv(env_file)
+        print(f"[NV_SlackErrorHandler] Loaded .env from {env_file}")
+except ImportError:
+    # python-dotenv not installed, rely on system env vars
+    pass
+
+# Check environment variables - if not set, skip everything
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
 SLACK_ERROR_CHANNEL = os.environ.get("SLACK_ERROR_CHANNEL", "")
 
