@@ -63,6 +63,28 @@ def adjust_for_wan_alignment(frame_count: int, min_frames: int = 5) -> int:
     return max(aligned, min_frames)
 
 
+# ============================================================================
+# File Path Helpers
+# ============================================================================
+
+def get_unique_filepath(filepath: str) -> str:
+    """
+    Return a unique filepath by appending _N if file exists.
+
+    chunk_plan.json → chunk_plan_1.json → chunk_plan_2.json → ...
+    """
+    if not os.path.exists(filepath):
+        return filepath
+
+    base, ext = os.path.splitext(filepath)
+    counter = 1
+    while True:
+        new_path = f"{base}_{counter}{ext}"
+        if not os.path.exists(new_path):
+            return new_path
+        counter += 1
+
+
 class NV_ParallelChunkPlanner:
     """
     Plans chunk splits for parallel video processing.
@@ -79,10 +101,16 @@ class NV_ParallelChunkPlanner:
                     "tooltip": "Input video frames [T, H, W, C] - used to get total frame count and resolution"
                 }),
                 "num_workers": ("INT", {
-                    "default": 2,
-                    "min": 1,
+                    "default": 0,
+                    "min": 0,
                     "max": 16,
-                    "tooltip": "Number of GPUs or machines to split work across"
+                    "tooltip": "Number of workers (0 = use max_frames_per_worker instead)"
+                }),
+                "max_frames_per_worker": ("INT", {
+                    "default": 300,
+                    "min": 0,
+                    "max": 10000,
+                    "tooltip": "Max frames per chunk (0 = use num_workers instead). Automatically calculates worker count."
                 }),
                 "overlap_frames": ("INT", {
                     "default": 32,
@@ -158,7 +186,7 @@ class NV_ParallelChunkPlanner:
     CATEGORY = "NV_Utils"
     DESCRIPTION = "Plans video chunk splits for parallel processing. Exports JSON config for multiple workers."
 
-    def plan_chunks(self, video, num_workers, overlap_frames, output_json_path,
+    def plan_chunks(self, video, num_workers, max_frames_per_worker, overlap_frames, output_json_path,
                     seed=0, steps=20, cfg=5.0, sampler_name="euler", scheduler="sgm_uniform",
                     denoise=0.75, context_window_size=81, context_overlap=16,
                     wan_frame_alignment=True):
@@ -171,9 +199,30 @@ class NV_ParallelChunkPlanner:
         height = video.shape[1]
         width = video.shape[2]
 
+        # Determine num_workers from inputs
+        if max_frames_per_worker > 0:
+            # Calculate workers needed for max frames per worker
+            # Account for overlap: each chunk has unique_frames + overlap, except last chunk
+            # effective_unique = max_frames - overlap (what each chunk contributes uniquely)
+            effective_unique = max_frames_per_worker - overlap_frames
+            if effective_unique <= 0:
+                raise ValueError(
+                    f"max_frames_per_worker ({max_frames_per_worker}) must be > overlap_frames ({overlap_frames})"
+                )
+            # Calculate how many workers we need
+            # total_frames = unique_per_worker * num_workers + (num_workers - 1) * overlap... simplified:
+            num_workers = max(1, -(-total_frames // effective_unique))  # Ceiling division
+            print(f"[NV_ParallelChunkPlanner] Auto-calculated {num_workers} workers from max_frames_per_worker={max_frames_per_worker}")
+        elif num_workers > 0:
+            # Use explicit num_workers
+            pass
+        else:
+            raise ValueError("Either num_workers or max_frames_per_worker must be > 0")
+
         print(f"[NV_ParallelChunkPlanner] Video metadata:")
         print(f"  Total frames: {total_frames}")
         print(f"  Resolution: {width}x{height}")
+        print(f"  Num workers: {num_workers}")
         print(f"  WAN frame alignment: {wan_frame_alignment}")
 
         warnings = []
@@ -292,6 +341,9 @@ class NV_ParallelChunkPlanner:
         output_dir = os.path.dirname(output_json_path)
         if output_dir and not os.path.exists(output_dir):
             os.makedirs(output_dir, exist_ok=True)
+
+        # Get unique filepath (don't overwrite existing files)
+        output_json_path = get_unique_filepath(output_json_path)
 
         # Write JSON file
         with open(output_json_path, 'w') as f:

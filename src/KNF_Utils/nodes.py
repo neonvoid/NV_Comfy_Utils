@@ -315,7 +315,7 @@ class GeminiVideoCaptioner:
                      image_tensor=None, max_tokens=1000, temperature=0.7):
         """Main function to caption video/image using selected API provider."""
         if not api_key:
-            return ("Error: API key is required",)
+            raise RuntimeError("API key is required")
         
         file_path = None
         is_temp_file = False
@@ -325,14 +325,14 @@ class GeminiVideoCaptioner:
             print("Processing image tensor input...")
             file_path = self.tensor_to_image(image_tensor)
             if file_path is None:
-                return ("Error: Failed to convert image tensor to file",)
+                raise RuntimeError("Failed to convert image tensor to file")
             is_temp_file = True
         # Priority 2: Handle video tensor input (from node link)
         elif video_tensor is not None:
             print(f"Processing video tensor input at {fps} FPS...")
             file_path = self.tensor_to_video(video_tensor, fps)
             if file_path is None:
-                return ("Error: Failed to convert video tensor to file",)
+                raise RuntimeError("Failed to convert video tensor to file")
             is_temp_file = True
         # Priority 3: Handle video file input
         elif video_file:
@@ -342,11 +342,11 @@ class GeminiVideoCaptioner:
                 file_path = os.path.join(input_dir, video_file)
             else:
                 file_path = video_file
-            
+
             if not os.path.exists(file_path):
-                return (f"Error: Video file not found: {file_path}",)
+                raise RuntimeError(f"Video file not found: {file_path}")
         else:
-            return ("Error: Either video file, video tensor, or image tensor must be provided",)
+            raise RuntimeError("Either video file, video tensor, or image tensor must be provided")
         
         try:
             # Route to appropriate API provider
@@ -356,8 +356,8 @@ class GeminiVideoCaptioner:
                 result = self._call_openrouter_api(file_path, prompt_text, api_key, model, 
                                                    max_tokens, temperature, is_temp_file)
             else:
-                result = (f"Error: Unknown provider: {provider}",)
-            
+                raise RuntimeError(f"Unknown provider: {provider}")
+
             return result
                 
         except Exception as e:
@@ -461,15 +461,34 @@ class GeminiVideoCaptioner:
                 else:
                     print("❌ Error: No content in API response")
                     print("="*50 + "\n")
-                    return ("Error: No content in API response",)
+                    # Clean up temp file before raising
+                    if is_temp_file and os.path.exists(file_path):
+                        try:
+                            os.remove(file_path)
+                        except:
+                            pass
+                    raise RuntimeError("Gemini API returned no content in response")
             else:
                 print("❌ Error: No candidates in API response")
                 print("="*50 + "\n")
-                return ("Error: No candidates in API response",)
+                # Clean up temp file before raising
+                if is_temp_file and os.path.exists(file_path):
+                    try:
+                        os.remove(file_path)
+                    except:
+                        pass
+                raise RuntimeError("Gemini API returned no candidates in response")
         else:
             print(f"❌ API Error: {response.status_code}")
             print("="*50 + "\n")
-            return (f"API error: {response.status_code} - {response.text}",)
+            # Clean up temp file before raising
+            if is_temp_file and os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                except:
+                    pass
+            error_msg = response.text[:500] if len(response.text) > 500 else response.text
+            raise RuntimeError(f"Gemini API error {response.status_code}: {error_msg}")
     
     def _call_openrouter_api(self, file_path, prompt_text, api_key, model, 
                             max_tokens, temperature, is_temp_file=False):
@@ -579,33 +598,60 @@ class GeminiVideoCaptioner:
                 
                 if 'choices' in result and len(result['choices']) > 0:
                     caption = result['choices'][0]['message']['content']
-                    
+
                     if not caption or caption.strip() == "":
                         print("⚠️ Warning: Model returned empty response")
-                        return ("Error: Model returned empty response.",)
-                    
+                        # Clean up temp file before raising
+                        if is_temp_file and os.path.exists(file_path):
+                            try:
+                                os.remove(file_path)
+                            except:
+                                pass
+                        raise RuntimeError("OpenRouter model returned empty response")
+
                     # Clean up temp file
                     if is_temp_file and os.path.exists(file_path):
                         try:
                             os.remove(file_path)
                         except:
                             pass
-                    
+
                     return (caption.strip(),)
                 else:
                     print("❌ Error: No caption generated by API")
                     print("="*50 + "\n")
-                    return ("Error: No caption generated by API",)
+                    # Clean up temp file before raising
+                    if is_temp_file and os.path.exists(file_path):
+                        try:
+                            os.remove(file_path)
+                        except:
+                            pass
+                    raise RuntimeError("OpenRouter API returned no choices in response")
             else:
                 print(f"❌ API Error: {response.status_code}")
                 print("="*50 + "\n")
-                error_msg = response.text[:200] if len(response.text) > 200 else response.text
-                return (f"API error {response.status_code}: {error_msg}",)
-                
+                # Clean up temp file before raising
+                if is_temp_file and os.path.exists(file_path):
+                    try:
+                        os.remove(file_path)
+                    except:
+                        pass
+                error_msg = response.text[:500] if len(response.text) > 500 else response.text
+                raise RuntimeError(f"OpenRouter API error {response.status_code}: {error_msg}")
+
+        except RuntimeError:
+            # Re-raise RuntimeErrors (our intentional workflow stops)
+            raise
         except Exception as e:
             print(f"❌ Exception: {str(e)}")
             print("="*50 + "\n")
-            return (f"Exception: {str(e)}",)
+            # Clean up temp file before raising
+            if is_temp_file and os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                except:
+                    pass
+            raise RuntimeError(f"OpenRouter API exception: {str(e)}")
 
 
 class CustomVideoSaver:

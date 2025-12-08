@@ -267,6 +267,22 @@ class NV_ChunkStitcher:
         for i in range(1, num_chunks):
             current_chunk = chunks[i]
 
+            # Get transition_start_index from plan (KEY FIX: use absolute position, not relative from end)
+            # The start_frame in the plan is where this chunk's overlap begins in the original video
+            if i < len(plan.get("chunks", [])):
+                transition_start_index = plan["chunks"][i].get("start_frame", output.shape[0] - crossfade_frames)
+            else:
+                # Fallback - use old behavior (relative from end)
+                transition_start_index = output.shape[0] - crossfade_frames
+
+            # Validate we have enough frames at the transition point
+            if transition_start_index + crossfade_frames > output.shape[0]:
+                # Edge case: fall back to end-based calculation
+                report_lines.append(
+                    f"  ⚠️  Chunk {i}: transition_start_index ({transition_start_index}) + crossfade ({crossfade_frames}) > output ({output.shape[0]})"
+                )
+                transition_start_index = output.shape[0] - crossfade_frames
+
             if crossfade_frames > 0:
                 # Check if we have enough frames for crossfade
                 if crossfade_frames >= output.shape[0] or crossfade_frames >= current_chunk.shape[0]:
@@ -276,36 +292,39 @@ class NV_ChunkStitcher:
                     output = torch.cat([output, current_chunk], dim=0)
                     continue
 
-                # Get overlap regions
-                prev_end = output[-crossfade_frames:]  # Last N frames of accumulated
-                curr_start = current_chunk[:crossfade_frames]  # First N frames of current
+                # Get overlap regions at ABSOLUTE positions (like KJNodes CrossFadeImages)
+                frames_to_blend_from_output = output[transition_start_index:transition_start_index + crossfade_frames]
+                frames_to_blend_from_chunk = current_chunk[:crossfade_frames]
 
                 # Validate dimensions match
-                if prev_end.shape[1:] != curr_start.shape[1:]:
+                if frames_to_blend_from_output.shape[1:] != frames_to_blend_from_chunk.shape[1:]:
                     raise ValueError(
                         f"Chunk dimension mismatch at chunk {i}!\n"
-                        f"Previous end shape: {prev_end.shape}\n"
-                        f"Current start shape: {curr_start.shape}"
+                        f"Output region shape: {frames_to_blend_from_output.shape}\n"
+                        f"Chunk start shape: {frames_to_blend_from_chunk.shape}"
                     )
 
-                # Linear crossfade weights: 0 → 1 over crossfade_frames
+                # Linear crossfade weights: 0 → 1, so we fade FROM output TO chunk
                 weights = torch.linspace(0, 1, crossfade_frames)
                 weights = weights.view(-1, 1, 1, 1)  # [T, 1, 1, 1] for broadcasting
 
-                # Blend: (1 - weight) * prev + weight * current
-                blended = (1.0 - weights) * prev_end + weights * curr_start
+                # Blend: (1 - weight) * output + weight * chunk
+                blended = (1.0 - weights) * frames_to_blend_from_output + weights * frames_to_blend_from_chunk
 
-                # Replace overlap region in output and append remaining frames
+                # Reconstruct output (KJNodes style):
+                # - Everything BEFORE transition point
+                # - Blended frames
+                # - Rest of current chunk after the overlap region
                 output = torch.cat([
-                    output[:-crossfade_frames],  # Everything before overlap
-                    blended,  # Blended overlap region
-                    current_chunk[crossfade_frames:]  # Rest of current chunk
+                    output[:transition_start_index],
+                    blended,
+                    current_chunk[crossfade_frames:]
                 ], dim=0)
 
                 new_frames = current_chunk.shape[0] - crossfade_frames
                 report_lines.append(
                     f"  Chunk {i}: {current_chunk.shape[0]} frames "
-                    f"({crossfade_frames} blended, {new_frames} new)"
+                    f"(transition at {transition_start_index}, {crossfade_frames} blended, {new_frames} new)"
                 )
             else:
                 # No crossfade - just concatenate (not recommended)
@@ -494,20 +513,40 @@ class NV_ChunkStitcherFromImages:
             current_chunk = chunks[i]
             effective_crossfade = crossfade_frames
 
+            # Get transition_start_index from plan (KEY FIX: use absolute position, not relative from end)
+            # The start_frame in the plan is where this chunk's overlap begins in the original video
+            if plan and i < len(plan.get("chunks", [])):
+                transition_start_index = plan["chunks"][i].get("start_frame", output.shape[0] - effective_crossfade)
+            else:
+                # Fallback if no plan - use old behavior (relative from end)
+                transition_start_index = output.shape[0] - effective_crossfade
+
+            # Validate we have enough frames at the transition point
+            if transition_start_index + effective_crossfade > output.shape[0]:
+                # Edge case: fall back to end-based calculation
+                report_lines.append(
+                    f"  ⚠️  Chunk {i}: transition_start_index ({transition_start_index}) + crossfade ({effective_crossfade}) > output ({output.shape[0]})"
+                )
+                transition_start_index = output.shape[0] - effective_crossfade
+
             # Check if we have enough frames for crossfade
             if effective_crossfade > 0 and effective_crossfade < min(output.shape[0], current_chunk.shape[0]):
-                # Get overlap regions
-                prev_end = output[-effective_crossfade:]
-                curr_start = current_chunk[:effective_crossfade]
+                # Get overlap regions at ABSOLUTE positions (like KJNodes CrossFadeImages)
+                frames_to_blend_from_output = output[transition_start_index:transition_start_index + effective_crossfade]
+                frames_to_blend_from_chunk = current_chunk[:effective_crossfade]
 
-                # Linear crossfade
+                # Linear crossfade: weight goes 0 → 1, so we fade FROM output TO chunk
                 weights = torch.linspace(0, 1, effective_crossfade, device=output.device)
                 weights = weights.view(-1, 1, 1, 1)
 
-                blended = (1.0 - weights) * prev_end + weights * curr_start
+                blended = (1.0 - weights) * frames_to_blend_from_output + weights * frames_to_blend_from_chunk
 
+                # Reconstruct output (KJNodes style):
+                # - Everything BEFORE transition point
+                # - Blended frames
+                # - Rest of current chunk after the overlap region
                 output = torch.cat([
-                    output[:-effective_crossfade],
+                    output[:transition_start_index],
                     blended,
                     current_chunk[effective_crossfade:]
                 ], dim=0)
@@ -515,7 +554,7 @@ class NV_ChunkStitcherFromImages:
                 new_frames = current_chunk.shape[0] - effective_crossfade
                 report_lines.append(
                     f"  Chunk {i}: {current_chunk.shape[0]} frames "
-                    f"({effective_crossfade} blended, {new_frames} new)"
+                    f"(transition at {transition_start_index}, {effective_crossfade} blended, {new_frames} new)"
                 )
             else:
                 output = torch.cat([output, current_chunk], dim=0)
