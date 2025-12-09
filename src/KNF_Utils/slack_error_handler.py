@@ -12,6 +12,7 @@ Supports loading from .env file in NV_Comfy_Utils directory (requires python-dot
 """
 
 import os
+import time
 from pathlib import Path
 
 # Try to load .env file from NV_Comfy_Utils directory
@@ -100,6 +101,74 @@ if SLACK_BOT_TOKEN and SLACK_ERROR_CHANNEL:
         # Apply the wrapper
         execution.PromptExecutor.handle_execution_error = _wrapped_handle_execution_error
         print(f"[NV_SlackErrorHandler] Enabled - errors will notify {SLACK_ERROR_CHANNEL}")
+
+        # ===== SUCCESS NOTIFICATION SETUP =====
+
+        # Track execution start times by prompt_id
+        _execution_start_times = {}
+
+        def _format_duration(seconds: float) -> str:
+            """Format duration as human-readable string."""
+            if seconds < 60:
+                return f"{seconds:.0f}s"
+            elif seconds < 3600:
+                minutes = int(seconds // 60)
+                secs = int(seconds % 60)
+                return f"{minutes}m {secs}s"
+            else:
+                hours = int(seconds // 3600)
+                minutes = int((seconds % 3600) // 60)
+                secs = int(seconds % 60)
+                return f"{hours}h {minutes}m {secs}s"
+
+        def _send_slack_success(prompt_id: str, duration_seconds: float):
+            """Send success notification to Slack."""
+            try:
+                import socket
+                computer_name = socket.gethostname()
+                formatted_duration = _format_duration(duration_seconds)
+
+                message = (
+                    f"{computer_name}\n"
+                    f"Workflow Complete\n"
+                    f"Prompt ID: {prompt_id}\n"
+                    f"Execution Time: {formatted_duration}"
+                )
+
+                client = WebClient(token=SLACK_BOT_TOKEN)
+                client.chat_postMessage(channel=SLACK_ERROR_CHANNEL, text=message)
+                print(f"[NV_SlackErrorHandler] Sent success notification to {SLACK_ERROR_CHANNEL}")
+
+            except SlackApiError as e:
+                error_msg = e.response.get('error', str(e)) if hasattr(e, 'response') else str(e)
+                print(f"[NV_SlackErrorHandler] Slack API error: {error_msg}")
+            except Exception as e:
+                print(f"[NV_SlackErrorHandler] Failed to send success notification: {e}")
+
+        # Wrap add_message to intercept execution events
+        _original_add_message = execution.PromptExecutor.add_message
+
+        def _wrapped_add_message(self, event, data, broadcast=False):
+            """Wrapped add_message that tracks execution timing."""
+            # Track start time
+            if event == "execution_start":
+                prompt_id = data.get("prompt_id")
+                if prompt_id:
+                    _execution_start_times[prompt_id] = time.time()
+            # Send success notification with timing
+            elif event == "execution_success":
+                prompt_id = data.get("prompt_id")
+                if prompt_id:
+                    start_time = _execution_start_times.pop(prompt_id, None)
+                    if start_time:
+                        duration = time.time() - start_time
+                        _send_slack_success(prompt_id, duration)
+
+            # Call original
+            return _original_add_message(self, event, data, broadcast)
+
+        execution.PromptExecutor.add_message = _wrapped_add_message
+        print(f"[NV_SlackErrorHandler] Success notifications enabled")
 
         # Send startup notification
         def _send_startup_notification():

@@ -139,9 +139,6 @@ class GeminiVideoCaptioner:
 
     @classmethod
     def INPUT_TYPES(s):
-        input_dir = folder_paths.get_input_directory()
-        files = [f for f in os.listdir(input_dir) if f.endswith(('.mp4', '.avi', '.mov', '.mkv', '.webm', '.wmv', '.flv', '.m4v'))]
-        files = folder_paths.filter_files_content_types(files, ["video"])
         return {
             "required": {
                 "prompt_text": ("STRING", {"multiline": True, "default": "Describe this video in detail."}),
@@ -165,7 +162,6 @@ class GeminiVideoCaptioner:
             },
             "optional": {
                 "use_cached_prompt": ("BOOLEAN", {"default": False}),
-                "video_file": (sorted(files), {"video_upload": True}),
                 "video_tensor": ("IMAGE",),
                 "image_tensor": ("IMAGE",),
                 "max_tokens": ("INT", {"default": 1000, "min": 100, "max": 4000, "step": 100}),
@@ -324,7 +320,7 @@ class GeminiVideoCaptioner:
             print(f"Error converting tensor to image: {e}")
             return None
     
-    def caption_video(self, video_file=None, prompt_text="Describe this video in detail.", api_key="",
+    def caption_video(self, prompt_text="Describe this video in detail.", api_key="",
                      provider="Gemini", model="gemini-2.5-pro", fps=30.0, video_tensor=None,
                      image_tensor=None, max_tokens=1000, temperature=0.7, use_cached_prompt=False):
         """Main function to caption video/image using selected API provider."""
@@ -359,19 +355,8 @@ class GeminiVideoCaptioner:
             if file_path is None:
                 raise RuntimeError("Failed to convert video tensor to file")
             is_temp_file = True
-        # Priority 3: Handle video file input
-        elif video_file:
-            # Construct full path for ComfyUI video file
-            if not os.path.isabs(video_file):
-                input_dir = folder_paths.get_input_directory()
-                file_path = os.path.join(input_dir, video_file)
-            else:
-                file_path = video_file
-
-            if not os.path.exists(file_path):
-                raise RuntimeError(f"Video file not found: {file_path}")
         else:
-            raise RuntimeError("Either video file, video tensor, or image tensor must be provided")
+            raise RuntimeError("Either video_tensor or image_tensor must be provided")
         
         try:
             # Route to appropriate API provider
