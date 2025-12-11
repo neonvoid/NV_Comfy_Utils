@@ -7352,13 +7352,24 @@ class NV_PathParser:
     Parse a file path into its components.
     Useful for extracting source video names from VideoHelperSuite paths,
     since VHS_VIDEOINFO doesn't include the filename.
+
+    Supports two input modes:
+    - video_file dropdown: Select from uploaded videos (mirrors VHS video selector)
+    - file_path input: Connect a string path from another node
     """
 
     @classmethod
     def INPUT_TYPES(cls):
+        input_dir = folder_paths.get_input_directory()
+        video_extensions = ('.mp4', '.avi', '.mov', '.mkv', '.webm', '.wmv', '.flv', '.m4v')
+        files = [""] + sorted([f for f in os.listdir(input_dir)
+                  if os.path.isfile(os.path.join(input_dir, f))
+                  and f.lower().endswith(video_extensions)])
         return {
-            "required": {
+            "required": {},
+            "optional": {
                 "file_path": ("STRING", {"forceInput": True}),
+                "video_file": (files, {"default": ""}),
             }
         }
 
@@ -7367,7 +7378,7 @@ class NV_PathParser:
     FUNCTION = "parse_path"
     CATEGORY = "NV_Utils/Metadata"
 
-    def parse_path(self, file_path):
+    def parse_path(self, file_path=None, video_file=None):
         """
         Parse file path into components.
 
@@ -7381,11 +7392,16 @@ class NV_PathParser:
         """
         from pathlib import Path
 
-        # Handle empty or None input
-        if not file_path:
+        # Priority: file_path input connection > video_file dropdown
+        if file_path:
+            path_to_parse = file_path
+        elif video_file:
+            # Resolve dropdown selection to absolute path (same as VHS does)
+            path_to_parse = folder_paths.get_annotated_filepath(video_file)
+        else:
             return ("", "", "", "", "")
 
-        path = Path(file_path)
+        path = Path(path_to_parse)
 
         full_path = str(path)
         directory = str(path.parent)

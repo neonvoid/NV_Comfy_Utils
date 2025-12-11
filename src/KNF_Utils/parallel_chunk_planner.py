@@ -100,17 +100,11 @@ class NV_ParallelChunkPlanner:
                 "video": ("IMAGE", {
                     "tooltip": "Input video frames [T, H, W, C] - used to get total frame count and resolution"
                 }),
-                "num_workers": ("INT", {
-                    "default": 0,
-                    "min": 0,
-                    "max": 16,
-                    "tooltip": "Number of workers (0 = use max_frames_per_worker instead)"
-                }),
                 "max_frames_per_worker": ("INT", {
                     "default": 300,
-                    "min": 0,
+                    "min": 1,
                     "max": 10000,
-                    "tooltip": "Max frames per chunk (0 = use num_workers instead). Automatically calculates worker count."
+                    "tooltip": "Maximum frames per chunk. Worker count is auto-calculated to ensure all chunks fit within this limit."
                 }),
                 "overlap_frames": ("INT", {
                     "default": 32,
@@ -186,7 +180,7 @@ class NV_ParallelChunkPlanner:
     CATEGORY = "NV_Utils"
     DESCRIPTION = "Plans video chunk splits for parallel processing. Exports JSON config for multiple workers."
 
-    def plan_chunks(self, video, num_workers, max_frames_per_worker, overlap_frames, output_json_path,
+    def plan_chunks(self, video, max_frames_per_worker, overlap_frames, output_json_path,
                     seed=0, steps=20, cfg=5.0, sampler_name="euler", scheduler="sgm_uniform",
                     denoise=0.75, context_window_size=81, context_overlap=16,
                     wan_frame_alignment=True):
@@ -199,25 +193,64 @@ class NV_ParallelChunkPlanner:
         height = video.shape[1]
         width = video.shape[2]
 
-        # Determine num_workers from inputs
-        if max_frames_per_worker > 0:
-            # Calculate workers needed for max frames per worker
-            # Account for overlap: each chunk has unique_frames + overlap, except last chunk
-            # effective_unique = max_frames - overlap (what each chunk contributes uniquely)
-            effective_unique = max_frames_per_worker - overlap_frames
-            if effective_unique <= 0:
+        # Store original max for JSON output
+        original_max_frames = max_frames_per_worker
+
+        # If WAN alignment enabled, snap max_frames to valid WAN size (4n+1)
+        if wan_frame_alignment:
+            wan_max = nearest_wan_aligned(max_frames_per_worker)  # rounds down
+            if wan_max < overlap_frames + 5:  # minimum viable chunk (overlap + at least 5 unique frames)
                 raise ValueError(
-                    f"max_frames_per_worker ({max_frames_per_worker}) must be > overlap_frames ({overlap_frames})"
+                    f"max_frames_per_worker ({max_frames_per_worker}) too small for WAN alignment. "
+                    f"Need at least {overlap_frames + 5} frames."
                 )
-            # Calculate how many workers we need
-            # total_frames = unique_per_worker * num_workers + (num_workers - 1) * overlap... simplified:
-            num_workers = max(1, -(-total_frames // effective_unique))  # Ceiling division
-            print(f"[NV_ParallelChunkPlanner] Auto-calculated {num_workers} workers from max_frames_per_worker={max_frames_per_worker}")
-        elif num_workers > 0:
-            # Use explicit num_workers
-            pass
-        else:
-            raise ValueError("Either num_workers or max_frames_per_worker must be > 0")
+            if wan_max != max_frames_per_worker:
+                print(f"[NV_ParallelChunkPlanner] Adjusted max_frames {max_frames_per_worker} → {wan_max} for WAN alignment")
+            max_frames_per_worker = wan_max
+
+        # Calculate effective unique frames per chunk
+        effective_unique = max_frames_per_worker - overlap_frames
+        if effective_unique <= 0:
+            raise ValueError(
+                f"max_frames_per_worker ({max_frames_per_worker}) must be > overlap_frames ({overlap_frames})"
+            )
+
+        # Initial estimate of workers needed
+        num_workers = max(1, -(-total_frames // effective_unique))  # Ceiling division
+
+        # Validation loop: ensure ALL chunks (including last) fit within max_frames_per_worker
+        while num_workers < 100:  # Safety cap
+            # Simulate chunk boundaries to check last chunk size
+            total_overlap = (num_workers - 1) * overlap_frames
+            unique_total = total_frames - total_overlap
+
+            if unique_total <= 0:
+                # Too many workers for this frame count - shouldn't happen with proper initial estimate
+                break
+
+            base_unique = unique_total // num_workers
+            extra = unique_total % num_workers
+
+            # Calculate where last chunk would start by simulating all previous chunks
+            if num_workers == 1:
+                last_chunk_frames = total_frames
+            else:
+                cumulative_end = 0
+                for i in range(num_workers - 1):
+                    chunk_unique = base_unique + (1 if i < extra else 0)
+                    if i == 0:
+                        cumulative_end = chunk_unique + overlap_frames
+                    else:
+                        cumulative_end = cumulative_end - overlap_frames + chunk_unique + overlap_frames
+
+                last_start = cumulative_end - overlap_frames
+                last_chunk_frames = total_frames - last_start
+
+            if last_chunk_frames <= max_frames_per_worker:
+                break
+            num_workers += 1
+
+        print(f"[NV_ParallelChunkPlanner] Auto-calculated {num_workers} workers for max_frames_per_worker={max_frames_per_worker}")
 
         print(f"[NV_ParallelChunkPlanner] Video metadata:")
         print(f"  Total frames: {total_frames}")
@@ -282,15 +315,24 @@ class NV_ParallelChunkPlanner:
 
             frame_count = end_frame - start_frame
 
-            # Check WAN alignment for this chunk
-            chunk_wan_aligned = is_wan_aligned(frame_count)
-            wan_adjusted_count = nearest_wan_aligned(frame_count) if wan_frame_alignment else frame_count
+            # If WAN alignment enabled, enforce aligned chunk sizes
+            if wan_frame_alignment and not is_wan_aligned(frame_count):
+                aligned_count = nearest_wan_aligned(frame_count)  # rounds down
+                if i < num_workers - 1:
+                    # Non-last chunks: adjust end_frame to be WAN-aligned
+                    end_frame = start_frame + aligned_count
+                    frame_count = aligned_count
+                else:
+                    # Last chunk must reach total_frames - warn if not aligned
+                    warnings.append(
+                        f"Chunk {i} (last): {frame_count} frames is not WAN-aligned. "
+                        f"Will be truncated to {aligned_count} by WAN. "
+                        f"Consider adjusting input video length."
+                    )
 
-            if wan_frame_alignment and not chunk_wan_aligned:
-                warnings.append(
-                    f"Chunk {i}: {frame_count} frames is not WAN-aligned. "
-                    f"May be truncated to {wan_adjusted_count} by VHS."
-                )
+            # Track WAN alignment status for output
+            chunk_wan_aligned = is_wan_aligned(frame_count)
+            wan_adjusted_count = nearest_wan_aligned(frame_count) if not chunk_wan_aligned else frame_count
 
             chunks.append({
                 "chunk_idx": i,
@@ -306,7 +348,7 @@ class NV_ParallelChunkPlanner:
 
         # Build the plan
         plan = {
-            "version": "1.1",
+            "version": "1.3",
             "video_metadata": {
                 "total_frames": total_frames,
                 "height": height,
@@ -314,6 +356,8 @@ class NV_ParallelChunkPlanner:
                 "wan_aligned": input_wan_aligned,
             },
             "num_workers": num_workers,
+            "max_frames_per_worker": original_max_frames,  # user's original input
+            "effective_max_frames": max_frames_per_worker,  # after WAN adjustment (if enabled)
             "overlap_frames": overlap_frames,
             "wan_frame_alignment": wan_frame_alignment,
             "chunks": chunks,
@@ -355,10 +399,19 @@ class NV_ParallelChunkPlanner:
             "PARALLEL CHUNK PLAN",
             "=" * 60,
             f"Video: {total_frames} frames @ {width}x{height}",
-            f"Workers: {num_workers}",
+        ]
+
+        # Show max frames info (with WAN adjustment if applicable)
+        if wan_frame_alignment and original_max_frames != max_frames_per_worker:
+            summary_lines.append(f"Max frames per worker: {original_max_frames} → {max_frames_per_worker} (WAN-aligned)")
+        else:
+            summary_lines.append(f"Max frames per worker: {max_frames_per_worker}")
+
+        summary_lines.extend([
+            f"Workers (auto-calculated): {num_workers}",
             f"Overlap: {overlap_frames} frames",
             f"WAN alignment mode: {wan_frame_alignment}",
-        ]
+        ])
 
         if wan_frame_alignment:
             if input_wan_aligned:
