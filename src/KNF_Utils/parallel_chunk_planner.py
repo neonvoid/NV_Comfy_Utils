@@ -215,40 +215,15 @@ class NV_ParallelChunkPlanner:
                 f"max_frames_per_worker ({max_frames_per_worker}) must be > overlap_frames ({overlap_frames})"
             )
 
-        # Initial estimate of workers needed
-        num_workers = max(1, -(-total_frames // effective_unique))  # Ceiling division
-
-        # Validation loop: ensure ALL chunks (including last) fit within max_frames_per_worker
-        while num_workers < 100:  # Safety cap
-            # Simulate chunk boundaries to check last chunk size
-            total_overlap = (num_workers - 1) * overlap_frames
-            unique_total = total_frames - total_overlap
-
-            if unique_total <= 0:
-                # Too many workers for this frame count - shouldn't happen with proper initial estimate
-                break
-
-            base_unique = unique_total // num_workers
-            extra = unique_total % num_workers
-
-            # Calculate where last chunk would start by simulating all previous chunks
-            if num_workers == 1:
-                last_chunk_frames = total_frames
-            else:
-                cumulative_end = 0
-                for i in range(num_workers - 1):
-                    chunk_unique = base_unique + (1 if i < extra else 0)
-                    if i == 0:
-                        cumulative_end = chunk_unique + overlap_frames
-                    else:
-                        cumulative_end = cumulative_end - overlap_frames + chunk_unique + overlap_frames
-
-                last_start = cumulative_end - overlap_frames
-                last_chunk_frames = total_frames - last_start
-
-            if last_chunk_frames <= max_frames_per_worker:
-                break
-            num_workers += 1
+        # Calculate number of workers needed
+        # Each chunk covers max_frames, with overlap between chunks
+        # Effective step between chunk starts = max_frames - overlap
+        # Formula: num_workers = ceil((total_frames - overlap) / (max_frames - overlap))
+        if total_frames <= max_frames_per_worker:
+            num_workers = 1
+        else:
+            # How many "steps" of (max_frames - overlap) do we need to cover (total_frames - overlap)?
+            num_workers = max(1, -(-( total_frames - overlap_frames) // effective_unique))  # Ceiling division
 
         print(f"[NV_ParallelChunkPlanner] Auto-calculated {num_workers} workers for max_frames_per_worker={max_frames_per_worker}")
 
@@ -270,44 +245,20 @@ class NV_ParallelChunkPlanner:
                 f"VHS may truncate to {aligned_total} before processing."
             )
 
-        # Validate inputs
-        if overlap_frames >= total_frames // num_workers:
-            raise ValueError(
-                f"Overlap ({overlap_frames}) is too large for the number of workers ({num_workers}). "
-                f"Each chunk would need at least {overlap_frames * 2} frames."
-            )
-
-        # Calculate chunk boundaries
-        # Each chunk needs: unique_frames + overlap_frames
-        # Total unique frames = total_frames - (num_workers - 1) * overlap_frames
-        total_overlap = (num_workers - 1) * overlap_frames
-        unique_frames_total = total_frames - total_overlap
-
-        if unique_frames_total <= 0:
-            raise ValueError(
-                f"Too much overlap! Total overlap ({total_overlap}) exceeds available frames ({total_frames}). "
-                f"Reduce overlap_frames or num_workers."
-            )
-
-        # Distribute unique frames evenly
-        base_unique_per_worker = unique_frames_total // num_workers
-        extra_frames = unique_frames_total % num_workers
-
+        # Generate chunk boundaries
+        # Each non-last chunk has max_frames_per_worker frames
+        # Last chunk gets whatever remains (will be <= max_frames_per_worker)
         chunks = []
 
         for i in range(num_workers):
-            # This worker gets base + 1 extra frame if there are remainders
-            unique_frames = base_unique_per_worker + (1 if i < extra_frames else 0)
-
-            # Calculate chunk boundaries
             if i == 0:
                 # First chunk starts at 0
                 start_frame = 0
-                end_frame = unique_frames + overlap_frames
+                end_frame = min(max_frames_per_worker, total_frames)
             elif i < num_workers - 1:
                 # Middle chunks: start where previous chunk's overlap begins
                 start_frame = chunks[i-1]["end_frame"] - overlap_frames
-                end_frame = start_frame + unique_frames + overlap_frames
+                end_frame = start_frame + max_frames_per_worker
             else:
                 # Last chunk: starts at overlap, ends at total_frames
                 start_frame = chunks[i-1]["end_frame"] - overlap_frames
