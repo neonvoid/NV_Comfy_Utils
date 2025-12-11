@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 import traceback
 import atexit
@@ -89,6 +90,89 @@ def _get_gpu_info() -> Dict[str, Any]:
         return {"available": True, "error": "Could not get properties"}
 
 
+def _get_environment_info() -> Dict[str, str]:
+    """Get software environment versions."""
+    env = {
+        "python_version": sys.version.split()[0],
+        "pytorch_version": torch.__version__,
+    }
+    if torch.cuda.is_available():
+        env["cuda_version"] = torch.version.cuda or "unknown"
+
+    # Try to get ComfyUI version
+    try:
+        import folder_paths
+        version_file = os.path.join(folder_paths.base_path, "version.txt")
+        if os.path.exists(version_file):
+            with open(version_file) as f:
+                env["comfyui_version"] = f.read().strip()
+    except Exception:
+        pass
+
+    return env
+
+
+def _get_memory_settings() -> Dict[str, Any]:
+    """Get current memory management settings."""
+    try:
+        from comfy import model_management
+        settings = {
+            "pinned_memory_enabled": getattr(model_management, 'ENABLE_PINNED_MEMORY', False),
+        }
+        if hasattr(model_management, 'vram_state'):
+            settings["vram_state"] = str(model_management.vram_state.name)
+        return settings
+    except Exception:
+        return {}
+
+
+def _detect_workflow_type(logs: List[Dict[str, Any]]) -> str:
+    """Detect workflow type based on log messages."""
+    has_vace = False
+    has_image_input = False
+    has_wan = False
+    has_controlnet = False
+    sampler_count = 0
+
+    for log_entry in logs:
+        msg = log_entry.get("message", "").lower()
+
+        # Check for VACE
+        if "vace" in msg or "control_video_latent" in msg:
+            has_vace = True
+
+        # Check for WAN model
+        if "wan" in msg and ("model" in msg or "loaded" in msg):
+            has_wan = True
+
+        # Check for image input (img2vid)
+        if "input image" in msg or "load image" in msg or "image_to_video" in msg:
+            has_image_input = True
+
+        # Check for ControlNet
+        if "controlnet" in msg:
+            has_controlnet = True
+
+        # Count samplers
+        if "ksampler" in msg or "sampler" in msg and "starting" in msg:
+            sampler_count += 1
+
+    # Determine workflow type
+    if has_vace:
+        return "vace"
+    elif has_controlnet:
+        return "controlnet"
+    elif has_wan:
+        if has_image_input:
+            return "img2vid"
+        else:
+            return "txt2vid"
+    elif sampler_count > 1:
+        return "multi_model"
+    else:
+        return "unknown"
+
+
 def _parse_logs_for_data(logs: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Parse captured logs to extract structured workflow data."""
     data = {
@@ -96,6 +180,11 @@ def _parse_logs_for_data(logs: List[Dict[str, Any]]) -> Dict[str, Any]:
         "vace": {},
         "models": [],
         "context_window": None,
+        "sampling": {},
+        "timing": {
+            "per_step_times": [],
+            "per_iteration_times": [],
+        },
         "errors": [],
     }
 
@@ -113,9 +202,25 @@ def _parse_logs_for_data(logs: List[Dict[str, Any]]) -> Dict[str, Any]:
         # Model loading
         "model_loaded": r"Requested to load (\w+)",
         "model_size": r"loaded completely.*?(\d+\.?\d*) MB loaded",
+        "model_dtype": r"dtype[=:\s]*(bf16|fp16|fp32|float16|float32|bfloat16)",
+        "lowvram_patches": r"lowvram patches:\s*(\d+)",
 
-        # Context window
-        "context_window": r"Using context windows (\d+) for (\d+) frames",
+        # Context window - enhanced to capture overlap
+        "context_window": r"Using context windows?\s*(\d+)\s*(?:for|with)?\s*(\d+)\s*frames?",
+        "context_overlap": r"overlap[=:\s]+(\d+)",
+        "context_stride": r"stride[=:\s]+(\d+)",
+
+        # Sampling info
+        "sampler_steps": r"(\d+)\s*(?:steps?|iterations?)",
+        "sampler_name": r"sampler[=:\s]+['\"]?(\w+)['\"]?",
+        "cfg_scale": r"cfg[=:\s]+(\d+\.?\d*)",
+
+        # Timing - iteration times from progress logs
+        "iteration_time": r"(\d+\.?\d*)\s*s/it",
+        "step_progress": r"(\d+)/(\d+)\s*\[",
+
+        # Attention type
+        "attention_type": r"(sage|flash|pytorch|sdpa)[\s_-]?attention",
 
         # Errors
         "oom_error": r"OutOfMemoryError|Allocation on device",
@@ -124,6 +229,7 @@ def _parse_logs_for_data(logs: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     current_model = None
     seen_models = set()
+    vace_shapes_seen = set()  # Track unique VACE shapes for condition counting
 
     for log_entry in logs:
         msg = log_entry.get("message", "")
@@ -153,11 +259,12 @@ def _parse_logs_for_data(logs: List[Dict[str, Any]]) -> Dict[str, Any]:
                 data["inputs"]["latent_frames"] = t
                 data["inputs"]["latent_spatial"] = [h, w]
 
-        # Parse VACE shapes
+        # Parse VACE shapes (track unique shapes for condition counting)
         match = re.search(patterns["vace_frames"], msg)
         if match:
             shape_str = match.group(1)
             data["vace"]["control_shape"] = [int(x.strip()) for x in shape_str.split(",")]
+            vace_shapes_seen.add(shape_str)  # Track for condition counting
 
         match = re.search(patterns["vace_mask"], msg)
         if match:
@@ -179,6 +286,22 @@ def _parse_logs_for_data(logs: List[Dict[str, Any]]) -> Dict[str, Any]:
             seen_models.add(current_model)
             current_model = None
 
+        # Parse model dtype
+        match = re.search(patterns["model_dtype"], msg, re.IGNORECASE)
+        if match:
+            dtype = match.group(1).lower()
+            # Normalize dtype names
+            dtype_map = {"float16": "fp16", "float32": "fp32", "bfloat16": "bf16"}
+            dtype = dtype_map.get(dtype, dtype)
+            if data["models"]:
+                data["models"][-1]["dtype"] = dtype
+
+        # Parse lowvram patches count
+        match = re.search(patterns["lowvram_patches"], msg)
+        if match:
+            data["memory_settings"] = data.get("memory_settings", {})
+            data["memory_settings"]["lowvram_patches_count"] = int(match.group(1))
+
         # Parse context window
         match = re.search(patterns["context_window"], msg)
         if match:
@@ -187,6 +310,46 @@ def _parse_logs_for_data(logs: List[Dict[str, Any]]) -> Dict[str, Any]:
                 "window_size": window_size,
                 "total_frames": total_frames,
             }
+
+        # Parse context overlap
+        match = re.search(patterns["context_overlap"], msg)
+        if match and data["context_window"]:
+            data["context_window"]["overlap"] = int(match.group(1))
+            # Calculate stride if we have overlap
+            if "window_size" in data["context_window"]:
+                data["context_window"]["stride"] = data["context_window"]["window_size"] - data["context_window"]["overlap"]
+
+        # Parse context stride (if explicitly provided)
+        match = re.search(patterns["context_stride"], msg)
+        if match and data["context_window"]:
+            data["context_window"]["stride"] = int(match.group(1))
+
+        # Parse sampling info
+        match = re.search(patterns["sampler_name"], msg, re.IGNORECASE)
+        if match:
+            data["sampling"]["sampler"] = match.group(1)
+
+        match = re.search(patterns["cfg_scale"], msg)
+        if match:
+            data["sampling"]["cfg_scale"] = float(match.group(1))
+
+        # Parse step progress to get total steps
+        match = re.search(patterns["step_progress"], msg)
+        if match:
+            current_step, total_steps = map(int, match.groups())
+            data["sampling"]["total_steps"] = total_steps
+
+        # Parse iteration times from progress logs
+        match = re.search(patterns["iteration_time"], msg)
+        if match:
+            it_time = float(match.group(1))
+            data["timing"]["per_iteration_times"].append(it_time)
+
+        # Parse attention type
+        match = re.search(patterns["attention_type"], msg, re.IGNORECASE)
+        if match:
+            data["gpu_settings"] = data.get("gpu_settings", {})
+            data["gpu_settings"]["attention_type"] = match.group(1).lower()
 
         # Parse errors
         if level == "ERROR" or re.search(patterns["oom_error"], msg):
@@ -199,6 +362,33 @@ def _parse_logs_for_data(logs: List[Dict[str, Any]]) -> Dict[str, Any]:
                 "location": location,
                 "is_oom": bool(re.search(patterns["oom_error"], msg)),
             })
+
+    # Calculate VACE condition count from unique shapes seen
+    if vace_shapes_seen:
+        data["vace"]["num_conditions"] = len(vace_shapes_seen)
+
+    # Calculate number of windows if we have context window data
+    if data["context_window"] and "total_frames" in data["context_window"]:
+        cw = data["context_window"]
+        total_frames = cw["total_frames"]
+        window_size = cw.get("window_size", 16)
+        stride = cw.get("stride", window_size // 2)  # Default to 50% overlap
+
+        if stride > 0 and total_frames > window_size:
+            num_windows = ((total_frames - window_size) // stride) + 1
+            if (total_frames - window_size) % stride > 0:
+                num_windows += 1
+            data["context_window"]["num_windows"] = num_windows
+        else:
+            data["context_window"]["num_windows"] = 1
+
+    # Clean up empty dicts
+    if not data["vace"]:
+        del data["vace"]
+    if not data["sampling"]:
+        del data["sampling"]
+    if not data["timing"]["per_step_times"] and not data["timing"]["per_iteration_times"]:
+        del data["timing"]
 
     return data
 
@@ -335,19 +525,42 @@ class NV_WorkflowLogger:
         timestamp = datetime.now().isoformat()
         execution_time = time.time() - _capture_handler.start_time
 
+        # Parse logs first to detect workflow type
+        parsed = _parse_logs_for_data(_capture_handler.logs)
+        workflow_type = _detect_workflow_type(_capture_handler.logs)
+
         log_entry = {
             "timestamp": timestamp,
             "execution_time_sec": round(execution_time, 2),
-            "gpu_info": _get_gpu_info(),
+            "outcome": "success",  # Will be updated if crash/OOM
+            "workflow_type": workflow_type,
+
+            # Environment info
+            "environment": _get_environment_info(),
+
+            # GPU info
+            "gpu": _get_gpu_info(),
+
+            # Memory settings and state
+            "memory_settings": _get_memory_settings(),
+
+            # Memory stats
             "memory": {
                 "peak": _get_memory_stats(),
             },
-            "outcome": "success",  # Will be updated if crash/OOM
+
             "raw_logs_count": len(_capture_handler.logs),
         }
 
-        # Parse logs for structured data
-        parsed = _parse_logs_for_data(_capture_handler.logs)
+        # Merge memory_settings from parsed data if present
+        if "memory_settings" in parsed:
+            log_entry["memory_settings"].update(parsed.pop("memory_settings"))
+
+        # Merge gpu_settings from parsed data if present
+        if "gpu_settings" in parsed:
+            log_entry["gpu"].update(parsed.pop("gpu_settings"))
+
+        # Add parsed data
         log_entry.update(parsed)
 
         # Store as pending in case of crash

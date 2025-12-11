@@ -63,12 +63,15 @@ def slice_vace_conditioning(handler, model, x_in, conds, timestep, model_options
     # Adaptive CPU offload: for long videos, cache on CPU to avoid OOM
     use_cpu_cache = full_temporal_size > LONG_VIDEO_THRESHOLD
 
-    # Debug: Log callback invocation
+    # Debug: Log callback invocation (with parseable format for workflow logger)
     if window_idx == 0:  # Only log first window to reduce noise
+        window_size = len(window.index_list)
         print(f"[VACE Slicer] Callback invoked for window {window_idx}")
         print(f"[VACE Slicer] x_in shape: {x_in.shape}, dim={dim}")
         print(f"[VACE Slicer] Window indices: {window.index_list[:5]}...{window.index_list[-5:] if len(window.index_list) > 5 else ''}")
         print(f"[VACE Slicer] Number of cond lists: {len(conds)}")
+        # Parseable log line for workflow logger
+        print(f"[VACE Slicer] Using context window {window_size} for {full_temporal_size} frames")
         if use_cpu_cache:
             print(f"[VACE Slicer] Long video detected ({full_temporal_size} frames > {LONG_VIDEO_THRESHOLD}), using CPU cache")
 
