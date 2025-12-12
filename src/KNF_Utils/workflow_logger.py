@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+import statistics
 import sys
 import time
 import traceback
@@ -177,10 +178,14 @@ def _parse_logs_for_data(logs: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Parse captured logs to extract structured workflow data."""
     data = {
         "inputs": {},
+        "vae": {},
         "vace": {},
         "models": [],
         "context_window": None,
         "sampling": {},
+        "multi_model": {},
+        "adaptive_shift": {},
+        "chunk": {},
         "timing": {
             "per_step_times": [],
             "per_iteration_times": [],
@@ -190,14 +195,41 @@ def _parse_logs_for_data(logs: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     # Regex patterns for extracting data from log messages
     patterns = {
-        # Input shapes
+        # Input shapes (legacy)
         "pixel_shape": r"Input shape: torch\.Size\(\[(\d+), (\d+), (\d+), (\d+)\]\)",
         "latent_shape": r"Output latent shape: torch\.Size\(\[(\d+), (\d+), (\d+), (\d+), (\d+)\]\)",
         "latent_input": r"Input shape: torch\.Size\(\[(\d+), (\d+), (\d+), (\d+), (\d+)\]\)",
 
-        # VACE shapes
+        # VACE shapes (legacy)
         "vace_frames": r"control_video_latent shape: torch\.Size\(\[([^\]]+)\]\)",
         "vace_mask": r"vace_mask shape: torch\.Size\(\[([^\]]+)\]\)",
+
+        # === VACE Slicer shapes (new) ===
+        "vace_slicer_frames": r"\[VACE Slicer\] Sliced vace_frames:.*?-> torch\.Size\(\[([^\]]+)\]\)",
+        "vace_slicer_mask": r"\[VACE Slicer\] Sliced vace_mask:.*?-> torch\.Size\(\[([^\]]+)\]\)",
+        "vace_slicer_context": r"\[VACE Slicer\] Sliced vace_context:.*?-> torch\.Size\(\[([^\]]+)\]\)",
+        "vace_original_frames": r"\[VACE Slicer\] Cached original vace_frames: shape torch\.Size\(\[([^\]]+)\]\)",
+        "vace_original_mask": r"\[VACE Slicer\] Cached original vace_mask: shape torch\.Size\(\[([^\]]+)\]\)",
+        "x_in_shape": r"x_in shape: torch\.Size\(\[([^\]]+)\]\)",
+
+        # === VAE Encode/Decode ===
+        "vae_encode_input": r"\[NV_StreamingVAEEncode\] Input shape: torch\.Size\(\[([^\]]+)\]\)",
+        "vae_encode_output": r"\[NV_StreamingVAEEncode\].*Output latent shape: torch\.Size\(\[([^\]]+)\]\)",
+        "vae_encode_memory": r"\[NV_StreamingVAEEncode\] Memory: ([\d.]+) GB pixels -> ([\d.]+) MB latents",
+        "vae_decode_input": r"\[NV_StreamingVAEDecode\] Input shape: torch\.Size\(\[([^\]]+)\]\)",
+        "vae_decode_output": r"\[NV_StreamingVAEDecode\].*Output shape: torch\.Size\(\[([^\]]+)\]\)",
+        "vae_decode_frames": r"\[NV_StreamingVAEDecode\] Starting decode of (\d+) latent frames",
+
+        # === Multi-Model Sampler ===
+        "multi_model_mode": r"\[NV_MultiModelSampler\] Sequential mode: (\d+) models",
+        "multi_model_steps": r"\[NV_MultiModelSampler\] Step distribution: \[([^\]]+)\]",
+        "multi_model_config": r"\[NV_MultiModelSampler\] Model (\d+): steps (\d+)-(\d+), cfg=([\d.]+)",
+
+        # === Adaptive Shift ===
+        "adaptive_shift": r"\[NV_AdaptiveShiftApplier\] Applied shift=([\d.]+) \(frames=(\d+), denoise=([\d.]+), type=(\w+)\)",
+
+        # === Chunk Loader ===
+        "chunk_loader": r"\[NV_ChunkLoaderVACE\] Loaded chunk (\d+):\s*Frames: (\d+) to (\d+) \((\d+) frames\)",
 
         # Model loading
         "model_loaded": r"Requested to load (\w+)",
@@ -207,6 +239,7 @@ def _parse_logs_for_data(logs: List[Dict[str, Any]]) -> Dict[str, Any]:
 
         # Context window - enhanced to capture overlap
         "context_window": r"Using context windows?\s*(\d+)\s*(?:for|with)?\s*(\d+)\s*frames?",
+        "context_window_full": r"context windows?\s*(\d+)\s*with overlap\s*(\d+)\s*for\s*(\d+)\s*frames",
         "context_overlap": r"overlap[=:\s]+(\d+)",
         "context_stride": r"stride[=:\s]+(\d+)",
 
@@ -215,9 +248,14 @@ def _parse_logs_for_data(logs: List[Dict[str, Any]]) -> Dict[str, Any]:
         "sampler_name": r"sampler[=:\s]+['\"]?(\w+)['\"]?",
         "cfg_scale": r"cfg[=:\s]+(\d+\.?\d*)",
 
-        # Timing - iteration times from progress logs
-        "iteration_time": r"(\d+\.?\d*)\s*s/it",
+        # Timing - iteration times from progress logs (fixed patterns)
+        "tqdm_progress": r"(\d+)/(\d+)\s*\[[^\]]+,\s*(\d+\.?\d*)s/it\]",
+        "iteration_time": r"(\d+\.?\d*)s/it",
+        "it_per_sec": r"(\d+\.?\d*)it/s",
         "step_progress": r"(\d+)/(\d+)\s*\[",
+
+        # Execution time
+        "prompt_executed": r"Prompt executed in (\d+):(\d+):(\d+)",
 
         # Attention type
         "attention_type": r"(sage|flash|pytorch|sdpa)[\s_-]?attention",
@@ -271,6 +309,122 @@ def _parse_logs_for_data(logs: List[Dict[str, Any]]) -> Dict[str, Any]:
             shape_str = match.group(1)
             data["vace"]["mask_shape"] = [int(x.strip()) for x in shape_str.split(",")]
 
+        # === Parse VACE Slicer shapes (new) ===
+        match = re.search(patterns["vace_original_frames"], msg)
+        if match:
+            shape_str = match.group(1)
+            shape = [int(x.strip()) for x in shape_str.split(",")]
+            data["vace"]["original_frames_shape"] = shape
+            # Extract dimensions: [B, C, T, H, W]
+            if len(shape) >= 5:
+                data["inputs"]["latent_frames"] = shape[2]
+                data["inputs"]["latent_spatial"] = [shape[3], shape[4]]
+
+        match = re.search(patterns["vace_original_mask"], msg)
+        if match:
+            shape_str = match.group(1)
+            data["vace"]["original_mask_shape"] = [int(x.strip()) for x in shape_str.split(",")]
+
+        match = re.search(patterns["vace_slicer_frames"], msg)
+        if match:
+            shape_str = match.group(1)
+            data["vace"]["sliced_frames_shape"] = [int(x.strip()) for x in shape_str.split(",")]
+
+        match = re.search(patterns["vace_slicer_mask"], msg)
+        if match:
+            shape_str = match.group(1)
+            data["vace"]["sliced_mask_shape"] = [int(x.strip()) for x in shape_str.split(",")]
+
+        match = re.search(patterns["x_in_shape"], msg)
+        if match:
+            shape_str = match.group(1)
+            data["vace"]["x_in_shape"] = [int(x.strip()) for x in shape_str.split(",")]
+
+        # === Parse VAE Encode/Decode ===
+        match = re.search(patterns["vae_encode_input"], msg)
+        if match:
+            shape_str = match.group(1)
+            shape = [int(x.strip()) for x in shape_str.split(",")]
+            data["vae"]["encode_input_shape"] = shape
+            # Extract pixel dimensions: [F, H, W, C]
+            if len(shape) >= 4:
+                data["inputs"]["pixel_frames"] = shape[0]
+                data["inputs"]["pixel_resolution"] = [shape[1], shape[2]]
+
+        match = re.search(patterns["vae_encode_output"], msg)
+        if match:
+            shape_str = match.group(1)
+            shape = [int(x.strip()) for x in shape_str.split(",")]
+            data["vae"]["encode_output_shape"] = shape
+            # Extract latent dimensions: [B, C, T, H, W]
+            if len(shape) >= 5:
+                data["inputs"]["latent_shape"] = shape
+                data["inputs"]["latent_frames"] = shape[2]
+                data["inputs"]["latent_spatial"] = [shape[3], shape[4]]
+
+        match = re.search(patterns["vae_encode_memory"], msg)
+        if match:
+            data["vae"]["encode_memory_gb"] = float(match.group(1))
+            data["vae"]["encode_output_mb"] = float(match.group(2))
+
+        match = re.search(patterns["vae_decode_input"], msg)
+        if match:
+            shape_str = match.group(1)
+            data["vae"]["decode_input_shape"] = [int(x.strip()) for x in shape_str.split(",")]
+
+        match = re.search(patterns["vae_decode_output"], msg)
+        if match:
+            shape_str = match.group(1)
+            shape = [int(x.strip()) for x in shape_str.split(",")]
+            data["vae"]["decode_output_shape"] = shape
+            # Also update pixel dimensions from decode output
+            if len(shape) >= 4:
+                data["inputs"]["pixel_frames"] = shape[0]
+                data["inputs"]["pixel_resolution"] = [shape[1], shape[2]]
+
+        # === Parse Multi-Model Sampler ===
+        match = re.search(patterns["multi_model_mode"], msg)
+        if match:
+            data["multi_model"]["num_models"] = int(match.group(1))
+
+        match = re.search(patterns["multi_model_steps"], msg)
+        if match:
+            steps_str = match.group(1)
+            data["multi_model"]["step_distribution"] = [int(x.strip()) for x in steps_str.split(",")]
+
+        match = re.search(patterns["multi_model_config"], msg)
+        if match:
+            model_num, start_step, end_step, cfg = match.groups()
+            if "configs" not in data["multi_model"]:
+                data["multi_model"]["configs"] = []
+            data["multi_model"]["configs"].append({
+                "model": int(model_num),
+                "steps": f"{start_step}-{end_step}",
+                "cfg": float(cfg),
+            })
+
+        # === Parse Adaptive Shift ===
+        match = re.search(patterns["adaptive_shift"], msg)
+        if match:
+            shift, frames, denoise, shift_type = match.groups()
+            data["adaptive_shift"] = {
+                "shift": float(shift),
+                "frames": int(frames),
+                "denoise": float(denoise),
+                "type": shift_type,
+            }
+
+        # === Parse Chunk Loader ===
+        match = re.search(patterns["chunk_loader"], msg)
+        if match:
+            chunk_idx, frame_start, frame_end, num_frames = match.groups()
+            data["chunk"] = {
+                "chunk_index": int(chunk_idx),
+                "frame_start": int(frame_start),
+                "frame_end": int(frame_end),
+                "num_frames": int(num_frames),
+            }
+
         # Parse model loading
         match = re.search(patterns["model_loaded"], msg)
         if match:
@@ -302,18 +456,30 @@ def _parse_logs_for_data(logs: List[Dict[str, Any]]) -> Dict[str, Any]:
             data["memory_settings"] = data.get("memory_settings", {})
             data["memory_settings"]["lowvram_patches_count"] = int(match.group(1))
 
-        # Parse context window
-        match = re.search(patterns["context_window"], msg)
+        # Parse context window with full pattern (includes overlap)
+        match = re.search(patterns["context_window_full"], msg)
         if match:
-            window_size, total_frames = map(int, match.groups())
+            window_size, overlap, total_frames = map(int, match.groups())
             data["context_window"] = {
                 "window_size": window_size,
+                "overlap": overlap,
                 "total_frames": total_frames,
+                "stride": window_size - overlap,
             }
+        else:
+            # Fallback to legacy pattern
+            match = re.search(patterns["context_window"], msg)
+            if match:
+                window_size, total_frames = map(int, match.groups())
+                if data["context_window"] is None:
+                    data["context_window"] = {
+                        "window_size": window_size,
+                        "total_frames": total_frames,
+                    }
 
-        # Parse context overlap
+        # Parse context overlap (legacy fallback)
         match = re.search(patterns["context_overlap"], msg)
-        if match and data["context_window"]:
+        if match and data["context_window"] and "overlap" not in data["context_window"]:
             data["context_window"]["overlap"] = int(match.group(1))
             # Calculate stride if we have overlap
             if "window_size" in data["context_window"]:
@@ -382,13 +548,35 @@ def _parse_logs_for_data(logs: List[Dict[str, Any]]) -> Dict[str, Any]:
         else:
             data["context_window"]["num_windows"] = 1
 
+    # Calculate timing statistics
+    if data["timing"]["per_iteration_times"]:
+        times = data["timing"]["per_iteration_times"]
+        data["timing"]["iteration_stats"] = {
+            "count": len(times),
+            "mean_sec": round(statistics.mean(times), 2),
+            "min_sec": round(min(times), 2),
+            "max_sec": round(max(times), 2),
+            "std_sec": round(statistics.stdev(times), 2) if len(times) > 1 else 0,
+            "total_sec": round(sum(times), 2),
+        }
+
     # Clean up empty dicts
     if not data["vace"]:
         del data["vace"]
+    if not data["vae"]:
+        del data["vae"]
     if not data["sampling"]:
         del data["sampling"]
+    if not data["multi_model"]:
+        del data["multi_model"]
+    if not data["adaptive_shift"]:
+        del data["adaptive_shift"]
+    if not data["chunk"]:
+        del data["chunk"]
     if not data["timing"]["per_step_times"] and not data["timing"]["per_iteration_times"]:
         del data["timing"]
+    if not data["inputs"]:
+        del data["inputs"]
 
     return data
 

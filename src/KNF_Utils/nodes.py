@@ -1350,7 +1350,12 @@ class CustomVideoSaver:
             # Generate filename with 5-digit counter (e.g., video_00001.mp4)
             video_filename = f"{filename_prefix}_{counter:05}.{video_format}"
             video_path = os.path.join(output_dir, video_filename)
-            
+
+            # Ensure parent directory exists (handles filename_prefix with path separators)
+            parent_dir = os.path.dirname(video_path)
+            if parent_dir and not os.path.exists(parent_dir):
+                os.makedirs(parent_dir, exist_ok=True)
+
             # Check if file already exists
             if not os.path.exists(video_path):
                 return video_filename, video_path

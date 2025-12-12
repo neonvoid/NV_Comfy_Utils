@@ -18,9 +18,9 @@ from comfy.context_windows import IndexListCallbacks, IndexListContextWindow
 VACE_TENSOR_KEYS = ["vace_frames", "vace_mask"]
 
 # Threshold for CPU offload: videos longer than this cache to CPU to avoid OOM
-# 100 latent frames ≈ 400 pixel frames. Below this, GPU cache is fast and fits.
+# 55 latent frames ≈ 220 pixel frames. Below this, GPU cache is fast and fits.
 # Above this, we offload to CPU and transfer one window at a time.
-LONG_VIDEO_THRESHOLD = 100
+LONG_VIDEO_THRESHOLD = 55
 
 # Cache for original full-length tensors, keyed by cond_dict uuid
 # This is necessary because we modify conds in-place, and need to preserve
