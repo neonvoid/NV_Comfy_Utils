@@ -42,6 +42,8 @@ from .b2_output_sync import NV_B2OutputSync
 from .vace_benchmark import NV_VACEBenchmarkLogger
 # Import workflow logger for memory analysis dataset collection
 from .workflow_logger import NV_WorkflowLogger, NV_WorkflowLoggerStart
+# Import frame number overlay for debugging
+from .frame_number_overlay import NV_FrameNumberOverlay
 
 # Import Slack notifier (optional dependency - requires slack-sdk)
 try:
@@ -7850,6 +7852,7 @@ NODE_CLASS_MAPPINGS = {
     "NV_VACEBenchmarkLogger": NV_VACEBenchmarkLogger,
     "NV_WorkflowLogger": NV_WorkflowLogger,
     "NV_WorkflowLoggerStart": NV_WorkflowLoggerStart,
+    "NV_FrameNumberOverlay": NV_FrameNumberOverlay,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -7886,6 +7889,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NV_VACEBenchmarkLogger": "NV VACE Benchmark Logger",
     "NV_WorkflowLogger": "NV Workflow Logger",
     "NV_WorkflowLoggerStart": "NV Workflow Logger (Start)",
+    "NV_FrameNumberOverlay": "NV Frame Number Overlay",
 }
 
 # Conditionally add NV_Video_Loader_Path if it imported successfully
