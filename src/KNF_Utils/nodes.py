@@ -7817,6 +7817,528 @@ class NV_FrameAnnotator:
         return (json_path, marked_frames_csv, marked_images, total_frames)
 
 
+class NV_BatchFolderScanner:
+    """
+    Scans subfolders for video files matching a pattern and allows iteration via index.
+
+    Use Case: Batch process videos from a hierarchical folder structure where each
+    subfolder contains one or more video files. Use index to iterate through all
+    discovered videos in a workflow loop.
+
+    Example Structure:
+        root_folder/
+            project_A/
+                video1.mp4
+            project_B/
+                video2.mp4
+            project_C/
+                video3.mp4
+
+    Set index=0 for project_A/video1.mp4, index=1 for project_B/video2.mp4, etc.
+    """
+
+    # Cache to avoid re-scanning on every execution
+    _scan_cache = {}
+    _cache_timestamp = {}
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "root_folder": ("STRING", {
+                    "default": "",
+                    "tooltip": "Root directory to scan for videos in subfolders"
+                }),
+                "filename_pattern": ("STRING", {
+                    "default": "*.mp4",
+                    "tooltip": "Glob pattern (e.g., '*.mp4', 'output*.mov') or exact filename (e.g., 'video.mp4')"
+                }),
+                "index": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 99999,
+                    "tooltip": "Index of video to return (0-based). Increment to iterate through all found videos."
+                }),
+            },
+            "optional": {
+                "fallback_pattern": ("STRING", {
+                    "default": "",
+                    "tooltip": "Fallback pattern if primary pattern finds no match in a folder (e.g., '*_B.mov' as backup for '*_A.mov')"
+                }),
+                "exclude_folders": ("STRING", {
+                    "default": "",
+                    "multiline": True,
+                    "tooltip": "Folder names/patterns to exclude (one per line or comma-separated). Supports glob patterns: 'backup*', '_*', 'archive'. Use to skip unwanted directories."
+                }),
+                "dry_run": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "If True, returns summary of all found files without selecting a specific index"
+                }),
+                "recursive": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Scan subfolders recursively"
+                }),
+                "max_depth": ("INT", {
+                    "default": 10,
+                    "min": 1,
+                    "max": 50,
+                    "tooltip": "Maximum folder depth to scan (prevents infinite loops)"
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "NV_METADATA", "INT", "STRING", "STRING")
+    RETURN_NAMES = ("video_path", "metadata", "total_count", "info", "export_json")
+    FUNCTION = "scan_and_select"
+    CATEGORY = "NV_Utils/Batch"
+    DESCRIPTION = "Scan subfolders for videos matching a pattern and iterate via index. Use dry_run to preview all found files. export_json output is Google Sheets/Excel importable."
+
+    def scan_and_select(self, root_folder, filename_pattern, index,
+                        fallback_pattern="", exclude_folders="", dry_run=False, recursive=True, max_depth=10):
+        """
+        Main execution function.
+
+        Returns:
+            - video_path: Absolute path to the selected video (empty in dry_run mode)
+            - metadata: NV_METADATA dict with folder/file information
+            - total_count: Total number of videos found
+            - info: Human-readable summary string
+        """
+        # Validate root folder
+        if not root_folder:
+            return self._error_result("Root folder path is empty")
+
+        if not os.path.exists(root_folder):
+            return self._error_result(f"Root folder not found: {root_folder}")
+
+        if not os.path.isdir(root_folder):
+            return self._error_result(f"Path is not a directory: {root_folder}")
+
+        root_path = Path(root_folder).resolve()
+
+        # Parse exclusion patterns
+        exclusions = self._parse_exclusions(exclude_folders)
+        if exclusions:
+            print(f"[NV_BatchFolderScanner] Excluding folders matching: {exclusions}")
+
+        # Log fallback pattern if provided
+        if fallback_pattern:
+            print(f"[NV_BatchFolderScanner] Using fallback pattern: {fallback_pattern}")
+
+        # Check cache (include exclusions and fallback in cache key)
+        cache_key = (str(root_path), filename_pattern, fallback_pattern, tuple(exclusions), recursive, max_depth)
+        cache_valid = self._is_cache_valid(cache_key)
+
+        if cache_valid:
+            video_list = self._scan_cache[cache_key]
+            print(f"[NV_BatchFolderScanner] Using cached scan ({len(video_list)} videos)")
+        else:
+            # Perform scan
+            print(f"[NV_BatchFolderScanner] Scanning {root_path} for pattern: {filename_pattern}")
+            start_time = time.time()
+
+            video_list = self._scan_folders(root_path, filename_pattern, fallback_pattern, exclusions, recursive, max_depth)
+
+            # Sort results by path (alphabetical)
+            video_list = sorted(video_list, key=lambda x: str(x[0]).lower())
+
+            # Update cache
+            self._scan_cache[cache_key] = video_list
+            self._cache_timestamp[cache_key] = time.time()
+
+            scan_duration = time.time() - start_time
+            print(f"[NV_BatchFolderScanner] Found {len(video_list)} videos in {scan_duration:.2f}s")
+
+        total_count = len(video_list)
+
+        # Dry run mode: return summary
+        if dry_run:
+            return self._dry_run_result(video_list, root_path, filename_pattern)
+
+        # Handle no matches
+        if not video_list:
+            return self._error_result(f"No videos found matching '{filename_pattern}' in {root_path}")
+
+        # Validate index
+        if index >= len(video_list):
+            return self._error_result(
+                f"Index {index} out of range. Found {len(video_list)} videos (valid indices: 0-{len(video_list)-1})"
+            )
+
+        # Get video at index
+        video_path, metadata = video_list[index]
+
+        # Add index info to metadata
+        metadata["index"] = index
+        metadata["total_count"] = total_count
+
+        # Create info string
+        info = self._create_info_string(video_path, metadata, index, total_count)
+
+        # Generate export JSON for all videos (spreadsheet import)
+        export_json = self._generate_export_json(video_list)
+
+        print(f"[NV_BatchFolderScanner] Selected [{index}/{total_count-1}]: {video_path}")
+
+        return (str(video_path), metadata, total_count, info, export_json)
+
+    def _scan_folders(self, root_path, pattern, fallback_pattern, exclusions, recursive, max_depth):
+        """
+        Recursively scan folders and collect matching videos with metadata.
+        Uses fallback_pattern if primary pattern finds no matches in a folder.
+
+        Returns:
+            List of tuples: [(Path, metadata_dict), ...]
+        """
+        video_list = []
+
+        if recursive:
+            video_paths = self._recursive_glob(root_path, pattern, fallback_pattern, exclusions, max_depth)
+        else:
+            # Only scan immediate subfolders (not root itself)
+            video_paths = []
+            for subfolder in root_path.iterdir():
+                if subfolder.is_dir() and not self._should_exclude(subfolder, root_path, exclusions):
+                    # Try primary pattern first
+                    matches = list(subfolder.glob(pattern))
+                    if not matches and fallback_pattern:
+                        # Try fallback pattern
+                        matches = list(subfolder.glob(fallback_pattern))
+                        if matches:
+                            print(f"[NV_BatchFolderScanner] Using fallback pattern in: {subfolder.name}")
+                    video_paths.extend(matches)
+
+        # Build metadata for each video
+        for video_path in video_paths:
+            metadata = self._create_metadata(video_path, root_path)
+            video_list.append((video_path, metadata))
+
+        return video_list
+
+    def _recursive_glob(self, root_path, pattern, fallback_pattern, exclusions, max_depth):
+        """
+        Recursively glob with depth limit to prevent infinite loops.
+        Only searches in subfolders, not in root itself.
+        Respects exclusion patterns.
+        Uses fallback_pattern if primary pattern finds no matches in a folder.
+        """
+        results = []
+
+        def scan_level(path, depth):
+            if depth > max_depth:
+                return
+
+            try:
+                for item in path.iterdir():
+                    if item.is_dir():
+                        # Check if this folder should be excluded
+                        if self._should_exclude(item, root_path, exclusions):
+                            print(f"[NV_BatchFolderScanner] Skipping excluded folder: {item}")
+                            continue
+
+                        # Try primary pattern first
+                        matches = list(item.glob(pattern))
+                        if not matches and fallback_pattern:
+                            # Try fallback pattern if primary found nothing
+                            matches = list(item.glob(fallback_pattern))
+                            if matches:
+                                print(f"[NV_BatchFolderScanner] Using fallback pattern in: {item.name}")
+
+                        results.extend(matches)
+
+                        # Recurse into subdirectories
+                        scan_level(item, depth + 1)
+            except PermissionError:
+                print(f"[NV_BatchFolderScanner] Permission denied: {path}")
+            except Exception as e:
+                print(f"[NV_BatchFolderScanner] Error scanning {path}: {e}")
+
+        scan_level(root_path, 0)
+        return results
+
+    def _parse_exclusions(self, exclude_folders):
+        """
+        Parse exclusion string into a list of patterns.
+        Supports comma-separated and newline-separated patterns.
+        """
+        if not exclude_folders or not exclude_folders.strip():
+            return []
+
+        # Split by newlines and commas
+        patterns = []
+        for line in exclude_folders.replace(',', '\n').split('\n'):
+            pattern = line.strip()
+            if pattern:
+                # Normalize path separators for cross-platform support
+                pattern = pattern.replace('/', os.sep).replace('\\', os.sep)
+                patterns.append(pattern)
+
+        return patterns
+
+    def _should_exclude(self, folder_path, root_path, exclusions):
+        """
+        Check if a folder matches any exclusion pattern.
+
+        Supports matching against:
+        - Full absolute path (e.g., Z:\\Projects\\2512_Miracle\\VideoSequences\\MOI_001_0600)
+        - Relative path from root (e.g., MOI_001_0600 or subdir/MOI_001_0600)
+        - Folder name only (e.g., MOI_001_0600)
+        - Glob patterns (*, ?) at any level
+        - Patterns ending with \\* or /* mean "this folder and everything in it"
+        """
+        import fnmatch
+
+        folder_path = Path(folder_path).resolve()
+        folder_name = folder_path.name
+        abs_path_str = str(folder_path)
+
+        # Calculate relative path from root
+        try:
+            relative_path = folder_path.relative_to(root_path)
+            rel_path_str = str(relative_path)
+        except ValueError:
+            rel_path_str = folder_name
+
+        for pattern in exclusions:
+            # Handle patterns ending with \* or /* (meaning "folder and all contents")
+            # Strip the trailing \* or /* and match the base
+            base_pattern = pattern
+            if pattern.endswith(os.sep + '*') or pattern.endswith('/*') or pattern.endswith('\\*'):
+                base_pattern = pattern.rstrip('*').rstrip('/').rstrip('\\').rstrip(os.sep)
+
+            # Check if pattern looks like an absolute path
+            is_abs_pattern = os.path.isabs(pattern) or (len(pattern) > 1 and pattern[1] == ':')
+
+            if is_abs_pattern:
+                # Match against absolute path
+                if fnmatch.fnmatch(abs_path_str, pattern):
+                    return True
+                if fnmatch.fnmatch(abs_path_str.lower(), pattern.lower()):
+                    return True
+                # Also check base pattern for \* patterns
+                if base_pattern != pattern:
+                    if fnmatch.fnmatch(abs_path_str, base_pattern):
+                        return True
+                    if fnmatch.fnmatch(abs_path_str.lower(), base_pattern.lower()):
+                        return True
+                    # Check if path starts with base pattern (for nested folders)
+                    if abs_path_str.lower().startswith(base_pattern.lower() + os.sep) or abs_path_str.lower() == base_pattern.lower():
+                        return True
+            else:
+                # Match against relative path
+                if fnmatch.fnmatch(rel_path_str, pattern):
+                    return True
+                if fnmatch.fnmatch(rel_path_str.lower(), pattern.lower()):
+                    return True
+
+                # Match against folder name only
+                if fnmatch.fnmatch(folder_name, pattern):
+                    return True
+                if fnmatch.fnmatch(folder_name.lower(), pattern.lower()):
+                    return True
+
+                # Handle base pattern for \* patterns
+                if base_pattern != pattern:
+                    # Check if folder name matches the base
+                    if fnmatch.fnmatch(folder_name, base_pattern):
+                        return True
+                    if fnmatch.fnmatch(folder_name.lower(), base_pattern.lower()):
+                        return True
+                    # Check if relative path starts with base pattern (for nested folders)
+                    if rel_path_str.lower().startswith(base_pattern.lower() + os.sep) or rel_path_str.lower() == base_pattern.lower():
+                        return True
+
+                # Also try matching if pattern is a path segment (e.g., "pdsSelects/subfolder")
+                if os.sep in pattern or '/' in pattern:
+                    pattern_normalized = pattern.replace('/', os.sep)
+                    if fnmatch.fnmatch(rel_path_str, pattern_normalized):
+                        return True
+                    if fnmatch.fnmatch(rel_path_str.lower(), pattern_normalized.lower()):
+                        return True
+
+        return False
+
+    def _create_metadata(self, video_path, root_path):
+        """
+        Create metadata dictionary for a video file.
+        """
+        video_path = video_path.resolve()
+        root_path = root_path.resolve()
+
+        # Calculate relative path and depth
+        try:
+            relative_path = video_path.parent.relative_to(root_path)
+            depth = len(relative_path.parts)
+        except ValueError:
+            relative_path = video_path.parent
+            depth = 0
+
+        # Get file stats
+        try:
+            stat = video_path.stat()
+            file_size_mb = round(stat.st_size / (1024 * 1024), 2)
+        except Exception:
+            file_size_mb = 0.0
+
+        metadata = {
+            "version": "1.0",
+            "scanned_at": datetime.now().isoformat(),
+            "file": {
+                "video_path": str(video_path),
+                "video_filename": video_path.name,
+                "video_basename": video_path.stem,
+                "video_extension": video_path.suffix,
+                "file_size_mb": file_size_mb,
+            },
+            "folder": {
+                "folder_path": str(video_path.parent),
+                "folder_name": video_path.parent.name,
+                "root_folder": str(root_path),
+                "relative_path": str(relative_path),
+                "depth": depth,
+            }
+        }
+
+        return metadata
+
+    def _is_cache_valid(self, cache_key):
+        """
+        Check if cached scan is still valid (60 second TTL).
+        """
+        if cache_key not in self._scan_cache:
+            return False
+
+        cache_age = time.time() - self._cache_timestamp.get(cache_key, 0)
+        if cache_age > 60:
+            print("[NV_BatchFolderScanner] Cache expired (>60s)")
+            return False
+
+        return True
+
+    def _error_result(self, message):
+        """Return error result with empty data."""
+        print(f"[NV_BatchFolderScanner] Error: {message}")
+
+        error_metadata = {
+            "version": "1.0",
+            "error": message,
+            "scanned_at": datetime.now().isoformat(),
+        }
+
+        return ("", error_metadata, 0, f"Error: {message}", "[]")
+
+    def _dry_run_result(self, video_list, root_path, pattern):
+        """Return summary of all found videos in dry-run mode."""
+        total_count = len(video_list)
+
+        # Generate export JSON for spreadsheet import
+        export_json = self._generate_export_json(video_list)
+
+        if not video_list:
+            info = f"Dry run: No videos found matching '{pattern}' in {root_path}"
+            metadata = {
+                "version": "1.0",
+                "dry_run": True,
+                "scanned_at": datetime.now().isoformat(),
+                "total_count": 0,
+                "root_folder": str(root_path),
+                "pattern": pattern,
+            }
+            return ("", metadata, 0, info, export_json)
+
+        # Create summary
+        summary_lines = [
+            f"=== DRY RUN: Found {total_count} videos ===",
+            f"Root: {root_path}",
+            f"Pattern: {pattern}",
+            "",
+        ]
+
+        for idx, (video_path, meta) in enumerate(video_list):
+            rel_path = meta["folder"]["relative_path"]
+            filename = meta["file"]["video_filename"]
+            size_mb = meta["file"]["file_size_mb"]
+            summary_lines.append(f"[{idx}] {rel_path}/{filename} ({size_mb} MB)")
+
+        info = "\n".join(summary_lines)
+
+        # Create summary metadata with all videos listed
+        metadata = {
+            "version": "1.0",
+            "dry_run": True,
+            "scanned_at": datetime.now().isoformat(),
+            "total_count": total_count,
+            "root_folder": str(root_path),
+            "pattern": pattern,
+            "videos": [
+                {
+                    "index": idx,
+                    "path": str(path),
+                    "folder_name": meta["folder"]["folder_name"],
+                    "relative_path": meta["folder"]["relative_path"],
+                }
+                for idx, (path, meta) in enumerate(video_list)
+            ]
+        }
+
+        print(f"[NV_BatchFolderScanner] Dry run complete: {total_count} videos found")
+
+        return ("", metadata, total_count, info, export_json)
+
+    def _create_info_string(self, video_path, metadata, index, total):
+        """Create human-readable info string for normal mode."""
+        filename = metadata["file"]["video_filename"]
+        rel_path = metadata["folder"]["relative_path"]
+        size_mb = metadata["file"]["file_size_mb"]
+
+        info = f"[{index}/{total-1}] {rel_path}/{filename} ({size_mb} MB)"
+
+        return info
+
+    def _generate_export_json(self, video_list):
+        """
+        Generate a flat JSON array for spreadsheet import (Google Sheets, Excel).
+
+        Format is an array of flat objects - each object becomes a row.
+        This format works with:
+        - Google Sheets: Use IMPORTJSON add-on or Apps Script
+        - Excel: Use Power Query (Get Data > From JSON)
+        - CSV conversion tools
+        """
+        export_data = []
+
+        for idx, (video_path, meta) in enumerate(video_list):
+            # Flatten the metadata into a single-level dict for easy spreadsheet import
+            row = {
+                "index": idx,
+                "video_path": meta["file"]["video_path"],
+                "video_filename": meta["file"]["video_filename"],
+                "video_basename": meta["file"]["video_basename"],
+                "video_extension": meta["file"]["video_extension"],
+                "file_size_mb": meta["file"]["file_size_mb"],
+                "folder_path": meta["folder"]["folder_path"],
+                "folder_name": meta["folder"]["folder_name"],
+                "root_folder": meta["folder"]["root_folder"],
+                "relative_path": meta["folder"]["relative_path"],
+                "depth": meta["folder"]["depth"],
+            }
+            export_data.append(row)
+
+        return json.dumps(export_data, indent=2, ensure_ascii=False)
+
+    @classmethod
+    def IS_CHANGED(cls, root_folder, filename_pattern, index, **kwargs):
+        """
+        Tell ComfyUI when to re-execute this node.
+        """
+        import hashlib
+        fallback = kwargs.get('fallback_pattern', '')
+        exclude = kwargs.get('exclude_folders', '')
+        dry_run = kwargs.get('dry_run', False)
+        param_str = f"{root_folder}|{filename_pattern}|{fallback}|{index}|{exclude}|{dry_run}"
+        return hashlib.md5(param_str.encode()).hexdigest()
+
+
 # Register the nodes (NodeBypasser is frontend-only, no Python registration needed)
 NODE_CLASS_MAPPINGS = {
     "KNF_Organizer": KNF_Organizer,
@@ -7853,6 +8375,7 @@ NODE_CLASS_MAPPINGS = {
     "NV_WorkflowLogger": NV_WorkflowLogger,
     "NV_WorkflowLoggerStart": NV_WorkflowLoggerStart,
     "NV_FrameNumberOverlay": NV_FrameNumberOverlay,
+    "NV_BatchFolderScanner": NV_BatchFolderScanner,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -7890,6 +8413,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NV_WorkflowLogger": "NV Workflow Logger",
     "NV_WorkflowLoggerStart": "NV Workflow Logger (Start)",
     "NV_FrameNumberOverlay": "NV Frame Number Overlay",
+    "NV_BatchFolderScanner": "NV Batch Folder Scanner",
 }
 
 # Conditionally add NV_Video_Loader_Path if it imported successfully
