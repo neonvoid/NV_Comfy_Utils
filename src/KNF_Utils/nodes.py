@@ -7878,6 +7878,10 @@ class NV_BatchFolderScanner:
                     "default": True,
                     "tooltip": "Scan subfolders recursively"
                 }),
+                "include_root": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Also check for matches in the root folder itself (not just subfolders)"
+                }),
                 "max_depth": ("INT", {
                     "default": 10,
                     "min": 1,
@@ -7894,7 +7898,7 @@ class NV_BatchFolderScanner:
     DESCRIPTION = "Scan subfolders for videos matching a pattern and iterate via index. Use dry_run to preview all found files. export_json output is Google Sheets/Excel importable."
 
     def scan_and_select(self, root_folder, filename_pattern, index,
-                        fallback_pattern="", exclude_folders="", dry_run=False, recursive=True, max_depth=10):
+                        fallback_pattern="", exclude_folders="", dry_run=False, recursive=True, include_root=True, max_depth=10):
         """
         Main execution function.
 
@@ -7925,8 +7929,8 @@ class NV_BatchFolderScanner:
         if fallback_pattern:
             print(f"[NV_BatchFolderScanner] Using fallback pattern: {fallback_pattern}")
 
-        # Check cache (include exclusions and fallback in cache key)
-        cache_key = (str(root_path), filename_pattern, fallback_pattern, tuple(exclusions), recursive, max_depth)
+        # Check cache (include all options in cache key)
+        cache_key = (str(root_path), filename_pattern, fallback_pattern, tuple(exclusions), recursive, include_root, max_depth)
         cache_valid = self._is_cache_valid(cache_key)
 
         if cache_valid:
@@ -7937,7 +7941,7 @@ class NV_BatchFolderScanner:
             print(f"[NV_BatchFolderScanner] Scanning {root_path} for pattern: {filename_pattern}")
             start_time = time.time()
 
-            video_list = self._scan_folders(root_path, filename_pattern, fallback_pattern, exclusions, recursive, max_depth)
+            video_list = self._scan_folders(root_path, filename_pattern, fallback_pattern, exclusions, recursive, include_root, max_depth)
 
             # Sort results by path (alphabetical)
             video_list = sorted(video_list, key=lambda x: str(x[0]).lower())
@@ -7982,7 +7986,7 @@ class NV_BatchFolderScanner:
 
         return (str(video_path), metadata, total_count, info, export_json)
 
-    def _scan_folders(self, root_path, pattern, fallback_pattern, exclusions, recursive, max_depth):
+    def _scan_folders(self, root_path, pattern, fallback_pattern, exclusions, recursive, include_root, max_depth):
         """
         Recursively scan folders and collect matching videos with metadata.
         Uses fallback_pattern if primary pattern finds no matches in a folder.
@@ -7991,12 +7995,21 @@ class NV_BatchFolderScanner:
             List of tuples: [(Path, metadata_dict), ...]
         """
         video_list = []
+        video_paths = []
+
+        # Check root folder itself if include_root is True
+        if include_root:
+            matches = list(root_path.glob(pattern))
+            if not matches and fallback_pattern:
+                matches = list(root_path.glob(fallback_pattern))
+                if matches:
+                    print(f"[NV_BatchFolderScanner] Using fallback pattern in root: {root_path.name}")
+            video_paths.extend(matches)
 
         if recursive:
-            video_paths = self._recursive_glob(root_path, pattern, fallback_pattern, exclusions, max_depth)
+            video_paths.extend(self._recursive_glob(root_path, pattern, fallback_pattern, exclusions, max_depth))
         else:
-            # Only scan immediate subfolders (not root itself)
-            video_paths = []
+            # Only scan immediate subfolders
             for subfolder in root_path.iterdir():
                 if subfolder.is_dir() and not self._should_exclude(subfolder, root_path, exclusions):
                     # Try primary pattern first
@@ -8335,7 +8348,8 @@ class NV_BatchFolderScanner:
         fallback = kwargs.get('fallback_pattern', '')
         exclude = kwargs.get('exclude_folders', '')
         dry_run = kwargs.get('dry_run', False)
-        param_str = f"{root_folder}|{filename_pattern}|{fallback}|{index}|{exclude}|{dry_run}"
+        include_root = kwargs.get('include_root', True)
+        param_str = f"{root_folder}|{filename_pattern}|{fallback}|{index}|{exclude}|{dry_run}|{include_root}"
         return hashlib.md5(param_str.encode()).hexdigest()
 
 
