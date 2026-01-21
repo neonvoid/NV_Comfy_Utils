@@ -10,7 +10,7 @@ from comfy.comfy_types.node_typing import IO
 class NV_JsonMetadataReader:
     """
     Reads key-value metadata from a JSON file.
-    Supports nested structure via parent_key.
+    Supports up to 2 levels of nested structure via parent_key and parent_key_2.
     """
 
     @classmethod
@@ -20,7 +20,8 @@ class NV_JsonMetadataReader:
                 "filepath": ("STRING", {"default": "", "tooltip": "Path to JSON file to read"}),
             },
             "optional": {
-                "parent_key": ("STRING", {"default": "", "tooltip": "Optional parent key to read from (e.g., 'chunk_0')"}),
+                "parent_key": ("STRING", {"default": "", "tooltip": "Level 1 parent key (e.g., 'clip_001')"}),
+                "parent_key_2": ("STRING", {"default": "", "tooltip": "Level 2 parent key (e.g., 'chunk_0')"}),
             }
         }
         # Add 5 key inputs
@@ -32,10 +33,11 @@ class NV_JsonMetadataReader:
     RETURN_NAMES = ("value_1", "value_2", "value_3", "value_4", "value_5", "json_output")
     FUNCTION = "read_metadata"
     CATEGORY = "NV_Utils/Serverless"
-    DESCRIPTION = "Reads values from a JSON metadata file by key names."
+    DESCRIPTION = "Reads values from a JSON metadata file. Supports up to 2 levels of nesting."
 
     def read_metadata(self, filepath, **kwargs):
         parent_key = kwargs.get("parent_key", "").strip()
+        parent_key_2 = kwargs.get("parent_key_2", "").strip()
 
         # Default outputs
         values = ["", "", "", "", ""]
@@ -57,13 +59,26 @@ class NV_JsonMetadataReader:
             print(f"[NV_JsonMetadataReader] Error reading file: {e}")
             return (*values, json_output)
 
-        # Get target dict (root or nested under parent_key)
-        if parent_key:
-            target = data.get(parent_key, {})
-            if not isinstance(target, dict):
-                target = {}
+        # Navigate to target based on nesting level
+        def get_nested(d, key):
+            if not key:
+                return d
+            val = d.get(key, {})
+            return val if isinstance(val, dict) else {}
+
+        if parent_key and parent_key_2:
+            # Two levels: data[parent_key][parent_key_2]
+            level1 = get_nested(data, parent_key)
+            target = get_nested(level1, parent_key_2)
+            path_str = f" [{parent_key}][{parent_key_2}]"
+        elif parent_key:
+            # One level: data[parent_key]
+            target = get_nested(data, parent_key)
+            path_str = f" [{parent_key}]"
         else:
+            # Root level
             target = data
+            path_str = ""
 
         json_output = json.dumps(target, indent=2, ensure_ascii=False)
 
@@ -77,5 +92,5 @@ class NV_JsonMetadataReader:
                     value = json.dumps(value)
                 values[i-1] = value
 
-        print(f"[NV_JsonMetadataReader] Read from {filepath}" + (f" [{parent_key}]" if parent_key else ""))
+        print(f"[NV_JsonMetadataReader] Read from {filepath}{path_str}")
         return (*values, json_output)

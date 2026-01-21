@@ -22,7 +22,8 @@ class NV_JsonMetadataWriter:
                 "filepath": ("STRING", {"default": "", "tooltip": "Path to JSON file (created if doesn't exist)"}),
             },
             "optional": {
-                "parent_key": ("STRING", {"default": "", "tooltip": "Optional parent key to nest all values under (e.g., 'chunk_0')"}),
+                "parent_key": ("STRING", {"default": "", "tooltip": "Level 1 parent key (e.g., 'clip_001')"}),
+                "parent_key_2": ("STRING", {"default": "", "tooltip": "Level 2 parent key (e.g., 'chunk_0')"}),
             }
         }
         # Add 10 key-value pairs
@@ -36,7 +37,7 @@ class NV_JsonMetadataWriter:
     FUNCTION = "write_metadata"
     CATEGORY = "NV_Utils/Serverless"
     OUTPUT_NODE = True
-    DESCRIPTION = "Writes key-value metadata to a JSON file. Merges with existing data. Use parent_key to nest under a specific key."
+    DESCRIPTION = "Writes key-value metadata to a JSON file. Supports up to 2 levels of nesting via parent_key and parent_key_2."
 
     def write_metadata(self, trigger, filepath, **kwargs):
         if not filepath.strip():
@@ -44,6 +45,7 @@ class NV_JsonMetadataWriter:
             return ("{}",)
 
         parent_key = kwargs.get("parent_key", "").strip()
+        parent_key_2 = kwargs.get("parent_key_2", "").strip()
 
         # Read existing JSON or start with empty dict
         data = {}
@@ -72,29 +74,37 @@ class NV_JsonMetadataWriter:
             else:
                 new_pairs[key] = value
 
-        # Apply to data (with optional parent nesting)
-        if parent_key:
-            # Nest under parent_key, merge with existing nested data
-            if parent_key not in data:
-                data[parent_key] = {}
-            elif not isinstance(data[parent_key], dict):
-                # Parent exists but isn't a dict, overwrite it
-                data[parent_key] = {}
+        # Get or create target dict based on nesting level
+        def ensure_dict(d, key):
+            if key not in d:
+                d[key] = {}
+            elif not isinstance(d[key], dict):
+                d[key] = {}
+            return d[key]
 
-            for key, value in new_pairs.items():
-                if value is None:
-                    data[parent_key].pop(key, None)
-                else:
-                    data[parent_key][key] = value
-
-            print(f"[NV_JsonMetadataWriter] Updated '{parent_key}' with {len([v for v in new_pairs.values() if v is not None])} fields")
+        # Determine target location for writing
+        if parent_key and parent_key_2:
+            # Two levels of nesting: data[parent_key][parent_key_2][key] = value
+            level1 = ensure_dict(data, parent_key)
+            target = ensure_dict(level1, parent_key_2)
+            path_str = f"'{parent_key}' > '{parent_key_2}'"
+        elif parent_key:
+            # One level of nesting: data[parent_key][key] = value
+            target = ensure_dict(data, parent_key)
+            path_str = f"'{parent_key}'"
         else:
             # Flat structure at root level
-            for key, value in new_pairs.items():
-                if value is None:
-                    data.pop(key, None)
-                else:
-                    data[key] = value
+            target = data
+            path_str = "root"
+
+        # Apply new pairs to target
+        for key, value in new_pairs.items():
+            if value is None:
+                target.pop(key, None)
+            else:
+                target[key] = value
+
+        print(f"[NV_JsonMetadataWriter] Updated {path_str} with {len([v for v in new_pairs.values() if v is not None])} fields")
 
         # Ensure directory exists
         dir_path = os.path.dirname(filepath)
