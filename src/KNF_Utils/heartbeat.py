@@ -59,18 +59,28 @@ class NV_Heartbeat:
 
         # Create stop event and start heartbeat thread
         stop_event = threading.Event()
+        # Capture client_id at start time
+        client_id = prompt_server.client_id
+        heartbeat_count = [0]  # Use list for mutable closure
 
         def heartbeat_loop():
+            print(f"[NV_Heartbeat] Thread started, client_id={client_id}")
             while not stop_event.wait(timeout=interval_seconds):
+                heartbeat_count[0] += 1
                 try:
                     prompt_server.send_sync("heartbeat", {
                         "timestamp": int(time.time() * 1000),
                         "prompt_id": prompt_id,
-                        "message": "workflow_alive"
-                    }, prompt_server.client_id)
+                        "message": "workflow_alive",
+                        "count": heartbeat_count[0]
+                    }, client_id)
+                    print(f"[NV_Heartbeat] Sent heartbeat #{heartbeat_count[0]}")
                 except Exception as e:
                     print(f"[NV_Heartbeat] Error sending heartbeat: {e}")
+                    import traceback
+                    traceback.print_exc()
                     break
+            print(f"[NV_Heartbeat] Thread stopped after {heartbeat_count[0]} heartbeats")
 
         thread = threading.Thread(target=heartbeat_loop, daemon=True, name="NV_Heartbeat")
         thread.start()
@@ -78,7 +88,7 @@ class NV_Heartbeat:
         with self._lock:
             self._active_heartbeats[thread_key] = (thread, stop_event)
 
-        print(f"[NV_Heartbeat] Started heartbeat every {interval_seconds}s")
+        print(f"[NV_Heartbeat] Started heartbeat every {interval_seconds}s (client_id={client_id})")
         return (trigger,)
 
     @classmethod
