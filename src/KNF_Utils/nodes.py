@@ -45,6 +45,9 @@ from .workflow_logger import NV_WorkflowLogger, NV_WorkflowLoggerStart
 from .frame_number_overlay import NV_FrameNumberOverlay
 # Import heartbeat for serverless deployments
 from .heartbeat import NV_Heartbeat
+# Import JSON metadata writer/reader for serverless deployments
+from .json_metadata_writer import NV_JsonMetadataWriter
+from .json_metadata_reader import NV_JsonMetadataReader
 
 # Import Slack notifier (optional dependency - requires slack-sdk)
 try:
@@ -7501,6 +7504,8 @@ NODE_CLASS_MAPPINGS = {
     "NV_FrameNumberOverlay": NV_FrameNumberOverlay,
     "NV_BatchFolderScanner": NV_BatchFolderScanner,
     "NV_Heartbeat": NV_Heartbeat,
+    "NV_JsonMetadataWriter": NV_JsonMetadataWriter,
+    "NV_JsonMetadataReader": NV_JsonMetadataReader,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -7537,6 +7542,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NV_FrameNumberOverlay": "NV Frame Number Overlay",
     "NV_BatchFolderScanner": "NV Batch Folder Scanner",
     "NV_Heartbeat": "NV Heartbeat (Serverless)",
+    "NV_JsonMetadataWriter": "NV JSON Metadata Writer",
+    "NV_JsonMetadataReader": "NV JSON Metadata Reader",
 }
 
 # Conditionally add NV_Video_Loader_Path if it imported successfully
