@@ -37,6 +37,8 @@ from .chunk_stitcher import NV_ChunkStitcher, NV_ChunkStitcherFromImages
 from .streaming_vace_to_video import NV_WanVaceToVideoStreaming
 # Import B2 output sync for cloud storage
 from .b2_output_sync import NV_B2OutputSync
+# Import B2 input sync for pulling from cloud storage
+from .b2_input_sync import NV_B2InputSync
 # Import VACE benchmark logger for memory analysis
 from .vace_benchmark import NV_VACEBenchmarkLogger
 # Import workflow logger for memory analysis dataset collection
@@ -7497,6 +7499,7 @@ NODE_CLASS_MAPPINGS = {
     "NV_MetadataCollector": NV_MetadataCollector,
     "NV_MetadataSaver": NV_MetadataSaver,
     "NV_B2OutputSync": NV_B2OutputSync,
+    "NV_B2InputSync": NV_B2InputSync,
     "NV_FrameAnnotator": NV_FrameAnnotator,
     "NV_VACEBenchmarkLogger": NV_VACEBenchmarkLogger,
     "NV_WorkflowLogger": NV_WorkflowLogger,
@@ -7535,6 +7538,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NV_MetadataCollector": "NV Metadata Collector",
     "NV_MetadataSaver": "NV Metadata Saver",
     "NV_B2OutputSync": "NV B2 Output Sync",
+    "NV_B2InputSync": "NV B2 Input Sync",
     "NV_FrameAnnotator": "NV Frame Annotator",
     "NV_VACEBenchmarkLogger": "NV VACE Benchmark Logger",
     "NV_WorkflowLogger": "NV Workflow Logger",
