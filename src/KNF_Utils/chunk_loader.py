@@ -258,6 +258,115 @@ class NV_ChunkLoaderAdvanced:
                 context_window_size, context_overlap, chunk_info)
 
 
+class NV_ChunkPlanReader:
+    """
+    Reads chunk plan JSON and outputs metadata WITHOUT loading video.
+
+    Use this when you just need the frame ranges, parameters, or other metadata
+    from a chunk plan - e.g., for workflow orchestration, passing to video loaders
+    that handle their own slicing, or for debugging/logging.
+
+    No video input required - just reads the JSON file.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "plan_json_path": ("STRING", {
+                    "default": "chunk_plan.json",
+                    "tooltip": "Path to the chunk_plan.json file from NV_ParallelChunkPlanner"
+                }),
+                "chunk_index": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 99,
+                    "tooltip": "Which chunk to read (0-indexed)"
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("INT", "INT", "INT", "INT", "INT", "INT",
+                    "INT", "INT", "FLOAT", "FLOAT", "STRING", "STRING", "INT", "INT",
+                    "INT", "INT", "INT", "INT", "STRING",)
+    RETURN_NAMES = ("start_frame", "end_frame", "frame_count", "vace_start", "vace_end", "chunk_index",
+                    "seed", "steps", "cfg", "denoise", "sampler_name", "scheduler", "context_window_size", "context_overlap",
+                    "total_frames", "num_chunks", "video_width", "video_height", "chunk_info",)
+    FUNCTION = "read_plan"
+    CATEGORY = "NV_Utils"
+    DESCRIPTION = "Reads chunk plan JSON metadata without loading video. Use for orchestration or passing to external loaders."
+
+    def read_plan(self, plan_json_path, chunk_index):
+        """
+        Read chunk plan and return metadata for the specified chunk.
+        """
+
+        # Load the plan
+        try:
+            with open(plan_json_path, 'r') as f:
+                plan = json.load(f)
+        except FileNotFoundError:
+            raise FileNotFoundError(
+                f"Chunk plan not found: {plan_json_path}\n"
+                f"Run NV_ParallelChunkPlanner first to create the plan."
+            )
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON in chunk plan: {e}")
+
+        # Validate chunk index
+        chunks = plan.get("chunks", [])
+        num_chunks = len(chunks)
+        if chunk_index >= num_chunks:
+            raise ValueError(
+                f"Invalid chunk_index {chunk_index}. Plan has {num_chunks} chunks (indices 0-{num_chunks-1})."
+            )
+
+        # Get this chunk's info
+        chunk = chunks[chunk_index]
+        start_frame = chunk["start_frame"]
+        end_frame = chunk["end_frame"]
+        frame_count = chunk.get("frame_count", end_frame - start_frame)
+        vace_start = chunk.get("vace_start", start_frame)
+        vace_end = chunk.get("vace_end", end_frame)
+
+        # Get video metadata
+        video_metadata = plan.get("video_metadata", {})
+        total_frames = video_metadata.get("total_frames", plan.get("total_frames", 0))
+        video_width = video_metadata.get("width", 0)
+        video_height = video_metadata.get("height", 0)
+
+        # Get shared parameters
+        params = plan.get("shared_params", {})
+        seed = params.get("seed", 0)
+        steps = params.get("steps", 20)
+        cfg = params.get("cfg", 5.0)
+        denoise = params.get("denoise", 0.75)
+        sampler_name = params.get("sampler_name", "euler")
+        scheduler = params.get("scheduler", "sgm_uniform")
+        context_window_size = params.get("context_window_size", 81)
+        context_overlap = params.get("context_overlap", 16)
+
+        # Build info string
+        info_lines = [
+            f"Chunk {chunk_index}/{num_chunks-1}",
+            f"Frames: {start_frame}-{end_frame-1} ({frame_count} total)",
+            f"VACE range: {vace_start}-{vace_end}",
+            f"Video: {video_width}x{video_height}, {total_frames} frames",
+            f"Seed: {seed} | Steps: {steps} | CFG: {cfg} | Denoise: {denoise}",
+            f"Sampler: {sampler_name} | Scheduler: {scheduler}",
+            f"Context: {context_window_size} window, {context_overlap} overlap",
+        ]
+        chunk_info = "\n".join(info_lines)
+
+        print(f"[NV_ChunkPlanReader] Read chunk {chunk_index}/{num_chunks-1}:")
+        print(f"  Frames: {start_frame} to {end_frame-1} ({frame_count} frames)")
+        print(f"  VACE: {vace_start} to {vace_end}")
+
+        return (start_frame, end_frame, frame_count, vace_start, vace_end, chunk_index,
+                seed, steps, cfg, denoise, sampler_name, scheduler, context_window_size, context_overlap,
+                total_frames, num_chunks, video_width, video_height, chunk_info)
+
+
 class NV_ChunkLoaderVACE:
     """
     Chunk loader with VACE control video support.
@@ -428,11 +537,13 @@ class NV_ChunkLoaderVACE:
 NODE_CLASS_MAPPINGS = {
     "NV_ChunkLoader": NV_ChunkLoader,
     "NV_ChunkLoaderAdvanced": NV_ChunkLoaderAdvanced,
+    "NV_ChunkPlanReader": NV_ChunkPlanReader,
     "NV_ChunkLoaderVACE": NV_ChunkLoaderVACE,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "NV_ChunkLoader": "NV Chunk Loader",
     "NV_ChunkLoaderAdvanced": "NV Chunk Loader (Advanced)",
+    "NV_ChunkPlanReader": "NV Chunk Plan Reader",
     "NV_ChunkLoaderVACE": "NV Chunk Loader (VACE)",
 }

@@ -31,7 +31,7 @@ from .streaming_vae_encode import NV_StreamingVAEEncode
 from .wan_memory_estimator import NV_WorkflowFeasibilityChecker
 # Import parallel chunk processing nodes
 from .parallel_chunk_planner import NV_ParallelChunkPlanner
-from .chunk_loader import NV_ChunkLoader, NV_ChunkLoaderAdvanced, NV_ChunkLoaderVACE
+from .chunk_loader import NV_ChunkLoader, NV_ChunkLoaderAdvanced, NV_ChunkPlanReader, NV_ChunkLoaderVACE
 from .chunk_stitcher import NV_ChunkStitcher, NV_ChunkStitcherFromImages
 # Import streaming VACE to video for long video VACE conditioning
 from .streaming_vace_to_video import NV_WanVaceToVideoStreaming
@@ -7504,6 +7504,7 @@ NODE_CLASS_MAPPINGS = {
     "NV_ChunkLoader": NV_ChunkLoader,
     "NV_ChunkLoaderAdvanced": NV_ChunkLoaderAdvanced,
     "NV_ChunkLoaderVACE": NV_ChunkLoaderVACE,
+    "NV_ChunkPlanReader": NV_ChunkPlanReader,
     "NV_ChunkStitcher": NV_ChunkStitcher,
     "NV_ChunkStitcherFromImages": NV_ChunkStitcherFromImages,
     "NV_WanVaceToVideoStreaming": NV_WanVaceToVideoStreaming,
@@ -7543,6 +7544,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NV_ChunkLoader": "NV Chunk Loader",
     "NV_ChunkLoaderAdvanced": "NV Chunk Loader (Advanced)",
     "NV_ChunkLoaderVACE": "NV Chunk Loader (VACE)",
+    "NV_ChunkPlanReader": "NV Chunk Plan Reader",
     "NV_ChunkStitcher": "NV Chunk Stitcher (From Files)",
     "NV_ChunkStitcherFromImages": "NV Chunk Stitcher (From Images)",
     "NV_WanVaceToVideoStreaming": "NV VACE To Video (Streaming)",
