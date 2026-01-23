@@ -855,12 +855,25 @@ class CustomVideoSaver:
             if custom_directory:
                 info += f" | Custom dir: {custom_directory}"
 
-            return (video_path, video_filename, info)
-            
+            # Determine subfolder for UI response
+            subfolder_used = subfolder.strip() if subfolder else ""
+
+            return {
+                "ui": {
+                    "videos": [{
+                        "filename": video_filename,
+                        "subfolder": subfolder_used,
+                        "type": self.type,
+                        "fullpath": video_path,
+                    }]
+                },
+                "result": (video_path, video_filename, info)
+            }
+
         except Exception as e:
             error_msg = f"Error saving video: {str(e)}"
             print(f"[CustomVideoSaver] {error_msg}")
-            return ("", "", error_msg)
+            return {"ui": {}, "result": ("", "", error_msg)}
     
     def _tensor_to_video_ffmpeg(self, video_tensor, output_path, fps, quality, codec, preset, preserve_colors=True, prompt=None, extra_pnginfo=None):
         """
