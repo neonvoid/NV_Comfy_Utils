@@ -455,43 +455,62 @@ class NV_ChunkLoaderVACE:
         chunk = plan["chunks"][chunk_index]
         start_frame = chunk["start_frame"]
         end_frame = chunk["end_frame"]
+        expected_chunk_frames = chunk.get("frame_count", end_frame - start_frame)
 
-        # Validate video dimensions match plan
-        total_video_frames = video.shape[0]
+        # Get video metadata
+        input_video_frames = video.shape[0]
         video_metadata = plan.get("video_metadata", {})
-        expected_frames = video_metadata.get("total_frames", plan.get("total_frames"))
+        expected_total_frames = video_metadata.get("total_frames", plan.get("total_frames"))
 
-        if expected_frames and total_video_frames != expected_frames:
+        # Determine mode: pre-sliced chunk OR full video
+        # Pre-sliced: input matches chunk frame count
+        # Full video: input matches total frame count
+        is_pre_sliced = (input_video_frames == expected_chunk_frames)
+        is_full_video = (expected_total_frames and input_video_frames == expected_total_frames)
+
+        if not is_pre_sliced and not is_full_video:
             raise ValueError(
-                f"Video frame count mismatch! Plan expects {expected_frames} frames, "
-                f"but input video has {total_video_frames} frames.\n"
-                f"Make sure you're using the same video that was planned for."
+                f"Video frame count mismatch! Input has {input_video_frames} frames.\n"
+                f"Expected either:\n"
+                f"  - Pre-sliced chunk: {expected_chunk_frames} frames (chunk {chunk_index})\n"
+                f"  - Full video: {expected_total_frames} frames (will be sliced)\n"
+                f"Make sure you're using the correct video."
             )
 
-        if end_frame > total_video_frames:
-            raise ValueError(
-                f"Chunk {chunk_index} requires frames {start_frame}-{end_frame-1}, "
-                f"but video only has {total_video_frames} frames.\n"
-                f"Make sure you're using the same video that was planned for."
-            )
+        if is_full_video and not is_pre_sliced:
+            # Full video mode - validate and slice
+            if end_frame > input_video_frames:
+                raise ValueError(
+                    f"Chunk {chunk_index} requires frames {start_frame}-{end_frame-1}, "
+                    f"but video only has {input_video_frames} frames."
+                )
+            chunk_video = video[start_frame:end_frame].clone()
+            slice_mode = "sliced"
+        else:
+            # Pre-sliced mode - pass through as-is
+            chunk_video = video
+            slice_mode = "pre-sliced"
 
-        # Extract chunk from main video
-        chunk_video = video[start_frame:end_frame].clone()
-
-        # Extract chunks from control videos (same frame range)
+        # Extract chunks from control videos (same logic)
         controls = [control_1, control_2, control_3, control_4]
         chunk_controls = []
 
         for i, ctrl in enumerate(controls):
             if ctrl is not None:
-                # Validate control video has same frame count as main video
-                if ctrl.shape[0] != total_video_frames:
+                ctrl_frames = ctrl.shape[0]
+                ctrl_is_pre_sliced = (ctrl_frames == expected_chunk_frames)
+                ctrl_is_full = (expected_total_frames and ctrl_frames == expected_total_frames)
+
+                if not ctrl_is_pre_sliced and not ctrl_is_full:
                     raise ValueError(
-                        f"Control video {i+1} has {ctrl.shape[0]} frames, "
-                        f"but main video has {total_video_frames} frames. "
-                        f"Control videos must match main video frame count."
+                        f"Control video {i+1} has {ctrl_frames} frames.\n"
+                        f"Expected either {expected_chunk_frames} (pre-sliced) or {expected_total_frames} (full)."
                     )
-                chunk_controls.append(ctrl[start_frame:end_frame].clone())
+
+                if ctrl_is_full and not ctrl_is_pre_sliced:
+                    chunk_controls.append(ctrl[start_frame:end_frame].clone())
+                else:
+                    chunk_controls.append(ctrl)
             else:
                 chunk_controls.append(None)
 
@@ -509,9 +528,9 @@ class NV_ChunkLoaderVACE:
         # Build info string
         num_controls = sum(1 for c in chunk_controls if c is not None)
         info_lines = [
-            f"Chunk {chunk_index}/{num_chunks-1}",
-            f"Frames: {start_frame}-{end_frame-1} ({end_frame - start_frame} total)",
-            f"Controls: {num_controls} sliced",
+            f"Chunk {chunk_index}/{num_chunks-1} ({slice_mode})",
+            f"Frames: {start_frame}-{end_frame-1} ({chunk_video.shape[0]} frames)",
+            f"Controls: {num_controls} processed",
             f"Seed: {seed}",
             f"Steps: {steps}",
             f"CFG: {cfg}",
@@ -524,9 +543,9 @@ class NV_ChunkLoaderVACE:
 
         chunk_info = "\n".join(info_lines)
 
-        print(f"[NV_ChunkLoaderVACE] Loaded chunk {chunk_index}:")
+        print(f"[NV_ChunkLoaderVACE] Loaded chunk {chunk_index} ({slice_mode}):")
         print(f"  Frames: {start_frame} to {end_frame-1} ({chunk_video.shape[0]} frames)")
-        print(f"  Controls sliced: {num_controls}")
+        print(f"  Controls: {num_controls}")
 
         return (chunk_video, chunk_controls[0], chunk_controls[1], chunk_controls[2], chunk_controls[3],
                 chunk_index, seed, steps, cfg, denoise, sampler_name, scheduler,
