@@ -130,7 +130,8 @@ def slice_vace_conditioning(handler, model, x_in, conds, timestep, model_options
                     for tensor in original_list:
                         if isinstance(tensor, torch.Tensor):
                             # If cached on CPU, move to GPU before slicing
-                            tensor_for_slice = tensor.to(device) if use_cpu_cache else tensor
+                            # Explicitly preserve dtype to avoid autocast issues with lowvram patches
+                            tensor_for_slice = tensor.to(device=device, dtype=tensor.dtype) if use_cpu_cache else tensor
                             sliced_tensor = window.get_tensor(tensor_for_slice, device, dim=dim)
                             sliced_list.append(sliced_tensor)
                             if window_idx == 0 and cond_idx == 0:
@@ -170,7 +171,8 @@ def slice_vace_conditioning(handler, model, x_in, conds, timestep, model_options
                         original_vace_context = cache[vace_context_key]
                         original_tensor = original_vace_context.cond
                         # If cached on CPU, move to GPU before slicing
-                        tensor_for_slice = original_tensor.to(device) if use_cpu_cache else original_tensor
+                        # Explicitly preserve dtype to avoid autocast issues with lowvram patches
+                        tensor_for_slice = original_tensor.to(device=device, dtype=original_tensor.dtype) if use_cpu_cache else original_tensor
                         sliced_tensor = window.get_tensor(tensor_for_slice, device, dim=vace_temporal_dim)
                         model_conds["vace_context"] = original_vace_context._copy_with(sliced_tensor)
                         if window_idx == 0 and cond_idx == 0:
