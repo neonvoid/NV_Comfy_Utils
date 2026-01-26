@@ -7484,6 +7484,142 @@ class NV_BatchFolderScanner:
         return hashlib.md5(param_str.encode()).hexdigest()
 
 
+class NV_VACEMotionReference:
+    """
+    Attach VACE motion context from cropped video to conditioning for inpainting.
+
+    This node is designed to work with InpaintCropImproved from comfy-inpaint-crop-fork.
+    It takes the already-cropped and rescaled video/mask and creates VACE conditioning
+    that preserves motion context from the surrounding pixels included in the extended crop.
+
+    The VACE dual-stream architecture:
+    - Inactive stream (where mask=0): Preserves surrounding context/motion
+    - Reactive stream (where mask=1): Region to be regenerated
+
+    Use this before sampling to inject motion context into localized inpainting.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "positive": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
+                "vae": ("VAE",),
+                "cropped_video": ("IMAGE", {
+                    "tooltip": "Cropped video from InpaintCropImproved (already rescaled to target resolution)"
+                }),
+                "cropped_mask": ("MASK", {
+                    "tooltip": "Cropped mask from InpaintCropImproved (already rescaled to match video)"
+                }),
+                "strength": ("FLOAT", {
+                    "default": 0.8,
+                    "min": 0.0,
+                    "max": 1.0,
+                    "step": 0.01,
+                    "tooltip": "VACE conditioning strength (0.8 recommended for inpainting)"
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("CONDITIONING", "CONDITIONING",)
+    RETURN_NAMES = ("positive", "negative",)
+    FUNCTION = "execute"
+    CATEGORY = "NV_Utils/VACE"
+    DESCRIPTION = "Attach VACE motion context to conditioning for localized video inpainting. Use with InpaintCropImproved."
+
+    def execute(self, positive, negative, vae, cropped_video, cropped_mask, strength):
+        """
+        Create VACE conditioning from cropped video for motion-aware inpainting.
+
+        The cropped video should include context pixels beyond the mask region
+        (via InpaintCropImproved's context_extend_factor). These surrounding pixels
+        provide motion context in the inactive stream.
+        """
+        import torch.nn.functional as F
+        import comfy.utils
+
+        # Get dimensions from input video
+        # cropped_video shape: [T, H, W, C] (batch of frames)
+        length = cropped_video.shape[0]
+        height = cropped_video.shape[1]
+        width = cropped_video.shape[2]
+
+        print(f"[NV_VACEMotionReference] Processing {length} frames at {width}x{height}")
+
+        # Handle mask dimensions
+        # cropped_mask expected shape: [T, H, W] or [T, H, W, 1]
+        mask = cropped_mask
+        if mask.ndim == 3:
+            mask = mask.unsqueeze(-1)  # [T, H, W] -> [T, H, W, 1]
+
+        # Ensure mask matches video dimensions
+        if mask.shape[0] != length:
+            print(f"[NV_VACEMotionReference] Warning: mask frames ({mask.shape[0]}) != video frames ({length}), padding/slicing")
+            if mask.shape[0] < length:
+                mask = F.pad(mask, (0, 0, 0, 0, 0, 0, 0, length - mask.shape[0]), value=1.0)
+            else:
+                mask = mask[:length]
+
+        if mask.shape[1:3] != cropped_video.shape[1:3]:
+            print(f"[NV_VACEMotionReference] Warning: mask size ({mask.shape[1:3]}) != video size ({cropped_video.shape[1:3]}), resizing")
+            mask = mask.permute(0, 3, 1, 2)  # [T, H, W, 1] -> [T, 1, H, W]
+            mask = F.interpolate(mask, size=(height, width), mode='bilinear', align_corners=False)
+            mask = mask.permute(0, 2, 3, 1)  # [T, 1, H, W] -> [T, H, W, 1]
+
+        # VACE dual-stream encoding (following nodes_wan.py pattern)
+        # Inactive stream: preserves context where mask=0
+        # Reactive stream: region to regenerate where mask=1
+        control_video = cropped_video - 0.5
+        inactive = (control_video * (1 - mask)) + 0.5  # Context edges preserved
+        reactive = (control_video * mask) + 0.5        # Masked region to regenerate
+
+        print(f"[NV_VACEMotionReference] Encoding inactive stream...")
+        inactive_latent = vae.encode(inactive[:, :, :, :3])
+        print(f"[NV_VACEMotionReference] Encoding reactive stream...")
+        reactive_latent = vae.encode(reactive[:, :, :, :3])
+
+        # Concatenate to form VACE conditioning [B, 32, T_latent, H_latent, W_latent]
+        control_video_latent = torch.cat((inactive_latent, reactive_latent), dim=1)
+        print(f"[NV_VACEMotionReference] VACE latent shape: {control_video_latent.shape}")
+
+        # Process mask to 64-channel format (per WanVaceToVideo)
+        latent_length = ((length - 1) // 4) + 1
+        vae_stride = 8
+        height_mask = height // vae_stride
+        width_mask = width // vae_stride
+
+        # Reshape mask for 64-channel encoding
+        # Input: [T, H, W, 1], need to create [1, 64, T_latent, H_latent, W_latent]
+        mask_processed = mask.squeeze(-1)  # [T, H, W]
+        mask_processed = mask_processed.view(length, height_mask, vae_stride, width_mask, vae_stride)
+        mask_processed = mask_processed.permute(2, 4, 0, 1, 3)  # [8, 8, T, H/8, W/8]
+        mask_processed = mask_processed.reshape(vae_stride * vae_stride, length, height_mask, width_mask)  # [64, T, H/8, W/8]
+        mask_processed = F.interpolate(
+            mask_processed.unsqueeze(0),
+            size=(latent_length, height_mask, width_mask),
+            mode='nearest-exact'
+        )  # [1, 64, T_latent, H/8, W/8]
+
+        print(f"[NV_VACEMotionReference] VACE mask shape: {mask_processed.shape}")
+
+        # Attach VACE conditioning to positive and negative
+        positive_out = node_helpers.conditioning_set_values(
+            positive,
+            {"vace_frames": [control_video_latent], "vace_mask": [mask_processed], "vace_strength": [strength]},
+            append=True
+        )
+        negative_out = node_helpers.conditioning_set_values(
+            negative,
+            {"vace_frames": [control_video_latent], "vace_mask": [mask_processed], "vace_strength": [strength]},
+            append=True
+        )
+
+        print(f"[NV_VACEMotionReference] Done. VACE motion reference attached to conditioning.")
+
+        return (positive_out, negative_out)
+
+
 # Register the nodes (NodeBypasser is frontend-only, no Python registration needed)
 NODE_CLASS_MAPPINGS = {
     "KNF_Organizer": KNF_Organizer,
@@ -7508,6 +7644,7 @@ NODE_CLASS_MAPPINGS = {
     "NV_ChunkStitcher": NV_ChunkStitcher,
     "NV_ChunkStitcherFromImages": NV_ChunkStitcherFromImages,
     "NV_WanVaceToVideoStreaming": NV_WanVaceToVideoStreaming,
+    "NV_VACEMotionReference": NV_VACEMotionReference,
     "NV_MaskPresenceFilter": NV_MaskPresenceFilter,
     "NV_PathParser": NV_PathParser,
     "NV_MetadataCollector": NV_MetadataCollector,
@@ -7548,6 +7685,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NV_ChunkStitcher": "NV Chunk Stitcher (From Files)",
     "NV_ChunkStitcherFromImages": "NV Chunk Stitcher (From Images)",
     "NV_WanVaceToVideoStreaming": "NV VACE To Video (Streaming)",
+    "NV_VACEMotionReference": "NV VACE Motion Reference",
     "NV_MaskPresenceFilter": "NV Mask Presence Filter",
     "NV_PathParser": "NV Path Parser",
     "NV_MetadataCollector": "NV Metadata Collector",
