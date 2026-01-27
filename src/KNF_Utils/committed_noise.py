@@ -256,8 +256,8 @@ class NV_LoadCommittedNoiseSlice:
             }
         }
 
-    RETURN_TYPES = ("LATENT",)
-    RETURN_NAMES = ("chunk_noise",)
+    RETURN_TYPES = ("COMMITTED_NOISE",)
+    RETURN_NAMES = ("committed_noise",)
     FUNCTION = "load_slice"
     CATEGORY = "NV_Utils/sampling"
     DESCRIPTION = "Load a specific chunk's noise slice from saved committed noise."
@@ -284,8 +284,15 @@ class NV_LoadCommittedNoiseSlice:
               f"-> Latent frames {latent_start}-{latent_end}")
         print(f"  Slice shape: {list(chunk_noise.shape)}")
 
-        # Return as LATENT format for compatibility with samplers
-        return ({"samples": chunk_noise},)
+        # Return as COMMITTED_NOISE format for compatibility with samplers
+        return ({
+            "noise": chunk_noise,
+            "seed": data.get("seed", 0),
+            "freenoise_applied": data.get("freenoise_applied", False),
+            "context_length_video": data.get("context_length_video", 81),
+            "context_overlap_video": data.get("context_overlap_video", 16),
+            "shape": list(chunk_noise.shape),
+        },)
 
 
 # Node registration
