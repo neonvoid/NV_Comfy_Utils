@@ -23,6 +23,7 @@ import comfy.samplers
 import comfy.utils
 import latent_preview
 from comfy.ldm.modules.attention import optimized_attention
+from nodes import common_ksampler
 
 
 def video_to_latent_frames(video_frames: int) -> int:
@@ -346,7 +347,7 @@ class NV_ExtractAttentionGuidance:
         # that doesn't support attention-level hooks like UNet models do.
         #
         # For now, we run normal sampling and output a placeholder for attention_data.
-        # A future version could use block-level hooks or model-specific mechanisms.
+        # A future version could use optimized_attention_override for capture.
 
         print(f"[NV_ExtractAttentionGuidance] WARNING: Attention extraction not yet implemented for video models.")
         print(f"[NV_ExtractAttentionGuidance] Running normal sampling (attention patterns will be empty).")
@@ -355,147 +356,116 @@ class NV_ExtractAttentionGuidance:
         # No patching - just use models as-is to avoid corrupting output
         patched_models = [m.clone() for m in models]
 
-        # Prepare noise
-        latent = latent_image["samples"]
-        latent = comfy.sample.fix_empty_latent_channels(patched_models[0], latent)
-
+        # Get committed noise tensor if provided
+        noise_tensor = committed_noise["noise"] if committed_noise is not None else None
         if committed_noise is not None:
-            noise = committed_noise["noise"]
             print(f"[NV_ExtractAttentionGuidance] Using committed noise (seed={committed_noise['seed']})")
-        else:
-            batch_inds = latent_image.get("batch_index", None)
-            noise = comfy.sample.prepare_noise(latent, seed, batch_inds)
-
-        noise_mask = latent_image.get("noise_mask", None)
 
         # Route to appropriate sampling method
+        # Note: We use common_ksampler which handles latent as dict properly
         if mode == "single" or len(patched_models) == 1:
             print(f"[NV_ExtractAttentionGuidance] Single model mode")
-            samples = self._sample_single(
-                patched_models[0], positive, negative, latent, noise,
+            result = self._sample_single(
+                patched_models[0], positive, negative, latent_image,
                 seed, steps, cfg, sampler_name, scheduler, denoise,
-                noise_mask, current_step
+                noise_tensor
             )
         elif mode == "sequential":
             print(f"[NV_ExtractAttentionGuidance] Sequential mode: {len(patched_models)} models")
-            samples = self._sample_sequential(
-                patched_models, positive, negative, latent, noise,
+            result = self._sample_sequential(
+                patched_models, positive, negative, latent_image,
                 seed, steps, cfg_scales, sampler_name, scheduler, denoise,
-                model_steps, noise_mask, current_step
+                model_steps, noise_tensor
             )
         elif mode == "boundary":
             print(f"[NV_ExtractAttentionGuidance] Boundary mode: {len(patched_models)} models")
-            samples = self._sample_boundary(
-                patched_models, positive, negative, latent, noise,
+            result = self._sample_boundary(
+                patched_models, positive, negative, latent_image,
                 seed, steps, cfg_scales, sampler_name, scheduler, denoise,
-                model_boundaries, noise_mask, current_step
+                model_boundaries, noise_tensor
             )
         else:
             # Fallback to single
-            samples = self._sample_single(
-                patched_models[0], positive, negative, latent, noise,
+            result = self._sample_single(
+                patched_models[0], positive, negative, latent_image,
                 seed, steps, cfg, sampler_name, scheduler, denoise,
-                noise_mask, current_step
+                noise_tensor
             )
 
         print(f"[NV_ExtractAttentionGuidance] Extraction complete: {extraction_count[0]} attention patterns stored")
 
-        out = latent_image.copy()
-        out["samples"] = samples
+        return (result, attention_data)
 
-        return (out, attention_data)
-
-    def _sample_single(self, model, positive, negative, latent, noise,
+    def _sample_single(self, model, positive, negative, latent_image,
                        seed, steps, cfg, sampler_name, scheduler, denoise,
-                       noise_mask, current_step):
-        """Single model sampling with step tracking."""
-        callback = latent_preview.prepare_callback(model, steps)
-        disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+                       noise_tensor=None):
+        """Single model sampling - matches NV_MultiModelSampler behavior."""
+        if noise_tensor is not None:
+            return self._ksampler_with_noise(
+                model, noise_tensor, seed, steps, cfg, sampler_name, scheduler,
+                positive, negative, latent_image, denoise=denoise
+            )
+        return common_ksampler(
+            model, seed, steps, cfg, sampler_name, scheduler,
+            positive, negative, latent_image, denoise=denoise
+        )[0]  # Extract from tuple
 
-        def combined_callback(step, x0, x, total_steps):
-            current_step[0] = step
-            if callback is not None:
-                return callback(step, x0, x, total_steps)
-            return None
-
-        return comfy.sample.sample(
-            model, noise, steps, cfg, sampler_name, scheduler,
-            positive, negative, latent,
-            denoise=denoise, disable_noise=False,
-            noise_mask=noise_mask, callback=combined_callback,
-            disable_pbar=disable_pbar, seed=seed
-        )
-
-    def _sample_sequential(self, models, positive, negative, latent, noise,
+    def _sample_sequential(self, models, positive, negative, latent_image,
                            seed, steps, cfg_scales, sampler_name, scheduler, denoise,
-                           model_steps_str, noise_mask, current_step):
-        """Sequential multi-model sampling."""
+                           model_steps_str, noise_tensor=None):
+        """Sequential multi-model sampling - matches NV_MultiModelSampler behavior."""
         step_distribution = self._parse_step_distribution(model_steps_str, steps, len(models))
         print(f"[NV_ExtractAttentionGuidance] Step distribution: {step_distribution}")
 
-        current_latent = latent
-        current_step_idx = 0
-        disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+        current_latent = latent_image
+        current_step = 0
 
-        for i, (model, model_steps_count, cfg) in enumerate(zip(models, step_distribution, cfg_scales)):
-            if model_steps_count <= 0:
+        for i, (model, model_steps, cfg) in enumerate(zip(models, step_distribution, cfg_scales)):
+            if model_steps <= 0:
                 continue
 
-            start_step = current_step_idx
-            end_step = current_step_idx + model_steps_count
+            start_step = current_step
+            end_step = current_step + model_steps
             disable_noise = (i > 0)
 
-            print(f"[NV_ExtractAttentionGuidance] Model {i+1}: steps {start_step}-{end_step}, cfg={cfg}")
+            print(f"[NV_ExtractAttentionGuidance] Model {i+1}: steps {start_step}-{end_step}, cfg={cfg}, disable_noise={disable_noise}")
 
-            callback = latent_preview.prepare_callback(model, steps)
-
-            def make_callback(cb, start):
-                def combined_callback(step, x0, x, total_steps):
-                    current_step[0] = start + step
-                    if cb is not None:
-                        return cb(step, x0, x, total_steps)
-                    return None
-                return combined_callback
-
-            if i == 0:
-                # First model uses noise
-                samples = comfy.sample.sample(
-                    model, noise, steps, cfg, sampler_name, scheduler,
+            if noise_tensor is not None and not disable_noise:
+                # Use committed noise for first model
+                result = self._ksampler_with_noise(
+                    model, noise_tensor, seed, steps, cfg, sampler_name, scheduler,
                     positive, negative, current_latent,
-                    denoise=denoise, disable_noise=False,
-                    start_step=start_step, last_step=end_step,
-                    force_full_denoise=(i == len(models) - 1),
-                    noise_mask=noise_mask, callback=make_callback(callback, start_step),
-                    disable_pbar=disable_pbar, seed=seed
+                    denoise=denoise,
+                    start_step=start_step,
+                    last_step=end_step,
+                    force_full_denoise=(i == len(models) - 1)
                 )
             else:
-                # Subsequent models continue without noise
-                samples = comfy.sample.sample(
-                    model, noise, steps, cfg, sampler_name, scheduler,
+                result = common_ksampler(
+                    model, seed, steps, cfg, sampler_name, scheduler,
                     positive, negative, current_latent,
-                    denoise=denoise, disable_noise=True,
-                    start_step=start_step, last_step=end_step,
-                    force_full_denoise=(i == len(models) - 1),
-                    noise_mask=noise_mask, callback=make_callback(callback, start_step),
-                    disable_pbar=disable_pbar, seed=seed
-                )
+                    denoise=denoise,
+                    disable_noise=disable_noise,
+                    start_step=start_step,
+                    last_step=end_step,
+                    force_full_denoise=(i == len(models) - 1)
+                )[0]  # Extract from tuple
 
-            current_latent = samples
-            current_step_idx = end_step
+            current_latent = result
+            current_step = end_step
 
         return current_latent
 
-    def _sample_boundary(self, models, positive, negative, latent, noise,
+    def _sample_boundary(self, models, positive, negative, latent_image,
                          seed, steps, cfg_scales, sampler_name, scheduler, denoise,
-                         model_boundaries_str, noise_mask, current_step):
-        """Boundary-based multi-model sampling."""
+                         model_boundaries_str, noise_tensor=None):
+        """Boundary-based multi-model sampling - matches NV_MultiModelSampler behavior."""
         boundaries = self._parse_boundaries(model_boundaries_str, len(models))
         step_ranges = self._boundaries_to_steps(boundaries, steps, denoise)
         print(f"[NV_ExtractAttentionGuidance] Sigma boundaries: {boundaries}")
         print(f"[NV_ExtractAttentionGuidance] Step ranges: {step_ranges}")
 
-        current_latent = latent
-        disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+        current_latent = latent_image
 
         for i, (model, (start_step, end_step), cfg) in enumerate(zip(models, step_ranges, cfg_scales)):
             if start_step >= end_step:
@@ -505,40 +475,65 @@ class NV_ExtractAttentionGuidance:
 
             print(f"[NV_ExtractAttentionGuidance] Model {i+1}: steps {start_step}-{end_step}, cfg={cfg}")
 
-            callback = latent_preview.prepare_callback(model, steps)
-
-            def make_callback(cb, start):
-                def combined_callback(step, x0, x, total_steps):
-                    current_step[0] = start + step
-                    if cb is not None:
-                        return cb(step, x0, x, total_steps)
-                    return None
-                return combined_callback
-
-            if i == 0:
-                samples = comfy.sample.sample(
-                    model, noise, steps, cfg, sampler_name, scheduler,
+            if noise_tensor is not None and not disable_noise:
+                result = self._ksampler_with_noise(
+                    model, noise_tensor, seed, steps, cfg, sampler_name, scheduler,
                     positive, negative, current_latent,
-                    denoise=denoise, disable_noise=False,
-                    start_step=start_step, last_step=end_step,
-                    force_full_denoise=(i == len(models) - 1),
-                    noise_mask=noise_mask, callback=make_callback(callback, start_step),
-                    disable_pbar=disable_pbar, seed=seed
+                    denoise=denoise,
+                    start_step=start_step,
+                    last_step=end_step,
+                    force_full_denoise=(i == len(models) - 1)
                 )
             else:
-                samples = comfy.sample.sample(
-                    model, noise, steps, cfg, sampler_name, scheduler,
+                result = common_ksampler(
+                    model, seed, steps, cfg, sampler_name, scheduler,
                     positive, negative, current_latent,
-                    denoise=denoise, disable_noise=True,
-                    start_step=start_step, last_step=end_step,
-                    force_full_denoise=(i == len(models) - 1),
-                    noise_mask=noise_mask, callback=make_callback(callback, start_step),
-                    disable_pbar=disable_pbar, seed=seed
-                )
+                    denoise=denoise,
+                    disable_noise=disable_noise,
+                    start_step=start_step,
+                    last_step=end_step,
+                    force_full_denoise=(i == len(models) - 1)
+                )[0]  # Extract from tuple
 
-            current_latent = samples
+            current_latent = result
 
         return current_latent
+
+    def _ksampler_with_noise(self, model, noise, seed, steps, cfg, sampler_name, scheduler,
+                              positive, negative, latent, denoise=1.0, start_step=None,
+                              last_step=None, force_full_denoise=False):
+        """
+        KSampler-like function that accepts pre-generated noise.
+        Mirrors common_ksampler but uses provided noise tensor.
+        """
+        latent_image = latent["samples"]
+        latent_image = comfy.sample.fix_empty_latent_channels(model, latent_image)
+
+        # Validate noise shape matches latent
+        if noise.shape != latent_image.shape:
+            raise ValueError(
+                f"Committed noise shape {list(noise.shape)} doesn't match "
+                f"latent shape {list(latent_image.shape)}"
+            )
+
+        noise_mask = latent.get("noise_mask", None)
+
+        callback = latent_preview.prepare_callback(model, steps)
+        disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+
+        samples = comfy.sample.sample(
+            model, noise, steps, cfg, sampler_name, scheduler,
+            positive, negative, latent_image,
+            denoise=denoise, disable_noise=False,
+            start_step=start_step, last_step=last_step,
+            force_full_denoise=force_full_denoise,
+            noise_mask=noise_mask, callback=callback,
+            disable_pbar=disable_pbar, seed=seed
+        )
+
+        out = latent.copy()
+        out["samples"] = samples
+        return out
 
     def _parse_step_distribution(self, model_steps_str, total_steps, num_models):
         """Parse step distribution string or auto-divide steps."""
