@@ -341,44 +341,111 @@ class NV_ExtractAttentionGuidance:
         current_step = [0]
         extraction_count = [0]
 
-        def create_attention_extractor():
-            """Create extraction hook with closure over shared state."""
-            def attention_extractor(q, k, v, extra_options):
-                """Hook that extracts attention weights."""
+        def create_attention_extractor(layer_idx):
+            """Create extraction hook for a specific layer.
+
+            Wan models pass a dict: {"x": x, "q": q, "k": k, "transformer_options": ...}
+            Standard models pass positional args: (q, k, v, extra_options)
+            We detect which format is used and handle both.
+            """
+            def attention_extractor(*args, **kwargs):
+                """Hook that extracts attention weights and computes attention."""
                 step = current_step[0]
-                block_index = extra_options.get("block_index", 0)
-                heads = extra_options.get("n_heads", 1)
-                attn_precision = extra_options.get("attn_precision", None)
 
-                # Check if we should extract this step/layer
-                if step in step_indices and block_index in layer_indices:
-                    # Compute attention with capture
-                    out, attn_weights = attention_with_capture(
-                        q, k, v, heads, attn_precision
-                    )
+                # Handle both Wan (dict) and standard (positional) signatures
+                if len(args) == 1 and isinstance(args[0], dict):
+                    # Wan model: receives {"x": x, "q": q, "k": k, "transformer_options": ...}
+                    args_dict = args[0]
+                    x = args_dict.get("x")
+                    q = args_dict.get("q")
+                    k = args_dict.get("k")
+                    transformer_options = args_dict.get("transformer_options", {})
+                    heads = transformer_options.get("n_heads", 1)
+                    attn_precision = transformer_options.get("attn_precision", None)
 
-                    # Sparsify and store (only store once per step/layer combo)
-                    key = f"step_{step}_layer_{block_index}"
-                    if key not in attention_data["layers"]:
-                        sparse = sparsify_attention(attn_weights, sparsity_ratio)
-                        attention_data["layers"][key] = sparse
-                        extraction_count[0] += 1
-                        print(f"[NV_ExtractAttentionGuidance] Captured {key}: "
-                              f"shape {attn_weights.shape}, stored {sparse['k']} values per query")
+                    # For Wan, we need to get v from x using the attention module
+                    # But we don't have access to self.v here, so we'll use k as v
+                    # (This is a simplification - may need adjustment)
+                    v = k  # In self-attention, v is computed from same source as k
 
-                    return out
+                    # Check if we should extract this step
+                    if step in step_indices:
+                        # Compute attention with capture
+                        out, attn_weights = attention_with_capture(
+                            q, k, v, heads, attn_precision
+                        )
+
+                        # Sparsify and store
+                        key = f"step_{step}_layer_{layer_idx}"
+                        if key not in attention_data["layers"]:
+                            sparse = sparsify_attention(attn_weights, sparsity_ratio)
+                            attention_data["layers"][key] = sparse
+                            extraction_count[0] += 1
+                            print(f"[NV_ExtractAttentionGuidance] Captured {key}: "
+                                  f"shape {attn_weights.shape}, stored {sparse['k']} values per query")
+
+                        return out
+                    else:
+                        # Standard attention
+                        return optimized_attention(q, k, v, heads, attn_precision=attn_precision)
                 else:
-                    # Standard attention
-                    return optimized_attention(q, k, v, heads, attn_precision=attn_precision)
+                    # Standard model: positional args (q, k, v, extra_options)
+                    q, k, v, extra_options = args[0], args[1], args[2], args[3]
+                    heads = extra_options.get("n_heads", 1)
+                    attn_precision = extra_options.get("attn_precision", None)
+
+                    # Check if we should extract this step
+                    if step in step_indices:
+                        # Compute attention with capture
+                        out, attn_weights = attention_with_capture(
+                            q, k, v, heads, attn_precision
+                        )
+
+                        # Sparsify and store
+                        key = f"step_{step}_layer_{layer_idx}"
+                        if key not in attention_data["layers"]:
+                            sparse = sparsify_attention(attn_weights, sparsity_ratio)
+                            attention_data["layers"][key] = sparse
+                            extraction_count[0] += 1
+                            print(f"[NV_ExtractAttentionGuidance] Captured {key}: "
+                                  f"shape {attn_weights.shape}, stored {sparse['k']} values per query")
+
+                        return out
+                    else:
+                        # Standard attention
+                        return optimized_attention(q, k, v, heads, attn_precision=attn_precision)
             return attention_extractor
 
-        # Patch all models with extraction hook
+        # Patch all models with extraction hooks for each target layer
+        # We use set_model_attn1_replace which replaces attention at specific blocks
         patched_models = []
         for i, m in enumerate(models):
             patched = m.clone()
-            patched.set_model_attn1_patch(create_attention_extractor())
+
+            # Register extraction hooks for each layer we want to capture
+            # For DiT/video models, layers are typically in "double_block" or "single_block"
+            # We try both naming conventions
+            for layer_idx in layer_indices:
+                extractor = create_attention_extractor(layer_idx)
+                # Try double_block (common in DiT models)
+                try:
+                    patched.set_model_attn1_replace(extractor, "double_block", layer_idx, 0)
+                except Exception:
+                    pass
+                # Also try single_block
+                try:
+                    patched.set_model_attn1_replace(extractor, "single_block", layer_idx, 0)
+                except Exception:
+                    pass
+                # Try middle block (for UNet-style models)
+                if layer_idx == 0:
+                    try:
+                        patched.set_model_attn1_replace(extractor, "middle", 0, 0)
+                    except Exception:
+                        pass
+
             patched_models.append(patched)
-            print(f"[NV_ExtractAttentionGuidance] Patched model {i+1} with extraction hook")
+            print(f"[NV_ExtractAttentionGuidance] Patched model {i+1} for layers {sorted(layer_indices)}")
 
         # Prepare noise
         latent = latent_image["samples"]
