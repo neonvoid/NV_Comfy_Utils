@@ -216,6 +216,9 @@ class NV_ExtractAttentionGuidance:
     Hooks into self-attention layers to capture which tokens attend
     to which, then compresses to sparse representation for storage.
 
+    Supports multi-model sampling (sequential/boundary modes) to match
+    production workflow configuration.
+
     Research-backed defaults:
     - Layers 0, 3, 8, 16, 19 preserve temporal structure
     - Steps 50-100% capture detail refinement phase
@@ -238,9 +241,30 @@ class NV_ExtractAttentionGuidance:
                 "denoise": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0}),
             },
             "optional": {
+                # Multi-model support
+                "model_2": ("MODEL",),
+                "model_3": ("MODEL",),
+                "mode": (["single", "sequential", "boundary"], {
+                    "default": "single",
+                    "tooltip": "single: use model only, sequential: chain models by steps, boundary: switch by sigma"
+                }),
+                "model_steps": ("STRING", {
+                    "default": "",
+                    "tooltip": "Sequential mode: comma-separated steps per model (e.g., '7,7,6'). Empty = auto-divide."
+                }),
+                "model_boundaries": ("STRING", {
+                    "default": "0.875,0.5",
+                    "tooltip": "Boundary mode: sigma thresholds (0-1). Model switches when sigma drops below threshold."
+                }),
+                "model_cfg_scales": ("STRING", {
+                    "default": "",
+                    "tooltip": "Per-model CFG overrides (e.g., '7.0,5.0,3.0'). Empty = use main cfg."
+                }),
+                # Committed noise
                 "committed_noise": ("COMMITTED_NOISE", {
                     "tooltip": "Pre-generated noise (from NV_CommittedNoise)"
                 }),
+                # Extraction settings
                 "extract_layers": ("STRING", {
                     "default": "0,3,8,16,19",
                     "tooltip": "Comma-separated layer indices. Research: 0,3,19 for structure preservation"
@@ -263,10 +287,12 @@ class NV_ExtractAttentionGuidance:
     RETURN_NAMES = ("latent", "attention_guidance")
     FUNCTION = "extract"
     CATEGORY = "NV_Utils/sampling"
-    DESCRIPTION = "Extract attention patterns during sampling for guidance in chunked processing."
+    DESCRIPTION = "Extract attention patterns during sampling for guidance in chunked processing. Supports multi-model workflows."
 
     def extract(self, model, positive, negative, latent_image, seed, steps, cfg,
-                sampler_name, scheduler, denoise, committed_noise=None,
+                sampler_name, scheduler, denoise, model_2=None, model_3=None,
+                mode="single", model_steps="", model_boundaries="0.875,0.5",
+                model_cfg_scales="", committed_noise=None,
                 extract_layers="0,3,8,16,19", extract_steps="50-100%",
                 sparsity_ratio=0.25):
 
@@ -285,6 +311,16 @@ class NV_ExtractAttentionGuidance:
         print(f"[NV_ExtractAttentionGuidance] Extracting at steps: {sorted(step_indices)}")
         print(f"[NV_ExtractAttentionGuidance] Sparsity ratio: {sparsity_ratio}")
 
+        # Collect models
+        models = [model]
+        if model_2 is not None:
+            models.append(model_2)
+        if model_3 is not None:
+            models.append(model_3)
+
+        # Parse cfg scales
+        cfg_scales = self._parse_cfg_scales(model_cfg_scales, cfg, len(models))
+
         # Storage for extracted attention
         attention_data = {
             "version": "1.0",
@@ -295,6 +331,8 @@ class NV_ExtractAttentionGuidance:
                 "sparsity_ratio": sparsity_ratio,
                 "extract_layers": sorted(layer_indices),
                 "extract_steps": sorted(step_indices),
+                "mode": mode,
+                "num_models": len(models),
             },
             "layers": {}
         }
@@ -303,50 +341,48 @@ class NV_ExtractAttentionGuidance:
         current_step = [0]
         extraction_count = [0]
 
-        def attention_extractor(q, k, v, extra_options):
-            """Hook that extracts attention weights."""
-            nonlocal attention_data
+        def create_attention_extractor():
+            """Create extraction hook with closure over shared state."""
+            def attention_extractor(q, k, v, extra_options):
+                """Hook that extracts attention weights."""
+                step = current_step[0]
+                block_index = extra_options.get("block_index", 0)
+                heads = extra_options.get("n_heads", 1)
+                attn_precision = extra_options.get("attn_precision", None)
 
-            step = current_step[0]
-            block_index = extra_options.get("block_index", 0)
-            heads = extra_options.get("n_heads", 1)
-            attn_precision = extra_options.get("attn_precision", None)
+                # Check if we should extract this step/layer
+                if step in step_indices and block_index in layer_indices:
+                    # Compute attention with capture
+                    out, attn_weights = attention_with_capture(
+                        q, k, v, heads, attn_precision
+                    )
 
-            # Check if we should extract this step/layer
-            if step in step_indices and block_index in layer_indices:
-                # Compute attention with capture
-                out, attn_weights = attention_with_capture(
-                    q, k, v, heads, attn_precision
-                )
+                    # Sparsify and store (only store once per step/layer combo)
+                    key = f"step_{step}_layer_{block_index}"
+                    if key not in attention_data["layers"]:
+                        sparse = sparsify_attention(attn_weights, sparsity_ratio)
+                        attention_data["layers"][key] = sparse
+                        extraction_count[0] += 1
+                        print(f"[NV_ExtractAttentionGuidance] Captured {key}: "
+                              f"shape {attn_weights.shape}, stored {sparse['k']} values per query")
 
-                # Sparsify and store (only store once per step/layer combo)
-                key = f"step_{step}_layer_{block_index}"
-                if key not in attention_data["layers"]:
-                    sparse = sparsify_attention(attn_weights, sparsity_ratio)
-                    attention_data["layers"][key] = sparse
-                    extraction_count[0] += 1
-                    print(f"[NV_ExtractAttentionGuidance] Captured {key}: "
-                          f"shape {attn_weights.shape}, stored {sparse['k']} values per query")
+                    return out
+                else:
+                    # Standard attention
+                    return optimized_attention(q, k, v, heads, attn_precision=attn_precision)
+            return attention_extractor
 
-                return out
-            else:
-                # Standard attention
-                return optimized_attention(q, k, v, heads, attn_precision=attn_precision)
+        # Patch all models with extraction hook
+        patched_models = []
+        for i, m in enumerate(models):
+            patched = m.clone()
+            patched.set_model_attn1_patch(create_attention_extractor())
+            patched_models.append(patched)
+            print(f"[NV_ExtractAttentionGuidance] Patched model {i+1} with extraction hook")
 
-        # Clone model and add extraction hook
-        patched_model = model.clone()
-
-        # Add hook to all transformer blocks (we filter by block_index in the hook)
-        # Using attn1_patch which applies to all self-attention layers
-        patched_model.set_model_attn1_patch(attention_extractor)
-
-        # Step tracking callback
-        def step_callback(step, x0, x, total_steps):
-            current_step[0] = step
-
-        # Prepare for sampling
+        # Prepare noise
         latent = latent_image["samples"]
-        latent = comfy.sample.fix_empty_latent_channels(patched_model, latent)
+        latent = comfy.sample.fix_empty_latent_channels(patched_models[0], latent)
 
         if committed_noise is not None:
             noise = committed_noise["noise"]
@@ -357,27 +393,35 @@ class NV_ExtractAttentionGuidance:
 
         noise_mask = latent_image.get("noise_mask", None)
 
-        # Progress callback
-        callback = latent_preview.prepare_callback(patched_model, steps)
-        disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
-
-        # Wrap callback to include step tracking
-        original_callback = callback
-
-        def combined_callback(step, x0, x, total_steps):
-            step_callback(step, x0, x, total_steps)
-            if original_callback is not None:
-                return original_callback(step, x0, x, total_steps)
-            return None
-
-        # Run sampling
-        samples = comfy.sample.sample(
-            patched_model, noise, steps, cfg, sampler_name, scheduler,
-            positive, negative, latent,
-            denoise=denoise, disable_noise=False,
-            noise_mask=noise_mask, callback=combined_callback,
-            disable_pbar=disable_pbar, seed=seed
-        )
+        # Route to appropriate sampling method
+        if mode == "single" or len(patched_models) == 1:
+            print(f"[NV_ExtractAttentionGuidance] Single model mode")
+            samples = self._sample_single(
+                patched_models[0], positive, negative, latent, noise,
+                seed, steps, cfg, sampler_name, scheduler, denoise,
+                noise_mask, current_step
+            )
+        elif mode == "sequential":
+            print(f"[NV_ExtractAttentionGuidance] Sequential mode: {len(patched_models)} models")
+            samples = self._sample_sequential(
+                patched_models, positive, negative, latent, noise,
+                seed, steps, cfg_scales, sampler_name, scheduler, denoise,
+                model_steps, noise_mask, current_step
+            )
+        elif mode == "boundary":
+            print(f"[NV_ExtractAttentionGuidance] Boundary mode: {len(patched_models)} models")
+            samples = self._sample_boundary(
+                patched_models, positive, negative, latent, noise,
+                seed, steps, cfg_scales, sampler_name, scheduler, denoise,
+                model_boundaries, noise_mask, current_step
+            )
+        else:
+            # Fallback to single
+            samples = self._sample_single(
+                patched_models[0], positive, negative, latent, noise,
+                seed, steps, cfg, sampler_name, scheduler, denoise,
+                noise_mask, current_step
+            )
 
         print(f"[NV_ExtractAttentionGuidance] Extraction complete: {extraction_count[0]} attention patterns stored")
 
@@ -385,6 +429,211 @@ class NV_ExtractAttentionGuidance:
         out["samples"] = samples
 
         return (out, attention_data)
+
+    def _sample_single(self, model, positive, negative, latent, noise,
+                       seed, steps, cfg, sampler_name, scheduler, denoise,
+                       noise_mask, current_step):
+        """Single model sampling with step tracking."""
+        callback = latent_preview.prepare_callback(model, steps)
+        disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+
+        def combined_callback(step, x0, x, total_steps):
+            current_step[0] = step
+            if callback is not None:
+                return callback(step, x0, x, total_steps)
+            return None
+
+        return comfy.sample.sample(
+            model, noise, steps, cfg, sampler_name, scheduler,
+            positive, negative, latent,
+            denoise=denoise, disable_noise=False,
+            noise_mask=noise_mask, callback=combined_callback,
+            disable_pbar=disable_pbar, seed=seed
+        )
+
+    def _sample_sequential(self, models, positive, negative, latent, noise,
+                           seed, steps, cfg_scales, sampler_name, scheduler, denoise,
+                           model_steps_str, noise_mask, current_step):
+        """Sequential multi-model sampling."""
+        step_distribution = self._parse_step_distribution(model_steps_str, steps, len(models))
+        print(f"[NV_ExtractAttentionGuidance] Step distribution: {step_distribution}")
+
+        current_latent = latent
+        current_step_idx = 0
+        disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+
+        for i, (model, model_steps_count, cfg) in enumerate(zip(models, step_distribution, cfg_scales)):
+            if model_steps_count <= 0:
+                continue
+
+            start_step = current_step_idx
+            end_step = current_step_idx + model_steps_count
+            disable_noise = (i > 0)
+
+            print(f"[NV_ExtractAttentionGuidance] Model {i+1}: steps {start_step}-{end_step}, cfg={cfg}")
+
+            callback = latent_preview.prepare_callback(model, steps)
+
+            def make_callback(cb, start):
+                def combined_callback(step, x0, x, total_steps):
+                    # Map local step to global step
+                    current_step[0] = start + step
+                    if cb is not None:
+                        return cb(step, x0, x, total_steps)
+                    return None
+                return combined_callback
+
+            if i == 0:
+                # First model uses noise
+                samples = comfy.sample.sample(
+                    model, noise, steps, cfg, sampler_name, scheduler,
+                    positive, negative, current_latent,
+                    denoise=denoise, disable_noise=False,
+                    start_step=start_step, last_step=end_step,
+                    force_full_denoise=(i == len(models) - 1),
+                    noise_mask=noise_mask, callback=make_callback(callback, start_step),
+                    disable_pbar=disable_pbar, seed=seed
+                )
+            else:
+                # Subsequent models continue without noise
+                samples = comfy.sample.sample(
+                    model, noise, steps, cfg, sampler_name, scheduler,
+                    positive, negative, current_latent,
+                    denoise=denoise, disable_noise=True,
+                    start_step=start_step, last_step=end_step,
+                    force_full_denoise=(i == len(models) - 1),
+                    noise_mask=noise_mask, callback=make_callback(callback, start_step),
+                    disable_pbar=disable_pbar, seed=seed
+                )
+
+            current_latent = samples
+            current_step_idx = end_step
+
+        return current_latent
+
+    def _sample_boundary(self, models, positive, negative, latent, noise,
+                         seed, steps, cfg_scales, sampler_name, scheduler, denoise,
+                         model_boundaries_str, noise_mask, current_step):
+        """Boundary-based multi-model sampling."""
+        boundaries = self._parse_boundaries(model_boundaries_str, len(models))
+        step_ranges = self._boundaries_to_steps(boundaries, steps, denoise)
+        print(f"[NV_ExtractAttentionGuidance] Sigma boundaries: {boundaries}")
+        print(f"[NV_ExtractAttentionGuidance] Step ranges: {step_ranges}")
+
+        current_latent = latent
+        disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+
+        for i, (model, (start_step, end_step), cfg) in enumerate(zip(models, step_ranges, cfg_scales)):
+            if start_step >= end_step:
+                continue
+
+            disable_noise = (i > 0)
+
+            print(f"[NV_ExtractAttentionGuidance] Model {i+1}: steps {start_step}-{end_step}, cfg={cfg}")
+
+            callback = latent_preview.prepare_callback(model, steps)
+
+            def make_callback(cb, start):
+                def combined_callback(step, x0, x, total_steps):
+                    current_step[0] = start + step
+                    if cb is not None:
+                        return cb(step, x0, x, total_steps)
+                    return None
+                return combined_callback
+
+            if i == 0:
+                samples = comfy.sample.sample(
+                    model, noise, steps, cfg, sampler_name, scheduler,
+                    positive, negative, current_latent,
+                    denoise=denoise, disable_noise=False,
+                    start_step=start_step, last_step=end_step,
+                    force_full_denoise=(i == len(models) - 1),
+                    noise_mask=noise_mask, callback=make_callback(callback, start_step),
+                    disable_pbar=disable_pbar, seed=seed
+                )
+            else:
+                samples = comfy.sample.sample(
+                    model, noise, steps, cfg, sampler_name, scheduler,
+                    positive, negative, current_latent,
+                    denoise=denoise, disable_noise=True,
+                    start_step=start_step, last_step=end_step,
+                    force_full_denoise=(i == len(models) - 1),
+                    noise_mask=noise_mask, callback=make_callback(callback, start_step),
+                    disable_pbar=disable_pbar, seed=seed
+                )
+
+            current_latent = samples
+
+        return current_latent
+
+    def _parse_step_distribution(self, model_steps_str, total_steps, num_models):
+        """Parse step distribution string or auto-divide steps."""
+        if model_steps_str.strip():
+            try:
+                parts = [int(x.strip()) for x in model_steps_str.split(",") if x.strip()]
+                while len(parts) < num_models:
+                    parts.append(0)
+                return parts[:num_models]
+            except ValueError:
+                pass
+
+        # Auto-divide
+        base_steps = total_steps // num_models
+        remainder = total_steps % num_models
+        distribution = []
+        for i in range(num_models):
+            extra = 1 if i < remainder else 0
+            distribution.append(base_steps + extra)
+        return distribution
+
+    def _parse_boundaries(self, boundaries_str, num_models):
+        """Parse sigma boundary thresholds."""
+        boundaries = [1.0]
+
+        if boundaries_str.strip():
+            try:
+                parts = [float(x.strip()) for x in boundaries_str.split(",") if x.strip()]
+                boundaries.extend(parts)
+            except ValueError:
+                pass
+
+        while len(boundaries) < num_models:
+            last = boundaries[-1] if boundaries else 1.0
+            boundaries.append(last / 2)
+
+        boundaries.append(0.0)
+        return boundaries[:num_models + 1]
+
+    def _boundaries_to_steps(self, boundaries, total_steps, denoise):
+        """Convert sigma boundaries to step ranges."""
+        step_ranges = []
+
+        for i in range(len(boundaries) - 1):
+            upper_sigma = boundaries[i]
+            lower_sigma = boundaries[i + 1]
+
+            start_step = int((1.0 - upper_sigma) * total_steps)
+            end_step = int((1.0 - lower_sigma) * total_steps)
+
+            start_step = max(0, min(start_step, total_steps))
+            end_step = max(0, min(end_step, total_steps))
+
+            step_ranges.append((start_step, end_step))
+
+        return step_ranges
+
+    def _parse_cfg_scales(self, cfg_scales_str, default_cfg, num_models):
+        """Parse per-model CFG scales or use default."""
+        if cfg_scales_str.strip():
+            try:
+                parts = [float(x.strip()) for x in cfg_scales_str.split(",") if x.strip()]
+                while len(parts) < num_models:
+                    parts.append(default_cfg)
+                return parts[:num_models]
+            except ValueError:
+                pass
+
+        return [default_cfg] * num_models
 
 
 class NV_SaveAttentionGuidance:
