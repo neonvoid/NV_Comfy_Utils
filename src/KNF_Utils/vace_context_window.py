@@ -28,6 +28,33 @@ LONG_VIDEO_THRESHOLD = 55
 _VACE_ORIGINALS_CACHE = {}
 
 
+def _slice_tensor_manual(tensor, index_list, dim, target_device, target_dtype):
+    """
+    Manually slice a tensor along a dimension using index_list.
+
+    This avoids using window.get_tensor() which has dtype issues under autocast.
+    We disable autocast during slicing to ensure clean dtype handling.
+    """
+    # Build index tuple for the slice
+    idx = tuple([slice(None)] * dim + [index_list])
+
+    # Disable autocast during slicing to avoid dtype ambiguity
+    with torch.cuda.amp.autocast(enabled=False):
+        # Move to device first, preserving dtype
+        if tensor.device.type == 'cpu':
+            tensor = tensor.to(device=target_device, dtype=target_dtype)
+        elif tensor.dtype != target_dtype:
+            tensor = tensor.to(dtype=target_dtype)
+
+        # Slice the tensor
+        sliced = tensor[idx]
+
+        # Ensure contiguous and on correct device with correct dtype
+        sliced = sliced.to(device=target_device, dtype=target_dtype).contiguous()
+
+    return sliced
+
+
 def slice_vace_conditioning(handler, model, x_in, conds, timestep, model_options,
                             window_idx, window: IndexListContextWindow,
                             model_opts, device, first_device):
@@ -63,17 +90,22 @@ def slice_vace_conditioning(handler, model, x_in, conds, timestep, model_options
     # Adaptive CPU offload: for long videos, cache on CPU to avoid OOM
     use_cpu_cache = full_temporal_size > LONG_VIDEO_THRESHOLD
 
+    # Get the model's target dtype from x_in to ensure VACE tensors match
+    # This is critical for autocast compatibility
+    target_dtype = x_in.dtype
+
     # Debug: Log callback invocation (with parseable format for workflow logger)
     if window_idx == 0:  # Only log first window to reduce noise
         window_size = len(window.index_list)
         print(f"[VACE Slicer] Callback invoked for window {window_idx}")
-        print(f"[VACE Slicer] x_in shape: {x_in.shape}, dim={dim}")
+        print(f"[VACE Slicer] x_in shape: {x_in.shape}, dtype={x_in.dtype}, dim={dim}")
         print(f"[VACE Slicer] Window indices: {window.index_list[:5]}...{window.index_list[-5:] if len(window.index_list) > 5 else ''}")
         print(f"[VACE Slicer] Number of cond lists: {len(conds)}")
         # Parseable log line for workflow logger
         print(f"[VACE Slicer] Using context window {window_size} for {full_temporal_size} frames")
         if use_cpu_cache:
             print(f"[VACE Slicer] Long video detected ({full_temporal_size} frames > {LONG_VIDEO_THRESHOLD}), using CPU cache")
+        print(f"[VACE Slicer] Target dtype: {target_dtype}")
 
     for cond_list in conds:
         if cond_list is None:

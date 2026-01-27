@@ -2170,6 +2170,15 @@ class NV_VideoSampler:
                     "tooltip": "Use start_image for VACE conditioning only in chunk 0 (chunks 1+ rely solely on previous 16 frames)"
                 }),
 
+                # Chunk consistency options (committed noise + shift_t)
+                "committed_noise": ("COMMITTED_NOISE", {
+                    "tooltip": "Pre-generated noise with FreeNoise correlation (from NV_CommittedNoise). Ensures overlapping frames get identical noise across chunks."
+                }),
+                "enable_shift_t": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Apply RoPE temporal offset per chunk so model knows absolute position in video (recommended for chunk consistency)"
+                }),
+
                 # Debug options
                 "debug_keep_vace_decoded": ("BOOLEAN", {
                     "default": False,
@@ -2387,6 +2396,8 @@ class NV_VideoSampler:
                color_match_threshold=5.0, color_match_adaptive_strength=True,
                # VACE reference options
                vace_use_start_image_chunk0_only=True,
+               # Chunk consistency options (committed noise + shift_t)
+               committed_noise=None, enable_shift_t=True,
                # Debug options
                debug_keep_vace_decoded=False):
         
@@ -2739,12 +2750,23 @@ class NV_VideoSampler:
         
         if disable_noise:
             noise = torch.zeros(
-                latent.size(), 
-                dtype=latent.dtype, 
-                layout=latent.layout, 
+                latent.size(),
+                dtype=latent.dtype,
+                layout=latent.layout,
                 device="cpu"
             )
             info_lines.append(f"NOISE: Disabled (mode={sampler_mode})")
+        elif committed_noise is not None:
+            # Use pre-committed noise (with optional FreeNoise correlation)
+            noise = committed_noise["noise"]
+            # Verify shape matches
+            if noise.shape != latent.shape:
+                raise ValueError(
+                    f"Committed noise shape {list(noise.shape)} doesn't match latent shape {list(latent.shape)}. "
+                    f"Did you generate committed noise with the correct latent?"
+                )
+            freenoise_status = "with FreeNoise" if committed_noise.get("freenoise_applied", False) else "without FreeNoise"
+            info_lines.append(f"NOISE: Using committed noise (seed={committed_noise['seed']}, {freenoise_status})")
         else:
             batch_inds = latent_image.get("batch_index", None)
             noise = comfy.sample.prepare_noise(latent, seed, batch_inds)
@@ -3268,12 +3290,26 @@ class NV_VideoSampler:
                     
                     last_step_time = current_time
 
+                # ============= RoPE Temporal Position Alignment (shift_t) =============
+                # Apply temporal offset so model knows chunk's absolute position in video
+                if enable_shift_t and chunk_start > 0:
+                    sampling_model = model.clone()
+                    # shift_t is in latent frames
+                    sampling_model.set_model_rope_options(
+                        scale_x=1.0, shift_x=0.0,
+                        scale_y=1.0, shift_y=0.0,
+                        scale_t=1.0, shift_t=float(chunk_start)
+                    )
+                    print(f"  RoPE shift_t={chunk_start} (chunk starts at latent frame {chunk_start})")
+                else:
+                    sampling_model = model
+
                 # ============= Multi-Model Support =============
                 # Check if multi-model mode is enabled
                 if multi_model_mode == "disabled" or model_2 is None:
                     # ORIGINAL SINGLE-MODEL PATH - COMPLETELY UNCHANGED
                     chunk_samples = comfy.sample.sample(
-                        model,
+                        sampling_model,
                         chunk_noise_for_sampling,
                         steps,
                         cfg,
@@ -3297,17 +3333,18 @@ class NV_VideoSampler:
                     print(f"  🔄 Multi-model mode: {multi_model_mode}")
 
                     # Prepare model sequence based on mode
+                    # Note: sampling_model has shift_t applied, use it as the primary model
                     if multi_model_mode == "sequential":
                         model_sequence = self._prepare_sequential_models(
-                            [model, model_2, model_3], steps, model_steps
+                            [sampling_model, model_2, model_3], steps, model_steps
                         )
-                        print(f"    Sequential mode: {len([m for m in [model, model_2, model_3] if m is not None])} models")
+                        print(f"    Sequential mode: {len([m for m in [sampling_model, model_2, model_3] if m is not None])} models")
                         if model_steps:
                             print(f"    Step allocation: {model_steps}")
                     elif multi_model_mode == "boundary":
                         # Calculate sigmas for boundary detection
                         import comfy.samplers
-                        sampling = model.get_model_object("model_sampling")
+                        sampling = sampling_model.get_model_object("model_sampling")
                         sigmas = comfy.samplers.calculate_sigmas(
                             sampling,
                             scheduler if scheduler != "beta57" else "normal",
@@ -3315,7 +3352,7 @@ class NV_VideoSampler:
                         ).to(chunk_latent_for_sampling.device)
 
                         model_sequence = self._prepare_boundary_models(
-                            [model, model_2, model_3], model_boundaries, sigmas
+                            [sampling_model, model_2, model_3], model_boundaries, sigmas
                         )
                         print(f"    Boundary mode: {len([m for m in [model, model_2, model_3] if m is not None])} models")
                         print(f"    Boundaries: {model_boundaries}")
