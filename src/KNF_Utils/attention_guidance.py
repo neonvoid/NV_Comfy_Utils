@@ -206,6 +206,10 @@ def create_attention_capture_override(storage, target_steps, target_layers, spar
         current_step_ref: List with single element [step] for mutable step tracking
         extraction_count_ref: List with single element [count] for tracking captures
     """
+    # Track which steps/layers we've seen for debugging
+    seen_combinations = set()
+    debug_logged = [False]  # Only log debug info once
+
     def attention_capture_override(original_func, *args, **kwargs):
         """
         Override function called for every attention computation.
@@ -226,6 +230,13 @@ def create_attention_capture_override(storage, target_steps, target_layers, spar
         step = current_step_ref[0]
         attn_precision = kwargs.get("attn_precision", None)
         skip_reshape = kwargs.get("skip_reshape", False)
+
+        # Debug logging - log first few unique step/layer combinations
+        combo = (step, block_idx)
+        if combo not in seen_combinations and len(seen_combinations) < 10:
+            seen_combinations.add(combo)
+            print(f"[AttentionCapture DEBUG] step={step}, block_idx={block_idx}, "
+                  f"target_steps={target_steps}, target_layers={target_layers}")
 
         # Check if we should capture at this step and layer
         if step in target_steps and block_idx in target_layers:
@@ -657,12 +668,21 @@ class NV_ExtractAttentionGuidance:
 
         return (result, attention_data)
 
-    def _create_step_callback(self, model, steps, step_ref):
-        """Create a callback that tracks the current step and updates step_ref."""
+    def _create_step_callback(self, model, steps, step_ref, start_step_offset=0):
+        """
+        Create a callback that tracks the current step and updates step_ref.
+
+        Args:
+            start_step_offset: Offset to add to step index (for multi-model sampling
+                               where step indices may be relative to current model's range)
+        """
         preview_callback = latent_preview.prepare_callback(model, steps)
 
         def step_tracking_callback(step, x0, x, total_steps):
-            step_ref[0] = step
+            # The callback is called AFTER the step completes with the step index.
+            # Add offset for multi-model sampling and add 1 since we want the
+            # NEXT step's index (since attention happens during, not after)
+            step_ref[0] = step + start_step_offset + 1
             if preview_callback is not None:
                 return preview_callback(step, x0, x, total_steps)
         return step_tracking_callback
@@ -784,7 +804,12 @@ class NV_ExtractAttentionGuidance:
         noise_mask = latent.get("noise_mask", None)
 
         # Create callback with step tracking
+        # Note: start_step offset is NOT needed because comfy.sample.sample
+        # passes absolute step indices to the callback
         if step_ref is not None:
+            # Initialize step_ref to start_step so first attention call sees correct step
+            if start_step is not None:
+                step_ref[0] = start_step
             callback = self._create_step_callback(model, steps, step_ref)
         else:
             callback = latent_preview.prepare_callback(model, steps)
