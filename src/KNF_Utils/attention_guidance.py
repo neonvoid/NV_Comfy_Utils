@@ -141,23 +141,34 @@ def densify_attention(sparse_data: dict, device: torch.device = None) -> torch.T
     return dense
 
 
-def attention_with_capture(q, k, v, heads, attn_precision=None):
+def attention_with_capture(q, k, v, heads, attn_precision=None, skip_reshape=False):
     """
     Compute attention and return both output and attention weights.
 
     Based on attention_basic_with_sim from nodes_sag.py
+    Handles both standard [B, S, H*D] and skip_reshape [B, H, S, D] formats.
     """
     from einops import rearrange
     from torch import einsum
 
-    b, _, dim_head = q.shape
-    dim_head //= heads
-    scale = dim_head ** -0.5
+    if skip_reshape:
+        # Already in [B, H, S, D] format
+        b, h, s, d = q.shape
+        heads = h
+        scale = d ** -0.5
 
-    # Reshape for multi-head attention
-    q_heads = rearrange(q, 'b n (h d) -> (b h) n d', h=heads)
-    k_heads = rearrange(k, 'b n (h d) -> (b h) n d', h=heads)
-    v_heads = rearrange(v, 'b n (h d) -> (b h) n d', h=heads)
+        q_heads = q.view(b * h, s, d)
+        k_heads = k.view(b * h, s, d)
+        v_heads = v.view(b * h, s, d)
+    else:
+        # Standard [B, S, H*D] format
+        b, _, dim_total = q.shape
+        dim_head = dim_total // heads
+        scale = dim_head ** -0.5
+
+        q_heads = rearrange(q, 'b n (h d) -> (b h) n d', h=heads)
+        k_heads = rearrange(k, 'b n (h d) -> (b h) n d', h=heads)
+        v_heads = rearrange(v, 'b n (h d) -> (b h) n d', h=heads)
 
     # Compute attention scores
     if attn_precision == torch.float32:
@@ -170,9 +181,236 @@ def attention_with_capture(q, k, v, heads, attn_precision=None):
 
     # Compute output
     out = einsum('b i j, b j d -> b i d', attn_weights.to(v_heads.dtype), v_heads)
-    out = rearrange(out, '(b h) n d -> b n (h d)', h=heads)
+
+    if skip_reshape:
+        out = out.view(b, heads, -1, out.shape[-1])
+    else:
+        out = rearrange(out, '(b h) n d -> b n (h d)', h=heads)
 
     return out, attn_weights
+
+
+def create_attention_capture_override(storage, target_steps, target_layers, sparsity_ratio,
+                                       current_step_ref, extraction_count_ref):
+    """
+    Create an attention override function that captures patterns.
+
+    This uses the optimized_attention_override mechanism which intercepts
+    ALL attention calls via the @wrap_attn decorator.
+
+    Args:
+        storage: Dict to store captured attention patterns (layers key)
+        target_steps: Set of step indices to capture
+        target_layers: Set of block indices to capture
+        sparsity_ratio: Top-k ratio for sparse storage (0.25 = 25%)
+        current_step_ref: List with single element [step] for mutable step tracking
+        extraction_count_ref: List with single element [count] for tracking captures
+    """
+    def attention_capture_override(original_func, *args, **kwargs):
+        """
+        Override function called for every attention computation.
+
+        Signature matches wrap_attn: (original_func, q, k, v, heads, ...)
+        """
+        # Extract arguments
+        q, k, v, heads = args[0], args[1], args[2], args[3]
+        t_opts = kwargs.get("transformer_options", {})
+        block_idx = t_opts.get("block_index", -1)
+        step = current_step_ref[0]
+        attn_precision = kwargs.get("attn_precision", None)
+        skip_reshape = kwargs.get("skip_reshape", False)
+
+        # Check if we should capture at this step and layer
+        if step in target_steps and block_idx in target_layers:
+            key = f"step_{step}_layer_{block_idx}"
+
+            # Only capture once per key (avoid duplicates from multiple attention calls)
+            if key not in storage:
+                # Compute attention with weights capture
+                output, attn_weights = attention_with_capture(
+                    q, k, v, heads,
+                    attn_precision=attn_precision,
+                    skip_reshape=skip_reshape
+                )
+
+                # Store sparsified weights
+                storage[key] = sparsify_attention(attn_weights, sparsity_ratio)
+                extraction_count_ref[0] += 1
+
+                print(f"[AttentionCapture] Captured {key}: shape {list(attn_weights.shape)}, "
+                      f"sparse vals {storage[key]['values'].shape}")
+
+                return output
+
+        # Normal attention - call original function
+        return original_func(*args, **kwargs)
+
+    return attention_capture_override
+
+
+def create_attention_guidance_override(guidance_data, target_steps, target_layers,
+                                         strength, mode, current_step_ref,
+                                         applications_ref, original_override=None):
+    """
+    Create an attention override that applies guidance patterns.
+
+    Args:
+        guidance_data: Dict with stored attention patterns (layers key)
+        target_steps: Set of step indices where guidance applies
+        target_layers: Set of block indices where guidance applies
+        strength: Guidance strength (0.0 to 1.0+)
+        mode: "blend", "mask", or "bias"
+        current_step_ref: List with single element [step]
+        applications_ref: List with single element [count] for tracking applications
+        original_override: Previous override to chain (or None)
+
+    Note: If step tracking is not available (step stays at 0), falls back to
+          using any available pattern for the target layer.
+    """
+    # Pre-build a lookup for layer-only fallback
+    layers_data = guidance_data.get("layers", {})
+    layer_patterns = {}  # block_idx -> first available pattern key for that layer
+    for key in layers_data.keys():
+        # Keys are formatted as "step_X_layer_Y"
+        parts = key.split("_")
+        if len(parts) >= 4 and parts[2] == "layer":
+            try:
+                layer_idx = int(parts[3])
+                if layer_idx not in layer_patterns:
+                    layer_patterns[layer_idx] = key
+            except ValueError:
+                pass
+
+    def attention_guidance_override(original_func, *args, **kwargs):
+        """
+        Override that applies guidance patterns to attention.
+        """
+        from einops import rearrange
+        from torch import einsum
+
+        q, k, v, heads = args[0], args[1], args[2], args[3]
+        t_opts = kwargs.get("transformer_options", {})
+        block_idx = t_opts.get("block_index", -1)
+        step = current_step_ref[0]
+        attn_precision = kwargs.get("attn_precision", None)
+        skip_reshape = kwargs.get("skip_reshape", False)
+
+        # Try exact step+layer match first
+        key = f"step_{step}_layer_{block_idx}"
+
+        # Fallback to any pattern for this layer if exact match not found
+        if key not in layers_data and block_idx in layer_patterns:
+            key = layer_patterns[block_idx]
+
+        # Check if we should apply guidance
+        # Apply if: (step matches OR fallback used) AND layer is in targets AND we have data
+        should_apply = block_idx in target_layers and key in layers_data
+        if should_apply:
+            # Get guidance pattern and densify it
+            guidance_attn = densify_attention(layers_data[key], device=q.device)
+
+            # Compute current attention
+            output, current_attn = attention_with_capture(
+                q, k, v, heads,
+                attn_precision=attn_precision,
+                skip_reshape=skip_reshape
+            )
+
+            # Scale guidance to match current resolution if needed
+            target_seq_len = current_attn.shape[-1]
+            if guidance_attn.shape[-1] != target_seq_len:
+                guidance_attn = scale_guidance_to_target(guidance_attn, target_seq_len)
+
+            # Apply guidance based on mode
+            if mode == "blend":
+                # Interpolate: result = (1-strength)*current + strength*guidance
+                blended = (1 - strength) * current_attn + strength * guidance_attn
+                # Re-normalize rows to sum to 1
+                blended = blended / (blended.sum(dim=-1, keepdim=True) + 1e-8)
+
+                # Recompute output with blended attention
+                if skip_reshape:
+                    b, h, s, d = v.shape
+                    v_heads = v.view(b * h, s, d)
+                else:
+                    v_heads = rearrange(v, 'b n (h d) -> (b h) n d', h=heads)
+
+                out = einsum('b i j, b j d -> b i d', blended.to(v_heads.dtype), v_heads)
+
+                if skip_reshape:
+                    out = out.view(b, h, -1, out.shape[-1])
+                else:
+                    out = rearrange(out, '(b h) n d -> b n (h d)', h=heads)
+
+            elif mode == "mask":
+                # Hard mask: use guidance pattern to mask attention
+                mask = (guidance_attn > 0.01).float()
+                masked = current_attn * mask
+                masked = masked / (masked.sum(dim=-1, keepdim=True) + 1e-8)
+
+                # Blend masked with original based on strength
+                final_attn = (1 - strength) * current_attn + strength * masked
+
+                if skip_reshape:
+                    b, h, s, d = v.shape
+                    v_heads = v.view(b * h, s, d)
+                else:
+                    v_heads = rearrange(v, 'b n (h d) -> (b h) n d', h=heads)
+
+                out = einsum('b i j, b j d -> b i d', final_attn.to(v_heads.dtype), v_heads)
+
+                if skip_reshape:
+                    out = out.view(b, h, -1, out.shape[-1])
+                else:
+                    out = rearrange(out, '(b h) n d -> b n (h d)', h=heads)
+
+            elif mode == "bias":
+                # Add guidance as bias before softmax
+                if skip_reshape:
+                    b, h, s, d = q.shape
+                    scale = d ** -0.5
+                    q_heads = q.view(b * h, s, d)
+                    k_heads = k.view(b * h, s, d)
+                    v_heads = v.view(b * h, s, d)
+                else:
+                    dim_head = q.shape[-1] // heads
+                    scale = dim_head ** -0.5
+                    q_heads = rearrange(q, 'b n (h d) -> (b h) n d', h=heads)
+                    k_heads = rearrange(k, 'b n (h d) -> (b h) n d', h=heads)
+                    v_heads = rearrange(v, 'b n (h d) -> (b h) n d', h=heads)
+
+                # Compute attention scores
+                if attn_precision == torch.float32:
+                    sim = einsum('b i d, b j d -> b i j', q_heads.float(), k_heads.float()) * scale
+                else:
+                    sim = einsum('b i d, b j d -> b i j', q_heads, k_heads) * scale
+
+                # Add guidance bias (scaled by strength)
+                guidance_bias = guidance_attn * strength * 5.0
+                sim = sim + guidance_bias.to(sim.dtype)
+
+                # Softmax
+                attn_weights = sim.softmax(dim=-1)
+
+                out = einsum('b i j, b j d -> b i d', attn_weights.to(v_heads.dtype), v_heads)
+
+                if skip_reshape:
+                    out = out.view(b, h, -1, out.shape[-1])
+                else:
+                    out = rearrange(out, '(b h) n d -> b n (h d)', h=heads)
+
+            else:
+                out = output
+
+            applications_ref[0] += 1
+            return out
+
+        # No guidance - use original or chain
+        if original_override is not None:
+            return original_override(original_func, *args, **kwargs)
+        return original_func(*args, **kwargs)
+
+    return attention_guidance_override
 
 
 def scale_guidance_to_target(guidance_attn: torch.Tensor, target_seq_len: int) -> torch.Tensor:
@@ -338,128 +576,135 @@ class NV_ExtractAttentionGuidance:
             "layers": {}
         }
 
-        # State tracking via closure
+        # State tracking via closure (mutable references)
         current_step = [0]
         extraction_count = [0]
 
-        # NOTE: Attention extraction for Wan/DiT models is not yet implemented
-        # These models use a different patching mechanism (patches_replace["dit"])
-        # that doesn't support attention-level hooks like UNet models do.
-        #
-        # For now, we run normal sampling and output a placeholder for attention_data.
-        # A future version could use optimized_attention_override for capture.
+        # Create the attention capture override
+        capture_override = create_attention_capture_override(
+            storage=attention_data["layers"],
+            target_steps=step_indices,
+            target_layers=layer_indices,
+            sparsity_ratio=sparsity_ratio,
+            current_step_ref=current_step,
+            extraction_count_ref=extraction_count
+        )
 
-        print(f"[NV_ExtractAttentionGuidance] WARNING: Attention extraction not yet implemented for video models.")
-        print(f"[NV_ExtractAttentionGuidance] Running normal sampling (attention patterns will be empty).")
+        # Clone models and apply the override to each
+        patched_models = []
+        for m in models:
+            pm = m.clone()
+            # Initialize transformer_options if it doesn't exist
+            if "transformer_options" not in pm.model_options:
+                pm.model_options["transformer_options"] = {}
+            # Set the attention override
+            pm.model_options["transformer_options"]["optimized_attention_override"] = capture_override
+            patched_models.append(pm)
+
+        print(f"[NV_ExtractAttentionGuidance] Applied attention capture override to {len(patched_models)} model(s)")
         print(f"[NV_ExtractAttentionGuidance] Target layers: {sorted(layer_indices)}, steps: {sorted(step_indices)}")
-
-        # No patching - just use models as-is to avoid corrupting output
-        patched_models = [m.clone() for m in models]
 
         # Get committed noise tensor if provided
         noise_tensor = committed_noise["noise"] if committed_noise is not None else None
         if committed_noise is not None:
             print(f"[NV_ExtractAttentionGuidance] Using committed noise (seed={committed_noise['seed']})")
 
-        # Route to appropriate sampling method
-        # Note: We use common_ksampler which handles latent as dict properly
+        # Route to appropriate sampling method with step tracking
         if mode == "single" or len(patched_models) == 1:
             print(f"[NV_ExtractAttentionGuidance] Single model mode")
             result = self._sample_single(
                 patched_models[0], positive, negative, latent_image,
                 seed, steps, cfg, sampler_name, scheduler, denoise,
-                noise_tensor
+                noise_tensor, step_ref=current_step
             )
         elif mode == "sequential":
             print(f"[NV_ExtractAttentionGuidance] Sequential mode: {len(patched_models)} models")
             result = self._sample_sequential(
                 patched_models, positive, negative, latent_image,
                 seed, steps, cfg_scales, sampler_name, scheduler, denoise,
-                model_steps, noise_tensor
+                model_steps, noise_tensor, step_ref=current_step
             )
         elif mode == "boundary":
             print(f"[NV_ExtractAttentionGuidance] Boundary mode: {len(patched_models)} models")
             result = self._sample_boundary(
                 patched_models, positive, negative, latent_image,
                 seed, steps, cfg_scales, sampler_name, scheduler, denoise,
-                model_boundaries, noise_tensor
+                model_boundaries, noise_tensor, step_ref=current_step
             )
         else:
             # Fallback to single
             result = self._sample_single(
                 patched_models[0], positive, negative, latent_image,
                 seed, steps, cfg, sampler_name, scheduler, denoise,
-                noise_tensor
+                noise_tensor, step_ref=current_step
             )
 
         print(f"[NV_ExtractAttentionGuidance] Extraction complete: {extraction_count[0]} attention patterns stored")
 
         return (result, attention_data)
 
+    def _create_step_callback(self, model, steps, step_ref):
+        """Create a callback that tracks the current step and updates step_ref."""
+        preview_callback = latent_preview.prepare_callback(model, steps)
+
+        def step_tracking_callback(step, x0, x, total_steps):
+            step_ref[0] = step
+            if preview_callback is not None:
+                return preview_callback(step, x0, x, total_steps)
+        return step_tracking_callback
+
     def _sample_single(self, model, positive, negative, latent_image,
                        seed, steps, cfg, sampler_name, scheduler, denoise,
-                       noise_tensor=None):
-        """Single model sampling - matches NV_MultiModelSampler behavior."""
-        if noise_tensor is not None:
-            return self._ksampler_with_noise(
-                model, noise_tensor, seed, steps, cfg, sampler_name, scheduler,
-                positive, negative, latent_image, denoise=denoise
-            )
-        return common_ksampler(
+                       noise_tensor=None, step_ref=None):
+        """Single model sampling with step tracking."""
+        # Use direct sampling to inject step callback
+        return self._ksampler_direct(
             model, seed, steps, cfg, sampler_name, scheduler,
-            positive, negative, latent_image, denoise=denoise
-        )[0]  # Extract from tuple
+            positive, negative, latent_image, denoise=denoise,
+            noise_tensor=noise_tensor, step_ref=step_ref
+        )
 
     def _sample_sequential(self, models, positive, negative, latent_image,
                            seed, steps, cfg_scales, sampler_name, scheduler, denoise,
-                           model_steps_str, noise_tensor=None):
-        """Sequential multi-model sampling - matches NV_MultiModelSampler behavior."""
+                           model_steps_str, noise_tensor=None, step_ref=None):
+        """Sequential multi-model sampling with step tracking."""
         step_distribution = self._parse_step_distribution(model_steps_str, steps, len(models))
         print(f"[NV_ExtractAttentionGuidance] Step distribution: {step_distribution}")
 
         current_latent = latent_image
-        current_step = 0
+        current_step_idx = 0
 
         for i, (model, model_steps, cfg) in enumerate(zip(models, step_distribution, cfg_scales)):
             if model_steps <= 0:
                 continue
 
-            start_step = current_step
-            end_step = current_step + model_steps
+            start_step = current_step_idx
+            end_step = current_step_idx + model_steps
             disable_noise = (i > 0)
 
             print(f"[NV_ExtractAttentionGuidance] Model {i+1}: steps {start_step}-{end_step}, cfg={cfg}, disable_noise={disable_noise}")
 
-            if noise_tensor is not None and not disable_noise:
-                # Use committed noise for first model
-                result = self._ksampler_with_noise(
-                    model, noise_tensor, seed, steps, cfg, sampler_name, scheduler,
-                    positive, negative, current_latent,
-                    denoise=denoise,
-                    start_step=start_step,
-                    last_step=end_step,
-                    force_full_denoise=(i == len(models) - 1)
-                )
-            else:
-                result = common_ksampler(
-                    model, seed, steps, cfg, sampler_name, scheduler,
-                    positive, negative, current_latent,
-                    denoise=denoise,
-                    disable_noise=disable_noise,
-                    start_step=start_step,
-                    last_step=end_step,
-                    force_full_denoise=(i == len(models) - 1)
-                )[0]  # Extract from tuple
+            result = self._ksampler_direct(
+                model, seed, steps, cfg, sampler_name, scheduler,
+                positive, negative, current_latent,
+                denoise=denoise,
+                noise_tensor=noise_tensor if not disable_noise else None,
+                disable_noise=disable_noise,
+                start_step=start_step,
+                last_step=end_step,
+                force_full_denoise=(i == len(models) - 1),
+                step_ref=step_ref
+            )
 
             current_latent = result
-            current_step = end_step
+            current_step_idx = end_step
 
         return current_latent
 
     def _sample_boundary(self, models, positive, negative, latent_image,
                          seed, steps, cfg_scales, sampler_name, scheduler, denoise,
-                         model_boundaries_str, noise_tensor=None):
-        """Boundary-based multi-model sampling - matches NV_MultiModelSampler behavior."""
+                         model_boundaries_str, noise_tensor=None, step_ref=None):
+        """Boundary-based multi-model sampling with step tracking."""
         boundaries = self._parse_boundaries(model_boundaries_str, len(models))
         step_ranges = self._boundaries_to_steps(boundaries, steps, denoise)
         print(f"[NV_ExtractAttentionGuidance] Sigma boundaries: {boundaries}")
@@ -475,56 +720,67 @@ class NV_ExtractAttentionGuidance:
 
             print(f"[NV_ExtractAttentionGuidance] Model {i+1}: steps {start_step}-{end_step}, cfg={cfg}")
 
-            if noise_tensor is not None and not disable_noise:
-                result = self._ksampler_with_noise(
-                    model, noise_tensor, seed, steps, cfg, sampler_name, scheduler,
-                    positive, negative, current_latent,
-                    denoise=denoise,
-                    start_step=start_step,
-                    last_step=end_step,
-                    force_full_denoise=(i == len(models) - 1)
-                )
-            else:
-                result = common_ksampler(
-                    model, seed, steps, cfg, sampler_name, scheduler,
-                    positive, negative, current_latent,
-                    denoise=denoise,
-                    disable_noise=disable_noise,
-                    start_step=start_step,
-                    last_step=end_step,
-                    force_full_denoise=(i == len(models) - 1)
-                )[0]  # Extract from tuple
+            result = self._ksampler_direct(
+                model, seed, steps, cfg, sampler_name, scheduler,
+                positive, negative, current_latent,
+                denoise=denoise,
+                noise_tensor=noise_tensor if not disable_noise else None,
+                disable_noise=disable_noise,
+                start_step=start_step,
+                last_step=end_step,
+                force_full_denoise=(i == len(models) - 1),
+                step_ref=step_ref
+            )
 
             current_latent = result
 
         return current_latent
 
-    def _ksampler_with_noise(self, model, noise, seed, steps, cfg, sampler_name, scheduler,
-                              positive, negative, latent, denoise=1.0, start_step=None,
-                              last_step=None, force_full_denoise=False):
+    def _ksampler_direct(self, model, seed, steps, cfg, sampler_name, scheduler,
+                          positive, negative, latent, denoise=1.0, noise_tensor=None,
+                          disable_noise=False, start_step=None, last_step=None,
+                          force_full_denoise=False, step_ref=None):
         """
-        KSampler-like function that accepts pre-generated noise.
-        Mirrors common_ksampler but uses provided noise tensor.
+        Unified sampling function with step tracking support.
+
+        Combines functionality of common_ksampler and committed noise support,
+        while also tracking the current step for attention capture.
         """
         latent_image = latent["samples"]
         latent_image = comfy.sample.fix_empty_latent_channels(model, latent_image)
 
-        # Validate noise shape matches latent
-        if noise.shape != latent_image.shape:
-            raise ValueError(
-                f"Committed noise shape {list(noise.shape)} doesn't match "
-                f"latent shape {list(latent_image.shape)}"
-            )
+        # Handle noise
+        if noise_tensor is not None:
+            # Use provided committed noise
+            if noise_tensor.shape != latent_image.shape:
+                raise ValueError(
+                    f"Committed noise shape {list(noise_tensor.shape)} doesn't match "
+                    f"latent shape {list(latent_image.shape)}"
+                )
+            noise = noise_tensor
+            disable_noise = False  # We have noise, don't disable
+        elif disable_noise:
+            # Create empty noise (all zeros) when continuing from previous model
+            noise = torch.zeros_like(latent_image)
+        else:
+            # Generate noise from seed
+            batch_inds = latent.get("batch_index", None)
+            noise = comfy.sample.prepare_noise(latent_image, seed, batch_inds)
 
         noise_mask = latent.get("noise_mask", None)
 
-        callback = latent_preview.prepare_callback(model, steps)
+        # Create callback with step tracking
+        if step_ref is not None:
+            callback = self._create_step_callback(model, steps, step_ref)
+        else:
+            callback = latent_preview.prepare_callback(model, steps)
+
         disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
 
         samples = comfy.sample.sample(
             model, noise, steps, cfg, sampler_name, scheduler,
             positive, negative, latent_image,
-            denoise=denoise, disable_noise=False,
+            denoise=denoise, disable_noise=disable_noise,
             start_step=start_step, last_step=last_step,
             force_full_denoise=force_full_denoise,
             noise_mask=noise_mask, callback=callback,
@@ -781,121 +1037,46 @@ class NV_ApplyAttentionGuidance:
         print(f"[NV_ApplyAttentionGuidance] Mode: {guidance_mode}, Strength: {guidance_strength}")
         print(f"[NV_ApplyAttentionGuidance] Applying to layers: {sorted(target_layers)}")
         print(f"[NV_ApplyAttentionGuidance] Active at steps: {sorted(extract_steps)}")
+        print(f"[NV_ApplyAttentionGuidance] Available patterns: {len(guidance_data.get('layers', {}))} keys")
 
-        # State tracking
+        # Check if guidance data is empty
+        if not guidance_data.get("layers"):
+            print(f"[NV_ApplyAttentionGuidance] WARNING: No attention patterns in guidance data!")
+            print(f"[NV_ApplyAttentionGuidance] Returning unmodified model")
+            return (model.clone(),)
+
+        # State tracking (mutable references)
         current_step = [0]
         applications = [0]
 
-        def guided_attention(q, k, v, extra_options):
-            """Hook that applies attention guidance."""
-            step = current_step[0]
-            block_index = extra_options.get("block_index", 0)
-            heads = extra_options.get("n_heads", 1)
-            attn_precision = extra_options.get("attn_precision", None)
+        # Get any existing override to chain
+        existing_override = None
+        if "transformer_options" in model.model_options:
+            existing_override = model.model_options["transformer_options"].get("optimized_attention_override")
 
-            # Check if we should apply guidance
-            key = f"step_{step}_layer_{block_index}"
-            if (step in extract_steps and
-                block_index in target_layers and
-                key in guidance_data.get("layers", {})):
+        # Create the guidance override
+        guidance_override = create_attention_guidance_override(
+            guidance_data=guidance_data,
+            target_steps=extract_steps,
+            target_layers=target_layers,
+            strength=guidance_strength,
+            mode=guidance_mode,
+            current_step_ref=current_step,
+            applications_ref=applications,
+            original_override=existing_override
+        )
 
-                # Get guidance pattern
-                sparse_guidance = guidance_data["layers"][key]
-                guidance_attn = densify_attention(sparse_guidance, device=q.device)
-
-                # Compute current attention
-                out, current_attn = attention_with_capture(
-                    q, k, v, heads, attn_precision
-                )
-
-                # Scale guidance to match current resolution
-                target_seq_len = current_attn.shape[-1]
-                scaled_guidance = scale_guidance_to_target(guidance_attn, target_seq_len)
-
-                # Apply guidance based on mode
-                if guidance_mode == "blend":
-                    # Interpolate: result = (1-strength)*current + strength*guidance
-                    # Then re-normalize
-                    blended = (1 - guidance_strength) * current_attn + guidance_strength * scaled_guidance
-                    # Re-normalize rows to sum to 1
-                    blended = blended / (blended.sum(dim=-1, keepdim=True) + 1e-8)
-
-                    # Recompute output with blended attention
-                    from einops import rearrange
-                    from torch import einsum
-
-                    v_heads = rearrange(v, 'b n (h d) -> (b h) n d', h=heads)
-                    out = einsum('b i j, b j d -> b i d', blended.to(v_heads.dtype), v_heads)
-                    out = rearrange(out, '(b h) n d -> b n (h d)', h=heads)
-
-                elif guidance_mode == "mask":
-                    # Hard mask: use guidance pattern to mask attention
-                    # Zero out attention where guidance is zero, scale up where it's non-zero
-                    mask = (scaled_guidance > 0.01).float()
-                    masked = current_attn * mask
-                    masked = masked / (masked.sum(dim=-1, keepdim=True) + 1e-8)
-
-                    # Blend masked with original based on strength
-                    final_attn = (1 - guidance_strength) * current_attn + guidance_strength * masked
-
-                    from einops import rearrange
-                    from torch import einsum
-
-                    v_heads = rearrange(v, 'b n (h d) -> (b h) n d', h=heads)
-                    out = einsum('b i j, b j d -> b i d', final_attn.to(v_heads.dtype), v_heads)
-                    out = rearrange(out, '(b h) n d -> b n (h d)', h=heads)
-
-                elif guidance_mode == "bias":
-                    # Add guidance as bias before softmax
-                    # This requires recomputing attention from scratch
-                    from einops import rearrange
-                    from torch import einsum
-
-                    dim_head = q.shape[-1] // heads
-                    scale = dim_head ** -0.5
-
-                    q_heads = rearrange(q, 'b n (h d) -> (b h) n d', h=heads)
-                    k_heads = rearrange(k, 'b n (h d) -> (b h) n d', h=heads)
-                    v_heads = rearrange(v, 'b n (h d) -> (b h) n d', h=heads)
-
-                    # Compute attention scores
-                    if attn_precision == torch.float32:
-                        sim = einsum('b i d, b j d -> b i j', q_heads.float(), k_heads.float()) * scale
-                    else:
-                        sim = einsum('b i d, b j d -> b i j', q_heads, k_heads) * scale
-
-                    # Add guidance bias (scaled by strength)
-                    guidance_bias = scaled_guidance * guidance_strength * 5.0  # Scale factor for effect
-                    sim = sim + guidance_bias.to(sim.dtype)
-
-                    # Softmax
-                    attn_weights = sim.softmax(dim=-1)
-
-                    # Output
-                    out = einsum('b i j, b j d -> b i d', attn_weights.to(v_heads.dtype), v_heads)
-                    out = rearrange(out, '(b h) n d -> b n (h d)', h=heads)
-
-                applications[0] += 1
-                return out
-            else:
-                # Standard attention
-                return optimized_attention(q, k, v, heads, attn_precision=attn_precision)
-
-        # Clone model and add guidance hook
+        # Clone model and apply the override
         patched_model = model.clone()
-        patched_model.set_model_attn1_patch(guided_attention)
+        if "transformer_options" not in patched_model.model_options:
+            patched_model.model_options["transformer_options"] = {}
+        patched_model.model_options["transformer_options"]["optimized_attention_override"] = guidance_override
 
-        # Add step tracking via sampler callback
-        def step_tracker(args):
-            # This is called after each CFG step
-            # We can track progress but step info comes from sigma
-            pass
-
-        # Store step tracking info in model for sampler to update
+        # Store step tracking info for external access (e.g., custom samplers)
         patched_model._attention_guidance_step = current_step
         patched_model._attention_guidance_applications = applications
 
-        print(f"[NV_ApplyAttentionGuidance] Model patched with attention guidance")
+        print(f"[NV_ApplyAttentionGuidance] Model patched with attention guidance override")
 
         return (patched_model,)
 
