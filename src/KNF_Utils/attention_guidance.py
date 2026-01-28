@@ -211,9 +211,16 @@ def create_attention_capture_override(storage, target_steps, target_layers, spar
         Override function called for every attention computation.
 
         Signature matches wrap_attn: (original_func, q, k, v, heads, ...)
+        Note: Wan models pass heads as kwarg, UNet models pass as positional arg.
         """
-        # Extract arguments
-        q, k, v, heads = args[0], args[1], args[2], args[3]
+        # Extract arguments - handle both positional and keyword args for heads
+        q, k, v = args[0], args[1], args[2]
+        # heads can be positional (arg 4) or keyword
+        if len(args) > 3:
+            heads = args[3]
+        else:
+            heads = kwargs.get("heads", 1)
+
         t_opts = kwargs.get("transformer_options", {})
         block_idx = t_opts.get("block_index", -1)
         step = current_step_ref[0]
@@ -284,11 +291,18 @@ def create_attention_guidance_override(guidance_data, target_steps, target_layer
     def attention_guidance_override(original_func, *args, **kwargs):
         """
         Override that applies guidance patterns to attention.
+        Note: Wan models pass heads as kwarg, UNet models pass as positional arg.
         """
         from einops import rearrange
         from torch import einsum
 
-        q, k, v, heads = args[0], args[1], args[2], args[3]
+        # Extract arguments - handle both positional and keyword args for heads
+        q, k, v = args[0], args[1], args[2]
+        if len(args) > 3:
+            heads = args[3]
+        else:
+            heads = kwargs.get("heads", 1)
+
         t_opts = kwargs.get("transformer_options", {})
         block_idx = t_opts.get("block_index", -1)
         step = current_step_ref[0]
