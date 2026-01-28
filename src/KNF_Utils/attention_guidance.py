@@ -237,6 +237,45 @@ def attention_with_capture(q, k, v, heads, attn_precision=None, skip_reshape=Fal
     return out, sparse_weights
 
 
+def compute_attention_only(q, k, v, heads, attn_precision=None, skip_reshape=False):
+    """
+    Compute attention output only (no weight capture).
+    Used when we just need to blend with guidance.
+    """
+    from einops import rearrange
+    from torch import einsum
+
+    if skip_reshape:
+        b, h, s, d = q.shape
+        heads = h
+        scale = d ** -0.5
+        q_heads = q.view(b * h, s, d)
+        k_heads = k.view(b * h, s, d)
+        v_heads = v.view(b * h, s, d)
+    else:
+        b, _, dim_total = q.shape
+        dim_head = dim_total // heads
+        scale = dim_head ** -0.5
+        q_heads = rearrange(q, 'b n (h d) -> (b h) n d', h=heads)
+        k_heads = rearrange(k, 'b n (h d) -> (b h) n d', h=heads)
+        v_heads = rearrange(v, 'b n (h d) -> (b h) n d', h=heads)
+
+    if attn_precision == torch.float32:
+        sim = einsum('b i d, b j d -> b i j', q_heads.float(), k_heads.float()) * scale
+    else:
+        sim = einsum('b i d, b j d -> b i j', q_heads, k_heads) * scale
+
+    attn_weights = sim.softmax(dim=-1)
+    out = einsum('b i j, b j d -> b i d', attn_weights.to(v_heads.dtype), v_heads)
+
+    if skip_reshape:
+        out = out.view(b, heads, -1, out.shape[-1])
+    else:
+        out = rearrange(out, '(b h) n d -> b n (h d)', h=heads)
+
+    return out, attn_weights
+
+
 def create_attention_capture_override(storage, target_steps, target_layers, sparsity_ratio,
                                        current_step_ref, extraction_count_ref):
     """
@@ -316,7 +355,8 @@ def create_attention_capture_override(storage, target_steps, target_layers, spar
 
 def create_attention_guidance_override(guidance_data, target_steps, target_layers,
                                          strength, mode, current_step_ref,
-                                         applications_ref, original_override=None):
+                                         applications_ref, original_override=None,
+                                         chunk_frame_ratio=(0.0, 1.0)):
     """
     Create an attention override that applies guidance patterns.
 
@@ -329,6 +369,8 @@ def create_attention_guidance_override(guidance_data, target_steps, target_layer
         current_step_ref: List with single element [step]
         applications_ref: List with single element [count] for tracking applications
         original_override: Previous override to chain (or None)
+        chunk_frame_ratio: Tuple (start_ratio, end_ratio) for slicing guidance.
+                          (0.0, 1.0) = full video, (0.0, 0.33) = first third, etc.
 
     Note: If step tracking is not available (step stays at 0), falls back to
           using any available pattern for the target layer.
@@ -382,8 +424,16 @@ def create_attention_guidance_override(guidance_data, target_steps, target_layer
             # Get guidance pattern and densify it
             guidance_attn = densify_attention(layers_data[key], device=q.device)
 
-            # Compute current attention
-            output, current_attn = attention_with_capture(
+            # Slice guidance for chunk if processing a portion of the video
+            if chunk_frame_ratio != (0.0, 1.0):
+                seq_len = guidance_attn.shape[-1]
+                start_idx = int(seq_len * chunk_frame_ratio[0])
+                end_idx = int(seq_len * chunk_frame_ratio[1])
+                # Slice both query and key dimensions
+                guidance_attn = guidance_attn[:, start_idx:end_idx, start_idx:end_idx]
+
+            # Compute current attention (dense, for blending)
+            output, current_attn = compute_attention_only(
                 q, k, v, heads,
                 attn_precision=attn_precision,
                 skip_reshape=skip_reshape
@@ -1094,9 +1144,21 @@ class NV_ApplyAttentionGuidance:
                     "default": "blend",
                     "tooltip": "blend: interpolate (best for V2V), mask: force pattern, bias: add to scores"
                 }),
-                "apply_layers": ("STRING", {
-                    "default": "",
-                    "tooltip": "Comma-separated layer indices to apply guidance (empty = use extracted layers)"
+                # Chunk info for manual chunked workflows
+                "chunk_index": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "tooltip": "Which chunk this is (0-indexed). Used to slice guidance patterns."
+                }),
+                "total_chunks": ("INT", {
+                    "default": 1,
+                    "min": 1,
+                    "tooltip": "Total number of chunks. Set to 1 if processing full video."
+                }),
+                "chunk_overlap_frames": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "tooltip": "Number of overlapping frames between chunks."
                 }),
             }
         }
@@ -1108,28 +1170,42 @@ class NV_ApplyAttentionGuidance:
     DESCRIPTION = "Apply attention guidance to model for consistent chunked sampling."
 
     def apply(self, model, attention_guidance, guidance_strength=0.7,
-              guidance_mode="blend", apply_layers=""):
+              guidance_mode="blend", chunk_index=0, total_chunks=1,
+              chunk_overlap_frames=0):
 
         guidance_data = attention_guidance
         metadata = guidance_data.get("metadata", {})
 
-        # Determine which layers to apply guidance
-        if apply_layers.strip():
-            target_layers = set()
-            for x in apply_layers.split(","):
-                try:
-                    target_layers.add(int(x.strip()))
-                except ValueError:
-                    pass
-        else:
-            target_layers = set(metadata.get("extract_layers", []))
+        # Auto-detect layers from guidance data
+        target_layers = set(metadata.get("extract_layers", []))
 
         extract_steps = set(metadata.get("extract_steps", []))
+
+        # Calculate chunk frame range from source video info
+        source_shape = metadata.get("source_shape", [1, 16, 1, 1, 1])  # [B, C, T, H, W]
+        source_frames = source_shape[2] if len(source_shape) > 2 else 1
+
+        # Calculate frame range for this chunk
+        if total_chunks > 1:
+            # Calculate frames per chunk (excluding overlap)
+            effective_frames = source_frames - (total_chunks - 1) * chunk_overlap_frames
+            frames_per_chunk = effective_frames // total_chunks
+            chunk_start_frame = chunk_index * (frames_per_chunk + chunk_overlap_frames) - (chunk_index * chunk_overlap_frames)
+            chunk_end_frame = min(chunk_start_frame + frames_per_chunk + chunk_overlap_frames, source_frames)
+            chunk_frame_ratio = (chunk_start_frame / source_frames, chunk_end_frame / source_frames)
+        else:
+            chunk_start_frame = 0
+            chunk_end_frame = source_frames
+            chunk_frame_ratio = (0.0, 1.0)
 
         print(f"[NV_ApplyAttentionGuidance] Mode: {guidance_mode}, Strength: {guidance_strength}")
         print(f"[NV_ApplyAttentionGuidance] Applying to layers: {sorted(target_layers)}")
         print(f"[NV_ApplyAttentionGuidance] Active at steps: {sorted(extract_steps)}")
         print(f"[NV_ApplyAttentionGuidance] Available patterns: {len(guidance_data.get('layers', {}))} keys")
+        if total_chunks > 1:
+            print(f"[NV_ApplyAttentionGuidance] Chunk {chunk_index + 1}/{total_chunks}: "
+                  f"frames {chunk_start_frame}-{chunk_end_frame} of {source_frames} "
+                  f"(ratio {chunk_frame_ratio[0]:.2f}-{chunk_frame_ratio[1]:.2f})")
 
         # Check if guidance data is empty
         if not guidance_data.get("layers"):
@@ -1146,7 +1222,7 @@ class NV_ApplyAttentionGuidance:
         if "transformer_options" in model.model_options:
             existing_override = model.model_options["transformer_options"].get("optimized_attention_override")
 
-        # Create the guidance override
+        # Create the guidance override with chunk info
         guidance_override = create_attention_guidance_override(
             guidance_data=guidance_data,
             target_steps=extract_steps,
@@ -1155,7 +1231,8 @@ class NV_ApplyAttentionGuidance:
             mode=guidance_mode,
             current_step_ref=current_step,
             applications_ref=applications,
-            original_override=existing_override
+            original_override=existing_override,
+            chunk_frame_ratio=chunk_frame_ratio
         )
 
         # Clone model and apply the override
