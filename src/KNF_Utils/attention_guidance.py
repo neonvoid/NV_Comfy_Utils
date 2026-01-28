@@ -147,12 +147,20 @@ def densify_attention(sparse_data: dict, device: torch.device = None) -> torch.T
     return dense
 
 
-def attention_with_capture(q, k, v, heads, attn_precision=None, skip_reshape=False):
+def attention_with_capture(q, k, v, heads, attn_precision=None, skip_reshape=False,
+                           sparsity_ratio=0.25, chunk_size=512):
     """
-    Compute attention and return both output and attention weights.
+    Compute attention and return both output and SPARSIFIED attention weights.
+
+    Uses chunked computation to avoid OOM - processes query tokens in chunks,
+    immediately sparsifies each chunk on CPU before processing the next.
 
     Based on attention_basic_with_sim from nodes_sag.py
     Handles both standard [B, S, H*D] and skip_reshape [B, H, S, D] formats.
+
+    Returns:
+        output: attention output tensor
+        sparse_weights: dict with sparsified attention (already on CPU)
     """
     from einops import rearrange
     from torch import einsum
@@ -176,24 +184,57 @@ def attention_with_capture(q, k, v, heads, attn_precision=None, skip_reshape=Fal
         k_heads = rearrange(k, 'b n (h d) -> (b h) n d', h=heads)
         v_heads = rearrange(v, 'b n (h d) -> (b h) n d', h=heads)
 
-    # Compute attention scores
-    if attn_precision == torch.float32:
-        sim = einsum('b i d, b j d -> b i j', q_heads.float(), k_heads.float()) * scale
-    else:
-        sim = einsum('b i d, b j d -> b i j', q_heads, k_heads) * scale
+    bh, seq_len, dim = q_heads.shape
+    k_sparse = max(1, int(seq_len * sparsity_ratio))
 
-    # Softmax
-    attn_weights = sim.softmax(dim=-1)
+    # Process in chunks to avoid OOM
+    # Accumulate sparse results on CPU, compute output on GPU
+    all_topk_vals = []
+    all_topk_indices = []
+    out_chunks = []
 
-    # Compute output
-    out = einsum('b i j, b j d -> b i d', attn_weights.to(v_heads.dtype), v_heads)
+    for chunk_start in range(0, seq_len, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, seq_len)
+        q_chunk = q_heads[:, chunk_start:chunk_end, :]  # [bh, chunk, d]
+
+        # Compute attention scores for this chunk of queries against all keys
+        if attn_precision == torch.float32:
+            sim_chunk = einsum('b i d, b j d -> b i j', q_chunk.float(), k_heads.float()) * scale
+        else:
+            sim_chunk = einsum('b i d, b j d -> b i j', q_chunk, k_heads) * scale
+
+        # Softmax
+        attn_chunk = sim_chunk.softmax(dim=-1)  # [bh, chunk, seq_len]
+
+        # Compute output for this chunk
+        out_chunk = einsum('b i j, b j d -> b i d', attn_chunk.to(v_heads.dtype), v_heads)
+        out_chunks.append(out_chunk)
+
+        # Sparsify this chunk immediately and move to CPU
+        topk_vals, topk_indices = torch.topk(attn_chunk.detach().cpu().float(), k_sparse, dim=-1)
+        all_topk_vals.append(topk_vals.half())
+        all_topk_indices.append(topk_indices.short())
+
+        # Free GPU memory
+        del sim_chunk, attn_chunk
+
+    # Concatenate output chunks
+    out = torch.cat(out_chunks, dim=1)  # [bh, seq_len, d]
 
     if skip_reshape:
         out = out.view(b, heads, -1, out.shape[-1])
     else:
         out = rearrange(out, '(b h) n d -> b n (h d)', h=heads)
 
-    return out, attn_weights
+    # Concatenate sparse weights on CPU
+    sparse_weights = {
+        "values": torch.cat(all_topk_vals, dim=1),  # [bh, seq_len, k]
+        "indices": torch.cat(all_topk_indices, dim=1),  # [bh, seq_len, k]
+        "original_shape": (bh, seq_len, seq_len),
+        "k": k_sparse,
+    }
+
+    return out, sparse_weights
 
 
 def create_attention_capture_override(storage, target_steps, target_layers, sparsity_ratio,
@@ -250,19 +291,20 @@ def create_attention_capture_override(storage, target_steps, target_layers, spar
 
             # Only capture once per key (avoid duplicates from multiple attention calls)
             if key not in storage:
-                # Compute attention with weights capture
-                output, attn_weights = attention_with_capture(
+                # Compute attention with chunked capture - returns already-sparsified weights
+                output, sparse_weights = attention_with_capture(
                     q, k, v, heads,
                     attn_precision=attn_precision,
-                    skip_reshape=skip_reshape
+                    skip_reshape=skip_reshape,
+                    sparsity_ratio=sparsity_ratio
                 )
 
-                # Store sparsified weights
-                storage[key] = sparsify_attention(attn_weights, sparsity_ratio)
+                # Store sparsified weights (already on CPU)
+                storage[key] = sparse_weights
                 extraction_count_ref[0] += 1
 
-                print(f"[AttentionCapture] Captured {key}: shape {list(attn_weights.shape)}, "
-                      f"sparse vals {storage[key]['values'].shape}")
+                print(f"[AttentionCapture] Captured {key}: original {list(sparse_weights['original_shape'])}, "
+                      f"sparse vals {sparse_weights['values'].shape}")
 
                 return output
 
