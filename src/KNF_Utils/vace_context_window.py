@@ -8,6 +8,12 @@ but the context window's get_resized_cond method only slices plain tensors.
 Solution: Register a callback on EVALUATE_CONTEXT_WINDOWS that slices the
 VACE tensors before each window is processed.
 
+Reference Image Support:
+When WanVaceToVideo is used with reference_image, it prepends 1 frame to the
+VACE conditioning. This creates a size mismatch (VACE has N+1 frames, latent
+has N frames). The slicer detects this and offsets the window indices by 1
+to slice the correct frames from the VACE tensors.
+
 All changes are isolated to NV_Comfy_Utils - no ComfyUI core modifications.
 """
 
@@ -137,37 +143,58 @@ def slice_vace_conditioning(handler, model, x_in, conds, timestep, model_options
                 if key not in cond_dict:
                     continue
 
-                # Cache original if not already cached (check by matching full temporal size)
+                # Cache original if not already cached
+                # Handle reference_image case: VACE may have 1 extra frame at the start
                 if key not in cache:
                     tensor_list = cond_dict[key]
                     if isinstance(tensor_list, list) and len(tensor_list) > 0:
                         first_tensor = tensor_list[0]
                         if isinstance(first_tensor, torch.Tensor) and first_tensor.ndim > dim:
-                            if first_tensor.size(dim) == full_temporal_size:
-                                # This is the original full-length tensor, cache it
+                            vace_temporal_size = first_tensor.size(dim)
+                            # Calculate offset: VACE may have extra frames (e.g., reference_image adds 1)
+                            frame_offset = vace_temporal_size - full_temporal_size
+
+                            # Accept exact match OR small positive offset (reference frames at start)
+                            if frame_offset == 0 or (0 < frame_offset <= 2):
+                                # Cache the tensors
                                 if use_cpu_cache:
-                                    # Long video: cache on CPU to avoid OOM
                                     cache[key] = [t.cpu().clone() if isinstance(t, torch.Tensor) else t for t in tensor_list]
                                 else:
-                                    # Short video: cache on GPU for speed
                                     cache[key] = [t.clone() if isinstance(t, torch.Tensor) else t for t in tensor_list]
+                                # Store the offset for slicing adjustment
+                                cache[f"{key}_offset"] = frame_offset
                                 if window_idx == 0 and cond_idx == 0:
                                     cache_loc = "CPU" if use_cpu_cache else "GPU"
-                                    print(f"[VACE Slicer] Cached original {key}: shape {first_tensor.shape} ({cache_loc})")
+                                    offset_msg = f" (offset={frame_offset} for reference frames)" if frame_offset > 0 else ""
+                                    print(f"[VACE Slicer] Cached original {key}: shape {first_tensor.shape} ({cache_loc}){offset_msg}")
+                            elif window_idx == 0 and cond_idx == 0:
+                                print(f"[VACE Slicer] WARNING: {key} has {vace_temporal_size} frames but latent has {full_temporal_size} (diff={frame_offset}), skipping")
 
                 # Slice from cached original
                 if key in cache:
                     original_list = cache[key]
+                    frame_offset = cache.get(f"{key}_offset", 0)
                     sliced_list = []
                     for tensor in original_list:
                         if isinstance(tensor, torch.Tensor):
                             # If cached on CPU, move to GPU before slicing
-                            # Explicitly preserve dtype to avoid autocast issues with lowvram patches
                             tensor_for_slice = tensor.to(device=device, dtype=tensor.dtype) if use_cpu_cache else tensor
-                            sliced_tensor = window.get_tensor(tensor_for_slice, device, dim=dim)
+
+                            if frame_offset > 0:
+                                # VACE has extra frames at start (reference_image case)
+                                # Offset the window indices to account for reference frame(s)
+                                adjusted_indices = [i + frame_offset for i in window.index_list]
+                                sliced_tensor = _slice_tensor_manual(
+                                    tensor_for_slice, adjusted_indices, dim, device, target_dtype
+                                )
+                            else:
+                                # No offset, use standard slicing
+                                sliced_tensor = window.get_tensor(tensor_for_slice, device, dim=dim)
+
                             sliced_list.append(sliced_tensor)
                             if window_idx == 0 and cond_idx == 0:
-                                print(f"[VACE Slicer] Sliced {key}: {tensor.shape} -> {sliced_tensor.shape}")
+                                offset_info = f" (indices offset by {frame_offset})" if frame_offset > 0 else ""
+                                print(f"[VACE Slicer] Sliced {key}: {tensor.shape} -> {sliced_tensor.shape}{offset_info}")
                         else:
                             sliced_list.append(tensor)
                     cond_dict[key] = sliced_list
@@ -186,29 +213,45 @@ def slice_vace_conditioning(handler, model, x_in, conds, timestep, model_options
                     vace_tensor = vace_context.cond
 
                     # Cache original vace_context if not already cached
+                    # Handle reference_image case: VACE may have 1 extra frame at the start
                     if vace_context_key not in cache:
-                        if vace_tensor.ndim > vace_temporal_dim and vace_tensor.size(vace_temporal_dim) == full_temporal_size:
-                            if use_cpu_cache:
-                                # Long video: cache on CPU to avoid OOM
-                                cache[vace_context_key] = vace_context._copy_with(vace_tensor.cpu().clone())
-                            else:
-                                # Short video: cache on GPU for speed
-                                cache[vace_context_key] = vace_context._copy_with(vace_tensor.clone())
-                            if window_idx == 0 and cond_idx == 0:
-                                cache_loc = "CPU" if use_cpu_cache else "GPU"
-                                print(f"[VACE Slicer] Cached original vace_context: shape {vace_tensor.shape} ({cache_loc})")
+                        if vace_tensor.ndim > vace_temporal_dim:
+                            vace_ctx_temporal_size = vace_tensor.size(vace_temporal_dim)
+                            frame_offset = vace_ctx_temporal_size - full_temporal_size
+
+                            if frame_offset == 0 or (0 < frame_offset <= 2):
+                                if use_cpu_cache:
+                                    cache[vace_context_key] = vace_context._copy_with(vace_tensor.cpu().clone())
+                                else:
+                                    cache[vace_context_key] = vace_context._copy_with(vace_tensor.clone())
+                                cache[f"{vace_context_key}_offset"] = frame_offset
+                                if window_idx == 0 and cond_idx == 0:
+                                    cache_loc = "CPU" if use_cpu_cache else "GPU"
+                                    offset_msg = f" (offset={frame_offset} for reference frames)" if frame_offset > 0 else ""
+                                    print(f"[VACE Slicer] Cached original vace_context: shape {vace_tensor.shape} ({cache_loc}){offset_msg}")
 
                     # Slice from cached original
                     if vace_context_key in cache:
                         original_vace_context = cache[vace_context_key]
                         original_tensor = original_vace_context.cond
+                        frame_offset = cache.get(f"{vace_context_key}_offset", 0)
+
                         # If cached on CPU, move to GPU before slicing
-                        # Explicitly preserve dtype to avoid autocast issues with lowvram patches
                         tensor_for_slice = original_tensor.to(device=device, dtype=original_tensor.dtype) if use_cpu_cache else original_tensor
-                        sliced_tensor = window.get_tensor(tensor_for_slice, device, dim=vace_temporal_dim)
+
+                        if frame_offset > 0:
+                            # Offset indices for reference frame(s)
+                            adjusted_indices = [i + frame_offset for i in window.index_list]
+                            sliced_tensor = _slice_tensor_manual(
+                                tensor_for_slice, adjusted_indices, vace_temporal_dim, device, target_dtype
+                            )
+                        else:
+                            sliced_tensor = window.get_tensor(tensor_for_slice, device, dim=vace_temporal_dim)
+
                         model_conds["vace_context"] = original_vace_context._copy_with(sliced_tensor)
                         if window_idx == 0 and cond_idx == 0:
-                            print(f"[VACE Slicer] Sliced vace_context: {original_tensor.shape} -> {sliced_tensor.shape}")
+                            offset_info = f" (indices offset by {frame_offset})" if frame_offset > 0 else ""
+                            print(f"[VACE Slicer] Sliced vace_context: {original_tensor.shape} -> {sliced_tensor.shape}{offset_info}")
 
 
 class NV_VACEContextWindowPatcher:

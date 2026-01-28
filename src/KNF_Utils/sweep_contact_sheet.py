@@ -19,6 +19,7 @@ Use Case:
 import json
 import os
 import glob
+import re
 from datetime import datetime
 from itertools import product
 from PIL import Image, ImageDraw, ImageFont
@@ -641,11 +642,27 @@ class NV_SweepContactSheetBuilder:
                     "default": "first",
                     "tooltip": "Which frame to extract from video files"
                 }),
+
+                # Filtering
+                "exclude_patterns": ("STRING", {
+                    "default": "",
+                    "tooltip": "Comma-separated substrings to exclude from file matching (e.g., '-comp,-crop' to skip debug files)"
+                }),
+
+                # Output options
+                "save_to_path": ("STRING", {
+                    "default": "",
+                    "tooltip": "Directory to save contact sheets. Empty = don't save to disk."
+                }),
+                "filename_prefix": ("STRING", {
+                    "default": "contact_sheet",
+                    "tooltip": "Prefix for saved filenames (e.g., 'contact_sheet' → 'contact_sheet_001.png')"
+                }),
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "STRING", "STRING")
-    RETURN_NAMES = ("contact_sheets", "sheet_labels", "build_report")
+    RETURN_TYPES = ("IMAGE", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("contact_sheets", "sheet_labels", "build_report", "saved_paths")
     FUNCTION = "build_sheets"
     CATEGORY = "NV_Utils/Sweep"
     DESCRIPTION = "Builds contact sheet images from layout JSON and sweep output images/videos."
@@ -658,7 +675,9 @@ class NV_SweepContactSheetBuilder:
                      header_width=80, header_height=40, header_font_size=14,
                      text_color="#ffffff", header_bg_color="#2a2a2a",
                      file_pattern="*", match_by="output_suffix",
-                     include_videos=True, video_frame_position="first"):
+                     include_videos=True, video_frame_position="first",
+                     exclude_patterns="",
+                     save_to_path="", filename_prefix="contact_sheet"):
         """
         Build contact sheet images.
         """
@@ -693,6 +712,35 @@ class NV_SweepContactSheetBuilder:
             media_files.extend(glob.glob(os.path.join(image_directory, pattern)))
             media_files.extend(glob.glob(os.path.join(image_directory, "**", pattern), recursive=True))
         media_files = list(set(media_files))  # Remove duplicates
+
+        # Parse and apply exclude patterns
+        exclude_list = []
+        if exclude_patterns and exclude_patterns.strip():
+            exclude_list = [p.strip() for p in exclude_patterns.split(",") if p.strip()]
+
+        if exclude_list:
+            filtered_files = []
+            excluded_count = 0
+            for file_path in media_files:
+                filename = os.path.basename(file_path)
+                should_exclude = False
+                for pattern in exclude_list:
+                    if pattern in filename:
+                        should_exclude = True
+                        excluded_count += 1
+                        break
+                if not should_exclude:
+                    filtered_files.append(file_path)
+            media_files = filtered_files
+            if excluded_count > 0:
+                print(f"[NV_SweepContactSheetBuilder] Excluded {excluded_count} files matching patterns: {exclude_list}")
+
+        # Debug: show which files passed filtering
+        print(f"[NV_SweepContactSheetBuilder] Files after filtering ({len(media_files)}):")
+        for f in media_files[:10]:  # Show first 10
+            print(f"  - {os.path.basename(f)}")
+        if len(media_files) > 10:
+            print(f"  ... and {len(media_files) - 10} more")
 
         # Build lookup dict
         file_lookup = {}
@@ -851,6 +899,8 @@ class NV_SweepContactSheetBuilder:
             files_found = 0
             files_missing = 0
             videos_loaded = 0
+            matched_files = set()  # Track unique files matched
+            match_log = []  # Log each match for debugging
 
             for row_idx, row in enumerate(grid):
                 for col_idx, cell in enumerate(row):
@@ -862,6 +912,11 @@ class NV_SweepContactSheetBuilder:
 
                     # Find and load image or video
                     file_path = self._find_media(suffix, iter_id, file_lookup, match_by)
+                    if file_path:
+                        matched_files.add(file_path)
+                        match_log.append(f"    [{row_idx},{col_idx}] suffix='{suffix}' → {os.path.basename(file_path)}")
+                    else:
+                        match_log.append(f"    [{row_idx},{col_idx}] suffix='{suffix}' → NO MATCH")
 
                     if file_path:
                         try:
@@ -934,10 +989,48 @@ class NV_SweepContactSheetBuilder:
                             draw.text((text_x, text_y), cell_label, fill=text_rgb, font=label_font)
 
             video_note = f" ({videos_loaded} videos)" if videos_loaded > 0 else ""
-            report_lines.append(f"  Found: {files_found}{video_note}, Missing: {files_missing}")
+            unique_note = f" ({len(matched_files)} unique)" if len(matched_files) != files_found else ""
+            report_lines.append(f"  Found: {files_found}{unique_note}{video_note}, Missing: {files_missing}")
+
+            # Debug: show first 5 matches per sheet
+            if match_log:
+                print(f"[NV_SweepContactSheetBuilder] Sheet {sheet_data['page_id']} matches (first 5):")
+                for log_line in match_log[:5]:
+                    print(log_line)
+                if len(match_log) > 5:
+                    print(f"    ... and {len(match_log) - 5} more")
+
+            if len(matched_files) < files_found:
+                print(f"[NV_SweepContactSheetBuilder] WARNING: Only {len(matched_files)} unique files matched {files_found} cells!")
+                for f in matched_files:
+                    print(f"  - {os.path.basename(f)}")
 
             # Store canvas and its dimensions
             result_images.append((canvas, sheet_width, sheet_height))
+
+        # Save sheets to disk if path provided
+        saved_paths_list = []
+        if save_to_path and save_to_path.strip():
+            os.makedirs(save_to_path, exist_ok=True)
+            for idx, (canvas, w, h) in enumerate(result_images):
+                # Build filename with sheet index and label
+                sheet_label_safe = sheet_labels_list[idx] if idx < len(sheet_labels_list) else ""
+                # Make label filename-safe
+                for char in [" ", "/", "\\", ":", "*", "?", '"', "<", ">", "|", ",", "="]:
+                    sheet_label_safe = sheet_label_safe.replace(char, "_")
+                while "__" in sheet_label_safe:
+                    sheet_label_safe = sheet_label_safe.replace("__", "_")
+                sheet_label_safe = sheet_label_safe.strip("_")
+
+                if sheet_label_safe:
+                    filename = f"{filename_prefix}_{idx:03d}_{sheet_label_safe}.png"
+                else:
+                    filename = f"{filename_prefix}_{idx:03d}.png"
+
+                save_path = os.path.join(save_to_path, filename)
+                canvas.save(save_path, "PNG")
+                saved_paths_list.append(save_path)
+                print(f"[NV_SweepContactSheetBuilder] Saved: {save_path}")
 
         # Find max dimensions across all sheets for uniform batching
         if result_images:
@@ -965,19 +1058,30 @@ class NV_SweepContactSheetBuilder:
 
         sheet_labels = ", ".join(sheet_labels_list)
         build_report = "\n".join(report_lines)
+        saved_paths = ", ".join(saved_paths_list) if saved_paths_list else ""
 
         print(f"[NV_SweepContactSheetBuilder] Built {len(result_images)} sheets")
         print(f"[NV_SweepContactSheetBuilder] Output size: {max_width}x{max_height}")
+        if saved_paths_list:
+            print(f"[NV_SweepContactSheetBuilder] Saved {len(saved_paths_list)} files to: {save_to_path}")
 
-        return (result_batch, sheet_labels, build_report)
+        return (result_batch, sheet_labels, build_report, saved_paths)
 
-    def _find_media(self, suffix, iter_id, file_lookup, match_by):
+    def _find_media(self, suffix, iter_id, file_lookup, match_by, debug=False):
         """Find image or video file matching the cell."""
         if match_by == "output_suffix" and suffix:
-            # Try substring match
+            # Look for suffix followed by a delimiter (_, -, ., or end of string)
+            # This prevents "0-4" from matching "0-45"
+            # Escape special regex chars in suffix, then require delimiter after
+            pattern = re.escape(suffix) + r'(?:[_\-\.]|$)'
+
             for key in file_lookup:
-                if suffix in key:
+                if re.search(pattern, key):
+                    if debug:
+                        print(f"  [match] suffix '{suffix}' found in '{key}'")
                     return file_lookup[key]
+            if debug:
+                print(f"  [no match] suffix '{suffix}' not found in any file")
 
         if match_by == "iteration_id" and iter_id is not None:
             # Look for iter_id in filename
