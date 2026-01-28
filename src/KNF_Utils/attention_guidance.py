@@ -82,8 +82,14 @@ def sparsify_attention(attn_weights: torch.Tensor, ratio: float = 0.25) -> torch
     Output: Sparse representation (indices and values)
 
     We store as a dict with indices and values for efficient storage.
+
+    Note: We move to CPU before topk to avoid GPU OOM during model forward pass.
     """
     original_shape = attn_weights.shape
+
+    # Move to CPU immediately to free GPU memory during forward pass
+    # This is critical - topk requires extra memory allocation
+    attn_weights = attn_weights.detach().cpu().float()
 
     # Handle different input shapes
     if attn_weights.dim() == 3:
@@ -97,13 +103,13 @@ def sparsify_attention(attn_weights: torch.Tensor, ratio: float = 0.25) -> torch
     else:
         raise ValueError(f"Unexpected attention shape: {attn_weights.shape}")
 
-    # Top-k per query
+    # Top-k per query (on CPU)
     k = max(1, int(sk * ratio))
     topk_vals, topk_indices = torch.topk(attn_weights, k, dim=-1)
 
     return {
-        "values": topk_vals.cpu().half(),  # Store as fp16
-        "indices": topk_indices.cpu().short(),  # Store as int16
+        "values": topk_vals.half(),  # Store as fp16
+        "indices": topk_indices.short(),  # Store as int16
         "original_shape": original_shape,
         "k": k,
     }
