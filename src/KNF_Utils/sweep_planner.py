@@ -40,6 +40,34 @@ def get_unique_filepath(filepath: str) -> str:
         counter += 1
 
 
+def make_filename_safe(val) -> str:
+    """
+    Convert a value to a filename-safe string.
+
+    - Floats: 3.0 → "3", 3.5 → "3-5" (period replaced with hyphen)
+    - Ints: passed through as string
+    - Strings: spaces/special chars replaced with hyphens
+    """
+    if isinstance(val, float):
+        # If it's a whole number, show without decimal
+        if val == int(val):
+            return str(int(val))
+        else:
+            # Replace period with hyphen for decimals
+            return str(val).replace(".", "-")
+    elif isinstance(val, int):
+        return str(val)
+    else:
+        # String: replace problematic characters
+        safe = str(val)
+        for char in [" ", "/", "\\", ":", "*", "?", '"', "<", ">", "|", "."]:
+            safe = safe.replace(char, "-")
+        # Remove consecutive hyphens
+        while "--" in safe:
+            safe = safe.replace("--", "-")
+        return safe.strip("-")
+
+
 def generate_numeric_values(start: float, end: float, increment: float, value_type: str) -> list:
     """
     Generate list of values from start to end with given increment.
@@ -234,11 +262,7 @@ class NV_SweepPlanner:
             suffix_parts = []
             for p_idx, p in enumerate(all_params):
                 val = combo[p_idx]
-                # Make filename-safe: replace spaces and special chars
-                if isinstance(val, str):
-                    safe_val = val.replace(" ", "-").replace("/", "-")
-                else:
-                    safe_val = str(val)
+                safe_val = make_filename_safe(val)
                 suffix_parts.append(f"{p['name']}{safe_val}")
             suffix = "_".join(suffix_parts)
 

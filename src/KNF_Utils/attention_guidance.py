@@ -421,15 +421,15 @@ def create_attention_guidance_override(guidance_data, target_steps, target_layer
         # Apply if: (step matches OR fallback used) AND layer is in targets AND we have data
         should_apply = block_idx in target_layers and key in layers_data
         if should_apply:
-            # Get guidance pattern and densify it
-            guidance_attn = densify_attention(layers_data[key], device=q.device)
+            # Densify on CPU first to avoid GPU OOM
+            guidance_attn = densify_attention(layers_data[key], device='cpu')
 
             # Slice guidance for chunk if processing a portion of the video
             if chunk_frame_ratio != (0.0, 1.0):
                 seq_len = guidance_attn.shape[-1]
                 start_idx = int(seq_len * chunk_frame_ratio[0])
                 end_idx = int(seq_len * chunk_frame_ratio[1])
-                # Slice both query and key dimensions
+                # Slice both query and key dimensions (still on CPU)
                 guidance_attn = guidance_attn[:, start_idx:end_idx, start_idx:end_idx]
 
             # Compute current attention (dense, for blending)
@@ -443,6 +443,9 @@ def create_attention_guidance_override(guidance_data, target_steps, target_layer
             target_seq_len = current_attn.shape[-1]
             if guidance_attn.shape[-1] != target_seq_len:
                 guidance_attn = scale_guidance_to_target(guidance_attn, target_seq_len)
+
+            # Now move to GPU (after slicing/scaling, so smaller tensor)
+            guidance_attn = guidance_attn.to(q.device)
 
             # Apply guidance based on mode
             if mode == "blend":
@@ -1091,7 +1094,8 @@ class NV_LoadAttentionGuidance:
         if not os.path.exists(guidance_path):
             raise FileNotFoundError(f"Attention guidance file not found: {guidance_path}")
 
-        data = torch.load(guidance_path, weights_only=False)
+        # Force load to CPU to avoid GPU memory pressure
+        data = torch.load(guidance_path, map_location='cpu', weights_only=False)
 
         metadata = data.get("metadata", {})
         num_patterns = len(data.get("layers", {}))
