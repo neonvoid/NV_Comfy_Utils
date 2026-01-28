@@ -72,20 +72,24 @@ def generate_numeric_values(start: float, end: float, increment: float, value_ty
     """
     Generate list of values from start to end with given increment.
 
+    Supports both ascending (start < end) and descending (start > end) ranges.
+    For descending ranges, the increment is used as a decrement.
+
     Args:
         start: Starting value
         end: Ending value (inclusive if hit exactly)
-        increment: Step size
+        increment: Step size (always positive, direction determined by start/end)
         value_type: "float" or "int"
 
     Returns:
         List of values
+
+    Examples:
+        start=0, end=1, increment=0.25 → [0, 0.25, 0.5, 0.75, 1.0]
+        start=1, end=0, increment=0.25 → [1.0, 0.75, 0.5, 0.25, 0]
     """
     if increment <= 0:
         raise ValueError(f"Increment must be positive, got {increment}")
-
-    if start > end:
-        raise ValueError(f"Start ({start}) must be <= end ({end})")
 
     values = []
     current = start
@@ -93,12 +97,25 @@ def generate_numeric_values(start: float, end: float, increment: float, value_ty
     # Use tolerance for floating point comparison
     tolerance = increment / 1000
 
-    while current <= end + tolerance:
-        if value_type == "int":
-            values.append(int(round(current)))
-        else:
-            values.append(round(current, 6))  # Round to avoid floating point artifacts
-        current += increment
+    # Determine direction
+    descending = start > end
+
+    if descending:
+        # Descending: decrement until we reach end
+        while current >= end - tolerance:
+            if value_type == "int":
+                values.append(int(round(current)))
+            else:
+                values.append(round(current, 6))
+            current -= increment
+    else:
+        # Ascending: increment until we reach end
+        while current <= end + tolerance:
+            if value_type == "int":
+                values.append(int(round(current)))
+            else:
+                values.append(round(current, 6))
+            current += increment
 
     return values
 
