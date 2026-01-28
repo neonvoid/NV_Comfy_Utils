@@ -617,7 +617,7 @@ class NV_ExtractAttentionGuidance:
 
         # Clone models and apply the override to each
         patched_models = []
-        for m in models:
+        for idx, m in enumerate(models):
             pm = m.clone()
             # Initialize transformer_options if it doesn't exist
             if "transformer_options" not in pm.model_options:
@@ -625,6 +625,8 @@ class NV_ExtractAttentionGuidance:
             # Set the attention override
             pm.model_options["transformer_options"]["optimized_attention_override"] = capture_override
             patched_models.append(pm)
+            print(f"[NV_ExtractAttentionGuidance] Model {idx+1} patched: "
+                  f"override set = {'optimized_attention_override' in pm.model_options.get('transformer_options', {})}")
 
         print(f"[NV_ExtractAttentionGuidance] Applied attention capture override to {len(patched_models)} model(s)")
         print(f"[NV_ExtractAttentionGuidance] Target layers: {sorted(layer_indices)}, steps: {sorted(step_indices)}")
@@ -716,7 +718,10 @@ class NV_ExtractAttentionGuidance:
             end_step = current_step_idx + model_steps
             disable_noise = (i > 0)
 
-            print(f"[NV_ExtractAttentionGuidance] Model {i+1}: steps {start_step}-{end_step}, cfg={cfg}, disable_noise={disable_noise}")
+            # Debug: verify override is still set on this model
+            has_override = "optimized_attention_override" in model.model_options.get("transformer_options", {})
+            print(f"[NV_ExtractAttentionGuidance] Model {i+1}: steps {start_step}-{end_step}, cfg={cfg}, "
+                  f"disable_noise={disable_noise}, has_override={has_override}")
 
             result = self._ksampler_direct(
                 model, seed, steps, cfg, sampler_name, scheduler,
