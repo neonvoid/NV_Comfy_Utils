@@ -1254,17 +1254,17 @@ class NV_ApplyAttentionGuidance:
         return (patched_model,)
 
 
-# Node registration
+# Node registration - EXPRT prefix marks experimental features
 NODE_CLASS_MAPPINGS = {
-    "NV_ExtractAttentionGuidance": NV_ExtractAttentionGuidance,
-    "NV_SaveAttentionGuidance": NV_SaveAttentionGuidance,
-    "NV_LoadAttentionGuidance": NV_LoadAttentionGuidance,
-    "NV_ApplyAttentionGuidance": NV_ApplyAttentionGuidance,
+    "EXPRT_NV_ExtractAttentionGuidance": NV_ExtractAttentionGuidance,
+    "EXPRT_NV_SaveAttentionGuidance": NV_SaveAttentionGuidance,
+    "EXPRT_NV_LoadAttentionGuidance": NV_LoadAttentionGuidance,
+    "EXPRT_NV_ApplyAttentionGuidance": NV_ApplyAttentionGuidance,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "NV_ExtractAttentionGuidance": "NV Extract Attention Guidance",
-    "NV_SaveAttentionGuidance": "NV Save Attention Guidance",
-    "NV_LoadAttentionGuidance": "NV Load Attention Guidance",
-    "NV_ApplyAttentionGuidance": "NV Apply Attention Guidance",
+    "EXPRT_NV_ExtractAttentionGuidance": "EXPRT NV Extract Attention Guidance",
+    "EXPRT_NV_SaveAttentionGuidance": "EXPRT NV Save Attention Guidance",
+    "EXPRT_NV_LoadAttentionGuidance": "EXPRT NV Load Attention Guidance",
+    "EXPRT_NV_ApplyAttentionGuidance": "EXPRT NV Apply Attention Guidance",
 }
