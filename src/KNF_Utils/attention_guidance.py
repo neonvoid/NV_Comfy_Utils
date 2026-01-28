@@ -231,9 +231,9 @@ def create_attention_capture_override(storage, target_steps, target_layers, spar
         attn_precision = kwargs.get("attn_precision", None)
         skip_reshape = kwargs.get("skip_reshape", False)
 
-        # Debug logging - log first few unique step/layer combinations
+        # Debug logging - log unique step/layer combinations (limit to avoid spam)
         combo = (step, block_idx)
-        if combo not in seen_combinations and len(seen_combinations) < 10:
+        if combo not in seen_combinations and len(seen_combinations) < 30:
             seen_combinations.add(combo)
             print(f"[AttentionCapture DEBUG] step={step}, block_idx={block_idx}, "
                   f"target_steps={target_steps}, target_layers={target_layers}")
@@ -809,13 +809,13 @@ class NV_ExtractAttentionGuidance:
         noise_mask = latent.get("noise_mask", None)
 
         # Create callback with step tracking
-        # Note: start_step offset is NOT needed because comfy.sample.sample
-        # passes absolute step indices to the callback
+        # Note: comfy.sample.sample passes RELATIVE step indices to the callback
+        # (0, 1, 2, ...) even when start_step is used. We need to add the offset.
         if step_ref is not None:
             # Initialize step_ref to start_step so first attention call sees correct step
-            if start_step is not None:
-                step_ref[0] = start_step
-            callback = self._create_step_callback(model, steps, step_ref)
+            offset = start_step if start_step is not None else 0
+            step_ref[0] = offset
+            callback = self._create_step_callback(model, steps, step_ref, start_step_offset=offset)
         else:
             callback = latent_preview.prepare_callback(model, steps)
 
