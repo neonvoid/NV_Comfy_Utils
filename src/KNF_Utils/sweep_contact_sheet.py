@@ -21,10 +21,23 @@ import os
 import glob
 import re
 from datetime import datetime
+from fractions import Fraction
 from itertools import product
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 import torch
+
+try:
+    import av
+    HAS_PYAV = True
+except ImportError:
+    HAS_PYAV = False
+
+try:
+    import comfy.utils
+    HAS_COMFY_UTILS = True
+except ImportError:
+    HAS_COMFY_UTILS = False
 
 # Video file extensions
 VIDEO_EXTENSIONS = {'.mp4', '.webm', '.mov', '.avi', '.mkv', '.m4v'}
@@ -1126,13 +1139,736 @@ class NV_SweepContactSheetBuilder:
             draw.text((text_x, text_y), text, fill=text_color, font=font)
 
 
+class VideoStreamManager:
+    """
+    Context manager for efficient frame-by-frame reading from multiple video files.
+
+    Keeps video handles open for sequential reading, avoiding repeated file opens
+    and seeking for each frame.
+    """
+
+    def __init__(self, video_info: dict, cell_width: int, cell_height: int):
+        """
+        Args:
+            video_info: Dict mapping cell_key to video info dict with 'path' key
+            cell_width: Target width for resized frames
+            cell_height: Target height for resized frames
+        """
+        self.video_info = video_info
+        self.cell_width = cell_width
+        self.cell_height = cell_height
+        self.handles = {}  # {cell_key: cv2.VideoCapture}
+
+    def __enter__(self):
+        try:
+            import cv2
+        except ImportError:
+            print("[VideoStreamManager] Warning: OpenCV not available")
+            return self
+
+        for cell_key, info in self.video_info.items():
+            if info and info.get("path"):
+                cap = cv2.VideoCapture(info["path"])
+                if cap.isOpened():
+                    self.handles[cell_key] = cap
+        return self
+
+    def __exit__(self, *args):
+        for cap in self.handles.values():
+            cap.release()
+        self.handles.clear()
+
+    def read_frame(self, cell_key) -> np.ndarray:
+        """
+        Read next frame from video, resize, and return as RGB numpy array.
+
+        Returns:
+            RGB numpy array of shape (cell_height, cell_width, 3), or None if failed
+        """
+        try:
+            import cv2
+        except ImportError:
+            return None
+
+        cap = self.handles.get(cell_key)
+        if cap is None:
+            return None
+
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            return None
+
+        # BGR to RGB
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        # Resize to cell dimensions
+        frame_resized = cv2.resize(
+            frame_rgb,
+            (self.cell_width, self.cell_height),
+            interpolation=cv2.INTER_LANCZOS4
+        )
+
+        return frame_resized
+
+
+class NV_SweepVideoContactSheetBuilder:
+    """
+    Builds animated MP4 contact sheets from layout JSON and sweep output videos.
+
+    Features:
+    - Synchronizes all videos by trimming to shortest length
+    - Row/column headers showing parameter values
+    - Labels below each cell
+    - Placeholder for missing videos
+    - H.264 MP4 output with configurable quality
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "layout_json_path": ("STRING", {
+                    "default": "",
+                    "tooltip": "Path to layout JSON from NV_SweepContactSheetPlanner"
+                }),
+                "video_directory": ("STRING", {
+                    "default": "",
+                    "tooltip": "Directory containing sweep output videos (.mp4, .webm, etc.)"
+                }),
+            },
+            "optional": {
+                # Cell sizing
+                "cell_width": ("INT", {
+                    "default": 256,
+                    "min": 64,
+                    "max": 1024,
+                    "tooltip": "Width of each video cell"
+                }),
+                "cell_height": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 1024,
+                    "tooltip": "Height of each cell (0 = auto from aspect ratio)"
+                }),
+                "cell_padding": ("INT", {
+                    "default": 8,
+                    "min": 0,
+                    "max": 32,
+                    "tooltip": "Padding between cells"
+                }),
+                "outer_padding": ("INT", {
+                    "default": 16,
+                    "min": 0,
+                    "max": 64,
+                    "tooltip": "Padding around entire grid"
+                }),
+
+                # Colors
+                "background_color": ("STRING", {
+                    "default": "#1a1a1a",
+                    "tooltip": "Background color (hex)"
+                }),
+                "text_color": ("STRING", {
+                    "default": "#ffffff",
+                    "tooltip": "Text color (hex)"
+                }),
+                "header_bg_color": ("STRING", {
+                    "default": "#2a2a2a",
+                    "tooltip": "Header background color (hex)"
+                }),
+
+                # Cell labels
+                "show_cell_labels": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Show parameter labels below each cell"
+                }),
+                "cell_label_height": ("INT", {
+                    "default": 40,
+                    "min": 20,
+                    "max": 100,
+                    "tooltip": "Height of label area below each cell"
+                }),
+                "cell_label_font_size": ("INT", {
+                    "default": 12,
+                    "min": 8,
+                    "max": 24,
+                    "tooltip": "Font size for cell labels"
+                }),
+
+                # Row/Column headers
+                "show_row_headers": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Show row headers on left side"
+                }),
+                "show_col_headers": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Show column headers on top"
+                }),
+                "header_width": ("INT", {
+                    "default": 80,
+                    "min": 40,
+                    "max": 200,
+                    "tooltip": "Width of row header column"
+                }),
+                "header_height": ("INT", {
+                    "default": 40,
+                    "min": 20,
+                    "max": 100,
+                    "tooltip": "Height of column header row"
+                }),
+                "header_font_size": ("INT", {
+                    "default": 14,
+                    "min": 10,
+                    "max": 24,
+                    "tooltip": "Font size for headers"
+                }),
+
+                # Video output
+                "fps": ("FLOAT", {
+                    "default": 24.0,
+                    "min": 1.0,
+                    "max": 60.0,
+                    "step": 0.01,
+                    "tooltip": "Output video frame rate"
+                }),
+                "crf": ("INT", {
+                    "default": 23,
+                    "min": 0,
+                    "max": 51,
+                    "tooltip": "H.264 quality (0=lossless, 23=default, 51=worst)"
+                }),
+
+                # File matching
+                "file_pattern": ("STRING", {
+                    "default": "*",
+                    "tooltip": "Glob pattern to match files (without extension)"
+                }),
+                "match_by": (["output_suffix", "iteration_id"], {
+                    "default": "output_suffix",
+                    "tooltip": "How to match files to iterations"
+                }),
+                "exclude_patterns": ("STRING", {
+                    "default": "",
+                    "tooltip": "Comma-separated substrings to exclude from file matching"
+                }),
+
+                # Output
+                "save_to_path": ("STRING", {
+                    "default": "",
+                    "tooltip": "Directory to save output MP4 files (required)"
+                }),
+                "filename_prefix": ("STRING", {
+                    "default": "video_contact_sheet",
+                    "tooltip": "Prefix for saved filenames"
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "INT")
+    RETURN_NAMES = ("saved_paths", "build_report", "total_frames")
+    OUTPUT_NODE = True
+    FUNCTION = "build_video_sheets"
+    CATEGORY = "NV_Utils/Sweep"
+    DESCRIPTION = "Builds animated MP4 contact sheets from layout JSON and sweep output videos."
+
+    def build_video_sheets(self, layout_json_path, video_directory,
+                           cell_width=256, cell_height=0, cell_padding=8, outer_padding=16,
+                           background_color="#1a1a1a", text_color="#ffffff", header_bg_color="#2a2a2a",
+                           show_cell_labels=True, cell_label_height=40, cell_label_font_size=12,
+                           show_row_headers=True, show_col_headers=True,
+                           header_width=80, header_height=40, header_font_size=14,
+                           fps=24.0, crf=23,
+                           file_pattern="*", match_by="output_suffix", exclude_patterns="",
+                           save_to_path="", filename_prefix="video_contact_sheet"):
+        """Build animated MP4 contact sheets from sweep output videos."""
+
+        # Check dependencies
+        if not HAS_PYAV:
+            raise ImportError("PyAV is required for video encoding. Install with: pip install av")
+
+        try:
+            import cv2
+        except ImportError:
+            raise ImportError("OpenCV is required for video reading. Install with: pip install opencv-python")
+
+        if not save_to_path or not save_to_path.strip():
+            raise ValueError("save_to_path is required for video output")
+
+        # Load layout JSON
+        try:
+            with open(layout_json_path, 'r') as f:
+                layout = json.load(f)
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Layout JSON not found: {layout_json_path}")
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid layout JSON: {e}")
+
+        sheets_data = layout.get("sheets", [])
+        if not sheets_data:
+            raise ValueError("Layout has no sheets")
+
+        # Find video files
+        video_files = []
+        for ext in VIDEO_EXTENSIONS:
+            pattern = f"{file_pattern}{ext}"
+            video_files.extend(glob.glob(os.path.join(video_directory, pattern)))
+            video_files.extend(glob.glob(os.path.join(video_directory, "**", pattern), recursive=True))
+        video_files = list(set(video_files))
+
+        # Apply exclude patterns
+        if exclude_patterns and exclude_patterns.strip():
+            exclude_list = [p.strip() for p in exclude_patterns.split(",") if p.strip()]
+            video_files = [f for f in video_files
+                          if not any(p in os.path.basename(f) for p in exclude_list)]
+
+        print(f"[NV_SweepVideoContactSheetBuilder] Found {len(video_files)} video files")
+
+        # Build lookup dict
+        file_lookup = {}
+        for file_path in video_files:
+            filename = os.path.basename(file_path)
+            name_no_ext = os.path.splitext(filename)[0]
+            file_lookup[name_no_ext] = file_path
+            file_lookup[filename] = file_path
+
+        # Match videos to cells and analyze
+        all_video_matches = {}  # {(sheet_idx, row, col): file_path}
+
+        for sheet_data in sheets_data:
+            sheet_idx = sheet_data["page_id"]
+            for row in sheet_data.get("grid", []):
+                for cell in row:
+                    cell_key = (sheet_idx, cell["row"], cell["col"])
+                    suffix = cell.get("suffix")
+                    iter_id = cell.get("iter_id")
+                    file_path = self._find_video(suffix, iter_id, file_lookup, match_by)
+                    all_video_matches[cell_key] = file_path
+
+        # Analyze all videos
+        video_analysis = self._analyze_videos(all_video_matches, cv2)
+        target_frames = video_analysis["target_frames"]
+
+        if target_frames == 0:
+            raise ValueError("No valid videos found or all videos have 0 frames")
+
+        print(f"[NV_SweepVideoContactSheetBuilder] Target frames (shortest video): {target_frames}")
+        print(f"[NV_SweepVideoContactSheetBuilder] Videos found: {len(video_analysis['videos'])}, Missing: {len(video_analysis['missing_cells'])}")
+
+        # Determine cell_height from first video if auto
+        if cell_height <= 0:
+            for info in video_analysis["videos"].values():
+                if info["width"] > 0 and info["height"] > 0:
+                    aspect = info["height"] / info["width"]
+                    cell_height = int(cell_width * aspect)
+                    break
+            if cell_height <= 0:
+                cell_height = cell_width  # Default to square
+
+        # Load fonts
+        header_font = get_font(header_font_size)
+        label_font = get_font(cell_label_font_size)
+
+        # Convert colors
+        bg_rgb = hex_to_rgb(background_color)
+        text_rgb = hex_to_rgb(text_color)
+        header_bg_rgb = hex_to_rgb(header_bg_color)
+        placeholder_rgb = (51, 51, 51)
+
+        # Get param names for headers
+        row_param_name = layout.get("layout", {}).get("row_param", {}).get("name", "")
+        col_param_name = layout.get("layout", {}).get("col_param", {}).get("name", "")
+
+        # Pre-calculate dimensions
+        label_h = cell_label_height if show_cell_labels else 0
+        row_header_w = header_width if show_row_headers else 0
+        col_header_h = header_height if show_col_headers else 0
+
+        # Ensure output directory exists
+        os.makedirs(save_to_path, exist_ok=True)
+
+        saved_paths_list = []
+        report_lines = [
+            f"Building video contact sheets from: {layout_json_path}",
+            f"Video directory: {video_directory}",
+            f"Target frames: {target_frames}",
+            f"Output FPS: {fps}",
+            f"Cell size: {cell_width}x{cell_height}",
+            f"CRF quality: {crf}",
+            ""
+        ]
+
+        # Process each sheet
+        for sheet_data in sheets_data:
+            sheet_idx = sheet_data["page_id"]
+            page_label = sheet_data.get("page_label", f"Sheet {sheet_idx}")
+
+            sheet_row_values = sheet_data.get("row_values", [])
+            sheet_col_values = sheet_data.get("col_values", [])
+            sheet_num_rows = len(sheet_row_values) if sheet_row_values else 1
+            sheet_num_cols = len(sheet_col_values) if sheet_col_values else 1
+
+            # Calculate canvas size
+            canvas_width = (
+                outer_padding +
+                row_header_w +
+                (cell_width + cell_padding) * sheet_num_cols - cell_padding +
+                outer_padding
+            )
+            canvas_height = (
+                outer_padding +
+                col_header_h +
+                (cell_height + label_h + cell_padding) * sheet_num_rows - cell_padding +
+                outer_padding
+            )
+
+            report_lines.append(f"Sheet {sheet_idx}: {page_label} ({sheet_num_rows}x{sheet_num_cols})")
+
+            # Pre-render static overlay (headers, labels, placeholders)
+            static_overlay = self._render_static_overlay(
+                sheet_data, layout, canvas_width, canvas_height,
+                cell_width, cell_height, cell_padding, outer_padding,
+                label_h, row_header_w, col_header_h,
+                row_param_name, col_param_name,
+                show_row_headers, show_col_headers, show_cell_labels,
+                header_font, label_font,
+                bg_rgb, text_rgb, header_bg_rgb, placeholder_rgb,
+                video_analysis, sheet_idx
+            )
+
+            # Build cell position map
+            cell_positions = {}
+            grid = sheet_data.get("grid", [])
+            for row in grid:
+                for cell in row:
+                    row_idx = cell["row"]
+                    col_idx = cell["col"]
+                    x = outer_padding + row_header_w + col_idx * (cell_width + cell_padding)
+                    y = outer_padding + col_header_h + row_idx * (cell_height + label_h + cell_padding)
+                    cell_key = (sheet_idx, row_idx, col_idx)
+                    cell_positions[cell_key] = (x, y)
+
+            # Get video info for this sheet's cells
+            sheet_video_info = {}
+            for row in grid:
+                for cell in row:
+                    cell_key = (sheet_idx, cell["row"], cell["col"])
+                    if cell_key in video_analysis["videos"]:
+                        sheet_video_info[cell_key] = video_analysis["videos"][cell_key]
+
+            # Generate output filename
+            sheet_label_safe = page_label
+            for char in [" ", "/", "\\", ":", "*", "?", '"', "<", ">", "|", ",", "="]:
+                sheet_label_safe = sheet_label_safe.replace(char, "_")
+            while "__" in sheet_label_safe:
+                sheet_label_safe = sheet_label_safe.replace("__", "_")
+            sheet_label_safe = sheet_label_safe.strip("_")
+
+            if sheet_label_safe:
+                output_filename = f"{filename_prefix}_{sheet_idx:03d}_{sheet_label_safe}.mp4"
+            else:
+                output_filename = f"{filename_prefix}_{sheet_idx:03d}.mp4"
+
+            output_path = os.path.join(save_to_path, output_filename)
+
+            # Encode video
+            self._encode_video(
+                output_path, target_frames,
+                canvas_width, canvas_height,
+                fps, crf, bg_rgb,
+                sheet_video_info, cell_positions, cell_width, cell_height,
+                static_overlay
+            )
+
+            saved_paths_list.append(output_path)
+            report_lines.append(f"  Saved: {output_path}")
+            print(f"[NV_SweepVideoContactSheetBuilder] Saved: {output_path}")
+
+        saved_paths = ", ".join(saved_paths_list)
+        build_report = "\n".join(report_lines)
+
+        print(f"[NV_SweepVideoContactSheetBuilder] Built {len(saved_paths_list)} video contact sheets")
+
+        return (saved_paths, build_report, target_frames)
+
+    def _find_video(self, suffix, iter_id, file_lookup, match_by):
+        """Find video file matching the cell (reuses logic from image builder)."""
+        if match_by == "output_suffix" and suffix:
+            pattern = re.escape(suffix) + r'(?:[_\-\.]|$)'
+            for key in file_lookup:
+                if re.search(pattern, key):
+                    return file_lookup[key]
+
+        if match_by == "iteration_id" and iter_id is not None:
+            patterns = [
+                f"iter{iter_id}_",
+                f"iter_{iter_id}_",
+                f"iteration{iter_id}_",
+                f"_{iter_id:04d}_",
+                f"_{iter_id:04d}.",
+            ]
+            for key in file_lookup:
+                for pat in patterns:
+                    if pat in key:
+                        return file_lookup[key]
+
+        return None
+
+    def _analyze_videos(self, video_paths: dict, cv2) -> dict:
+        """
+        Analyze all matched videos and determine target frame count.
+
+        Returns dict with:
+            target_frames: int (shortest video length)
+            videos: {cell_key: {path, frame_count, fps, width, height}}
+            missing_cells: [cell_key, ...]
+        """
+        analysis = {"videos": {}, "missing_cells": []}
+        min_frames = float('inf')
+
+        for cell_key, path in video_paths.items():
+            if path is None:
+                analysis["missing_cells"].append(cell_key)
+                continue
+
+            cap = cv2.VideoCapture(path)
+            if not cap.isOpened():
+                analysis["missing_cells"].append(cell_key)
+                continue
+
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            video_fps = cap.get(cv2.CAP_PROP_FPS)
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            cap.release()
+
+            if frame_count <= 0:
+                analysis["missing_cells"].append(cell_key)
+                continue
+
+            analysis["videos"][cell_key] = {
+                "path": path,
+                "frame_count": frame_count,
+                "fps": video_fps,
+                "width": width,
+                "height": height,
+            }
+
+            min_frames = min(min_frames, frame_count)
+
+        analysis["target_frames"] = min_frames if min_frames != float('inf') else 0
+        return analysis
+
+    def _render_static_overlay(self, sheet_data, layout, canvas_width, canvas_height,
+                                cell_width, cell_height, cell_padding, outer_padding,
+                                label_h, row_header_w, col_header_h,
+                                row_param_name, col_param_name,
+                                show_row_headers, show_col_headers, show_cell_labels,
+                                header_font, label_font,
+                                bg_rgb, text_rgb, header_bg_rgb, placeholder_rgb,
+                                video_analysis, sheet_idx):
+        """
+        Pre-render static overlay with headers, labels, and placeholders.
+
+        Returns RGBA image where cell areas are transparent.
+        """
+        # Create RGBA canvas (transparent background for cells)
+        overlay = Image.new("RGBA", (canvas_width, canvas_height), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
+
+        sheet_row_values = sheet_data.get("row_values", [])
+        sheet_col_values = sheet_data.get("col_values", [])
+
+        # Draw column headers
+        if show_col_headers and sheet_col_values:
+            for col_idx, col_val in enumerate(sheet_col_values):
+                x = outer_padding + row_header_w + col_idx * (cell_width + cell_padding)
+                y = outer_padding
+
+                draw.rectangle(
+                    [x, y, x + cell_width, y + col_header_h],
+                    fill=header_bg_rgb + (255,)
+                )
+
+                header_text = f"{col_param_name}={col_val}" if col_param_name else str(col_val)
+                if header_font:
+                    bbox = draw.textbbox((0, 0), header_text, font=header_font)
+                    text_w = bbox[2] - bbox[0]
+                    text_h = bbox[3] - bbox[1]
+                    text_x = x + (cell_width - text_w) // 2
+                    text_y = y + (col_header_h - text_h) // 2
+                    draw.text((text_x, text_y), header_text, fill=text_rgb + (255,), font=header_font)
+
+        # Draw row headers
+        if show_row_headers and sheet_row_values:
+            for row_idx, row_val in enumerate(sheet_row_values):
+                x = outer_padding
+                y = outer_padding + col_header_h + row_idx * (cell_height + label_h + cell_padding)
+
+                draw.rectangle(
+                    [x, y, x + row_header_w, y + cell_height + label_h],
+                    fill=header_bg_rgb + (255,)
+                )
+
+                header_text = f"{row_param_name}={row_val}" if row_param_name else str(row_val)
+                if header_font:
+                    bbox = draw.textbbox((0, 0), header_text, font=header_font)
+                    text_w = bbox[2] - bbox[0]
+                    text_h = bbox[3] - bbox[1]
+                    text_x = x + (row_header_w - text_w) // 2
+                    text_y = y + (cell_height + label_h - text_h) // 2
+                    draw.text((text_x, text_y), header_text, fill=text_rgb + (255,), font=header_font)
+
+        # Draw cell labels and placeholders for missing videos
+        grid = sheet_data.get("grid", [])
+        for row in grid:
+            for cell in row:
+                row_idx = cell["row"]
+                col_idx = cell["col"]
+                cell_key = (sheet_idx, row_idx, col_idx)
+
+                x = outer_padding + row_header_w + col_idx * (cell_width + cell_padding)
+                y = outer_padding + col_header_h + row_idx * (cell_height + label_h + cell_padding)
+
+                # Draw placeholder if missing
+                if cell_key in video_analysis["missing_cells"]:
+                    iter_id = cell.get("iter_id")
+                    self._draw_placeholder_rgba(draw, x, y, cell_width, cell_height,
+                                                f"Missing: #{iter_id}", placeholder_rgb, text_rgb, label_font)
+
+                # Draw cell label
+                if show_cell_labels:
+                    label_y = y + cell_height
+
+                    params = cell.get("params", {})
+                    label_parts = []
+                    for k, v in params.items():
+                        if k == row_param_name or k == col_param_name:
+                            continue
+                        skip = False
+                        for pp in layout.get("layout", {}).get("page_params", []):
+                            if k == pp.get("name"):
+                                skip = True
+                                break
+                        if skip:
+                            continue
+                        if isinstance(v, float):
+                            if v == int(v):
+                                label_parts.append(f"{k}={int(v)}")
+                            else:
+                                label_parts.append(f"{k}={v:.2f}")
+                        else:
+                            label_parts.append(f"{k}={v}")
+
+                    cell_label = ", ".join(label_parts) if label_parts else f"iter {cell.get('iter_id')}"
+
+                    # Draw label background
+                    draw.rectangle(
+                        [x, label_y, x + cell_width, label_y + label_h],
+                        fill=bg_rgb + (255,)
+                    )
+
+                    if label_font:
+                        bbox = draw.textbbox((0, 0), cell_label, font=label_font)
+                        text_w = bbox[2] - bbox[0]
+                        text_h = bbox[3] - bbox[1]
+                        text_x = x + (cell_width - text_w) // 2
+                        text_y = label_y + (label_h - text_h) // 2
+                        draw.text((text_x, text_y), cell_label, fill=text_rgb + (255,), font=label_font)
+
+        return overlay
+
+    def _draw_placeholder_rgba(self, draw, x, y, width, height, text, bg_color, text_color, font):
+        """Draw a placeholder cell for missing videos (RGBA version)."""
+        draw.rectangle([x, y, x + width, y + height], fill=bg_color + (255,))
+
+        line_color = (80, 80, 80, 255)
+        draw.line([(x, y), (x + width, y + height)], fill=line_color, width=2)
+        draw.line([(x + width, y), (x, y + height)], fill=line_color, width=2)
+
+        if font:
+            bbox = draw.textbbox((0, 0), text, font=font)
+            text_w = bbox[2] - bbox[0]
+            text_h = bbox[3] - bbox[1]
+            text_x = x + (width - text_w) // 2
+            text_y = y + (height - text_h) // 2
+
+            padding = 4
+            draw.rectangle(
+                [text_x - padding, text_y - padding, text_x + text_w + padding, text_y + text_h + padding],
+                fill=bg_color + (255,)
+            )
+            draw.text((text_x, text_y), text, fill=text_color + (255,), font=font)
+
+    def _encode_video(self, output_path, target_frames, canvas_width, canvas_height,
+                      fps, crf, bg_rgb, sheet_video_info, cell_positions,
+                      cell_width, cell_height, static_overlay):
+        """Encode frames to H.264 MP4 using PyAV."""
+
+        # Create output container
+        container = av.open(output_path, mode='w')
+
+        # Add video stream
+        stream = container.add_stream('h264', rate=Fraction(int(fps * 1000), 1000))
+        stream.width = canvas_width
+        stream.height = canvas_height
+        stream.pix_fmt = 'yuv420p'
+        stream.options = {'crf': str(crf)}
+
+        # Progress bar
+        pbar = None
+        if HAS_COMFY_UTILS:
+            pbar = comfy.utils.ProgressBar(target_frames)
+
+        # Open all video streams
+        with VideoStreamManager(sheet_video_info, cell_width, cell_height) as streams:
+            for frame_idx in range(target_frames):
+                # Create canvas with background
+                canvas = Image.new("RGB", (canvas_width, canvas_height), bg_rgb)
+
+                # Read and paste each cell's video frame
+                for cell_key, (x, y) in cell_positions.items():
+                    if cell_key in sheet_video_info:
+                        frame_data = streams.read_frame(cell_key)
+                        if frame_data is not None:
+                            cell_img = Image.fromarray(frame_data)
+                            canvas.paste(cell_img, (x, y))
+
+                # Composite static overlay
+                canvas.paste(static_overlay, (0, 0), static_overlay)
+
+                # Convert to numpy array
+                img_array = np.array(canvas)
+
+                # Create video frame
+                frame = av.VideoFrame.from_ndarray(img_array, format='rgb24')
+                frame = frame.reformat(format='yuv420p')
+
+                # Encode
+                for packet in stream.encode(frame):
+                    container.mux(packet)
+
+                if pbar:
+                    pbar.update(1)
+
+                if (frame_idx + 1) % 100 == 0:
+                    print(f"[NV_SweepVideoContactSheetBuilder] Encoded frame {frame_idx + 1}/{target_frames}")
+
+        # Flush encoder
+        for packet in stream.encode(None):
+            container.mux(packet)
+
+        container.close()
+
+
 # Node registration
 NODE_CLASS_MAPPINGS = {
     "NV_SweepContactSheetPlanner": NV_SweepContactSheetPlanner,
     "NV_SweepContactSheetBuilder": NV_SweepContactSheetBuilder,
+    "NV_SweepVideoContactSheetBuilder": NV_SweepVideoContactSheetBuilder,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "NV_SweepContactSheetPlanner": "NV Sweep Contact Sheet Planner",
     "NV_SweepContactSheetBuilder": "NV Sweep Contact Sheet Builder",
+    "NV_SweepVideoContactSheetBuilder": "NV Sweep Video Contact Sheet Builder",
 }
