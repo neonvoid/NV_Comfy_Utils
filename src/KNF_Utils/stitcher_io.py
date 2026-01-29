@@ -31,7 +31,11 @@ from PIL import Image
 
 
 def save_tensor_as_image(tensor, filepath):
-    """Save a single image tensor [H, W, C] or [H, W] as PNG."""
+    """Save a single image tensor [H, W, C], [B, H, W, C], [H, W], or [B, H, W] as PNG."""
+    # Squeeze batch dimension if present
+    while tensor.dim() > 3:
+        tensor = tensor.squeeze(0)
+
     if tensor.dim() == 2:
         # Mask: [H, W] -> grayscale
         arr = (tensor.cpu().numpy() * 255).astype(np.uint8)
@@ -44,13 +48,20 @@ def save_tensor_as_image(tensor, filepath):
         else:
             img = Image.fromarray(arr, mode='RGB')
     else:
-        raise ValueError(f"Unexpected tensor dimensions: {tensor.shape}")
+        raise ValueError(f"Unexpected tensor dimensions after squeeze: {tensor.shape}")
 
     img.save(filepath, compress_level=1)  # Fast compression
 
 
-def load_image_as_tensor(filepath, is_mask=False, device='cpu'):
-    """Load PNG as tensor."""
+def load_image_as_tensor(filepath, is_mask=False, device='cpu', add_batch_dim=True):
+    """Load PNG as tensor.
+
+    Args:
+        filepath: Path to image file
+        is_mask: If True, load as grayscale mask [H, W] or [1, H, W]
+        device: Device to load tensor to
+        add_batch_dim: If True, add batch dimension to match stitcher format
+    """
     img = Image.open(filepath)
     arr = np.array(img).astype(np.float32) / 255.0
 
@@ -58,14 +69,20 @@ def load_image_as_tensor(filepath, is_mask=False, device='cpu'):
         # Grayscale mask
         if arr.ndim == 3:
             arr = arr[:, :, 0]  # Take first channel
-        return torch.from_numpy(arr).to(device)
+        tensor = torch.from_numpy(arr).to(device)
+        if add_batch_dim:
+            tensor = tensor.unsqueeze(0)  # [H, W] -> [1, H, W]
+        return tensor
     else:
         # Color image
         if arr.ndim == 2:
             arr = np.stack([arr, arr, arr], axis=-1)
         elif arr.shape[2] == 4:
             arr = arr[:, :, :3]  # Drop alpha
-        return torch.from_numpy(arr).to(device)
+        tensor = torch.from_numpy(arr).to(device)
+        if add_batch_dim:
+            tensor = tensor.unsqueeze(0)  # [H, W, C] -> [1, H, W, C]
+        return tensor
 
 
 class NV_SaveStitcher:
