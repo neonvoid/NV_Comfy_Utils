@@ -68,6 +68,12 @@ class NV_B2InputSync:
                 "passthrough": (ANY_TYPE, {
                     "tooltip": "Connect to chain this node with other operations."
                 }),
+                # Remote name (allows different rclone remotes)
+                "remote_name": ("STRING", {
+                    "default": "",
+                    "multiline": False,
+                    "tooltip": "rclone remote name (e.g., 'b2', 'zs_b2'). Empty = 'b2'. Must be configured in rclone."
+                }),
                 # B2 source path (within bucket)
                 "b2_path": ("STRING", {
                     "default": "",
@@ -106,9 +112,12 @@ class NV_B2InputSync:
     CATEGORY = "NV_Utils/Cloud"
     DESCRIPTION = "Pulls files FROM B2 bucket to local folder using rclone. Use at workflow start to fetch assets."
 
-    def _check_rclone_available(self) -> Tuple[bool, str]:
+    def _check_rclone_available(self, remote_name: str = "b2") -> Tuple[bool, str]:
         """
-        Check if rclone is installed and has a [b2] remote configured.
+        Check if rclone is installed and has the specified remote configured.
+
+        Args:
+            remote_name: Name of the rclone remote to check for (default: "b2")
 
         Returns:
             Tuple of (available: bool, message: str)
@@ -118,7 +127,7 @@ class NV_B2InputSync:
         if not rclone_path:
             return False, "rclone not found in PATH. Install rclone or add to PATH."
 
-        # Check if [b2] remote is configured
+        # Check if the specified remote is configured
         try:
             result = subprocess.run(
                 ["rclone", "listremotes"],
@@ -130,10 +139,11 @@ class NV_B2InputSync:
                 return False, f"rclone error: {result.stderr}"
 
             remotes = result.stdout.strip().split('\n')
-            if 'b2:' not in remotes:
-                return False, "rclone [b2] remote not configured. Run 'rclone config' to set up B2."
+            remote_with_colon = f"{remote_name}:"
+            if remote_with_colon not in remotes:
+                return False, f"rclone [{remote_name}] remote not configured. Run 'rclone config' to set up. Available: {', '.join(remotes)}"
 
-            return True, f"rclone available at {rclone_path}"
+            return True, f"rclone available at {rclone_path}, using remote [{remote_name}]"
 
         except subprocess.TimeoutExpired:
             return False, "rclone command timed out"
@@ -156,7 +166,8 @@ class NV_B2InputSync:
         self,
         b2_path: str,
         local_path: str,
-        bucket: str
+        bucket: str,
+        remote_name: str = "b2"
     ) -> Tuple[str, str]:
         """
         Resolve remote and local paths to full paths.
@@ -165,6 +176,7 @@ class NV_B2InputSync:
             b2_path: User-provided B2 path (empty = default)
             local_path: User-provided local path (empty = input folder)
             bucket: B2 bucket name
+            remote_name: rclone remote name (default: "b2")
 
         Returns:
             Tuple of (resolved_remote_path, resolved_local_path)
@@ -185,8 +197,8 @@ class NV_B2InputSync:
         # Ensure forward slashes for B2 paths
         remote_subpath = remote_subpath.replace("\\", "/")
 
-        # Build full remote path: b2:bucket-name/path
-        resolved_remote = f"b2:{bucket}/{remote_subpath}"
+        # Build full remote path: remote_name:bucket-name/path
+        resolved_remote = f"{remote_name}:{bucket}/{remote_subpath}"
 
         # Resolve local path (destination)
         if local_path and local_path.strip():
@@ -326,6 +338,7 @@ class NV_B2InputSync:
         sync_mode: str,
         dry_run: bool,
         passthrough=None,
+        remote_name: str = "",
         b2_path: str = "",
         local_path: str = "",
         include_filter: str = "",
@@ -338,17 +351,21 @@ class NV_B2InputSync:
         Returns:
             Tuple of (passthrough, local_path, status, details, files_transferred, success)
         """
+        # Default remote_name to "b2" if empty
+        if not remote_name or not remote_name.strip():
+            remote_name = "b2"
+        else:
+            remote_name = remote_name.strip()
+
         print("\n" + "=" * 60)
-        print("[NV_B2InputSync] Starting B2 input sync (download)...")
+        print(f"[NV_B2InputSync] Starting B2 input sync (download, remote: {remote_name})...")
         print("=" * 60)
 
-        # Check rclone availability (cache result)
-        if self._rclone_available is None:
-            self._rclone_available, rclone_msg = self._check_rclone_available()
-            print(f"[NV_B2InputSync] {rclone_msg}")
+        # Check rclone availability (don't cache - remote may change)
+        available, rclone_msg = self._check_rclone_available(remote_name)
+        print(f"[NV_B2InputSync] {rclone_msg}")
 
-        if not self._rclone_available:
-            _, rclone_msg = self._check_rclone_available()
+        if not available:
             error_msg = f"rclone not available: {rclone_msg}"
             print(f"[NV_B2InputSync] ERROR: {error_msg}")
             return (passthrough, "", "ERROR", error_msg, 0, False)
@@ -362,7 +379,7 @@ class NV_B2InputSync:
         print(f"[NV_B2InputSync] {bucket_msg}")
 
         # Resolve paths
-        resolved_remote, resolved_local = self._resolve_paths(b2_path, local_path, bucket)
+        resolved_remote, resolved_local = self._resolve_paths(b2_path, local_path, bucket, remote_name)
 
         # Create local folder if needed and requested
         if not os.path.exists(resolved_local):
