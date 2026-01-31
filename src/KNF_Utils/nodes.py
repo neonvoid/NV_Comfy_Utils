@@ -922,18 +922,24 @@ class CustomVideoSaver:
             print(f"[CustomVideoSaver] Original data: dtype={original_dtype}, range=[{original_min:.6f}, {original_max:.6f}]")
             
             # Convert to uint8 with color preservation
+            # Determine if data is in [0,1] range (with possible overflow) or [0,255] range
+            # ComfyUI tensors are typically [0,1] but can have slight overflow from processing
+            # Use threshold of 2.0 to distinguish: if max < 2.0, assume [0,1] data
+            is_normalized = original_max < 2.0
+
             if preserve_colors:
                 if original_dtype == np.float32 or original_dtype == np.float64:
-                    if original_max <= 1.0:
-                        # Normalized float data [0,1] -> [0,255]
+                    if is_normalized:
+                        # Normalized float data [0,1] (with possible overflow) -> [0,255]
                         video_array = np.clip(video_array * 255.0 + 0.5, 0, 255).astype(np.uint8)
                     else:
+                        # Already in [0,255] range
                         video_array = np.clip(video_array + 0.5, 0, 255).astype(np.uint8)
                 else:
                     video_array = np.clip(video_array, 0, 255).astype(np.uint8)
             else:
                 if original_dtype == np.float32 or original_dtype == np.float64:
-                    if original_max <= 1.0:
+                    if is_normalized:
                         video_array = np.clip(video_array * 255.0, 0, 255).astype(np.uint8)
                     else:
                         video_array = np.clip(video_array, 0, 255).astype(np.uint8)
@@ -1207,13 +1213,17 @@ class CustomVideoSaver:
 
             print(f"[CustomVideoSaver] Original data: dtype={original_dtype}, range=[{original_min:.6f}, {original_max:.6f}]")
 
+            # Determine if data is in [0,1] range (with possible overflow) or [0,255] range
+            # ComfyUI tensors are typically [0,1] but can have slight overflow from processing
+            # Use threshold of 2.0 to distinguish: if max < 2.0, assume [0,1] data
+            is_normalized = original_max < 2.0
+
             # Color preservation mode: use high-precision conversion
             if preserve_colors:
                 # Use high-precision conversion to preserve color accuracy
                 if original_dtype == np.float32 or original_dtype == np.float64:
-                    if original_max <= 1.0:
-                        # Normalized float data [0,1] -> [0,255] with high precision
-                        # Multiply by 255 and add 0.5 before floor (equivalent to round but faster)
+                    if is_normalized:
+                        # Normalized float data [0,1] (with possible overflow) -> [0,255]
                         video_array = np.clip(video_array * 255.0 + 0.5, 0, 255).astype(np.uint8)
                     else:
                         # Float data in [0,255] range - preserve as much precision as possible
@@ -1233,7 +1243,7 @@ class CustomVideoSaver:
             else:
                 # Standard conversion mode (faster but less precise)
                 if original_dtype == np.float32 or original_dtype == np.float64:
-                    if original_max <= 1.0:
+                    if is_normalized:
                         video_array = np.clip(video_array * 255.0, 0, 255).astype(np.uint8)
                     else:
                         video_array = np.clip(video_array, 0, 255).astype(np.uint8)
