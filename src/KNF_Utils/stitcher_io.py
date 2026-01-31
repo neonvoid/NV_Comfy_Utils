@@ -446,15 +446,188 @@ class NV_StitcherInfo:
         return (info,)
 
 
+class NV_CropFromStitcher:
+    """
+    Crop an image/video using coordinates from a STITCHER object.
+
+    This allows you to apply the same crop settings used on one video
+    to another video (e.g., a mask video, depth map, or different angle).
+
+    The node uses the stitcher's stored crop coordinates to extract
+    the same region from each frame of the input.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "stitcher": ("STITCHER",),
+                "images": ("IMAGE",),
+            },
+            "optional": {
+                "resize_to_crop_output": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Resize cropped region to match the original crop output size"
+                }),
+                "interpolation": (["bilinear", "bicubic", "nearest", "area"], {
+                    "default": "bilinear",
+                    "tooltip": "Interpolation method for resizing"
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK",)
+    RETURN_NAMES = ("cropped_images", "cropped_masks",)
+    FUNCTION = "crop_from_stitcher"
+    CATEGORY = "NV_Utils/Stitcher"
+    DESCRIPTION = "Crop images using the same coordinates stored in a STITCHER object."
+
+    def crop_from_stitcher(self, stitcher, images, resize_to_crop_output=True, interpolation="bilinear"):
+        """
+        Crop images using stitcher coordinates.
+
+        Args:
+            stitcher: STITCHER object with crop coordinates
+            images: Input images [B, H, W, C]
+            resize_to_crop_output: Whether to resize to match original crop output
+            interpolation: Interpolation method for resizing
+
+        Returns:
+            Cropped images and masks
+        """
+        import comfy.model_management
+
+        device = comfy.model_management.get_torch_device()
+        intermediate = comfy.model_management.intermediate_device()
+
+        # Get stitcher coordinates
+        ctc_x_list = stitcher.get('cropped_to_canvas_x', [])
+        ctc_y_list = stitcher.get('cropped_to_canvas_y', [])
+        ctc_w_list = stitcher.get('cropped_to_canvas_w', [])
+        ctc_h_list = stitcher.get('cropped_to_canvas_h', [])
+
+        if not ctc_x_list:
+            raise ValueError("Stitcher has no crop coordinates. Was it created correctly?")
+
+        batch_size = images.shape[0]
+        num_coords = len(ctc_x_list)
+
+        # Handle batch size mismatch
+        if batch_size != num_coords:
+            print(f"[NV_CropFromStitcher] Warning: Image batch size ({batch_size}) != stitcher frames ({num_coords})")
+            if batch_size == 1:
+                # Single image, apply first crop to it
+                print("[NV_CropFromStitcher] Single image input - applying first crop coordinates")
+            elif num_coords == 1:
+                # Single set of coords, apply to all frames
+                print("[NV_CropFromStitcher] Single crop coords - applying to all frames")
+                ctc_x_list = ctc_x_list * batch_size
+                ctc_y_list = ctc_y_list * batch_size
+                ctc_w_list = ctc_w_list * batch_size
+                ctc_h_list = ctc_h_list * batch_size
+            else:
+                # Use min of both
+                use_count = min(batch_size, num_coords)
+                print(f"[NV_CropFromStitcher] Processing {use_count} frames")
+
+        # Get target size from blend masks if available
+        blend_masks = stitcher.get('cropped_mask_for_blend', [])
+        target_h, target_w = None, None
+        if blend_masks and resize_to_crop_output:
+            first_mask = blend_masks[0]
+            if hasattr(first_mask, 'shape'):
+                if first_mask.dim() == 3:  # [1, H, W]
+                    target_h, target_w = first_mask.shape[1], first_mask.shape[2]
+                elif first_mask.dim() == 2:  # [H, W]
+                    target_h, target_w = first_mask.shape[0], first_mask.shape[1]
+                print(f"[NV_CropFromStitcher] Target output size: {target_w}x{target_h}")
+
+        cropped_images = []
+        cropped_masks = []
+
+        for i in range(min(batch_size, len(ctc_x_list))):
+            # Get crop coordinates for this frame
+            x = ctc_x_list[i]
+            y = ctc_y_list[i]
+            w = ctc_w_list[i]
+            h = ctc_h_list[i]
+
+            # Get image for this frame
+            img_idx = min(i, batch_size - 1)
+            img = images[img_idx:img_idx+1].to(device)  # [1, H, W, C]
+
+            img_h, img_w = img.shape[1], img.shape[2]
+
+            # Handle coordinates that extend beyond image bounds
+            # Pad image if needed
+            pad_left = max(0, -x)
+            pad_top = max(0, -y)
+            pad_right = max(0, (x + w) - img_w)
+            pad_bottom = max(0, (y + h) - img_h)
+
+            if pad_left > 0 or pad_top > 0 or pad_right > 0 or pad_bottom > 0:
+                # Pad with zeros (black)
+                padded = torch.zeros(
+                    1, img_h + pad_top + pad_bottom, img_w + pad_left + pad_right, img.shape[3],
+                    device=device, dtype=img.dtype
+                )
+                padded[:, pad_top:pad_top+img_h, pad_left:pad_left+img_w, :] = img
+                img = padded
+                # Adjust coordinates for padding
+                x = x + pad_left
+                y = y + pad_top
+
+            # Crop the image
+            cropped = img[:, y:y+h, x:x+w, :]  # [1, h, w, C]
+
+            # Create mask (all ones for the cropped region)
+            mask = torch.ones(1, h, w, device=device, dtype=img.dtype)
+
+            # Resize if needed
+            if resize_to_crop_output and target_h is not None and target_w is not None:
+                if h != target_h or w != target_w:
+                    # Resize image: [1, H, W, C] -> [1, C, H, W] -> interpolate -> [1, H, W, C]
+                    cropped = cropped.permute(0, 3, 1, 2)  # [1, C, H, W]
+                    cropped = torch.nn.functional.interpolate(
+                        cropped,
+                        size=(target_h, target_w),
+                        mode=interpolation,
+                        align_corners=False if interpolation in ['bilinear', 'bicubic'] else None
+                    )
+                    cropped = cropped.permute(0, 2, 3, 1)  # [1, H, W, C]
+
+                    # Resize mask: [1, H, W] -> [1, 1, H, W] -> interpolate -> [1, H, W]
+                    mask = mask.unsqueeze(1)  # [1, 1, H, W]
+                    mask = torch.nn.functional.interpolate(
+                        mask,
+                        size=(target_h, target_w),
+                        mode='nearest'
+                    )
+                    mask = mask.squeeze(1)  # [1, H, W]
+
+            cropped_images.append(cropped.squeeze(0).to(intermediate))  # [H, W, C]
+            cropped_masks.append(mask.squeeze(0).to(intermediate))  # [H, W]
+
+        # Stack results
+        result_images = torch.stack(cropped_images, dim=0)  # [B, H, W, C]
+        result_masks = torch.stack(cropped_masks, dim=0)  # [B, H, W]
+
+        print(f"[NV_CropFromStitcher] Output: {result_images.shape[0]} frames at {result_images.shape[2]}x{result_images.shape[1]}")
+
+        return (result_images, result_masks)
+
+
 # Node registration
 NODE_CLASS_MAPPINGS = {
     "NV_SaveStitcher": NV_SaveStitcher,
     "NV_LoadStitcher": NV_LoadStitcher,
     "NV_StitcherInfo": NV_StitcherInfo,
+    "NV_CropFromStitcher": NV_CropFromStitcher,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "NV_SaveStitcher": "NV Save Stitcher",
     "NV_LoadStitcher": "NV Load Stitcher",
     "NV_StitcherInfo": "NV Stitcher Info",
+    "NV_CropFromStitcher": "NV Crop From Stitcher",
 }

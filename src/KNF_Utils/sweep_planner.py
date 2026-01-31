@@ -181,11 +181,12 @@ class NV_SweepPlanner:
         for i in range(1, 3):
             inputs["optional"][f"string_param_{i}_name"] = ("STRING", {
                 "default": "",
-                "tooltip": f"Name for string parameter {i} (e.g., 'sampler_name', 'scheduler')"
+                "tooltip": f"Name for string parameter {i} (e.g., 'sampler_name', 'ref_image')"
             })
             inputs["optional"][f"string_param_{i}_values"] = ("STRING", {
                 "default": "",
-                "tooltip": f"Comma-separated values for string parameter {i} (e.g., 'euler,dpmpp_2m,uni_pc')"
+                "multiline": True,
+                "tooltip": f"One value per line for string parameter {i} (e.g., file paths or sampler names)"
             })
 
         return inputs
@@ -237,9 +238,18 @@ class NV_SweepPlanner:
             name = kwargs.get(f"string_param_{i}_name", "")
             values_str = kwargs.get(f"string_param_{i}_values", "")
             if name and name.strip() and values_str and values_str.strip():
-                values = [v.strip() for v in values_str.split(",") if v.strip()]
+                # Parse newline-separated values (also support comma for backwards compatibility)
+                values = []
+                for line in values_str.split("\n"):
+                    line = line.strip()
+                    if line:
+                        # If line contains commas and no file path indicators, split by comma
+                        if "," in line and "/" not in line and "\\" not in line and ":" not in line:
+                            values.extend([v.strip() for v in line.split(",") if v.strip()])
+                        else:
+                            values.append(line)
                 if len(values) == 0:
-                    raise ValueError(f"String parameter {i} ({name}): No values found. Check comma-separated list.")
+                    raise ValueError(f"String parameter {i} ({name}): No values found. Enter one value per line.")
 
                 string_params.append({
                     "slot": f"string_param_{i}",
