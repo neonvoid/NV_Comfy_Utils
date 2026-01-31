@@ -896,7 +896,7 @@ class CustomVideoSaver:
         """
         import threading
         import queue
-        
+
         try:
             # Handle tensor dimensions
             if len(video_tensor.shape) == 5:
@@ -905,6 +905,11 @@ class CustomVideoSaver:
             elif len(video_tensor.shape) == 4:
                 # (frames, height, width, channels)
                 video_array = video_tensor.cpu().numpy()
+            elif len(video_tensor.shape) == 3:
+                # (frames, height, width) - this is a MASK tensor, add channel dimension
+                print(f"[CustomVideoSaver] Detected 3D mask tensor {video_tensor.shape}, converting to grayscale video")
+                video_array = video_tensor.cpu().numpy()
+                video_array = np.expand_dims(video_array, axis=-1)  # [B, H, W] -> [B, H, W, 1]
             else:
                 print(f"[CustomVideoSaver] Unexpected tensor shape: {video_tensor.shape}")
                 return False
@@ -949,6 +954,13 @@ class CustomVideoSaver:
                 channels = 3
             elif channels != 3:
                 print(f"[CustomVideoSaver] Warning: Unexpected channel count {channels}, attempting to continue")
+
+            # Debug: Check uint8 data after conversion
+            uint8_min, uint8_max = video_array.min(), video_array.max()
+            print(f"[CustomVideoSaver] After uint8 conversion: range=[{uint8_min}, {uint8_max}]")
+            if uint8_max == 0:
+                print(f"[CustomVideoSaver] WARNING: All pixel values are 0! Video will be black.")
+                print(f"[CustomVideoSaver] First frame sample (center pixel): {video_array[0, height//2, width//2, :]}")
 
             print(f"[CustomVideoSaver] Processing {num_frames} frames of {width}x{height} with {channels} channels")
             print(f"[CustomVideoSaver] Using FFmpeg with codec: {codec} (CRF: {quality}, Preset: {preset})")
@@ -1179,17 +1191,22 @@ class CustomVideoSaver:
             elif len(video_tensor.shape) == 4:
                 # (frames, height, width, channels)
                 video_array = video_tensor.cpu().numpy()
+            elif len(video_tensor.shape) == 3:
+                # (frames, height, width) - this is a MASK tensor, add channel dimension
+                print(f"[CustomVideoSaver] Detected 3D mask tensor {video_tensor.shape}, converting to grayscale video")
+                video_array = video_tensor.cpu().numpy()
+                video_array = np.expand_dims(video_array, axis=-1)  # [B, H, W] -> [B, H, W, 1]
             else:
                 print(f"[CustomVideoSaver] Unexpected tensor shape: {video_tensor.shape}")
                 return False
-            
+
             # Preserve original data type and range for maximum color fidelity
             original_dtype = video_array.dtype
             original_min = video_array.min()
             original_max = video_array.max()
-            
+
             print(f"[CustomVideoSaver] Original data: dtype={original_dtype}, range=[{original_min:.6f}, {original_max:.6f}]")
-            
+
             # Color preservation mode: use high-precision conversion
             if preserve_colors:
                 # Use high-precision conversion to preserve color accuracy
