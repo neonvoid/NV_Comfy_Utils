@@ -32,7 +32,7 @@ from PIL import Image
 
 def save_tensor_as_image(tensor, filepath):
     """Save a single image tensor [H, W, C], [B, H, W, C], [H, W], or [B, H, W] as PNG."""
-    # Squeeze batch dimension if present
+    # Squeeze batch dimension if present (for 4D+ tensors)
     while tensor.dim() > 3:
         tensor = tensor.squeeze(0)
 
@@ -41,12 +41,33 @@ def save_tensor_as_image(tensor, filepath):
         arr = (tensor.cpu().numpy() * 255).astype(np.uint8)
         img = Image.fromarray(arr, mode='L')
     elif tensor.dim() == 3:
-        # Image: [H, W, C]
-        arr = (tensor.cpu().numpy() * 255).astype(np.uint8)
-        if arr.shape[2] == 4:
-            img = Image.fromarray(arr, mode='RGBA')
+        # Could be [H, W, C] image OR [1, H, W] batched mask
+        # Check if it's a batched mask (first dim is 1 and last dim is large)
+        if tensor.shape[0] == 1 and tensor.shape[2] > 4:
+            # This is [1, H, W] batched mask, squeeze to [H, W]
+            tensor = tensor.squeeze(0)
+            arr = (tensor.cpu().numpy() * 255).astype(np.uint8)
+            img = Image.fromarray(arr, mode='L')
+        elif tensor.shape[2] <= 4:
+            # This is [H, W, C] image (C is 1, 3, or 4)
+            arr = (tensor.cpu().numpy() * 255).astype(np.uint8)
+            if arr.shape[2] == 4:
+                img = Image.fromarray(arr, mode='RGBA')
+            elif arr.shape[2] == 3:
+                img = Image.fromarray(arr, mode='RGB')
+            else:
+                # Single channel image, convert to grayscale
+                img = Image.fromarray(arr[:, :, 0], mode='L')
         else:
-            img = Image.fromarray(arr, mode='RGB')
+            # Ambiguous case, try to determine from shape
+            # If shape[0] is small (like 1) and shape[2] is large, it's likely [B, H, W]
+            if tensor.shape[0] <= 4 and tensor.shape[2] > 4:
+                tensor = tensor.squeeze(0) if tensor.shape[0] == 1 else tensor[0]
+                arr = (tensor.cpu().numpy() * 255).astype(np.uint8)
+                img = Image.fromarray(arr, mode='L')
+            else:
+                arr = (tensor.cpu().numpy() * 255).astype(np.uint8)
+                img = Image.fromarray(arr, mode='RGB')
     else:
         raise ValueError(f"Unexpected tensor dimensions after squeeze: {tensor.shape}")
 
@@ -170,6 +191,14 @@ class NV_SaveStitcher:
         report_lines.append(f"Blend masks: {num_blend_masks}")
         report_lines.append(f"Skipped frames: {num_original_frames}")
         report_lines.append(f"Total frames: {metadata['total_frames']}")
+
+        # Debug: Show tensor shapes
+        if num_canvas_images > 0:
+            first_canvas = stitcher['canvas_image'][0]
+            print(f"[NV_SaveStitcher] First canvas_image shape: {first_canvas.shape}")
+        if num_blend_masks > 0:
+            first_mask = stitcher['cropped_mask_for_blend'][0]
+            print(f"[NV_SaveStitcher] First blend_mask shape: {first_mask.shape}, range=[{first_mask.min():.4f}, {first_mask.max():.4f}]")
 
         # Save canvas images
         if save_canvas_images and num_canvas_images > 0:
@@ -313,6 +342,11 @@ class NV_LoadStitcher:
 
             report_lines.append(f"Loaded {len(stitcher['canvas_image'])} canvas images")
 
+            # Debug: Show loaded canvas image shapes
+            if len(stitcher['canvas_image']) > 0:
+                first_canvas = stitcher['canvas_image'][0]
+                print(f"[NV_LoadStitcher] First loaded canvas_image shape: {first_canvas.shape}")
+
         # Load blend masks
         mask_dir = metadata.get('blend_masks_dir')
         if mask_dir:
@@ -326,6 +360,11 @@ class NV_LoadStitcher:
                     stitcher['cropped_mask_for_blend'].append(tensor)
 
             report_lines.append(f"Loaded {len(stitcher['cropped_mask_for_blend'])} blend masks")
+
+            # Debug: Show loaded mask shapes
+            if len(stitcher['cropped_mask_for_blend']) > 0:
+                first_mask = stitcher['cropped_mask_for_blend'][0]
+                print(f"[NV_LoadStitcher] First loaded blend_mask shape: {first_mask.shape}, range=[{first_mask.min():.4f}, {first_mask.max():.4f}]")
 
         # Load original frames
         orig_dir = metadata.get('original_frames_dir')
