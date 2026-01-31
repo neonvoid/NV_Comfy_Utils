@@ -937,7 +937,19 @@ class CustomVideoSaver:
             
             # Get video dimensions
             num_frames, height, width, channels = video_array.shape
-            
+
+            # FFmpeg rgb24 expects exactly 3 channels - handle RGBA and grayscale
+            if channels == 4:
+                print(f"[CustomVideoSaver] Converting RGBA to RGB (dropping alpha channel)")
+                video_array = video_array[:, :, :, :3]
+                channels = 3
+            elif channels == 1:
+                print(f"[CustomVideoSaver] Converting grayscale to RGB")
+                video_array = np.repeat(video_array, 3, axis=-1)
+                channels = 3
+            elif channels != 3:
+                print(f"[CustomVideoSaver] Warning: Unexpected channel count {channels}, attempting to continue")
+
             print(f"[CustomVideoSaver] Processing {num_frames} frames of {width}x{height} with {channels} channels")
             print(f"[CustomVideoSaver] Using FFmpeg with codec: {codec} (CRF: {quality}, Preset: {preset})")
             
