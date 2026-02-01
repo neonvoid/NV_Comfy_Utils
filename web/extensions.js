@@ -6,4 +6,5 @@ import "./simple_variables.js";
 import "./simple_link_switcher.js";
 import "./momentary_button.js";
 import "./frame_annotator.js";
+import "./bbox_creator.js";
 console.log("[NV_Comfy_Utils] All extensions loaded successfully"); 
