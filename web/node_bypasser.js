@@ -31,8 +31,8 @@ class NodeBypasser extends LGraphNode {
         console.log("[NodeBypasser] Created listNodesButton:", this.listNodesButton);
         
         // Add a text input for node names to bypass
-        this.nodeNamesInput = ComfyWidgets["STRING"](this, "node_names", ["STRING", { 
-            default: "Enter node names separated by commas (e.g., LoadImage, LoadVideo, singlePass*, !extension)",
+        this.nodeNamesInput = ComfyWidgets["STRING"](this, "node_names", ["STRING", {
+            default: "Enter node names separated by commas (e.g., LoadImage, singlePass*, !extension, @GroupName)",
             multiline: true
         }], app).widget;
         this.nodeNamesInput.name = "Node Names to Bypass";
@@ -508,8 +508,24 @@ class NodeBypasser extends LGraphNode {
                 this.resultWidget.value = "No other nodes found in graph";
                 return;
             }
-            
-            const result = `Found ${nodeDetails.length} nodes in graph:\n\n${nodeDetails.join('\n')}`;
+
+            // Also list available groups
+            const groups = graph._groups || [];
+            let groupDetails = [];
+            if (groups.length > 0) {
+                for (const group of groups) {
+                    if (group.recomputeInsideNodes) {
+                        group.recomputeInsideNodes();
+                    }
+                    const nodeCount = (group._nodes || []).length;
+                    groupDetails.push(`@${group.title} (${nodeCount} nodes)`);
+                }
+            }
+
+            let result = `Found ${nodeDetails.length} nodes in graph:\n\n${nodeDetails.join('\n')}`;
+            if (groupDetails.length > 0) {
+                result += `\n\n--- Groups (use @GroupName to bypass) ---\n${groupDetails.join('\n')}`;
+            }
             this.resultWidget.value = result;
             console.log("[NodeBypasser] Result set:", result);
             
@@ -577,13 +593,19 @@ class NodeBypasser extends LGraphNode {
         const results = [];
         const notFound = [];
         const errors = [];
-        
+
         for (const nodeName of nodeNames) {
             try {
                 let matchingNodes = [];
-                
+
+                // Check if it's a group pattern (starts with @)
+                if (nodeName.startsWith('@')) {
+                    const groupName = nodeName.substring(1); // Remove @ prefix
+                    console.log(`[NodeBypasser] Processing group pattern (${label}):`, groupName);
+                    matchingNodes = this.findNodesInGroup(groupName, nodes);
+                }
                 // Check if it's a regex pattern (contains * or ! or other regex chars)
-                if (this.isRegexPattern(nodeName)) {
+                else if (this.isRegexPattern(nodeName)) {
                     console.log(`[NodeBypasser] Processing regex pattern (${label}):`, nodeName);
                     matchingNodes = this.findNodesByRegex(nodeName, nodes);
                 } else {
@@ -689,13 +711,74 @@ class NodeBypasser extends LGraphNode {
             
             console.log(`[NodeBypasser] Found ${matchingNodes.length} nodes matching pattern "${pattern}"`);
             return matchingNodes;
-            
+
         } catch (error) {
             console.error(`[NodeBypasser] Regex error for pattern "${pattern}":`, error);
             throw new Error(`Invalid regex pattern: ${error.message}`);
         }
     }
-        
+
+    // Find nodes inside a group by group name
+    findNodesInGroup(groupName, nodes) {
+        const graph = app.graph;
+        const groups = graph._groups || [];
+
+        if (groups.length === 0) {
+            console.log(`[NodeBypasser] No groups found in graph`);
+            return [];
+        }
+
+        // Support wildcard matching for group names (e.g., @My* matches "My Group", "MyNodes")
+        let matchingGroups = [];
+        const isWildcard = groupName.includes('*') || groupName.includes('?');
+
+        if (isWildcard) {
+            // Convert wildcard pattern to regex
+            let regexPattern = groupName
+                .replace(/\*/g, '.*')
+                .replace(/\?/g, '.');
+            const regex = new RegExp(`^${regexPattern}$`, 'i');
+
+            matchingGroups = groups.filter(g => g.title && regex.test(g.title));
+            console.log(`[NodeBypasser] Wildcard group pattern "${groupName}" matched ${matchingGroups.length} groups`);
+        } else {
+            // Exact or partial match (case-insensitive)
+            matchingGroups = groups.filter(g =>
+                g.title && g.title.toLowerCase().includes(groupName.toLowerCase())
+            );
+        }
+
+        if (matchingGroups.length === 0) {
+            console.log(`[NodeBypasser] No groups found matching "${groupName}". Available groups: ${groups.map(g => g.title).join(', ')}`);
+            return [];
+        }
+
+        // Collect all nodes from matching groups
+        const nodesInGroups = [];
+        const seenNodeIds = new Set();
+
+        for (const group of matchingGroups) {
+            // Recompute which nodes are inside this group
+            if (group.recomputeInsideNodes) {
+                group.recomputeInsideNodes();
+            }
+
+            const groupNodes = group._nodes || [];
+            console.log(`[NodeBypasser] Group "${group.title}" contains ${groupNodes.length} nodes`);
+
+            for (const node of groupNodes) {
+                // Skip the bypasser node itself and avoid duplicates
+                if (node !== this && !seenNodeIds.has(node.id)) {
+                    nodesInGroups.push(node);
+                    seenNodeIds.add(node.id);
+                }
+            }
+        }
+
+        console.log(`[NodeBypasser] Found ${nodesInGroups.length} unique nodes in ${matchingGroups.length} matching group(s)`);
+        return nodesInGroups;
+    }
+
 }
 
 // Set up the node properties
