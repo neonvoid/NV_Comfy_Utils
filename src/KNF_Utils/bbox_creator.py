@@ -91,7 +91,8 @@ class NV_BBoxCreator:
                 mask[:, y1:y2, x1:x2] = 1.0
 
         # Build SAM3-compatible outputs (normalized center format)
-        sam3_box = None
+        # Always return valid dict structures to avoid UI rendering bugs
+        sam3_box = {"box": [0.5, 0.5, 0.0, 0.0], "label": True}  # Zero-size box at center
         sam3_boxes = {"boxes": [], "labels": []}
 
         if all(v is not None for v in [x1, y1, x2, y2]) and x2 > x1 and y2 > y1:
