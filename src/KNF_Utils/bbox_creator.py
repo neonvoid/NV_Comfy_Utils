@@ -36,8 +36,8 @@ class NV_BBoxCreator:
             },
         }
 
-    RETURN_TYPES = ("MASK",)
-    RETURN_NAMES = ("mask",)
+    RETURN_TYPES = ("MASK", "SAM3_BOX_PROMPT", "SAM3_BOXES_PROMPT")
+    RETURN_NAMES = ("mask", "sam3_box", "sam3_boxes")
     FUNCTION = "create_bbox"
     CATEGORY = "NV_Utils/mask"
     OUTPUT_NODE = True  # Required to send preview back to frontend
@@ -90,10 +90,34 @@ class NV_BBoxCreator:
             if x2 > x1 and y2 > y1:
                 mask[:, y1:y2, x1:x2] = 1.0
 
+        # Build SAM3-compatible outputs (normalized center format)
+        sam3_box = None
+        sam3_boxes = {"boxes": [], "labels": []}
+
+        if all(v is not None for v in [x1, y1, x2, y2]) and x2 > x1 and y2 > y1:
+            # Convert pixel coords to normalized 0-1 center format
+            # SAM3 expects: [center_x, center_y, width, height]
+            center_x = ((x1 + x2) / 2) / W
+            center_y = ((y1 + y2) / 2) / H
+            width = (x2 - x1) / W
+            height = (y2 - y1) / H
+
+            # Single box format (SAM3_BOX_PROMPT)
+            sam3_box = {
+                "box": [center_x, center_y, width, height],
+                "label": True  # Positive box by default
+            }
+
+            # Multi-box format (SAM3_BOXES_PROMPT)
+            sam3_boxes = {
+                "boxes": [[center_x, center_y, width, height]],
+                "labels": [True]
+            }
+
         # Send first frame as preview to frontend (for canvas display)
         preview_image = self._encode_preview(images[0])
 
-        return {"ui": {"bg_image": [preview_image]}, "result": (mask,)}
+        return {"ui": {"bg_image": [preview_image]}, "result": (mask, sam3_box, sam3_boxes)}
 
     def _encode_preview(self, image_tensor):
         """
