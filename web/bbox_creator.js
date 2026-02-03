@@ -150,11 +150,9 @@ app.registerExtension({
             // Add as DOM widget
             const widget = node.addDOMWidget("canvas", "bboxCanvas", container);
 
-            // Dynamic sizing based on node height
+            // Fixed widget height to avoid feedback loop with node sizing
             widget.computeSize = (width) => {
-                const nodeHeight = node.size ? node.size[1] : 480;
-                const widgetHeight = Math.max(200, nodeHeight - 100);
-                return [width, widgetHeight];
+                return [width, 400];
             };
 
             // Store widget reference
@@ -212,18 +210,8 @@ app.registerExtension({
                 }
             };
 
-            // Handle node resize
-            const originalOnResize = node.onResize;
-            node.onResize = function(size) {
-                if (originalOnResize) {
-                    originalOnResize.apply(this, arguments);
-                }
-                const containerHeight = Math.max(200, size[1] - 100);
-                container.style.height = containerHeight + "px";
-            };
-
             // Set initial size
-            node.setSize([400, 500]);
+            node.setSize([400, 520]);
             container.style.height = "400px";
 
             // Draw initial placeholder

@@ -27,6 +27,7 @@ class NV_BBoxCreator:
             "required": {
                 "images": ("IMAGE",),
                 "aspect_ratio": (cls.ASPECT_RATIOS, {"default": "Free"}),
+                "is_positive": ("BOOLEAN", {"default": True, "tooltip": "True = positive box (include region), False = negative box (exclude region)"}),
             },
             "optional": {
                 "custom_ratio": ("STRING", {"default": "16:9"}),
@@ -36,19 +37,20 @@ class NV_BBoxCreator:
             },
         }
 
-    RETURN_TYPES = ("MASK", "SAM3_BOX_PROMPT", "SAM3_BOXES_PROMPT")
-    RETURN_NAMES = ("mask", "sam3_box", "sam3_boxes")
+    RETURN_TYPES = ("MASK", "SAM3_BOXES_PROMPT", "SAM3_BOXES_PROMPT")
+    RETURN_NAMES = ("mask", "positive_boxes", "negative_boxes")
     FUNCTION = "create_bbox"
     CATEGORY = "NV_Utils/mask"
     OUTPUT_NODE = True  # Required to send preview back to frontend
 
-    def create_bbox(self, images, aspect_ratio, custom_ratio="16:9", bbox_data="{}"):
+    def create_bbox(self, images, aspect_ratio, is_positive=True, custom_ratio="16:9", bbox_data="{}"):
         """
         Create a mask from the bounding box drawn by the user.
 
         Args:
             images: Input image tensor [B, H, W, C]
             aspect_ratio: Selected aspect ratio preset
+            is_positive: True for positive box (include), False for negative (exclude)
             custom_ratio: Custom ratio string (e.g., "21:9")
             bbox_data: JSON string with bbox coordinates from frontend
 
@@ -91,9 +93,9 @@ class NV_BBoxCreator:
                 mask[:, y1:y2, x1:x2] = 1.0
 
         # Build SAM3-compatible outputs (normalized center format)
-        # Always return valid dict structures to avoid UI rendering bugs
-        sam3_box = {"box": [0.5, 0.5, 0.0, 0.0], "label": True}  # Zero-size box at center
-        sam3_boxes = {"boxes": [], "labels": []}
+        # Two separate outputs for positive and negative boxes
+        positive_boxes = {"boxes": [], "labels": []}
+        negative_boxes = {"boxes": [], "labels": []}
 
         if all(v is not None for v in [x1, y1, x2, y2]) and x2 > x1 and y2 > y1:
             # Convert pixel coords to normalized 0-1 center format
@@ -103,22 +105,19 @@ class NV_BBoxCreator:
             width = (x2 - x1) / W
             height = (y2 - y1) / H
 
-            # Single box format (SAM3_BOX_PROMPT)
-            sam3_box = {
-                "box": [center_x, center_y, width, height],
-                "label": True  # Positive box by default
-            }
+            box_coords = [[center_x, center_y, width, height]]
 
-            # Multi-box format (SAM3_BOXES_PROMPT)
-            sam3_boxes = {
-                "boxes": [[center_x, center_y, width, height]],
-                "labels": [True]
-            }
+            # Route to correct output based on is_positive toggle
+            # Labels must match: True for positive boxes, False for negative boxes
+            if is_positive:
+                positive_boxes = {"boxes": box_coords, "labels": [True]}
+            else:
+                negative_boxes = {"boxes": box_coords, "labels": [False]}
 
         # Send first frame as preview to frontend (for canvas display)
         preview_image = self._encode_preview(images[0])
 
-        return {"ui": {"bg_image": [preview_image]}, "result": (mask, sam3_box, sam3_boxes)}
+        return {"ui": {"bg_image": [preview_image]}, "result": (mask, positive_boxes, negative_boxes)}
 
     def _encode_preview(self, image_tensor):
         """
