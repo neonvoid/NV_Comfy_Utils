@@ -1,11 +1,7 @@
 /**
  * NV BBox Creator Frontend Extension
  * Interactive canvas-based bounding box drawing with aspect ratio constraints.
- *
- * Patterns used:
- * - hideWidgetForGood() from SAM3 BBox Widget
- * - DOM widget canvas from SAM3 BBox Widget
- * - Extension registration from Frame Annotator
+ * Supports both positive (left-click, green) and negative (right-click, red) boxes.
  */
 
 import { app } from "../../scripts/app.js";
@@ -14,27 +10,19 @@ console.log("[NV_BBoxCreator] Loading extension...");
 
 /**
  * Hide a widget visually while keeping serialization enabled.
- * This allows the widget to send data to backend without showing in UI.
- * IMPORTANT: Must preserve serializeValue so ComfyUI sends the value to backend.
  */
 function hideWidgetForGood(node, widget) {
     if (!widget) return;
 
-    // Save original properties
     widget.origType = widget.type;
     widget.origComputeSize = widget.computeSize;
     widget.origSerializeValue = widget.serializeValue;
 
-    // Hide visually but keep serialization
-    widget.computeSize = () => [0, -4];  // -4 compensates for litegraph's widget gap
+    widget.computeSize = () => [0, -4];
     widget.type = "converted-widget";
     widget.hidden = true;
-
-    // CRITICAL: Ensure serializeValue returns the actual value
-    // This is what ComfyUI uses to send widget values to the backend
     widget.serializeValue = () => widget.value;
 
-    // Hide DOM element if present
     if (widget.element) {
         widget.element.style.display = "none";
         widget.element.style.visibility = "hidden";
@@ -54,9 +42,7 @@ app.registerExtension({
         const onNodeCreated = nodeType.prototype.onNodeCreated;
 
         nodeType.prototype.onNodeCreated = function() {
-            // Call original if exists
             const result = onNodeCreated?.apply(this, arguments);
-
             const node = this;
 
             // Create canvas container
@@ -72,7 +58,7 @@ app.registerExtension({
                 justify-content: center;
             `;
 
-            // Info bar with bbox dimensions and clear button
+            // Info bar
             const infoBar = document.createElement("div");
             infoBar.style.cssText = `
                 position: absolute;
@@ -97,12 +83,12 @@ app.registerExtension({
                 font-size: 12px;
                 font-family: monospace;
             `;
-            bboxInfo.textContent = "Draw a bounding box";
+            bboxInfo.textContent = "Left-click: positive | Right-click: negative";
             infoBar.appendChild(bboxInfo);
 
             // Clear button
             const clearBtn = document.createElement("button");
-            clearBtn.textContent = "Clear";
+            clearBtn.textContent = "Clear All";
             clearBtn.style.cssText = `
                 padding: 5px 10px;
                 background: #d44;
@@ -134,14 +120,16 @@ app.registerExtension({
 
             const ctx = canvas.getContext("2d");
 
-            // Initialize state
+            // Initialize state with positive AND negative boxes
             node._bboxWidget = {
                 canvas: canvas,
                 ctx: ctx,
                 container: container,
                 image: null,
-                bbox: null,           // Finalized bbox {x1, y1, x2, y2}
+                positiveBBoxes: [],    // Array of {x1, y1, x2, y2}
+                negativeBBoxes: [],    // Array of {x1, y1, x2, y2}
                 drawing: false,
+                isNegative: false,     // Is current drawing a negative box?
                 startPoint: null,
                 currentPoint: null,
                 bboxInfo: bboxInfo
@@ -149,29 +137,18 @@ app.registerExtension({
 
             // Add as DOM widget
             const widget = node.addDOMWidget("canvas", "bboxCanvas", container);
-
-            // Fixed widget height to avoid feedback loop with node sizing
-            widget.computeSize = (width) => {
-                return [width, 400];
-            };
-
-            // Store widget reference
+            widget.computeSize = (width) => [width, 400];
             node._bboxWidget.domWidget = widget;
 
-            // Hide the bbox_data widget (delay to ensure widget is created)
+            // Hide the bbox_data widget
             setTimeout(() => {
                 const bboxDataWidget = node.widgets?.find(w => w.name === "bbox_data");
                 if (bboxDataWidget) {
                     node._hiddenBboxWidget = bboxDataWidget;
-                    // Ensure default value is set
                     if (!bboxDataWidget.value) {
                         bboxDataWidget.value = "{}";
                     }
                     hideWidgetForGood(node, bboxDataWidget);
-                    console.log("[NV_BBoxCreator] Hidden bbox_data widget, value:", bboxDataWidget.value);
-                } else {
-                    console.warn("[NV_BBoxCreator] Could not find bbox_data widget. Available widgets:",
-                        node.widgets?.map(w => w.name));
                 }
             }, 100);
 
@@ -179,10 +156,11 @@ app.registerExtension({
             clearBtn.addEventListener("click", (e) => {
                 e.preventDefault();
                 e.stopPropagation();
-                node._bboxWidget.bbox = null;
+                node._bboxWidget.positiveBBoxes = [];
+                node._bboxWidget.negativeBBoxes = [];
                 node.updateBBoxData();
                 node.redrawCanvas();
-                console.log("[NV_BBoxCreator] Cleared bbox");
+                console.log("[NV_BBoxCreator] Cleared all bboxes");
             });
 
             // Mouse event handlers
@@ -194,13 +172,11 @@ app.registerExtension({
             // Prevent context menu on canvas
             canvas.addEventListener("contextmenu", (e) => e.preventDefault());
 
-            // Receive image from backend via onExecuted
+            // Receive image from backend
             node.onExecuted = (message) => {
-                console.log("[NV_BBoxCreator] onExecuted received");
                 if (message.bg_image && message.bg_image[0]) {
                     const img = new Image();
                     img.onload = () => {
-                        console.log(`[NV_BBoxCreator] Image loaded: ${img.width}x${img.height}`);
                         node._bboxWidget.image = img;
                         canvas.width = img.width;
                         canvas.height = img.height;
@@ -214,30 +190,20 @@ app.registerExtension({
             node.setSize([400, 520]);
             container.style.height = "400px";
 
-            // Draw initial placeholder
             node.redrawCanvas();
-
-            console.log("[NV_BBoxCreator] Node initialized");
             return result;
         };
 
         /**
          * Get current aspect ratio from widget selection.
-         * Returns null for "Free" mode (no constraint).
          */
         nodeType.prototype.getAspectRatio = function() {
             const arWidget = this.widgets?.find(w => w.name === "aspect_ratio");
             const ratio = arWidget?.value || "Free";
 
             const presets = {
-                "Free": null,
-                "1:1": 1,
-                "4:3": 4/3,
-                "3:4": 3/4,
-                "16:9": 16/9,
-                "9:16": 9/16,
-                "3:2": 3/2,
-                "2:3": 2/3
+                "Free": null, "1:1": 1, "4:3": 4/3, "3:4": 3/4,
+                "16:9": 16/9, "9:16": 9/16, "3:2": 3/2, "2:3": 2/3
             };
 
             if (ratio === "Custom") {
@@ -247,7 +213,7 @@ app.registerExtension({
                 if (parts.length === 2 && parts[0] > 0 && parts[1] > 0) {
                     return parts[0] / parts[1];
                 }
-                return 16/9;  // Default fallback
+                return 16/9;
             }
 
             return presets[ratio];
@@ -263,16 +229,12 @@ app.registerExtension({
             let width = Math.abs(curX - startX);
             let height = Math.abs(curY - startY);
 
-            // Determine constraint based on which dimension would result in larger area
             if (width / height > ratio) {
-                // Width is proportionally larger, constrain it
                 width = height * ratio;
             } else {
-                // Height is proportionally larger, constrain it
                 height = width / ratio;
             }
 
-            // Preserve direction from start point
             const dirX = curX >= startX ? 1 : -1;
             const dirY = curY >= startY ? 1 : -1;
 
@@ -284,21 +246,26 @@ app.registerExtension({
 
         /**
          * Handle mouse down - start drawing bbox.
+         * Left-click = positive, Right-click = negative
          */
         nodeType.prototype.handleMouseDown = function(e) {
             const rect = this._bboxWidget.canvas.getBoundingClientRect();
             const x = ((e.clientX - rect.left) / rect.width) * this._bboxWidget.canvas.width;
             const y = ((e.clientY - rect.top) / rect.height) * this._bboxWidget.canvas.height;
 
+            // Right-click (button 2) or shift+click = negative box
+            const isNegative = e.button === 2 || e.shiftKey;
+
             this._bboxWidget.drawing = true;
+            this._bboxWidget.isNegative = isNegative;
             this._bboxWidget.startPoint = { x, y };
             this._bboxWidget.currentPoint = { x, y };
 
-            console.log(`[NV_BBoxCreator] Start drawing at (${x.toFixed(1)}, ${y.toFixed(1)})`);
+            console.log(`[NV_BBoxCreator] Start drawing ${isNegative ? 'NEGATIVE' : 'POSITIVE'} at (${x.toFixed(1)}, ${y.toFixed(1)})`);
         };
 
         /**
-         * Handle mouse move - update bbox preview with aspect ratio constraint.
+         * Handle mouse move - update bbox preview.
          */
         nodeType.prototype.handleMouseMove = function(e) {
             if (!this._bboxWidget.drawing) return;
@@ -307,7 +274,6 @@ app.registerExtension({
             let x = ((e.clientX - rect.left) / rect.width) * this._bboxWidget.canvas.width;
             let y = ((e.clientY - rect.top) / rect.height) * this._bboxWidget.canvas.height;
 
-            // Apply aspect ratio constraint
             const constrained = this.constrainToRatio(
                 this._bboxWidget.startPoint.x,
                 this._bboxWidget.startPoint.y,
@@ -327,22 +293,31 @@ app.registerExtension({
             const start = this._bboxWidget.startPoint;
             const end = this._bboxWidget.currentPoint;
 
-            // Only save bbox if it has sufficient size
             const width = Math.abs(end.x - start.x);
             const height = Math.abs(end.y - start.y);
 
             if (width > 5 && height > 5) {
-                this._bboxWidget.bbox = {
+                const bbox = {
                     x1: Math.round(Math.min(start.x, end.x)),
                     y1: Math.round(Math.min(start.y, end.y)),
                     x2: Math.round(Math.max(start.x, end.x)),
                     y2: Math.round(Math.max(start.y, end.y))
                 };
+
+                // Add to appropriate array
+                if (this._bboxWidget.isNegative) {
+                    this._bboxWidget.negativeBBoxes.push(bbox);
+                    console.log(`[NV_BBoxCreator] Added NEGATIVE bbox:`, bbox);
+                } else {
+                    this._bboxWidget.positiveBBoxes.push(bbox);
+                    console.log(`[NV_BBoxCreator] Added POSITIVE bbox:`, bbox);
+                }
+
                 this.updateBBoxData();
-                console.log(`[NV_BBoxCreator] BBox finalized:`, this._bboxWidget.bbox);
             }
 
             this._bboxWidget.drawing = false;
+            this._bboxWidget.isNegative = false;
             this._bboxWidget.startPoint = null;
             this._bboxWidget.currentPoint = null;
             this.redrawCanvas();
@@ -352,33 +327,29 @@ app.registerExtension({
          * Sync bbox data to hidden widget for backend.
          */
         nodeType.prototype.updateBBoxData = function() {
-            const bboxJson = JSON.stringify(this._bboxWidget.bbox || {});
+            const data = {
+                positive: this._bboxWidget.positiveBBoxes,
+                negative: this._bboxWidget.negativeBBoxes
+            };
+            const bboxJson = JSON.stringify(data);
 
             if (this._hiddenBboxWidget) {
                 this._hiddenBboxWidget.value = bboxJson;
-                console.log("[NV_BBoxCreator] Updated bbox_data widget:", bboxJson);
             } else {
-                // Try to find widget again (might have been created after initial search)
                 const widget = this.widgets?.find(w => w.name === "bbox_data");
                 if (widget) {
                     this._hiddenBboxWidget = widget;
                     widget.value = bboxJson;
-                    console.log("[NV_BBoxCreator] Found and updated bbox_data widget:", bboxJson);
-                } else {
-                    console.warn("[NV_BBoxCreator] bbox_data widget not found!");
                 }
             }
 
             // Update info display
-            const bbox = this._bboxWidget.bbox;
-            if (bbox) {
-                const w = bbox.x2 - bbox.x1;
-                const h = bbox.y2 - bbox.y1;
-                const ratio = this.getAspectRatio();
-                const ratioStr = ratio ? ` (${(w/h).toFixed(2)})` : "";
-                this._bboxWidget.bboxInfo.textContent = `${w}x${h} at (${bbox.x1}, ${bbox.y1})${ratioStr}`;
+            const posCount = this._bboxWidget.positiveBBoxes.length;
+            const negCount = this._bboxWidget.negativeBBoxes.length;
+            if (posCount > 0 || negCount > 0) {
+                this._bboxWidget.bboxInfo.textContent = `Positive: ${posCount} | Negative: ${negCount}`;
             } else {
-                this._bboxWidget.bboxInfo.textContent = "Draw a bounding box";
+                this._bboxWidget.bboxInfo.textContent = "Left-click: positive | Right-click: negative";
             }
         };
 
@@ -386,9 +357,8 @@ app.registerExtension({
          * Redraw the canvas with image and bbox overlays.
          */
         nodeType.prototype.redrawCanvas = function() {
-            const { canvas, ctx, image, bbox, drawing, startPoint, currentPoint } = this._bboxWidget;
+            const { canvas, ctx, image, positiveBBoxes, negativeBBoxes, drawing, isNegative, startPoint, currentPoint } = this._bboxWidget;
 
-            // Clear canvas
             ctx.clearRect(0, 0, canvas.width, canvas.height);
 
             // Draw image or placeholder
@@ -400,48 +370,66 @@ app.registerExtension({
                 ctx.fillStyle = "#888";
                 ctx.font = "16px sans-serif";
                 ctx.textAlign = "center";
-                ctx.fillText("Run node to load image", canvas.width / 2, canvas.height / 2);
-                ctx.fillText("Then draw a bounding box", canvas.width / 2, canvas.height / 2 + 25);
+                ctx.fillText("Run node to load image", canvas.width / 2, canvas.height / 2 - 12);
+                ctx.fillText("Left-click: positive (green)", canvas.width / 2, canvas.height / 2 + 12);
+                ctx.fillText("Right-click: negative (red)", canvas.width / 2, canvas.height / 2 + 36);
             }
 
-            // Draw finalized bbox (green solid)
-            if (bbox) {
+            // Draw positive bboxes (green)
+            for (const bbox of positiveBBoxes) {
                 const w = bbox.x2 - bbox.x1;
                 const h = bbox.y2 - bbox.y1;
 
-                // Semi-transparent fill
                 ctx.fillStyle = "rgba(0, 255, 0, 0.15)";
                 ctx.fillRect(bbox.x1, bbox.y1, w, h);
 
-                // Solid border
                 ctx.strokeStyle = "#0f0";
                 ctx.lineWidth = 2;
                 ctx.strokeRect(bbox.x1, bbox.y1, w, h);
 
                 // Corner markers
-                const markerSize = 8;
+                const markerSize = 6;
                 ctx.fillStyle = "#0f0";
-                // Top-left
                 ctx.fillRect(bbox.x1 - markerSize/2, bbox.y1 - markerSize/2, markerSize, markerSize);
-                // Top-right
                 ctx.fillRect(bbox.x2 - markerSize/2, bbox.y1 - markerSize/2, markerSize, markerSize);
-                // Bottom-left
                 ctx.fillRect(bbox.x1 - markerSize/2, bbox.y2 - markerSize/2, markerSize, markerSize);
-                // Bottom-right
                 ctx.fillRect(bbox.x2 - markerSize/2, bbox.y2 - markerSize/2, markerSize, markerSize);
             }
 
-            // Draw in-progress bbox (yellow dotted)
+            // Draw negative bboxes (red)
+            for (const bbox of negativeBBoxes) {
+                const w = bbox.x2 - bbox.x1;
+                const h = bbox.y2 - bbox.y1;
+
+                ctx.fillStyle = "rgba(255, 0, 0, 0.15)";
+                ctx.fillRect(bbox.x1, bbox.y1, w, h);
+
+                ctx.strokeStyle = "#f00";
+                ctx.lineWidth = 2;
+                ctx.strokeRect(bbox.x1, bbox.y1, w, h);
+
+                // Corner markers
+                const markerSize = 6;
+                ctx.fillStyle = "#f00";
+                ctx.fillRect(bbox.x1 - markerSize/2, bbox.y1 - markerSize/2, markerSize, markerSize);
+                ctx.fillRect(bbox.x2 - markerSize/2, bbox.y1 - markerSize/2, markerSize, markerSize);
+                ctx.fillRect(bbox.x1 - markerSize/2, bbox.y2 - markerSize/2, markerSize, markerSize);
+                ctx.fillRect(bbox.x2 - markerSize/2, bbox.y2 - markerSize/2, markerSize, markerSize);
+            }
+
+            // Draw in-progress bbox
             if (drawing && startPoint && currentPoint) {
                 const w = currentPoint.x - startPoint.x;
                 const h = currentPoint.y - startPoint.y;
 
-                // Semi-transparent fill
-                ctx.fillStyle = "rgba(255, 255, 0, 0.1)";
+                // Use color based on type
+                const color = isNegative ? "#f00" : "#0f0";
+                const fillColor = isNegative ? "rgba(255, 0, 0, 0.1)" : "rgba(0, 255, 0, 0.1)";
+
+                ctx.fillStyle = fillColor;
                 ctx.fillRect(startPoint.x, startPoint.y, w, h);
 
-                // Dotted border
-                ctx.strokeStyle = "#ff0";
+                ctx.strokeStyle = color;
                 ctx.lineWidth = 2;
                 ctx.setLineDash([5, 5]);
                 ctx.strokeRect(startPoint.x, startPoint.y, w, h);
@@ -453,7 +441,7 @@ app.registerExtension({
                 if (absW > 30 && absH > 20) {
                     ctx.fillStyle = "rgba(0,0,0,0.7)";
                     ctx.fillRect(startPoint.x + w/2 - 30, startPoint.y + h/2 - 10, 60, 20);
-                    ctx.fillStyle = "#ff0";
+                    ctx.fillStyle = color;
                     ctx.font = "12px monospace";
                     ctx.textAlign = "center";
                     ctx.fillText(`${Math.round(absW)}x${Math.round(absH)}`, startPoint.x + w/2, startPoint.y + h/2 + 4);
@@ -461,11 +449,12 @@ app.registerExtension({
             }
         };
 
-        // Override serialize/configure for state persistence
+        // Serialize/configure for state persistence
         nodeType.prototype.onSerialize = function(data) {
-            if (this._bboxWidget?.bbox) {
+            if (this._bboxWidget) {
                 data.bboxCreatorState = {
-                    bbox: this._bboxWidget.bbox
+                    positive: this._bboxWidget.positiveBBoxes,
+                    negative: this._bboxWidget.negativeBBoxes
                 };
             }
         };
@@ -476,11 +465,11 @@ app.registerExtension({
                 originalConfigure.apply(this, arguments);
             }
 
-            if (data.bboxCreatorState?.bbox) {
-                // Restore bbox after widgets are initialized
+            if (data.bboxCreatorState) {
                 setTimeout(() => {
                     if (this._bboxWidget) {
-                        this._bboxWidget.bbox = data.bboxCreatorState.bbox;
+                        this._bboxWidget.positiveBBoxes = data.bboxCreatorState.positive || [];
+                        this._bboxWidget.negativeBBoxes = data.bboxCreatorState.negative || [];
                         this.updateBBoxData();
                         this.redrawCanvas();
                     }
