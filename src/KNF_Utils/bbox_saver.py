@@ -121,6 +121,8 @@ class NV_BBoxLoader:
     """
     Load a mask and its associated metadata from disk.
     Reads a PNG mask file and its JSON metadata file.
+
+    Use dropdown to select from output directory, or provide custom_path to load from anywhere.
     """
 
     @classmethod
@@ -143,6 +145,13 @@ class NV_BBoxLoader:
             "required": {
                 "mask_file": (sorted(mask_files), {"default": mask_files[0] if mask_files else "none"}),
             },
+            "optional": {
+                "custom_path": ("STRING", {
+                    "default": "",
+                    "placeholder": "Optional: full path to mask.png (overrides dropdown)",
+                    "tooltip": "If provided, loads from this path instead of the dropdown selection."
+                }),
+            },
         }
 
     RETURN_TYPES = ("MASK", "STRING", "FLOAT", "INT", "INT", "SAM3_BOXES_PROMPT", "SAM3_BOXES_PROMPT")
@@ -151,20 +160,30 @@ class NV_BBoxLoader:
     CATEGORY = "NV_Utils/io"
 
     @classmethod
-    def IS_CHANGED(cls, mask_file):
-        # Always check file modification time
-        output_dir = folder_paths.get_output_directory()
-        mask_path = os.path.join(output_dir, mask_file)
+    def IS_CHANGED(cls, mask_file, custom_path=""):
+        # Determine which path to check
+        if custom_path and custom_path.strip():
+            mask_path = custom_path.strip()
+        else:
+            output_dir = folder_paths.get_output_directory()
+            mask_path = os.path.join(output_dir, mask_file)
+
         if os.path.exists(mask_path):
             return os.path.getmtime(mask_path)
         return float("nan")
 
-    def load_bbox(self, mask_file):
+    def load_bbox(self, mask_file, custom_path=""):
         """
-        Load mask and metadata from output directory.
+        Load mask and metadata from output directory or custom path.
         """
-        output_dir = folder_paths.get_output_directory()
-        mask_path = os.path.join(output_dir, mask_file)
+        # Determine which path to use
+        if custom_path and custom_path.strip():
+            mask_path = custom_path.strip()
+            print(f"[NV_BBoxLoader] Using custom path: {mask_path}")
+        else:
+            output_dir = folder_paths.get_output_directory()
+            mask_path = os.path.join(output_dir, mask_file)
+
         meta_path = mask_path.replace('.png', '.json')
 
         # Load mask
