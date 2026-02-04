@@ -483,9 +483,20 @@ class FloatingPanel {
     }
 
     toggleGroup(group, enable) {
-        if (!group._nodes) return;
+        // Recompute which nodes are inside this group
+        if (group.recomputeInsideNodes) {
+            group.recomputeInsideNodes();
+        }
 
-        const newMode = enable ? MODE_ALWAYS : MODE_NEVER;
+        if (!group._nodes || group._nodes.length === 0) {
+            console.warn("[FloatingPanel] No nodes in group:", group.title);
+            return;
+        }
+
+        // Use BYPASS mode when disabling (not mute)
+        const newMode = enable ? MODE_ALWAYS : MODE_BYPASS;
+        console.log(`[FloatingPanel] Setting ${group._nodes.length} nodes in "${group.title}" to mode ${newMode}`);
+
         for (const node of group._nodes) {
             node.mode = newMode;
         }
