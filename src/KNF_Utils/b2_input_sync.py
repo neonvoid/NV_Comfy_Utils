@@ -13,8 +13,8 @@ Use cases:
 
 Requirements:
 - rclone installed and in PATH
-- rclone configured with a [b2] remote (in ~/.config/rclone/rclone.conf)
-- B2_BUCKET environment variable set
+- EITHER: rclone configured with a named remote (e.g. [b2]) + B2_BUCKET env var or bucket_name input
+- OR: inline B2 credentials (b2_app_key_id + b2_app_key) + bucket_name — no pre-configured remote needed
 """
 
 import os
@@ -72,7 +72,25 @@ class NV_B2InputSync:
                 "remote_name": ("STRING", {
                     "default": "",
                     "multiline": False,
-                    "tooltip": "rclone remote name (e.g., 'b2', 'zs_b2'). Empty = 'b2'. Must be configured in rclone."
+                    "tooltip": "rclone remote name (e.g., 'b2', 'b2-inputs'). Empty = 'b2'. Must be configured in rclone. Ignored when app key credentials are provided."
+                }),
+                # Bucket name (overrides B2_BUCKET env var)
+                "bucket_name": ("STRING", {
+                    "default": "",
+                    "multiline": False,
+                    "tooltip": "B2 bucket name. Overrides B2_BUCKET env var. Leave empty for bucket-scoped remotes (where bucket is implicit in the remote config)."
+                }),
+                # B2 app key ID for inline credential config
+                "b2_app_key_id": ("STRING", {
+                    "default": "",
+                    "multiline": False,
+                    "tooltip": "B2 Application Key ID. If provided with app_key, creates a dynamic rclone remote — no pre-configured remote needed."
+                }),
+                # B2 app key for inline credential config
+                "b2_app_key": ("STRING", {
+                    "default": "",
+                    "multiline": False,
+                    "tooltip": "B2 Application Key. Used with app_key_id to create a dynamic rclone remote."
                 }),
                 # B2 source path (within bucket)
                 "b2_path": ("STRING", {
@@ -150,17 +168,25 @@ class NV_B2InputSync:
         except Exception as e:
             return False, f"Error checking rclone: {str(e)}"
 
-    def _get_b2_bucket(self) -> Tuple[Optional[str], str]:
+    def _get_b2_bucket(self, bucket_override: str = "") -> Tuple[Optional[str], str]:
         """
-        Get B2 bucket name from environment variable.
+        Get B2 bucket name from input override or environment variable.
+
+        Args:
+            bucket_override: Bucket name from node input (takes priority over env var)
 
         Returns:
             Tuple of (bucket_name: Optional[str], message: str)
         """
+        if bucket_override and bucket_override.strip():
+            return bucket_override.strip(), f"Using bucket (from input): {bucket_override.strip()}"
+
         bucket = os.environ.get("B2_BUCKET")
-        if not bucket:
-            return None, "B2_BUCKET environment variable not set."
-        return bucket, f"Using bucket: {bucket}"
+        if bucket:
+            return bucket, f"Using bucket (from env): {bucket}"
+
+        # No bucket specified — valid for bucket-scoped remotes
+        return None, "No bucket specified (using bucket-scoped remote or bucket implicit in remote config)."
 
     def _resolve_paths(
         self,
@@ -197,8 +223,12 @@ class NV_B2InputSync:
         # Ensure forward slashes for B2 paths
         remote_subpath = remote_subpath.replace("\\", "/")
 
-        # Build full remote path: remote_name:bucket-name/path
-        resolved_remote = f"{remote_name}:{bucket}/{remote_subpath}"
+        # Build full remote path
+        if bucket:
+            resolved_remote = f"{remote_name}:{bucket}/{remote_subpath}"
+        else:
+            # Bucket-scoped remote — bucket is implicit in the remote config
+            resolved_remote = f"{remote_name}:{remote_subpath}"
 
         # Resolve local path (destination)
         if local_path and local_path.strip():
@@ -339,6 +369,9 @@ class NV_B2InputSync:
         dry_run: bool,
         passthrough=None,
         remote_name: str = "",
+        bucket_name: str = "",
+        b2_app_key_id: str = "",
+        b2_app_key: str = "",
         b2_path: str = "",
         local_path: str = "",
         include_filter: str = "",
@@ -351,32 +384,58 @@ class NV_B2InputSync:
         Returns:
             Tuple of (passthrough, local_path, status, details, files_transferred, success)
         """
-        # Default remote_name to "b2" if empty
-        if not remote_name or not remote_name.strip():
-            remote_name = "b2"
+        # Determine if using inline credentials (dynamic remote)
+        use_dynamic = bool(b2_app_key_id and b2_app_key_id.strip() and b2_app_key and b2_app_key.strip())
+        subprocess_env = None
+
+        if use_dynamic:
+            # Dynamic remote via rclone env var config — no pre-configured remote needed
+            remote_name = "b2dyn"
+            subprocess_env = os.environ.copy()
+            subprocess_env["RCLONE_CONFIG_B2DYN_TYPE"] = "b2"
+            subprocess_env["RCLONE_CONFIG_B2DYN_ACCOUNT"] = b2_app_key_id.strip()
+            subprocess_env["RCLONE_CONFIG_B2DYN_KEY"] = b2_app_key.strip()
+
+            print("\n" + "=" * 60)
+            print(f"[NV_B2InputSync] Starting B2 input sync (dynamic remote with inline credentials)...")
+            print("=" * 60)
         else:
-            remote_name = remote_name.strip()
+            # Default remote_name to "b2" if empty
+            if not remote_name or not remote_name.strip():
+                remote_name = "b2"
+            else:
+                remote_name = remote_name.strip()
 
-        print("\n" + "=" * 60)
-        print(f"[NV_B2InputSync] Starting B2 input sync (download, remote: {remote_name})...")
-        print("=" * 60)
+            print("\n" + "=" * 60)
+            print(f"[NV_B2InputSync] Starting B2 input sync (download, remote: {remote_name})...")
+            print("=" * 60)
 
-        # Check rclone availability (don't cache - remote may change)
-        available, rclone_msg = self._check_rclone_available(remote_name)
-        print(f"[NV_B2InputSync] {rclone_msg}")
+            # Check rclone availability (don't cache - remote may change)
+            available, rclone_msg = self._check_rclone_available(remote_name)
+            print(f"[NV_B2InputSync] {rclone_msg}")
 
-        if not available:
-            error_msg = f"rclone not available: {rclone_msg}"
-            print(f"[NV_B2InputSync] ERROR: {error_msg}")
-            return (passthrough, "", "ERROR", error_msg, 0, False)
+            if not available:
+                error_msg = f"rclone not available: {rclone_msg}"
+                print(f"[NV_B2InputSync] ERROR: {error_msg}")
+                return (passthrough, "", "ERROR", error_msg, 0, False)
+
+        # Check rclone binary exists (needed for both modes)
+        if use_dynamic:
+            rclone_path = shutil.which("rclone")
+            if not rclone_path:
+                error_msg = "rclone not found in PATH. Install rclone or add to PATH."
+                print(f"[NV_B2InputSync] ERROR: {error_msg}")
+                return (passthrough, "", "ERROR", error_msg, 0, False)
 
         # Get B2 bucket
-        bucket, bucket_msg = self._get_b2_bucket()
-        if not bucket:
-            print(f"[NV_B2InputSync] ERROR: {bucket_msg}")
-            return (passthrough, "", "ERROR", bucket_msg, 0, False)
-
+        bucket, bucket_msg = self._get_b2_bucket(bucket_name)
         print(f"[NV_B2InputSync] {bucket_msg}")
+
+        # Bucket is required when using dynamic credentials
+        if use_dynamic and not bucket:
+            error_msg = "bucket_name is required when using inline credentials (no bucket-scoped remote)."
+            print(f"[NV_B2InputSync] ERROR: {error_msg}")
+            return (passthrough, "", "ERROR", error_msg, 0, False)
 
         # Resolve paths
         resolved_remote, resolved_local = self._resolve_paths(b2_path, local_path, bucket, remote_name)
@@ -424,7 +483,8 @@ class NV_B2InputSync:
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=1800  # 30 minute timeout for large downloads
+                timeout=1800,  # 30 minute timeout for large downloads
+                env=subprocess_env  # None uses inherited env, or custom env for dynamic remotes
             )
 
             # Parse output for transfer stats
