@@ -19,8 +19,113 @@ Usage:
 
 import os
 import json
+import math
 import torch
 import numpy as np
+
+
+# ============================================================================
+# Blend Weight Functions
+# ============================================================================
+# Different window functions for chunk transition blending.
+# Linear is the simplest; Hamming/Hann have better sidelobe properties
+# (less ringing/ghosting at boundaries).
+# See: Overlapping Co-Denoising (arxiv 2511.03272) for motivation.
+
+BLEND_MODES = ["linear", "hamming", "hann", "cosine", "fft_spectral"]
+
+
+def compute_blend_weights(num_frames: int, mode: str = "linear", device=None) -> torch.Tensor:
+    """
+    Compute blend weights for crossfade transition.
+
+    All modes produce weights that go from 0 (keep output) to 1 (keep chunk).
+
+    Args:
+        num_frames: Number of frames in the crossfade region
+        mode: One of "linear", "hamming", "hann", "cosine"
+        device: Torch device for the output tensor
+
+    Returns:
+        Tensor of shape [num_frames] with values in [0, 1]
+    """
+    if num_frames <= 1:
+        return torch.ones(max(1, num_frames), device=device)
+
+    t = torch.linspace(0, 1, num_frames, device=device)
+
+    if mode == "linear":
+        weights = t
+    elif mode == "hamming":
+        # Hamming window: good sidelobe suppression (-43dB)
+        # We use the rising half of the window (0 -> 1)
+        weights = 0.54 - 0.46 * torch.cos(math.pi * t)
+    elif mode == "hann":
+        # Hann window: first sidelobe -31dB, but zero endpoints
+        weights = 0.5 * (1.0 - torch.cos(math.pi * t))
+    elif mode == "cosine":
+        # Cosine (raised cosine): smooth S-curve transition
+        weights = 0.5 * (1.0 - torch.cos(math.pi * t))
+    else:
+        raise ValueError(f"Unknown blend mode: {mode}. Choose from {BLEND_MODES}")
+
+    return weights
+
+
+def fft_spectral_blend(region_a: torch.Tensor, region_b: torch.Tensor,
+                       cutoff_ratio: float = 0.25) -> torch.Tensor:
+    """
+    FFT spectral blending: take low frequencies (structure/motion) from region_a
+    and high frequencies (detail/sharpness) from region_b.
+
+    Inspired by FreeLong (NeurIPS 2024, arxiv 2407.19918).
+
+    Args:
+        region_a: Overlap frames from previous chunk [T, H, W, C]
+        region_b: Overlap frames from next chunk [T, H, W, C]
+        cutoff_ratio: Fraction of frequencies to take from region_a (0.25 = bottom 25%)
+
+    Returns:
+        Blended frames [T, H, W, C]
+    """
+    # Move to channel-first for FFT: [T, H, W, C] -> [T, C, H, W]
+    a = region_a.permute(0, 3, 1, 2).float()
+    b = region_b.permute(0, 3, 1, 2).float()
+
+    # 3D FFT over temporal + spatial dims
+    a_freq = torch.fft.fftn(a, dim=(-3, -2, -1))
+    b_freq = torch.fft.fftn(b, dim=(-3, -2, -1))
+
+    # Build low-pass mask (ellipsoidal in frequency space)
+    T, C, H, W = a.shape
+    t_freqs = torch.fft.fftfreq(T, device=a.device)
+    h_freqs = torch.fft.fftfreq(H, device=a.device)
+    w_freqs = torch.fft.fftfreq(W, device=a.device)
+
+    # Normalized frequency magnitude (0 to 1)
+    t_grid, h_grid, w_grid = torch.meshgrid(t_freqs, h_freqs, w_freqs, indexing='ij')
+    freq_magnitude = torch.sqrt(t_grid**2 + h_grid**2 + w_grid**2)
+    freq_magnitude = freq_magnitude / (freq_magnitude.max() + 1e-8)
+
+    # Smooth transition around cutoff (sigmoid) to avoid ringing
+    sharpness = 10.0
+    low_pass = torch.sigmoid(-sharpness * (freq_magnitude - cutoff_ratio))
+    high_pass = 1.0 - low_pass
+
+    # Expand mask for channels: [T, H, W] -> [T, C, H, W]
+    low_pass = low_pass.unsqueeze(1).expand_as(a_freq)
+    high_pass = high_pass.unsqueeze(1).expand_as(b_freq)
+
+    # Blend in frequency domain
+    blended_freq = a_freq * low_pass + b_freq * high_pass
+
+    # IFFT back to spatial domain
+    blended = torch.fft.ifftn(blended_freq, dim=(-3, -2, -1)).real
+
+    # Back to [T, H, W, C]
+    blended = blended.permute(0, 2, 3, 1)
+
+    return blended.to(region_a.dtype)
 
 
 # ============================================================================
@@ -150,6 +255,10 @@ class NV_ChunkStitcher:
                     "default": True,
                     "tooltip": "WAN frame alignment awareness. Validates (N%4)==1 constraint and reports issues."
                 }),
+                "blend_mode": (BLEND_MODES, {
+                    "default": "linear",
+                    "tooltip": "Crossfade blend function. hamming/hann have better boundary properties than linear."
+                }),
             }
         }
 
@@ -161,7 +270,7 @@ class NV_ChunkStitcher:
 
     def stitch_chunks(self, plan_json_path, chunk_directory,
                       chunk_prefix="chunk_", chunk_extension=".mp4",
-                      crossfade_override=-1, wan_mode=True):
+                      crossfade_override=-1, wan_mode=True, blend_mode="linear"):
         """
         Load and stitch all chunks with crossfade blending.
         """
@@ -304,12 +413,13 @@ class NV_ChunkStitcher:
                         f"Chunk start shape: {frames_to_blend_from_chunk.shape}"
                     )
 
-                # Linear crossfade weights: 0 → 1, so we fade FROM output TO chunk
-                weights = torch.linspace(0, 1, crossfade_frames)
-                weights = weights.view(-1, 1, 1, 1)  # [T, 1, 1, 1] for broadcasting
-
-                # Blend: (1 - weight) * output + weight * chunk
-                blended = (1.0 - weights) * frames_to_blend_from_output + weights * frames_to_blend_from_chunk
+                # Blend the overlap region
+                if blend_mode == "fft_spectral":
+                    blended = fft_spectral_blend(frames_to_blend_from_output, frames_to_blend_from_chunk)
+                else:
+                    weights = compute_blend_weights(crossfade_frames, mode=blend_mode, device=output.device)
+                    weights = weights.view(-1, 1, 1, 1)  # [T, 1, 1, 1] for broadcasting
+                    blended = (1.0 - weights) * frames_to_blend_from_output + weights * frames_to_blend_from_chunk
 
                 # Reconstruct output (KJNodes style):
                 # - Everything BEFORE transition point
@@ -324,7 +434,7 @@ class NV_ChunkStitcher:
                 new_frames = current_chunk.shape[0] - crossfade_frames
                 report_lines.append(
                     f"  Chunk {i}: {current_chunk.shape[0]} frames "
-                    f"(transition at {transition_start_index}, {crossfade_frames} blended, {new_frames} new)"
+                    f"(transition at {transition_start_index}, {crossfade_frames} blended [{blend_mode}], {new_frames} new)"
                 )
             else:
                 # No crossfade - just concatenate (not recommended)
@@ -399,6 +509,10 @@ class NV_ChunkStitcherFromImages:
                     "default": True,
                     "tooltip": "WAN frame alignment awareness. Validates (N%4)==1 constraint and adjusts overlap if needed."
                 }),
+                "blend_mode": (BLEND_MODES, {
+                    "default": "linear",
+                    "tooltip": "Crossfade blend function. hamming/hann have better boundary properties than linear."
+                }),
             }
         }
 
@@ -410,7 +524,7 @@ class NV_ChunkStitcherFromImages:
 
     def stitch_chunks(self, chunk_0, crossfade_frames,
                       chunk_1=None, chunk_2=None, chunk_3=None,
-                      plan_json_path="", wan_mode=True):
+                      plan_json_path="", wan_mode=True, blend_mode="linear"):
         """
         Stitch chunk IMAGE inputs with crossfade.
         """
@@ -535,11 +649,13 @@ class NV_ChunkStitcherFromImages:
                 frames_to_blend_from_output = output[transition_start_index:transition_start_index + effective_crossfade]
                 frames_to_blend_from_chunk = current_chunk[:effective_crossfade]
 
-                # Linear crossfade: weight goes 0 → 1, so we fade FROM output TO chunk
-                weights = torch.linspace(0, 1, effective_crossfade, device=output.device)
-                weights = weights.view(-1, 1, 1, 1)
-
-                blended = (1.0 - weights) * frames_to_blend_from_output + weights * frames_to_blend_from_chunk
+                # Blend the overlap region
+                if blend_mode == "fft_spectral":
+                    blended = fft_spectral_blend(frames_to_blend_from_output, frames_to_blend_from_chunk)
+                else:
+                    weights = compute_blend_weights(effective_crossfade, mode=blend_mode, device=output.device)
+                    weights = weights.view(-1, 1, 1, 1)
+                    blended = (1.0 - weights) * frames_to_blend_from_output + weights * frames_to_blend_from_chunk
 
                 # Reconstruct output (KJNodes style):
                 # - Everything BEFORE transition point
@@ -554,7 +670,7 @@ class NV_ChunkStitcherFromImages:
                 new_frames = current_chunk.shape[0] - effective_crossfade
                 report_lines.append(
                     f"  Chunk {i}: {current_chunk.shape[0]} frames "
-                    f"(transition at {transition_start_index}, {effective_crossfade} blended, {new_frames} new)"
+                    f"(transition at {transition_start_index}, {effective_crossfade} blended [{blend_mode}], {new_frames} new)"
                 )
             else:
                 output = torch.cat([output, current_chunk], dim=0)
