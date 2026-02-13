@@ -321,8 +321,11 @@ def create_attention_capture_override(storage, target_steps, target_layers, spar
         combo = (step, block_idx)
         if combo not in seen_combinations and len(seen_combinations) < 30:
             seen_combinations.add(combo)
+            t_keys = sorted(t_opts.keys()) if t_opts else []
             print(f"[AttentionCapture DEBUG] step={step}, block_idx={block_idx}, "
                   f"target_steps={target_steps}, target_layers={target_layers}")
+            print(f"[AttentionCapture DEBUG]   t_opts id={id(t_opts)}, keys={t_keys}")
+            print(f"[AttentionCapture DEBUG]   q.shape={args[0].shape}, kwargs_keys={sorted(kwargs.keys())}")
 
         # Check if we should capture at this step and layer
         if step in target_steps and block_idx in target_layers:
@@ -726,8 +729,11 @@ class NV_ExtractAttentionGuidance:
             # Set the attention override
             pm.model_options["transformer_options"]["optimized_attention_override"] = capture_override
             patched_models.append(pm)
+            to_id = id(pm.model_options["transformer_options"])
+            to_keys = sorted(pm.model_options["transformer_options"].keys())
             print(f"[NV_ExtractAttentionGuidance] Model {idx+1} patched: "
                   f"override set = {'optimized_attention_override' in pm.model_options.get('transformer_options', {})}")
+            print(f"[NV_ExtractAttentionGuidance] Model {idx+1} transformer_options id={to_id}, keys={to_keys}")
 
         print(f"[NV_ExtractAttentionGuidance] Applied attention capture override to {len(patched_models)} model(s)")
         print(f"[NV_ExtractAttentionGuidance] Target layers: {sorted(layer_indices)}, steps: {sorted(step_indices)}")
