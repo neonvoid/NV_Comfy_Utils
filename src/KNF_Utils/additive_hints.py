@@ -487,12 +487,12 @@ class NV_CaptureAdditiveHints:
                     "tooltip": "averaged: one hint per block (tiny file, broadcasts to all frames). "
                                "per_frame: individual frame hints (richer, applies to overlap region)."
                 }),
-                "total_latent_frames": ("INT", {
-                    "default": 21,
+                "total_video_frames": ("INT", {
+                    "default": 81,
                     "min": 1,
-                    "max": 200,
-                    "tooltip": "Total latent frames in the generation (for spatial size estimation). "
-                               "81 video frames = 21 latent frames."
+                    "max": 800,
+                    "tooltip": "Total VIDEO frames in the chunk (e.g. 81). "
+                               "Auto-converted to latent frames for spatial size estimation."
                 }),
             }
         }
@@ -505,7 +505,7 @@ class NV_CaptureAdditiveHints:
                    "Zero VRAM overhead. Inspired by Daydream VACE streaming.")
 
     def capture(self, model, num_hint_video_frames=4, target_blocks="0,5,10,15,19",
-                capture_at_step="last", hint_mode="averaged", total_latent_frames=21):
+                capture_at_step="last", hint_mode="averaged", total_video_frames=81):
 
         # Parse target blocks
         blocks = set()
@@ -515,8 +515,9 @@ class NV_CaptureAdditiveHints:
             except ValueError:
                 pass
 
-        # Convert video frames to latent frames
-        num_hint_latent = max(1, num_hint_video_frames // 4)
+        # Convert video frames to latent frames (Wan 4:1 compression)
+        num_hint_latent = max(1, (num_hint_video_frames - 1) // 4 + 1)
+        total_latent_frames = max(1, (total_video_frames - 1) // 4 + 1)
 
         # Parse capture step
         try:
@@ -544,6 +545,7 @@ class NV_CaptureAdditiveHints:
 
         print(f"[NV_CaptureAdditiveHints] Model patched for hint capture")
         print(f"  Hint frames: {num_hint_video_frames} video / {num_hint_latent} latent")
+        print(f"  Total frames: {total_video_frames} video / {total_latent_frames} latent")
         print(f"  Target blocks: {sorted(blocks)}")
         print(f"  Capture at step: {cap_step}")
         print(f"  Hint mode: {hint_mode}")
