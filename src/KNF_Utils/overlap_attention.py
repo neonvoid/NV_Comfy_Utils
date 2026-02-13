@@ -118,6 +118,14 @@ def densify_overlap_attention(sparse_data: dict, device='cpu') -> torch.Tensor:
     indices = sparse_data["indices"].to(device).long()
     heads, n_overlap, n_total = sparse_data["shape"]
 
+    # Validate indices are in range (int16 storage could wrap negative for large seq_len)
+    if indices.min() < 0 or indices.max() >= n_total:
+        raise ValueError(
+            f"Sparse attention indices out of range: min={indices.min().item()}, "
+            f"max={indices.max().item()}, n_total={n_total}. "
+            f"This can happen if seq_len exceeded int16 range (32767) during capture."
+        )
+
     dense = torch.zeros(heads, n_overlap, n_total, device=device, dtype=values.dtype)
     dense.scatter_(-1, indices, values)
 
@@ -961,8 +969,9 @@ class NV_ApplyOverlapAttention:
 
                 # Memory-efficient guidance: use flash attention for base output,
                 # then recompute only overlap token outputs with blended attention.
-                # Avoids materializing full [bh, seq, seq] which OOMs at higher res.
-                output = original_func(*args, **kwargs)
+                # Clone output to avoid in-place modification of flash attention result
+                # (modifying the original can cause CUDA device-side asserts).
+                output = original_func(*args, **kwargs).clone()
 
                 if guidance_mode == "blend":
                     n_overlap_tokens = end_token - start_token
@@ -971,6 +980,9 @@ class NV_ApplyOverlapAttention:
                     scale = d_per_head ** -0.5
                     attn_precision = kwargs.get("attn_precision", None)
                     batch_size = q.shape[0]
+
+                    # Ensure guidance attention is float32 for blending
+                    guidance_f32 = guidance_attn.float()
 
                     # Recompute overlap outputs with blended attention, per batch+head
                     for b_idx in range(batch_size):
@@ -988,8 +1000,8 @@ class NV_ApplyOverlapAttention:
                                 sim = torch.matmul(q_h.float(), k_h.float().transpose(-1, -2)) * scale
                             else:
                                 sim = torch.matmul(q_h, k_h.transpose(-1, -2)) * scale
-                            cur_attn = sim.softmax(dim=-1)
-                            blended = (1 - guidance_strength) * cur_attn + guidance_strength * guidance_attn
+                            cur_attn = sim.softmax(dim=-1).float()
+                            blended = (1 - guidance_strength) * cur_attn + guidance_strength * guidance_f32
                             blended = blended / (blended.sum(dim=-1, keepdim=True) + 1e-8)
                             v_h = v_b[h_idx:h_idx+1]
                             overlap_out[h_idx] = torch.matmul(blended.to(v_h.dtype), v_h)[0]
@@ -1001,6 +1013,8 @@ class NV_ApplyOverlapAttention:
                 if applications[0] == 0:
                     print(f"[NV_ApplyOverlapAttention] First guidance at step {step}, layer {block_idx}, "
                           f"local frames {local_start}-{local_end}")
+                    print(f"  guidance_attn: {list(guidance_attn.shape)}, q: {list(q.shape)}, "
+                          f"start_token={start_token}, end_token={end_token}")
                 applications[0] += 1
                 return output
 
