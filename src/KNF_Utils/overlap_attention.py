@@ -102,9 +102,11 @@ def sparsify_overlap_attention(attn_weights: torch.Tensor, ratio: float = 0.25) 
 
     topk_vals, topk_indices = torch.topk(attn_weights, k, dim=-1)
 
+    # Use int32 for indices — int16 overflows when seq_len > 32767
+    # (e.g. 720p with 17-frame context windows: 17 * 3600 = 61200)
     return {
         "values": topk_vals.half(),
-        "indices": topk_indices.short(),
+        "indices": topk_indices.int(),
         "shape": (heads, n_overlap, n_total),
         "k": k,
     }
