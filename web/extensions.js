@@ -8,4 +8,5 @@ import "./momentary_button.js";
 import "./frame_annotator.js";
 import "./bbox_creator.js";
 import "./floating_panel.js";
+import "./variables_panel.js";
 console.log("[NV_Comfy_Utils] All extensions loaded successfully"); 

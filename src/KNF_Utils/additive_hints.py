@@ -66,7 +66,7 @@ class AdditiveHintManager:
         self.hint_mode = hint_mode
 
         # Cache: block_idx -> tensor
-        # averaged mode: {block_idx: [1, S_per_frame, D]} (single averaged hint)
+        # averaged mode: {block_idx: [1, 1, D]} (spatially-averaged style vector)
         # per_frame mode: {block_idx: [N_frames, S_per_frame, D]} (per-frame hints)
         self.hint_cache: Dict[int, torch.Tensor] = {}
 
@@ -170,7 +170,7 @@ class AdditiveHintManager:
 
         Returns:
             Hint tensor for the target frames.
-            averaged: [1, spatial_size, D]
+            averaged: [1, 1, D] (spatially averaged -- pure style vector)
             per_frame: [N, spatial_size, D]
         """
         if spatial_size <= 0:
@@ -183,13 +183,16 @@ class AdditiveHintManager:
         hint = hidden_state[0, :n_tokens, :].detach().cpu().float()
 
         if self.hint_mode == "averaged":
-            # Reshape to [N_frames, spatial_size, D] then mean over frames
+            # Reshape to [N_frames, spatial_size, D] then mean over frames AND spatial
+            # Averaging spatially produces a pure per-block style vector [1, 1, D]
+            # that broadcasts without spatial contamination (token 0 = top-left, etc.)
             n_frames = n_tokens // spatial_size
             if n_frames > 0 and spatial_size > 0:
                 hint = hint[:n_frames * spatial_size].view(n_frames, spatial_size, -1)
                 hint = hint.mean(dim=0, keepdim=True)  # [1, spatial_size, D]
+                hint = hint.mean(dim=1, keepdim=True)  # [1, 1, D]
             else:
-                hint = hint.unsqueeze(0)  # [1, n_tokens, D]
+                hint = hint.mean(dim=0, keepdim=True).unsqueeze(0)  # [1, 1, D]
         else:
             # per_frame: reshape to [N_frames, spatial_size, D]
             n_frames = n_tokens // spatial_size
@@ -279,12 +282,21 @@ class AdditiveHintManager:
               f"{total_bytes / 1024 / 1024:.1f} MB, "
               f"mode={self.hint_mode}")
 
-    def create_apply_patch(self, block_idx: int, scale: float = 0.3):
+    def create_apply_patch(self, block_idx: int, scale: float = 0.3,
+                           apply_after_pct: float = 0.0):
         """
         Create a patches_replace patch function for apply mode.
 
         This wraps a single block: runs the original, adds the cached hint
         as a scaled residual, returns the modified output.
+
+        Args:
+            block_idx: Which block this patch is for.
+            scale: Hint strength multiplier.
+            apply_after_pct: Only apply hints after this % of denoising is done.
+                0.0 = apply from the start (all steps). 0.5 = only the last 50%.
+                Since hints are captured at the final step, applying only at late
+                steps (when activations are cleaner) can improve quality.
         """
         manager = self
 
@@ -295,32 +307,28 @@ class AdditiveHintManager:
             if manager._mode != "apply" or block_idx not in manager.hint_cache:
                 return out
 
+            # Step gating: skip early steps if apply_after_pct > 0
+            t_opts = args.get("transformer_options", {})
+            if apply_after_pct > 0.0:
+                manager._infer_step_from_sigma(t_opts)
+                if manager._total_steps > 0:
+                    progress = manager._current_step / manager._total_steps
+                    if progress < apply_after_pct:
+                        return out
+
             hidden = out["img"]  # [B, S, D]
-            hint = manager.hint_cache[block_idx]  # [N, spatial, D] or [1, spatial, D]
+            hint = manager.hint_cache[block_idx]  # [1, 1, D] or [N, spatial, D]
 
             # Move hint to device
             hint_dev = hint.to(device=hidden.device, dtype=hidden.dtype)
 
-            t_opts = args.get("transformer_options", {})
             seq_len = hidden.shape[1]
             spatial_size = manager._estimate_spatial_size(seq_len, t_opts)
 
             if manager.hint_mode == "averaged":
-                # Broadcast averaged hint across all frames in the sequence
-                # hint_dev shape: [1, spatial_size, D]
-                # Tile to match sequence length
-                hint_spatial = hint_dev.shape[1]
-                if hint_spatial > 0 and seq_len >= hint_spatial:
-                    n_repeats = seq_len // hint_spatial
-                    # Repeat the spatial hint for each frame
-                    hint_expanded = hint_dev.repeat(1, n_repeats, 1)  # [1, S, D]
-                    # Trim to exact seq_len (in case of rounding)
-                    hint_expanded = hint_expanded[:, :seq_len, :]
-                    # Apply to all batch elements
-                    out["img"] = hidden + hint_expanded * scale
-                else:
-                    # Hint doesn't fit -- skip gracefully
-                    return out
+                # hint_dev shape: [1, 1, D] -- pure style vector, spatially averaged
+                # PyTorch broadcasts [1, 1, D] to [B, S, D] automatically
+                out["img"] = hidden + hint_dev * scale
 
             elif manager.hint_mode == "per_frame":
                 # Apply per-frame hints to the first N frames of the sequence
@@ -346,7 +354,7 @@ class AdditiveHintManager:
             if manager._apply_count == 1:
                 print(f"[AdditiveHint] First apply at block {block_idx}: "
                       f"hint {list(hint_dev.shape)} -> hidden {list(hidden.shape)}, "
-                      f"scale={scale}")
+                      f"scale={scale}, step_gate={apply_after_pct:.0%}")
 
             return out
 
@@ -580,6 +588,16 @@ class NV_ApplyAdditiveHints:
                     "tooltip": "Hint strength. 0.0=no effect, 0.3=moderate, 1.0=strong. "
                                "Too high may freeze appearance or cause artifacts."
                 }),
+                "apply_after_pct": ("FLOAT", {
+                    "default": 0.0,
+                    "min": 0.0,
+                    "max": 0.95,
+                    "step": 0.05,
+                    "tooltip": "Only apply hints after this % of denoising is done. "
+                               "0.0 = all steps (default). 0.5 = last 50% only. "
+                               "Since hints are captured from the final step, "
+                               "applying only at late steps can reduce noise-hint mismatch."
+                }),
             }
         }
 
@@ -590,7 +608,7 @@ class NV_ApplyAdditiveHints:
     DESCRIPTION = ("Apply additive hints from chunk 0 for cross-chunk consistency. "
                    "Zero VRAM overhead. x = x + hint * scale after each block.")
 
-    def apply(self, model, hint_cache, scale=0.3):
+    def apply(self, model, hint_cache, scale=0.3, apply_after_pct=0.0):
         manager = hint_cache
 
         if not manager.has_hints:
@@ -603,11 +621,13 @@ class NV_ApplyAdditiveHints:
             model, manager,
             patch_factory=manager.create_apply_patch,
             scale=scale,
+            apply_after_pct=apply_after_pct,
         )
 
         stats = manager.get_cache_stats()
+        step_gate_str = f", step_gate={apply_after_pct:.0%}" if apply_after_pct > 0 else ""
         print(f"[NV_ApplyAdditiveHints] Model patched with {stats['cached_blocks']} hint blocks "
-              f"({stats['total_mb']:.1f} MB, scale={scale}, mode={stats['hint_mode']})")
+              f"({stats['total_mb']:.1f} MB, scale={scale}, mode={stats['hint_mode']}{step_gate_str})")
 
         return (patched,)
 
