@@ -343,6 +343,10 @@ def create_attention_capture_override(storage, target_steps, target_layers, spar
                 t_opts["_debug_attn_sentinel"] = f"set_at_step0_call1"
                 sentinel_dict_id[0] = id(t_opts)
                 print(f"[AttentionCapture DETAIL]   ** Set sentinel on dict id={id(t_opts)} **")
+                # STACK TRACE: find out WHERE the override is being called from
+                import traceback
+                print("[AttentionCapture STACK TRACE] Call stack for first override call:")
+                traceback.print_stack()
 
         # First call of step 1: check if sentinel survived
         if step == 1 and step_call == 1:
