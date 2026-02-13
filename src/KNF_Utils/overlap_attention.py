@@ -21,7 +21,6 @@ import comfy.sample
 import comfy.samplers
 import comfy.utils
 from comfy_extras import nodes_model_advanced
-from nodes import common_ksampler
 import latent_preview
 
 
@@ -276,18 +275,31 @@ class NV_CaptureOverlapAttention:
             patched_model.model_options["transformer_options"] = {}
         patched_model.model_options["transformer_options"]["optimized_attention_override"] = attention_capture_override
 
-        # Create step tracking callback
+        # Sample directly (not via common_ksampler) so we can inject step callback.
+        # common_ksampler creates its own internal callback, ignoring ours.
         preview_cb = latent_preview.prepare_callback(patched_model, steps)
         def step_callback(step, x0, x, total_steps):
-            current_step[0] = step + 1  # Next step
+            current_step[0] = step + 1  # Next step's attention will see this value
             if preview_cb:
                 return preview_cb(step, x0, x, total_steps)
 
-        # Sample
-        result = common_ksampler(
-            patched_model, seed, steps, cfg, sampler_name, scheduler,
-            positive, negative, latent, denoise=denoise
+        latent_image_fixed = comfy.sample.fix_empty_latent_channels(patched_model, latent_image)
+        noise = comfy.sample.prepare_noise(latent_image_fixed, seed, latent.get("batch_index", None))
+        noise_mask = latent.get("noise_mask", None)
+        disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+
+        samples = comfy.sample.sample(
+            patched_model, noise, steps, cfg, sampler_name, scheduler,
+            positive, negative, latent_image_fixed,
+            denoise=denoise, disable_noise=False,
+            start_step=None, last_step=None,
+            force_full_denoise=False,
+            noise_mask=noise_mask, callback=step_callback,
+            disable_pbar=disable_pbar, seed=seed
         )
+
+        out = latent.copy()
+        out["samples"] = samples
 
         # Package captured data
         overlap_data = {
@@ -306,7 +318,7 @@ class NV_CaptureOverlapAttention:
 
         print(f"[NV_CaptureOverlapAttention] Captured {len(captured_patterns)} patterns")
 
-        return (result[0], overlap_data)
+        return (out, overlap_data)
 
     def _compute_attention(self, q, k, v, heads, kwargs):
         """Compute attention and return weights."""
@@ -494,6 +506,7 @@ class NV_ApplyOverlapAttention:
         print(f"  Strength: {guidance_strength}, Mode: {guidance_mode}")
 
         current_step = [0]
+        last_sigma_val = [None]
         applications = [0]
 
         def attention_guidance_override(original_func, *args, **kwargs):
@@ -505,6 +518,22 @@ class NV_ApplyOverlapAttention:
 
             t_opts = kwargs.get("transformer_options", {})
             block_idx = t_opts.get("block_index", -1)
+
+            # Infer step from sigma schedule. The Apply node returns a MODEL
+            # (doesn't control sampling), so we can't use a step callback.
+            # Instead, derive step by matching current sigma to the schedule.
+            sigmas = t_opts.get("sigmas", None)
+            if sigmas is not None:
+                sigma_val = sigmas.flatten()[0].item()
+                if last_sigma_val[0] is None or abs(sigma_val - last_sigma_val[0]) > 1e-6:
+                    last_sigma_val[0] = sigma_val
+                    sample_sigmas = t_opts.get("sample_sigmas", None)
+                    if sample_sigmas is not None:
+                        for idx in range(len(sample_sigmas)):
+                            if abs(sample_sigmas[idx].item() - sigma_val) < 1e-5:
+                                current_step[0] = idx
+                                break
+
             step = current_step[0]
 
             # Check if we should apply guidance
@@ -537,6 +566,8 @@ class NV_ApplyOverlapAttention:
 
                         output = self._apply_attention(modified_attn, v, heads, kwargs)
 
+                    if applications[0] == 0:
+                        print(f"[NV_ApplyOverlapAttention] First guidance at step {step}, layer {block_idx}")
                     applications[0] += 1
                     return output
 
@@ -548,11 +579,7 @@ class NV_ApplyOverlapAttention:
             patched_model.model_options["transformer_options"] = {}
         patched_model.model_options["transformer_options"]["optimized_attention_override"] = attention_guidance_override
 
-        # Store step tracker
-        patched_model._overlap_attention_step = current_step
-        patched_model._overlap_attention_applications = applications
-
-        print(f"[NV_ApplyOverlapAttention] Model patched")
+        print(f"[NV_ApplyOverlapAttention] Model patched (step tracking via sigma inference)")
 
         return (patched_model,)
 
