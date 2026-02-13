@@ -284,6 +284,11 @@ class NV_CaptureOverlapAttention:
 
                 if key not in captured_patterns:
                     seq_len = q.shape[1] if q.dim() == 3 else q.shape[2]
+                    k_seq = k.shape[1] if k.dim() == 3 else k.shape[2]
+
+                    # Skip cross-attention (Q from latent, K from text context)
+                    if seq_len != k_seq:
+                        return original_func(*args, **kwargs)
 
                     # Context windows split the full sequence into smaller windows.
                     # Each attention call processes only one window's frames.
@@ -898,6 +903,11 @@ class NV_ApplyOverlapAttention:
             key = f"step_{step}_layer_{block_idx}"
             if key in patterns:
                 seq_len = q.shape[1] if q.dim() == 3 else q.shape[2]
+                k_seq = k.shape[1] if k.dim() == 3 else k.shape[2]
+
+                # Skip cross-attention (Q from latent, K from text context)
+                if seq_len != k_seq:
+                    return original_func(*args, **kwargs)
 
                 # Context windows: find overlap frames in this window
                 context_window = t_opts.get("context_window", None)
