@@ -281,35 +281,60 @@ class NV_CaptureOverlapAttention:
                 key = f"step_{step}_layer_{block_idx}"
 
                 if key not in captured_patterns:
-                    # Get sequence length to determine frame structure
                     seq_len = q.shape[1] if q.dim() == 3 else q.shape[2]
 
-                    # Only capture if sequence matches expected video structure
-                    expected_seq = t_latent * spatial_size
-                    if seq_len == expected_seq:
-                        # Compute attention
-                        output, attn_weights = self._compute_attention(
-                            q, k, v, heads, kwargs
-                        )
+                    # Context windows split the full sequence into smaller windows.
+                    # Each attention call processes only one window's frames.
+                    context_window = t_opts.get("context_window", None)
+                    if context_window is not None:
+                        window_indices = context_window.index_list
+                        window_frames = len(window_indices)
+                    else:
+                        window_indices = list(range(t_latent))
+                        window_frames = t_latent
 
-                        # Extract only overlap frame attention
-                        overlap_attn = extract_frame_attention(
-                            attn_weights,
-                            overlap_start_latent, overlap_end_latent,
-                            spatial_size, t_latent
-                        )
+                    expected_seq = window_frames * spatial_size
+                    if seq_len != expected_seq:
+                        return original_func(*args, **kwargs)
 
-                        # Sparsify and store
-                        captured_patterns[key] = sparsify_overlap_attention(
-                            overlap_attn, sparsity_ratio
-                        )
+                    # Find which overlap frames are in this window (local indices)
+                    local_overlap = []
+                    for local_idx, global_idx in enumerate(window_indices):
+                        if overlap_start_latent <= global_idx < overlap_end_latent:
+                            local_overlap.append(local_idx)
 
-                        n_overlap = overlap_end_latent - overlap_start_latent
-                        print(f"[NV_CaptureOverlapAttention] Captured {key}: "
-                              f"{n_overlap} frames × {spatial_size} spatial = "
-                              f"{overlap_attn.shape[1]} tokens")
+                    if not local_overlap:
+                        # No overlap frames in this window - skip, don't block key
+                        return original_func(*args, **kwargs)
 
-                        return output
+                    local_start = min(local_overlap)
+                    local_end = max(local_overlap) + 1
+
+                    # Compute attention
+                    output, attn_weights = self._compute_attention(
+                        q, k, v, heads, kwargs
+                    )
+
+                    # Extract only overlap frame attention (using local window indices)
+                    overlap_attn = extract_frame_attention(
+                        attn_weights,
+                        local_start, local_end,
+                        spatial_size, window_frames
+                    )
+
+                    # Sparsify and store
+                    captured_patterns[key] = sparsify_overlap_attention(
+                        overlap_attn, sparsity_ratio
+                    )
+
+                    n_overlap = local_end - local_start
+                    global_start = window_indices[local_start]
+                    global_end = window_indices[local_end - 1]
+                    print(f"[NV_CaptureOverlapAttention] Captured {key}: "
+                          f"{n_overlap}/{window_frames} window frames "
+                          f"(global {global_start}-{global_end})")
+
+                    return output
 
             return original_func(*args, **kwargs)
 
@@ -768,6 +793,16 @@ class NV_ApplyOverlapAttention:
                     "default": "blend",
                     "tooltip": "blend: interpolate attention, bias: add to scores"
                 }),
+                "target_overlap_start": ("INT", {
+                    "default": 0, "min": 0,
+                    "tooltip": "Start of overlap region in target chunk (latent frames). "
+                               "Default 0 = head of chunk (most common for sequential chunks)."
+                }),
+                "target_overlap_end": ("INT", {
+                    "default": -1, "min": -1,
+                    "tooltip": "End of overlap region in target chunk (latent frames). "
+                               "-1 = auto: same number of frames as captured overlap."
+                }),
             }
         }
 
@@ -777,7 +812,8 @@ class NV_ApplyOverlapAttention:
     CATEGORY = "NV_Utils/sampling"
     DESCRIPTION = "Apply overlap attention for chunk consistency."
 
-    def apply(self, model, overlap_attention, guidance_strength=0.5, guidance_mode="blend"):
+    def apply(self, model, overlap_attention, guidance_strength=0.5, guidance_mode="blend",
+              target_overlap_start=0, target_overlap_end=-1):
 
         patterns = overlap_attention.get("patterns", {})
         metadata = overlap_attention.get("metadata", {})
@@ -786,14 +822,19 @@ class NV_ApplyOverlapAttention:
             print("[NV_ApplyOverlapAttention] WARNING: No patterns to apply!")
             return (model.clone(),)
 
-        overlap_start = metadata.get("overlap_start_latent", 0)
-        overlap_end = metadata.get("overlap_end_latent", 0)
+        src_overlap_start = metadata.get("overlap_start_latent", 0)
+        src_overlap_end = metadata.get("overlap_end_latent", 0)
         spatial_size = metadata.get("spatial_size", 1408)
-        target_layers = set(metadata.get("layers", []))
-        target_steps = set(metadata.get("steps", []))
+        n_overlap_frames = src_overlap_end - src_overlap_start
+
+        # Target overlap region in the receiving chunk.
+        # Default: head of chunk (frames 0 to N) for sequential chunk processing.
+        apply_start = target_overlap_start
+        apply_end = target_overlap_end if target_overlap_end > 0 else n_overlap_frames
 
         print(f"[NV_ApplyOverlapAttention] Applying {len(patterns)} patterns")
-        print(f"  Overlap: latent frames {overlap_start}-{overlap_end}")
+        print(f"  Source overlap: latent frames {src_overlap_start}-{src_overlap_end} ({n_overlap_frames} frames)")
+        print(f"  Target overlap: latent frames {apply_start}-{apply_end}")
         print(f"  Strength: {guidance_strength}, Mode: {guidance_mode}")
 
         current_step = [0]
@@ -832,35 +873,77 @@ class NV_ApplyOverlapAttention:
             if key in patterns:
                 seq_len = q.shape[1] if q.dim() == 3 else q.shape[2]
 
-                # Get token indices for overlap region
-                start_idx = overlap_start * spatial_size
-                end_idx = overlap_end * spatial_size
+                # Context windows: find overlap frames in this window
+                context_window = t_opts.get("context_window", None)
+                if context_window is not None:
+                    window_indices = context_window.index_list
+                    window_frames = len(window_indices)
+                else:
+                    window_indices = None
+                    window_frames = seq_len // spatial_size if spatial_size > 0 else 0
 
-                if end_idx <= seq_len:
-                    # Densify the guidance pattern
-                    guidance_attn = densify_overlap_attention(patterns[key], device=q.device)
+                expected_seq = window_frames * spatial_size
+                if seq_len != expected_seq or window_frames == 0:
+                    return original_func(*args, **kwargs)
 
-                    # Compute current attention
-                    output, current_attn = self._compute_attention(q, k, v, heads, kwargs)
+                # Find target overlap frames in this window (local indices)
+                if window_indices is not None:
+                    local_overlap = []
+                    for local_idx, global_idx in enumerate(window_indices):
+                        if apply_start <= global_idx < apply_end:
+                            local_overlap.append(local_idx)
+                    if not local_overlap:
+                        return original_func(*args, **kwargs)
+                    local_start = min(local_overlap)
+                    local_end = max(local_overlap) + 1
+                else:
+                    local_start = apply_start
+                    local_end = apply_end
+                    if local_end * spatial_size > seq_len:
+                        return original_func(*args, **kwargs)
 
-                    # Apply guidance only to overlap region
-                    if guidance_mode == "blend":
-                        # Blend overlap region attention
-                        current_overlap = current_attn[:, start_idx:end_idx, :]
-                        blended = (1 - guidance_strength) * current_overlap + guidance_strength * guidance_attn
-                        blended = blended / (blended.sum(dim=-1, keepdim=True) + 1e-8)
+                start_token = local_start * spatial_size
+                end_token = local_end * spatial_size
+                n_local_overlap = local_end - local_start
 
-                        # Recompute output for overlap region with blended attention
-                        # For simplicity, recompute full output with modified attention
-                        modified_attn = current_attn.clone()
-                        modified_attn[:, start_idx:end_idx, :] = blended
+                # Densify the guidance pattern
+                guidance_attn = densify_overlap_attention(patterns[key], device=q.device)
+                g_heads, g_tokens, g_total = guidance_attn.shape
 
-                        output = self._apply_attention(modified_attn, v, heads, kwargs)
+                # Shape check: guidance overlap tokens must match local overlap tokens
+                expected_tokens = n_local_overlap * spatial_size
+                if g_tokens != expected_tokens:
+                    # Mismatch - captured and target have different overlap frame counts
+                    # in this window. Skip gracefully.
+                    return original_func(*args, **kwargs)
 
-                    if applications[0] == 0:
-                        print(f"[NV_ApplyOverlapAttention] First guidance at step {step}, layer {block_idx}")
-                    applications[0] += 1
-                    return output
+                # Column dimension check: guidance columns span the capture window,
+                # current attention columns span this apply window. They must match
+                # (same total tokens = same window frame count) for direct blending.
+                if g_total != seq_len:
+                    return original_func(*args, **kwargs)
+
+                # Compute current attention
+                output, current_attn = self._compute_attention(q, k, v, heads, kwargs)
+
+                # Apply guidance only to overlap region
+                if guidance_mode == "blend":
+                    current_overlap = current_attn[:, start_token:end_token, :]
+                    # Both capture and apply windows have the same frame count,
+                    # so guidance columns align with current attention columns.
+                    blended = (1 - guidance_strength) * current_overlap + guidance_strength * guidance_attn
+                    blended = blended / (blended.sum(dim=-1, keepdim=True) + 1e-8)
+
+                    modified_attn = current_attn.clone()
+                    modified_attn[:, start_token:end_token, :] = blended
+
+                    output = self._apply_attention(modified_attn, v, heads, kwargs)
+
+                if applications[0] == 0:
+                    print(f"[NV_ApplyOverlapAttention] First guidance at step {step}, layer {block_idx}, "
+                          f"local frames {local_start}-{local_end}")
+                applications[0] += 1
+                return output
 
             return original_func(*args, **kwargs)
 
