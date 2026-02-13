@@ -203,7 +203,9 @@ class NV_CaptureOverlapAttention:
 
         latent_image = latent["samples"]
         b, c, t_latent, h, w = latent_image.shape
-        spatial_size = h * w
+        # WAN uses 2x2 patch embedding before attention, so each frame has
+        # (h/2)*(w/2) spatial tokens in the attention layer, not h*w.
+        spatial_size = (h // 2) * (w // 2)
 
         # Convert video frames to latent frames (÷4 for WAN)
         t_video = t_latent * 4
@@ -824,7 +826,8 @@ class NV_ApplyOverlapAttention:
 
         src_overlap_start = metadata.get("overlap_start_latent", 0)
         src_overlap_end = metadata.get("overlap_end_latent", 0)
-        spatial_size = metadata.get("spatial_size", 1408)
+        # spatial_size is in attention tokens (post-patch-embedding), not latent pixels
+        spatial_size = metadata.get("spatial_size", 220)
         n_overlap_frames = src_overlap_end - src_overlap_start
 
         # Target overlap region in the receiving chunk.
