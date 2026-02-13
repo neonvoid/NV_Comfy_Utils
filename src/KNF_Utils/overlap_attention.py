@@ -317,6 +317,15 @@ class NV_CaptureOverlapAttention:
                         q, k, v, heads, kwargs
                     )
 
+                    # Compress: [bh, seq, seq] → take conditional batch, average heads
+                    # This reduces from 80 heads to 1, cutting file size ~80x.
+                    batch_size = q.shape[0]
+                    bh = attn_weights.shape[0]
+                    n_heads = bh // batch_size
+                    attn_weights = attn_weights.view(batch_size, n_heads, seq_len, seq_len)
+                    # Take conditional batch only (index 0), average across heads
+                    attn_weights = attn_weights[0].mean(dim=0, keepdim=True)  # [1, seq, seq]
+
                     # Extract only overlap frame attention (using local window indices)
                     overlap_attn = extract_frame_attention(
                         attn_weights,
