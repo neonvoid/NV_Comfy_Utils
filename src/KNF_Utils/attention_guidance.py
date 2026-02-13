@@ -292,9 +292,11 @@ def create_attention_capture_override(storage, target_steps, target_layers, spar
         current_step_ref: List with single element [step] for mutable step tracking
         extraction_count_ref: List with single element [count] for tracking captures
     """
-    # Track which steps/layers we've seen for debugging
-    seen_combinations = set()
-    debug_logged = [False]  # Only log debug info once
+    # Track debug state
+    call_count = [0]  # Total calls across all steps
+    per_step_count = {}  # calls per step
+    last_step = [-1]
+    sentinel_dict_id = [None]  # Track dict identity across calls
 
     def attention_capture_override(original_func, *args, **kwargs):
         """
@@ -317,15 +319,38 @@ def create_attention_capture_override(storage, target_steps, target_layers, spar
         attn_precision = kwargs.get("attn_precision", None)
         skip_reshape = kwargs.get("skip_reshape", False)
 
-        # Debug logging - log unique step/layer combinations (limit to avoid spam)
-        combo = (step, block_idx)
-        if combo not in seen_combinations and len(seen_combinations) < 30:
-            seen_combinations.add(combo)
+        # --- Enhanced debug: count ALL calls, track dict identity ---
+        call_count[0] += 1
+        per_step_count[step] = per_step_count.get(step, 0) + 1
+        step_call = per_step_count[step]
+
+        # Print step summary when step changes
+        if step != last_step[0]:
+            if last_step[0] >= 0:
+                print(f"[AttentionCapture] Step {last_step[0]} completed: {per_step_count.get(last_step[0], 0)} total override calls, block_idx was always -1")
+            last_step[0] = step
+
+        # First 5 calls of step 0: full detail (no dedup)
+        if step == 0 and step_call <= 5:
             t_keys = sorted(t_opts.keys()) if t_opts else []
-            print(f"[AttentionCapture DEBUG] step={step}, block_idx={block_idx}, "
-                  f"target_steps={target_steps}, target_layers={target_layers}")
-            print(f"[AttentionCapture DEBUG]   t_opts id={id(t_opts)}, keys={t_keys}")
-            print(f"[AttentionCapture DEBUG]   q.shape={args[0].shape}, kwargs_keys={sorted(kwargs.keys())}")
+            has_sentinel = t_opts.get("_debug_attn_sentinel", None)
+            print(f"[AttentionCapture DETAIL] step={step} call#{step_call} block_idx={block_idx} "
+                  f"dict_id={id(t_opts)} sentinel={has_sentinel}")
+            print(f"[AttentionCapture DETAIL]   keys={t_keys}")
+            print(f"[AttentionCapture DETAIL]   q.shape={q.shape}")
+            # Set sentinel on first call to test if dict persists
+            if step_call == 1:
+                t_opts["_debug_attn_sentinel"] = f"set_at_step0_call1"
+                sentinel_dict_id[0] = id(t_opts)
+                print(f"[AttentionCapture DETAIL]   ** Set sentinel on dict id={id(t_opts)} **")
+
+        # First call of step 1: check if sentinel survived
+        if step == 1 and step_call == 1:
+            t_keys = sorted(t_opts.keys()) if t_opts else []
+            has_sentinel = t_opts.get("_debug_attn_sentinel", None)
+            print(f"[AttentionCapture DETAIL] step=1 call#1 block_idx={block_idx} "
+                  f"dict_id={id(t_opts)} (step0 dict was {sentinel_dict_id[0]}) sentinel={has_sentinel}")
+            print(f"[AttentionCapture DETAIL]   keys={t_keys}")
 
         # Check if we should capture at this step and layer
         if step in target_steps and block_idx in target_layers:
