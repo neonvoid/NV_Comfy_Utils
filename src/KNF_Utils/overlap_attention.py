@@ -949,21 +949,44 @@ class NV_ApplyOverlapAttention:
                 if g_total != seq_len:
                     return original_func(*args, **kwargs)
 
-                # Compute current attention
-                output, current_attn = self._compute_attention(q, k, v, heads, kwargs)
+                # Memory-efficient guidance: use flash attention for base output,
+                # then recompute only overlap token outputs with blended attention.
+                # Avoids materializing full [bh, seq, seq] which OOMs at higher res.
+                output = original_func(*args, **kwargs)
 
-                # Apply guidance only to overlap region
                 if guidance_mode == "blend":
-                    current_overlap = current_attn[:, start_token:end_token, :]
-                    # Both capture and apply windows have the same frame count,
-                    # so guidance columns align with current attention columns.
-                    blended = (1 - guidance_strength) * current_overlap + guidance_strength * guidance_attn
-                    blended = blended / (blended.sum(dim=-1, keepdim=True) + 1e-8)
+                    n_overlap_tokens = end_token - start_token
+                    dim = q.shape[-1]
+                    d_per_head = dim // heads
+                    scale = d_per_head ** -0.5
+                    attn_precision = kwargs.get("attn_precision", None)
+                    batch_size = q.shape[0]
 
-                    modified_attn = current_attn.clone()
-                    modified_attn[:, start_token:end_token, :] = blended
+                    # Recompute overlap outputs with blended attention, per batch+head
+                    for b_idx in range(batch_size):
+                        q_b = q[b_idx].view(seq_len, heads, d_per_head).permute(1, 0, 2)
+                        k_b = k[b_idx].view(seq_len, heads, d_per_head).permute(1, 0, 2)
+                        v_b = v[b_idx].view(seq_len, heads, d_per_head).permute(1, 0, 2)
+                        q_ov = q_b[:, start_token:end_token, :]
 
-                    output = self._apply_attention(modified_attn, v, heads, kwargs)
+                        overlap_out = torch.zeros(heads, n_overlap_tokens, d_per_head,
+                                                   device=q.device, dtype=v.dtype)
+                        for h_idx in range(heads):
+                            q_h = q_ov[h_idx:h_idx+1]
+                            k_h = k_b[h_idx:h_idx+1]
+                            if attn_precision == torch.float32:
+                                sim = torch.matmul(q_h.float(), k_h.float().transpose(-1, -2)) * scale
+                            else:
+                                sim = torch.matmul(q_h, k_h.transpose(-1, -2)) * scale
+                            cur_attn = sim.softmax(dim=-1)
+                            blended = (1 - guidance_strength) * cur_attn + guidance_strength * guidance_attn
+                            blended = blended / (blended.sum(dim=-1, keepdim=True) + 1e-8)
+                            v_h = v_b[h_idx:h_idx+1]
+                            overlap_out[h_idx] = torch.matmul(blended.to(v_h.dtype), v_h)[0]
+                            del sim, cur_attn, blended
+                        # [heads, n_overlap, d] → [n_overlap, dim]
+                        output[b_idx, start_token:end_token, :] = overlap_out.permute(1, 0, 2).reshape(n_overlap_tokens, dim)
+                        del q_b, k_b, v_b, q_ov, overlap_out
 
                 if applications[0] == 0:
                     print(f"[NV_ApplyOverlapAttention] First guidance at step {step}, layer {block_idx}, "
