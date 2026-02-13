@@ -1,5 +1,6 @@
 /node_notes
 nul
+claude.md
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -115,3 +116,4 @@ yarn-error.log*
 node.zip
 .vscode/
 .claude/
+CLAUDE.local.md

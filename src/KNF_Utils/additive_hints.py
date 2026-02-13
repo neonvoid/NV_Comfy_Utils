@@ -624,6 +624,13 @@ class NV_SaveAdditiveHints:
                     "default": "additive_hints.pt",
                     "tooltip": "Path to save the hint cache"
                 }),
+            },
+            "optional": {
+                "trigger": ("*", {
+                    "tooltip": "Connect sampler output (LATENT or IMAGE) here to ensure "
+                               "save runs AFTER sampling completes. Without this, ComfyUI "
+                               "may execute save before hints are captured."
+                }),
             }
         }
 
@@ -633,7 +640,7 @@ class NV_SaveAdditiveHints:
     FUNCTION = "save"
     CATEGORY = "NV_Utils/attention"
 
-    def save(self, hint_cache, output_path):
+    def save(self, hint_cache, output_path, trigger=None):
         manager = hint_cache
 
         if not manager.has_hints:
