@@ -312,26 +312,40 @@ class NV_CaptureOverlapAttention:
                     local_start = min(local_overlap)
                     local_end = max(local_overlap) + 1
 
-                    # Compute attention
-                    output, attn_weights = self._compute_attention(
-                        q, k, v, heads, kwargs
-                    )
+                    # Memory-efficient capture: use flash attention for output,
+                    # compute only overlap attention rows head-by-head.
+                    # Avoids materializing full [bh, seq, seq] which OOMs at higher res.
+                    output = original_func(*args, **kwargs)
 
-                    # Compress: [bh, seq, seq] → take conditional batch, average heads
-                    # This reduces from 80 heads to 1, cutting file size ~80x.
-                    batch_size = q.shape[0]
-                    bh = attn_weights.shape[0]
-                    n_heads = bh // batch_size
-                    attn_weights = attn_weights.view(batch_size, n_heads, seq_len, seq_len)
-                    # Take conditional batch only (index 0), average across heads
-                    attn_weights = attn_weights[0].mean(dim=0, keepdim=True)  # [1, seq, seq]
+                    # Compute overlap-only attention, head-averaged, cond batch only
+                    overlap_start_token = local_start * spatial_size
+                    overlap_end_token = local_end * spatial_size
+                    n_overlap_tokens = overlap_end_token - overlap_start_token
 
-                    # Extract only overlap frame attention (using local window indices)
-                    overlap_attn = extract_frame_attention(
-                        attn_weights,
-                        local_start, local_end,
-                        spatial_size, window_frames
-                    )
+                    dim = q.shape[-1]
+                    d_per_head = dim // heads
+                    scale = d_per_head ** -0.5
+                    attn_precision = kwargs.get("attn_precision", None)
+
+                    # Conditional batch only (index 0), reshape to per-head
+                    q_per_head = q[0].view(seq_len, heads, d_per_head).permute(1, 0, 2)
+                    k_per_head = k[0].view(seq_len, heads, d_per_head).permute(1, 0, 2)
+                    q_overlap_heads = q_per_head[:, overlap_start_token:overlap_end_token, :]
+
+                    # Accumulate head-averaged attention one head at a time
+                    overlap_attn = torch.zeros(1, n_overlap_tokens, seq_len,
+                                               device=q.device, dtype=torch.float32)
+                    for h_idx in range(heads):
+                        q_h = q_overlap_heads[h_idx:h_idx+1]
+                        k_h = k_per_head[h_idx:h_idx+1]
+                        if attn_precision == torch.float32:
+                            sim = torch.matmul(q_h.float(), k_h.float().transpose(-1, -2)) * scale
+                        else:
+                            sim = torch.matmul(q_h, k_h.transpose(-1, -2)) * scale
+                        overlap_attn += sim.softmax(dim=-1).float()
+                        del sim
+                    overlap_attn /= heads
+                    del q_per_head, k_per_head, q_overlap_heads
 
                     # Sparsify and store
                     captured_patterns[key] = sparsify_overlap_attention(
