@@ -65,10 +65,11 @@ class AdditiveHintManager:
         self.capture_at_step = capture_at_step
         self.hint_mode = hint_mode
 
-        # Cache: block_idx -> tensor
+        # Cache: block_idx -> tensor or dict
         # averaged mode: {block_idx: [1, 1, D]} (spatially-averaged style vector)
         # per_frame mode: {block_idx: [N_frames, S_per_frame, D]} (per-frame hints)
-        self.hint_cache: Dict[int, torch.Tensor] = {}
+        # adain mode: {block_idx: {"mean": [D], "std": [D]}} (per-channel statistics)
+        self.hint_cache: Dict[int, any] = {}
 
         # State
         self._mode = "idle"  # "idle", "capture", "apply"
@@ -104,7 +105,11 @@ class AdditiveHintManager:
                 print("[AdditiveHintManager] WARNING: No hints cached! Run capture first.")
             else:
                 sample_block = next(iter(self.hint_cache))
-                shape = list(self.hint_cache[sample_block].shape)
+                sample = self.hint_cache[sample_block]
+                if isinstance(sample, dict):
+                    shape = f"adain(mean+std [{len(sample['mean'])}])"
+                else:
+                    shape = list(sample.shape)
                 print(f"[AdditiveHintManager] Mode: APPLY "
                       f"({n_cached} blocks, hint shape: {shape})")
 
@@ -182,7 +187,16 @@ class AdditiveHintManager:
         # Take first batch element only (conditional, not unconditional)
         hint = hidden_state[0, :n_tokens, :].detach().cpu().float()
 
-        if self.hint_mode == "averaged":
+        if self.hint_mode == "adain":
+            # AdaIN: compute per-channel mean and std across all tokens
+            # These statistics capture the "style" (activation distribution) without
+            # carrying any spatial structure. Applied via normalization matching:
+            #   x_new = ref_std * ((x - cur_mean) / (cur_std + eps)) + ref_mean
+            mean = hint.mean(dim=0)  # [D]
+            std = hint.std(dim=0)    # [D]
+            return {"mean": mean, "std": std}
+
+        elif self.hint_mode == "averaged":
             # Reshape to [N_frames, spatial_size, D] then mean over frames AND spatial
             # Averaging spatially produces a pure per-block style vector [1, 1, D]
             # that broadcasts without spatial contamination (token 0 = top-left, etc.)
@@ -266,21 +280,44 @@ class AdditiveHintManager:
             return
 
         for block_idx, hints in self._capture_accum.items():
-            if len(hints) == 1:
-                self.hint_cache[block_idx] = hints[0]
+            if self.hint_mode == "adain":
+                # hints is a list of {"mean": [D], "std": [D]} dicts
+                # Average the statistics across context windows
+                if len(hints) == 1:
+                    self.hint_cache[block_idx] = hints[0]
+                else:
+                    mean_stack = torch.stack([h["mean"] for h in hints], dim=0)
+                    std_stack = torch.stack([h["std"] for h in hints], dim=0)
+                    self.hint_cache[block_idx] = {
+                        "mean": mean_stack.mean(dim=0),
+                        "std": std_stack.mean(dim=0),
+                    }
             else:
-                # Multiple captures (e.g. if capture_at_step matched multiple times
-                # due to context windows calling the same block multiple times per step)
-                # Average them
-                stacked = torch.stack(hints, dim=0)
-                self.hint_cache[block_idx] = stacked.mean(dim=0)
+                if len(hints) == 1:
+                    self.hint_cache[block_idx] = hints[0]
+                else:
+                    # Multiple captures (e.g. if capture_at_step matched multiple times
+                    # due to context windows calling the same block multiple times per step)
+                    # Average them
+                    stacked = torch.stack(hints, dim=0)
+                    self.hint_cache[block_idx] = stacked.mean(dim=0)
 
         self._capture_complete = True
-        total_bytes = sum(h.nbytes for h in self.hint_cache.values())
+        total_bytes = self._compute_cache_bytes()
         print(f"[AdditiveHint] Capture complete! "
               f"{len(self.hint_cache)} blocks, "
               f"{total_bytes / 1024 / 1024:.1f} MB, "
               f"mode={self.hint_mode}")
+
+    def _compute_cache_bytes(self) -> int:
+        """Compute total bytes of hint cache, handling both tensor and dict formats."""
+        total = 0
+        for h in self.hint_cache.values():
+            if isinstance(h, dict):
+                total += sum(t.nbytes for t in h.values() if isinstance(t, torch.Tensor))
+            else:
+                total += h.nbytes
+        return total
 
     def create_apply_patch(self, block_idx: int, scale: float = 0.3,
                            apply_after_pct: float = 0.0):
@@ -317,20 +354,44 @@ class AdditiveHintManager:
                         return out
 
             hidden = out["img"]  # [B, S, D]
-            hint = manager.hint_cache[block_idx]  # [1, 1, D] or [N, spatial, D]
-
-            # Move hint to device
-            hint_dev = hint.to(device=hidden.device, dtype=hidden.dtype)
+            hint = manager.hint_cache[block_idx]
 
             seq_len = hidden.shape[1]
             spatial_size = manager._estimate_spatial_size(seq_len, t_opts)
 
-            if manager.hint_mode == "averaged":
+            if manager.hint_mode == "adain":
+                # AdaIN: match per-channel activation statistics from chunk 0
+                # Formula: x_new = ref_std * ((x - cur_mean) / (cur_std + eps)) + ref_mean
+                # Blended: out = strength * x_new + (1 - strength) * x
+                #
+                # This preserves spatial structure (each token keeps its relative
+                # position in the distribution) while transferring the "style"
+                # (per-channel mean/std) from the reference chunk.
+                ref_mean = hint["mean"].to(device=hidden.device, dtype=hidden.dtype)  # [D]
+                ref_std = hint["std"].to(device=hidden.device, dtype=hidden.dtype)    # [D]
+
+                eps = 1e-6
+                # Compute current stats across all tokens (per channel)
+                cur_mean = hidden.mean(dim=1, keepdim=True)  # [B, 1, D]
+                cur_std = hidden.std(dim=1, keepdim=True)    # [B, 1, D]
+
+                # Normalize then denormalize with reference stats
+                normalized = (hidden - cur_mean) / (cur_std + eps)
+                styled = normalized * ref_std + ref_mean  # broadcasts [D] -> [B, S, D]
+
+                # Blend: scale=0 means no effect, scale=1 means full AdaIN
+                out["img"] = hidden + (styled - hidden) * scale
+
+            elif manager.hint_mode == "averaged":
+                # Move hint to device
+                hint_dev = hint.to(device=hidden.device, dtype=hidden.dtype)
                 # hint_dev shape: [1, 1, D] -- pure style vector, spatially averaged
                 # PyTorch broadcasts [1, 1, D] to [B, S, D] automatically
                 out["img"] = hidden + hint_dev * scale
 
             elif manager.hint_mode == "per_frame":
+                # Move hint to device
+                hint_dev = hint.to(device=hidden.device, dtype=hidden.dtype)
                 # Apply per-frame hints to the first N frames of the sequence
                 # hint_dev shape: [N_frames, spatial_size, D]
                 n_hint_frames = hint_dev.shape[0]
@@ -352,8 +413,12 @@ class AdditiveHintManager:
 
             manager._apply_count += 1
             if manager._apply_count == 1:
+                if isinstance(hint, dict):
+                    hint_info = f"adain(mean+std [{len(hint['mean'])}])"
+                else:
+                    hint_info = f"hint {list(hint.shape)}"
                 print(f"[AdditiveHint] First apply at block {block_idx}: "
-                      f"hint {list(hint_dev.shape)} -> hidden {list(hidden.shape)}, "
+                      f"{hint_info} -> hidden {list(hidden.shape)}, "
                       f"scale={scale}, step_gate={apply_after_pct:.0%}")
 
             return out
@@ -364,9 +429,14 @@ class AdditiveHintManager:
         if not self.hint_cache:
             return {"cached_blocks": 0, "total_bytes": 0, "total_mb": 0}
 
-        total_bytes = sum(h.nbytes for h in self.hint_cache.values())
+        total_bytes = self._compute_cache_bytes()
         sample_block = next(iter(self.hint_cache))
-        shape = list(self.hint_cache[sample_block].shape)
+        sample = self.hint_cache[sample_block]
+
+        if isinstance(sample, dict):
+            shape = f"adain(mean+std [{len(sample['mean'])}])"
+        else:
+            shape = list(sample.shape)
 
         return {
             "cached_blocks": len(self.hint_cache),
@@ -378,11 +448,18 @@ class AdditiveHintManager:
         }
 
     def to_serializable(self) -> dict:
+        serialized_cache = {}
+        for block_idx, h in self.hint_cache.items():
+            if isinstance(h, dict):
+                # adain format: {"mean": tensor, "std": tensor}
+                serialized_cache[block_idx] = {
+                    k: v.cpu() for k, v in h.items()
+                }
+            else:
+                serialized_cache[block_idx] = h.cpu()
+
         return {
-            "hint_cache": {
-                block_idx: h.cpu()
-                for block_idx, h in self.hint_cache.items()
-            },
+            "hint_cache": serialized_cache,
             "config": {
                 "num_hint_latent_frames": self.num_hint_latent_frames,
                 "target_blocks": sorted(self.target_blocks),
@@ -402,7 +479,13 @@ class AdditiveHintManager:
             hint_mode=config.get("hint_mode", "averaged"),
         )
         for block_idx, h in data.get("hint_cache", {}).items():
-            manager.hint_cache[int(block_idx)] = h.cpu()
+            if isinstance(h, dict):
+                # adain format: {"mean": tensor, "std": tensor}
+                manager.hint_cache[int(block_idx)] = {
+                    k: v.cpu() for k, v in h.items()
+                }
+            else:
+                manager.hint_cache[int(block_idx)] = h.cpu()
         return manager
 
 
@@ -490,10 +573,12 @@ class NV_CaptureAdditiveHints:
                     "tooltip": "When to capture: 'last' (cleanest), 'first' (earliest), "
                                "a step number, or '80%'"
                 }),
-                "hint_mode": (["averaged", "per_frame"], {
-                    "default": "averaged",
-                    "tooltip": "averaged: one hint per block (tiny file, broadcasts to all frames). "
-                               "per_frame: individual frame hints (richer, applies to overlap region)."
+                "hint_mode": (["adain", "averaged", "per_frame"], {
+                    "default": "adain",
+                    "tooltip": "adain: match per-channel activation statistics (mean+std) -- "
+                               "preserves spatial structure while transferring style. "
+                               "averaged: one hint per block (additive bias, broadcasts). "
+                               "per_frame: individual frame hints (additive, overlap region)."
                 }),
                 "total_video_frames": ("INT", {
                     "default": 81,
@@ -585,8 +670,9 @@ class NV_ApplyAdditiveHints:
                     "min": 0.0,
                     "max": 2.0,
                     "step": 0.05,
-                    "tooltip": "Hint strength. 0.0=no effect, 0.3=moderate, 1.0=strong. "
-                               "Too high may freeze appearance or cause artifacts."
+                    "tooltip": "Hint strength. For adain mode: 0=no effect, 1=full style match. "
+                               "For averaged/per_frame: additive scale. "
+                               "Start low (0.3) and increase."
                 }),
                 "apply_after_pct": ("FLOAT", {
                     "default": 0.0,
@@ -598,6 +684,12 @@ class NV_ApplyAdditiveHints:
                                "Since hints are captured from the final step, "
                                "applying only at late steps can reduce noise-hint mismatch."
                 }),
+                "apply_blocks": ("STRING", {
+                    "default": "",
+                    "tooltip": "Filter which cached blocks to apply. Comma-separated indices. "
+                               "Empty = use all cached blocks. Example: '15,19' applies only "
+                               "late blocks without needing to re-capture."
+                }),
             }
         }
 
@@ -606,14 +698,36 @@ class NV_ApplyAdditiveHints:
     FUNCTION = "apply"
     CATEGORY = "NV_Utils/attention"
     DESCRIPTION = ("Apply additive hints from chunk 0 for cross-chunk consistency. "
-                   "Zero VRAM overhead. x = x + hint * scale after each block.")
+                   "Zero VRAM overhead. Supports adain (style matching) and additive modes.")
 
-    def apply(self, model, hint_cache, scale=0.3, apply_after_pct=0.0):
+    def apply(self, model, hint_cache, scale=0.3, apply_after_pct=0.0, apply_blocks=""):
         manager = hint_cache
 
         if not manager.has_hints:
             print("[NV_ApplyAdditiveHints] WARNING: No hints in cache! Was capture run?")
             return (model.clone(),)
+
+        # Filter blocks if apply_blocks is specified
+        if apply_blocks.strip():
+            requested = set()
+            for x in apply_blocks.split(","):
+                try:
+                    requested.add(int(x.strip()))
+                except ValueError:
+                    pass
+            # Only apply to blocks that are both requested AND cached
+            available = set(manager.hint_cache.keys())
+            active_blocks = requested & available
+            skipped = requested - available
+            if skipped:
+                print(f"[NV_ApplyAdditiveHints] WARNING: Blocks {sorted(skipped)} "
+                      f"requested but not in cache (available: {sorted(available)})")
+            # Temporarily override target_blocks for patching
+            original_blocks = manager.target_blocks
+            manager.target_blocks = active_blocks
+        else:
+            original_blocks = None
+            active_blocks = manager.target_blocks
 
         manager.set_mode("apply")
 
@@ -624,10 +738,16 @@ class NV_ApplyAdditiveHints:
             apply_after_pct=apply_after_pct,
         )
 
+        # Restore original target_blocks if we overrode them
+        if original_blocks is not None:
+            manager.target_blocks = original_blocks
+
         stats = manager.get_cache_stats()
         step_gate_str = f", step_gate={apply_after_pct:.0%}" if apply_after_pct > 0 else ""
-        print(f"[NV_ApplyAdditiveHints] Model patched with {stats['cached_blocks']} hint blocks "
-              f"({stats['total_mb']:.1f} MB, scale={scale}, mode={stats['hint_mode']}{step_gate_str})")
+        blocks_str = f", apply_blocks={sorted(active_blocks)}" if apply_blocks.strip() else ""
+        print(f"[NV_ApplyAdditiveHints] Model patched with {len(active_blocks)} hint blocks "
+              f"({stats['total_mb']:.1f} MB, scale={scale}, mode={stats['hint_mode']}"
+              f"{step_gate_str}{blocks_str})")
 
         return (patched,)
 
@@ -711,11 +831,12 @@ class NV_LoadAdditiveHints:
         manager = AdditiveHintManager.from_serializable(data)
 
         stats = manager.get_cache_stats()
+        size_mb = os.path.getsize(path) / (1024 * 1024)
         print(f"[NV_LoadAdditiveHints] Loaded from {path}")
         print(f"  Blocks: {stats['cached_blocks']} ({stats.get('block_indices', [])})")
         print(f"  Mode: {stats.get('hint_mode', 'unknown')}")
         print(f"  Hint shape: {stats.get('hint_shape_per_block', [])}")
-        print(f"  Total: {stats['total_mb']:.1f} MB")
+        print(f"  File size: {size_mb:.1f} MB")
 
         return (manager,)
 
