@@ -261,8 +261,12 @@ class AdditiveHintManager:
                     manager._capture_accum[block_idx] = []
                 manager._capture_accum[block_idx].append(hint)
 
+                if isinstance(hint, dict):
+                    hint_desc = f"adain(mean+std [{len(hint['mean'])}])"
+                else:
+                    hint_desc = f"shape {list(hint.shape)}"
                 print(f"[AdditiveHint] Captured block {block_idx}: "
-                      f"hint shape {list(hint.shape)}, "
+                      f"hint {hint_desc}, "
                       f"spatial_size={spatial_size}, step={manager._current_step}")
 
                 # Finalize if we've seen all target blocks
