@@ -851,17 +851,24 @@ app.registerExtension({
             }
         });
 
-        // Add menu item to ComfyUI menu if available
+        // Add sidebar button to ComfyUI menu bar
         try {
-            const menu = app.ui?.menu;
-            if (menu) {
-                // Try to add to existing menu
-                console.log("[FloatingPanel] ComfyUI menu found, panel accessible via Ctrl+Shift+P");
-            }
+            const { ComfyButton } = await import("../../scripts/ui/components/button.js");
+
+            const toggleBtn = new ComfyButton({
+                icon: "toggle-switch",
+                action: () => floatingPanelInstance.toggle(),
+                tooltip: "Quick Toggle (Ctrl+Shift+P)",
+                content: "Toggle",
+                classList: "comfyui-button comfyui-menu-mobile-collapse"
+            });
+
+            app.menu?.settingsGroup.element.before(toggleBtn.element);
+            console.log("[FloatingPanel] Sidebar button added");
         } catch (e) {
-            // Menu not available, that's fine
+            console.warn("[FloatingPanel] Could not add sidebar button:", e);
         }
 
-        console.log("[FloatingPanel] Ready! Toggle with Ctrl+Shift+P");
+        console.log("[FloatingPanel] Ready! Toggle with sidebar button or Ctrl+Shift+P");
     }
 });
