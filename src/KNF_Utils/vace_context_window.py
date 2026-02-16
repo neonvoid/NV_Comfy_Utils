@@ -154,8 +154,10 @@ def slice_vace_conditioning(handler, model, x_in, conds, timestep, model_options
                             # Calculate offset: VACE may have extra frames (e.g., reference_image adds 1)
                             frame_offset = vace_temporal_size - full_temporal_size
 
-                            # Accept exact match OR small positive offset (reference frames at start)
-                            if frame_offset == 0 or (0 < frame_offset <= 2):
+                            # Accept exact match OR positive offset (reference frames at start)
+                            # Offset <= 2: single reference image (native WanVaceToVideo)
+                            # Offset <= 15: multi-frame pre-pass reference (NV_VacePrePassReference)
+                            if frame_offset == 0 or (0 < frame_offset <= 15):
                                 # Cache the tensors
                                 if use_cpu_cache:
                                     cache[key] = [t.cpu().clone() if isinstance(t, torch.Tensor) else t for t in tensor_list]
@@ -165,7 +167,12 @@ def slice_vace_conditioning(handler, model, x_in, conds, timestep, model_options
                                 cache[f"{key}_offset"] = frame_offset
                                 if window_idx == 0 and cond_idx == 0:
                                     cache_loc = "CPU" if use_cpu_cache else "GPU"
-                                    offset_msg = f" (offset={frame_offset} for reference frames)" if frame_offset > 0 else ""
+                                    if frame_offset > 2:
+                                        offset_msg = f" (offset={frame_offset} for multi-frame pre-pass reference)"
+                                    elif frame_offset > 0:
+                                        offset_msg = f" (offset={frame_offset} for reference frames)"
+                                    else:
+                                        offset_msg = ""
                                     print(f"[VACE Slicer] Cached original {key}: shape {first_tensor.shape} ({cache_loc}){offset_msg}")
                             elif window_idx == 0 and cond_idx == 0:
                                 print(f"[VACE Slicer] WARNING: {key} has {vace_temporal_size} frames but latent has {full_temporal_size} (diff={frame_offset}), skipping")
@@ -213,13 +220,14 @@ def slice_vace_conditioning(handler, model, x_in, conds, timestep, model_options
                     vace_tensor = vace_context.cond
 
                     # Cache original vace_context if not already cached
-                    # Handle reference_image case: VACE may have 1 extra frame at the start
+                    # Handle reference frames: VACE may have extra frames at the start
+                    # Offset <= 2: single reference (native), <= 15: multi-frame pre-pass
                     if vace_context_key not in cache:
                         if vace_tensor.ndim > vace_temporal_dim:
                             vace_ctx_temporal_size = vace_tensor.size(vace_temporal_dim)
                             frame_offset = vace_ctx_temporal_size - full_temporal_size
 
-                            if frame_offset == 0 or (0 < frame_offset <= 2):
+                            if frame_offset == 0 or (0 < frame_offset <= 15):
                                 if use_cpu_cache:
                                     cache[vace_context_key] = vace_context._copy_with(vace_tensor.cpu().clone())
                                 else:
@@ -227,7 +235,12 @@ def slice_vace_conditioning(handler, model, x_in, conds, timestep, model_options
                                 cache[f"{vace_context_key}_offset"] = frame_offset
                                 if window_idx == 0 and cond_idx == 0:
                                     cache_loc = "CPU" if use_cpu_cache else "GPU"
-                                    offset_msg = f" (offset={frame_offset} for reference frames)" if frame_offset > 0 else ""
+                                    if frame_offset > 2:
+                                        offset_msg = f" (offset={frame_offset} for multi-frame pre-pass reference)"
+                                    elif frame_offset > 0:
+                                        offset_msg = f" (offset={frame_offset} for reference frames)"
+                                    else:
+                                        offset_msg = ""
                                     print(f"[VACE Slicer] Cached original vace_context: shape {vace_tensor.shape} ({cache_loc}){offset_msg}")
 
                     # Slice from cached original
