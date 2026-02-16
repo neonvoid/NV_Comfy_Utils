@@ -59,7 +59,13 @@ class NV_VacePrePassReference:
                            "tooltip": "Number of output video frames (pixel space)"}),
                 "batch_size": ("INT", {"default": 1, "min": 1, "max": 4096}),
                 "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1000.0, "step": 0.01,
-                            "tooltip": "Overall VACE conditioning strength"}),
+                            "tooltip": "VACE conditioning strength for the control video. "
+                                       "This is the entry-level vace_strength applied to both references and control."}),
+                "ref_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01,
+                                "tooltip": "Effective strength for reference frames. When different from 'strength', "
+                                           "reference latents are pre-scaled so their effective influence equals this value "
+                                           "after the model applies vace_strength. E.g., strength=0.35 + ref_strength=1.0 "
+                                           "means beauty control at 0.35, references at 1.0."}),
                 "reference_frames": ("IMAGE", {
                     "tooltip": "Pre-pass reference frames (any resolution, will be upscaled to target). "
                                "num_refs_per_chunk frames will be uniformly sampled from these."
@@ -93,7 +99,7 @@ class NV_VacePrePassReference:
     )
 
     def execute(self, positive, negative, vae, width, height, length, batch_size, strength,
-                reference_frames, num_refs_per_chunk, frame_repeat,
+                ref_strength, reference_frames, num_refs_per_chunk, frame_repeat,
                 control_video=None, control_masks=None):
 
         latent_length = ((length - 1) // 4) + 1
@@ -149,6 +155,19 @@ class NV_VacePrePassReference:
             comfy.latent_formats.Wan21().process_out(torch.zeros_like(ref_latent))
         ], dim=1)
         # ref_latent shape: [1, 32, ref_latent_length, H/8, W/8]
+
+        # === Step 1b: Pre-scale reference latent for independent strength control ===
+        # The entry-level vace_strength applies uniformly to the entire VACE entry
+        # (both references and control frames). To give references a different effective
+        # strength, we pre-scale the reference latent so that:
+        #   effective_ref = ref_latent * ref_scale * vace_strength = ref_latent * ref_strength
+        # This allows e.g. beauty control at 0.35 with references at 1.0
+        if strength > 0 and abs(ref_strength - strength) > 1e-6:
+            ref_scale = ref_strength / strength
+            ref_latent = ref_latent * ref_scale
+            print(f"[NV_VacePrePassReference] Pre-scaled reference latent by {ref_scale:.2f}x "
+                  f"(ref_strength={ref_strength}, vace_strength={strength}, "
+                  f"effective reference influence={ref_strength})")
 
         # === Step 2: Process control video (same as native WanVaceToVideo) ===
         if control_video is not None:
