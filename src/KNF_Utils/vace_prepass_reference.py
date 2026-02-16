@@ -87,8 +87,8 @@ class NV_VacePrePassReference:
             }
         }
 
-    RETURN_TYPES = ("CONDITIONING", "CONDITIONING", "LATENT", "INT",)
-    RETURN_NAMES = ("positive", "negative", "latent", "trim_latent",)
+    RETURN_TYPES = ("CONDITIONING", "CONDITIONING", "LATENT", "LATENT", "INT",)
+    RETURN_NAMES = ("positive", "negative", "latent", "ref_latent", "trim_latent",)
     FUNCTION = "execute"
     CATEGORY = "NV_Utils"
     DESCRIPTION = (
@@ -262,20 +262,31 @@ class NV_VacePrePassReference:
             append=True
         )
 
-        # === Step 8: Create output latent ===
+        # === Step 8: Create output latents ===
+        intermediate_device = comfy.model_management.intermediate_device()
         latent = torch.zeros(
             [batch_size, 16, total_latent_length, height // 8, width // 8],
-            device=comfy.model_management.intermediate_device()
+            device=intermediate_device
         )
         out_latent = {"samples": latent}
+
+        # Reference-only latent: zero frames matching the prepended reference region.
+        # Use this with NV_LatentTemporalConcat to prepend to a custom denoised latent
+        # when bypassing the main latent output (e.g., low-denoise input latent workflows).
+        ref_only_latent = torch.zeros(
+            [batch_size, 16, ref_latent_length, height // 8, width // 8],
+            device=intermediate_device
+        )
+        out_ref_latent = {"samples": ref_only_latent}
 
         print(f"[NV_VacePrePassReference] Done.")
         print(f"  VACE latent shape: {control_video_latent.shape}")
         print(f"  VACE mask shape: {mask.shape}")
         print(f"  Output latent shape: {latent.shape}")
+        print(f"  ref_latent shape: {ref_only_latent.shape} (prepend to custom latent input)")
         print(f"  trim_latent: {trim_latent} (reference latent frames to trim from output)")
 
-        return (positive, negative, out_latent, trim_latent)
+        return (positive, negative, out_latent, out_ref_latent, trim_latent)
 
 
 # Node registration
