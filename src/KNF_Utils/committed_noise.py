@@ -288,9 +288,12 @@ class NV_LoadCommittedNoiseSlice:
         data = torch.load(noise_path, weights_only=False)
         noise = data["noise"]
 
-        # Convert video frames to latent frames
-        latent_start = video_to_latent_frames(chunk_start_frame) if chunk_start_frame > 0 else 0
-        latent_end = video_to_latent_frames(chunk_start_frame + chunk_frame_count)
+        # Convert video frame index to latent frame index.
+        # video_to_latent_frames() converts a frame COUNT: (n-1)//4 + 1
+        # For a frame INDEX, the mapping is: index // 4 (Wan's 4:1 temporal stride)
+        latent_start = chunk_start_frame // 4
+        chunk_latent_count = video_to_latent_frames(chunk_frame_count)
+        latent_end = latent_start + chunk_latent_count
 
         # Slice on temporal dimension (dim=2 for [B, C, T, H, W])
         chunk_noise = noise[:, :, latent_start:latent_end, :, :].clone()

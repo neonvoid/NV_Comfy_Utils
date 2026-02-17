@@ -191,10 +191,25 @@ app.registerExtension({
                     );
                 };
 
-                // Update output type based on setter
+                // Update output type based on setter (explicit type > connection-inferred)
                 this.updateType = function() {
                     const setter = this.findSetter();
-                    if (setter && setter.inputs[0].type) {
+                    if (!setter) {
+                        this.outputs[0].type = "*";
+                        this.outputs[0].name = "*";
+                        return;
+                    }
+
+                    // Explicit type set by user in panel takes priority
+                    const explicit = setter.properties?.explicitType;
+                    if (explicit && explicit !== "*") {
+                        this.outputs[0].type = explicit;
+                        this.outputs[0].name = explicit;
+                        return;
+                    }
+
+                    // Fall back to connection-inferred type
+                    if (setter.inputs[0].type && setter.inputs[0].type !== "*") {
                         this.outputs[0].type = setter.inputs[0].type;
                         this.outputs[0].name = setter.inputs[0].type;
                     } else {

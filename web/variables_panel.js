@@ -181,15 +181,47 @@ class VariablesPanel {
             }
             e.stopPropagation();
         });
-        this.createInput.addEventListener("blur", () => {
-            // Small delay so click events can fire first
-            setTimeout(() => this._hideCreateInput(), 150);
-        });
+
+        // Type selector dropdown for new variables
+        const typeRow = document.createElement("div");
+        typeRow.style.cssText = "display: flex; align-items: center; gap: 6px; margin-top: 4px;";
+
+        const typeLabel = document.createElement("span");
+        typeLabel.textContent = "Type:";
+        typeLabel.style.cssText = "font-size: 11px; color: #888; flex-shrink: 0;";
+
+        this.createTypeSelect = document.createElement("select");
+        this.createTypeSelect.style.cssText = `
+            flex: 1;
+            padding: 4px 6px;
+            background: #2a2a2a;
+            border: 1px solid #444;
+            border-radius: 4px;
+            color: #e0e0e0;
+            font-size: 11px;
+            outline: none;
+            cursor: pointer;
+        `;
+        this.createTypeSelect.addEventListener("focus", () => this.createTypeSelect.style.borderColor = "#5af");
+        this.createTypeSelect.addEventListener("blur", () => this.createTypeSelect.style.borderColor = "#444");
+        this.createTypeSelect.addEventListener("keydown", (e) => e.stopPropagation());
+
+        // Populate type options
+        for (const t of variableManager.getVariableTypes()) {
+            const opt = document.createElement("option");
+            opt.value = t;
+            opt.textContent = t === "*" ? "Any (*)" : t;
+            this.createTypeSelect.appendChild(opt);
+        }
+
+        typeRow.appendChild(typeLabel);
+        typeRow.appendChild(this.createTypeSelect);
 
         this.createError = document.createElement("div");
         this.createError.style.cssText = "color: #f44; font-size: 10px; min-height: 14px; padding: 2px 0 0 0;";
 
         this.createInputContainer.appendChild(this.createInput);
+        this.createInputContainer.appendChild(typeRow);
         this.createInputContainer.appendChild(this.createError);
 
         // Search bar
@@ -240,6 +272,7 @@ class VariablesPanel {
     _showCreateInput() {
         this.createInputContainer.style.display = "block";
         this.createInput.value = "";
+        this.createTypeSelect.value = "*";
         this.createError.textContent = "";
         this.createInput.focus();
     }
@@ -247,6 +280,7 @@ class VariablesPanel {
     _hideCreateInput() {
         this.createInputContainer.style.display = "none";
         this.createInput.value = "";
+        this.createTypeSelect.value = "*";
         this.createError.textContent = "";
     }
 
@@ -263,7 +297,8 @@ class VariablesPanel {
             return;
         }
 
-        const setter = variableManager.createVariable(name);
+        const explicitType = this.createTypeSelect.value || "*";
+        const setter = variableManager.createVariable(name, explicitType);
         if (setter) {
             this._hideCreateInput();
             this._lastHash = "";
@@ -487,9 +522,13 @@ class VariablesPanel {
             white-space: nowrap;
         `;
 
-        // Type badge
+        // Type badge — show explicit type with a pin icon to distinguish
+        const hasExplicitType = info.explicitType && info.explicitType !== "*";
         const typeBadge = document.createElement("span");
         typeBadge.textContent = info.type === "unconnected" ? "\u2014" : info.type;
+        typeBadge.title = hasExplicitType
+            ? `Explicit type: ${info.explicitType}`
+            : (info.isConnected ? `Inferred from connection: ${info.type}` : "No type set");
         typeBadge.style.cssText = `
             font-size: 10px;
             color: ${typeColor};
@@ -800,6 +839,11 @@ class VariablesPanel {
                 action: () => this._showRenameDialog(info)
             },
             {
+                label: `Change Type (${info.explicitType || "*"})`,
+                enabled: true,
+                action: () => this._showChangeTypeDialog(info)
+            },
+            {
                 label: "Unassign Source",
                 enabled: !!variableManager.getSourceInfo(info.name),
                 action: () => {
@@ -1074,6 +1118,161 @@ class VariablesPanel {
         document.body.appendChild(dialog);
         input.focus();
         input.select();
+    }
+
+    // ===== Change Type Dialog =====
+
+    _showChangeTypeDialog(info) {
+        const overlay = document.createElement("div");
+        overlay.style.cssText = `
+            position: fixed;
+            inset: 0;
+            background: rgba(0,0,0,0.5);
+            z-index: 10000;
+        `;
+
+        const dialog = document.createElement("div");
+        dialog.style.cssText = `
+            position: fixed;
+            left: 50%;
+            top: 50%;
+            transform: translate(-50%, -50%);
+            background: #1a1a1a;
+            border: 1px solid #444;
+            border-radius: 8px;
+            padding: 16px;
+            z-index: 10001;
+            min-width: 300px;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.6);
+        `;
+
+        const title = document.createElement("h3");
+        title.textContent = `Set Type: ${info.name}`;
+        title.style.cssText = "margin: 0 0 12px 0; color: #e0e0e0; font-size: 14px;";
+
+        const currentType = info.explicitType || "*";
+        const hint = document.createElement("div");
+        hint.textContent = `Current type: ${currentType === "*" ? "Any (*)" : currentType}`;
+        hint.style.cssText = "margin-bottom: 8px; font-size: 11px; color: #888;";
+
+        const select = document.createElement("select");
+        select.style.cssText = `
+            width: 100%;
+            padding: 8px;
+            margin-bottom: 16px;
+            background: #2a2a2a;
+            border: 1px solid #444;
+            border-radius: 4px;
+            color: #e0e0e0;
+            font-size: 12px;
+            outline: none;
+            cursor: pointer;
+        `;
+        select.addEventListener("keydown", (e) => e.stopPropagation());
+
+        const allTypes = variableManager.getVariableTypes();
+        // Core types are the first batch before any extras appear
+        const coreCount = 22; // matches CORE_TYPES length in variable_manager
+        let addedSeparator = false;
+        for (let i = 0; i < allTypes.length; i++) {
+            const t = allTypes[i];
+            // Add separator between core and custom types
+            if (i >= coreCount && !addedSeparator) {
+                const sep = document.createElement("option");
+                sep.disabled = true;
+                sep.textContent = "\u2500\u2500 Custom Node Types \u2500\u2500";
+                select.appendChild(sep);
+                addedSeparator = true;
+            }
+            const opt = document.createElement("option");
+            opt.value = t;
+            opt.textContent = t === "*" ? "Any (*)" : t;
+            if (t === currentType) opt.selected = true;
+            select.appendChild(opt);
+        }
+
+        // Color preview
+        const preview = document.createElement("div");
+        preview.style.cssText = "display: flex; align-items: center; gap: 8px; margin-bottom: 16px;";
+        const previewDot = document.createElement("span");
+        const updatePreview = () => {
+            const c = variableManager.getTypeColor(select.value === "*" ? "unconnected" : select.value);
+            previewDot.style.cssText = `
+                width: 12px; height: 12px; border-radius: 50%;
+                background: ${c}; flex-shrink: 0;
+            `;
+            previewLabel.textContent = select.value === "*" ? "Any type (wildcard)" : select.value;
+            previewLabel.style.color = c;
+        };
+        const previewLabel = document.createElement("span");
+        previewLabel.style.cssText = "font-size: 12px;";
+        preview.appendChild(previewDot);
+        preview.appendChild(previewLabel);
+        updatePreview();
+        select.addEventListener("change", updatePreview);
+
+        const buttons = document.createElement("div");
+        buttons.style.cssText = "display: flex; gap: 8px; justify-content: flex-end;";
+
+        const cleanup = () => {
+            document.body.removeChild(dialog);
+            document.body.removeChild(overlay);
+        };
+
+        const cancelBtn = document.createElement("button");
+        cancelBtn.textContent = "Cancel";
+        cancelBtn.style.cssText = `
+            padding: 8px 16px;
+            background: #333;
+            border: none;
+            border-radius: 4px;
+            color: #e0e0e0;
+            cursor: pointer;
+            font-size: 12px;
+        `;
+        cancelBtn.addEventListener("click", cleanup);
+
+        const applyBtn = document.createElement("button");
+        applyBtn.textContent = "Apply";
+        applyBtn.style.cssText = `
+            padding: 8px 16px;
+            background: #5b8def;
+            border: none;
+            border-radius: 4px;
+            color: white;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 500;
+        `;
+        applyBtn.addEventListener("click", () => {
+            variableManager.setVariableType(info.name, select.value);
+            cleanup();
+            this._lastHash = "";
+            this.refresh();
+        });
+
+        select.addEventListener("keydown", (e) => {
+            if (e.key === "Enter") {
+                applyBtn.click();
+            } else if (e.key === "Escape") {
+                cleanup();
+            }
+        });
+
+        overlay.addEventListener("click", cleanup);
+
+        buttons.appendChild(cancelBtn);
+        buttons.appendChild(applyBtn);
+
+        dialog.appendChild(title);
+        dialog.appendChild(hint);
+        dialog.appendChild(select);
+        dialog.appendChild(preview);
+        dialog.appendChild(buttons);
+
+        document.body.appendChild(overlay);
+        document.body.appendChild(dialog);
+        select.focus();
     }
 
     // ===== Search Filter =====

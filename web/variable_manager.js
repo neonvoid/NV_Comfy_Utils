@@ -30,6 +30,91 @@ const TYPE_COLORS = {
     unconnected: "#666",
 };
 
+// Core ComfyUI types (always shown at top of type list)
+const CORE_TYPES = [
+    "*",
+    "IMAGE",
+    "LATENT",
+    "CONDITIONING",
+    "MODEL",
+    "CLIP",
+    "VAE",
+    "MASK",
+    "STRING",
+    "INT",
+    "FLOAT",
+    "BOOLEAN",
+    "CONTROL_NET",
+    "CLIP_VISION",
+    "CLIP_VISION_OUTPUT",
+    "STYLE_MODEL",
+    "GLIGEN",
+    "UPSCALE_MODEL",
+    "SIGMAS",
+    "NOISE",
+    "SAMPLER",
+    "GUIDER",
+];
+
+/**
+ * Dynamically discover all slot types registered in the current LiteGraph session.
+ * This picks up types from custom nodes (Impact Pack, KJNodes, etc.) automatically.
+ * Returns core types first, then any additional discovered types sorted alphabetically.
+ */
+function discoverAllTypes() {
+    const allTypes = new Set(CORE_TYPES);
+
+    // Discover from LiteGraph slot_types_default_in (input slot types)
+    if (LiteGraph.slot_types_default_in) {
+        for (const typeName of Object.keys(LiteGraph.slot_types_default_in)) {
+            if (typeName && typeName !== "" && typeName !== "undefined") {
+                allTypes.add(typeName);
+            }
+        }
+    }
+
+    // Discover from LiteGraph slot_types_default_out (output slot types)
+    if (LiteGraph.slot_types_default_out) {
+        for (const typeName of Object.keys(LiteGraph.slot_types_default_out)) {
+            if (typeName && typeName !== "" && typeName !== "undefined") {
+                allTypes.add(typeName);
+            }
+        }
+    }
+
+    // Discover from registered node definitions (scan all input/output slot types)
+    if (LiteGraph.registered_node_types) {
+        for (const nodeType of Object.values(LiteGraph.registered_node_types)) {
+            try {
+                // Check if the node class has default inputs/outputs defined
+                const proto = nodeType.prototype;
+                if (proto && proto.inputs) {
+                    for (const input of proto.inputs) {
+                        if (input && input.type && input.type !== "*") {
+                            allTypes.add(input.type);
+                        }
+                    }
+                }
+                if (proto && proto.outputs) {
+                    for (const output of proto.outputs) {
+                        if (output && output.type && output.type !== "*") {
+                            allTypes.add(output.type);
+                        }
+                    }
+                }
+            } catch (e) {
+                // Skip nodes that error during introspection
+            }
+        }
+    }
+
+    // Build final list: core types first (in order), then extras sorted
+    const coreSet = new Set(CORE_TYPES);
+    const extras = [...allTypes].filter(t => !coreSet.has(t)).sort();
+
+    return [...CORE_TYPES, ...extras];
+}
+
 const MANAGED_SETTER_X = -5000;
 const MANAGED_SETTER_Y_SPACING = 60;
 
@@ -42,9 +127,11 @@ class VariableManager {
 
     /**
      * Create a new variable. Places a hidden SetVariableNode offscreen.
+     * @param {string} name - Variable name
+     * @param {string} [explicitType="*"] - Explicit data type (e.g. "IMAGE", "LATENT")
      * Returns the created setter node, or null if name already exists.
      */
-    createVariable(name) {
+    createVariable(name, explicitType = "*") {
         if (!name || !app.graph) return null;
 
         // Check for duplicate name
@@ -63,9 +150,16 @@ class VariableManager {
 
         // Configure as managed
         setter.properties._nv_managed = true;
+        setter.properties.explicitType = explicitType;
         setter.widgets[0].value = name;
         setter.properties.previousName = name;
         setter.title = `_var_${name}`;
+
+        // Set the input/output slot types to match the explicit type
+        if (explicitType && explicitType !== "*") {
+            setter.inputs[0].type = explicitType;
+            setter.outputs[0].type = explicitType;
+        }
 
         // Position offscreen
         const index = this._countManagedSetters();
@@ -74,7 +168,7 @@ class VariableManager {
         app.graph.add(setter);
         app.graph.setDirtyCanvas(true, false);
 
-        console.log(`[VariableManager] Created variable "${name}"`);
+        console.log(`[VariableManager] Created variable "${name}" (type: ${explicitType})`);
         return setter;
     }
 
@@ -197,6 +291,48 @@ class VariableManager {
     }
 
     /**
+     * Set the explicit data type for a variable.
+     * Updates the setter's slot types and propagates to all getters.
+     */
+    setVariableType(varName, newType) {
+        if (!app.graph) return false;
+
+        const setter = this._findSetter(varName);
+        if (!setter) return false;
+
+        setter.properties.explicitType = newType;
+
+        // Update setter slot types
+        if (newType && newType !== "*") {
+            setter.inputs[0].type = newType;
+            setter.outputs[0].type = newType;
+        } else {
+            // Revert to wildcard or connection-inferred type
+            setter.inputs[0].type = "*";
+            setter.outputs[0].type = "*";
+        }
+
+        // Propagate to all getters
+        if (setter.updateGetters) {
+            setter.updateGetters();
+        }
+
+        app.graph.setDirtyCanvas(true, false);
+        console.log(`[VariableManager] Set type for "${varName}" → ${newType}`);
+        return true;
+    }
+
+    /**
+     * Get the explicit type set for a variable, or null if none.
+     */
+    getExplicitType(varName) {
+        const setter = this._findSetter(varName);
+        if (!setter) return null;
+        const t = setter.properties?.explicitType;
+        return (t && t !== "*") ? t : null;
+    }
+
+    /**
      * Disconnect the source from a variable's setter.
      */
     unassignSource(varName) {
@@ -315,6 +451,7 @@ class VariableManager {
                 variableMap.set(name, {
                     name,
                     type: this._resolveType(setter),
+                    explicitType: setter.properties?.explicitType || "*",
                     isConnected: this._isSetterConnected(setter),
                     setter: setter,
                     getters: [],
@@ -379,9 +516,29 @@ class VariableManager {
 
     /**
      * Get the color for a variable type.
+     * Known types get curated colors; unknown types (from custom nodes)
+     * get a deterministic color generated from the type name.
      */
     getTypeColor(type) {
-        return TYPE_COLORS[type] || TYPE_COLORS["*"];
+        if (TYPE_COLORS[type]) return TYPE_COLORS[type];
+
+        // Generate a deterministic HSL color from the type name string
+        // so custom node types always get a consistent color
+        let hash = 0;
+        for (let i = 0; i < type.length; i++) {
+            hash = type.charCodeAt(i) + ((hash << 5) - hash);
+        }
+        const hue = Math.abs(hash) % 360;
+        return `hsl(${hue}, 55%, 60%)`;
+    }
+
+    /**
+     * Get the list of available variable types for dropdowns.
+     * Dynamically discovers types from all registered nodes (including custom nodes).
+     * Core types appear first, then additional types sorted alphabetically.
+     */
+    getVariableTypes() {
+        return discoverAllTypes();
     }
 
     /**
@@ -393,7 +550,7 @@ class VariableManager {
         let hash = "";
         for (const n of nodes) {
             if (n.type === "SetVariableNode" || n.type === "GetVariableNode") {
-                hash += `${n.id}=${n.widgets?.[0]?.value}|${n.inputs?.[0]?.type}|${n.inputs?.[0]?.link},`;
+                hash += `${n.id}=${n.widgets?.[0]?.value}|${n.inputs?.[0]?.type}|${n.inputs?.[0]?.link}|${n.properties?.explicitType},`;
             }
         }
         return hash;
@@ -524,6 +681,12 @@ class VariableManager {
     }
 
     _resolveType(setter) {
+        // Explicit type takes priority
+        const explicit = setter.properties?.explicitType;
+        if (explicit && explicit !== "*") {
+            return explicit;
+        }
+        // Fall back to connection-inferred type
         if (setter.inputs && setter.inputs[0]) {
             const inputType = setter.inputs[0].type;
             return (inputType && inputType !== "*") ? inputType : "unconnected";

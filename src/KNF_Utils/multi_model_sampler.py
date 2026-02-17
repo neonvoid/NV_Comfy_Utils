@@ -296,7 +296,8 @@ class NV_MultiModelSampler:
         generating new noise from seed.
         """
         latent_image = latent["samples"]
-        latent_image = comfy.sample.fix_empty_latent_channels(model, latent_image)
+        latent_image = comfy.sample.fix_empty_latent_channels(model, latent_image,
+                                                               latent.get("downscale_ratio_spacial", None))
 
         # Validate noise shape matches latent
         if noise.shape != latent_image.shape:
@@ -321,6 +322,7 @@ class NV_MultiModelSampler:
         )
 
         out = latent.copy()
+        out.pop("downscale_ratio_spacial", None)
         out["samples"] = samples
         return (out,)
 
