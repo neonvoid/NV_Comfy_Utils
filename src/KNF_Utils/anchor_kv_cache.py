@@ -122,6 +122,14 @@ class NV_AnchorKVCache:
         def anchor_kv_override(original_func, *args, **kwargs):
             q, k, v = args[0], args[1], args[2]
 
+            # Skip cross-attention — only cache/inject for self-attention.
+            # Self-attention: Q and K have same seq_len (both are video tokens).
+            # Cross-attention: Q=video tokens (long), K=text tokens (~512) — different lengths.
+            # Without this check, cross-attn's 512-token K/V overwrites the correct
+            # 8040-token self-attn cache since both share the same block_idx key.
+            if q.shape[1] != k.shape[1]:
+                return _call_next(original_func, args, kwargs)
+
             t_opts = kwargs.get("transformer_options", {})
             block_idx = t_opts.get("block_index", -1)
             window = t_opts.get("context_window", None)
