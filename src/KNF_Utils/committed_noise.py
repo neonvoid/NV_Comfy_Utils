@@ -233,6 +233,10 @@ class NV_LoadCommittedNoiseSlice:
 
     For parallel workers: load only the noise slice needed for your chunk,
     avoiding the need to load the entire noise tensor into memory.
+
+    When using NV_VacePrePassReference, the input latent has prepended reference
+    frames. Set prepend_ref_frames to match trim_latent so the noise tensor
+    has the correct temporal size for the sampler.
     """
 
     @classmethod
@@ -253,6 +257,17 @@ class NV_LoadCommittedNoiseSlice:
                     "min": 1,
                     "tooltip": "Number of VIDEO frames in the chunk"
                 }),
+            },
+            "optional": {
+                "prepend_ref_frames": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 20,
+                    "tooltip": "Number of LATENT frames to prepend for VACE reference padding. "
+                               "Connect trim_latent from NV_VacePrePassReference here. "
+                               "These frames get random noise (seeded deterministically) "
+                               "and are trimmed after generation."
+                }),
             }
         }
 
@@ -260,13 +275,14 @@ class NV_LoadCommittedNoiseSlice:
     RETURN_NAMES = ("committed_noise",)
     FUNCTION = "load_slice"
     CATEGORY = "NV_Utils/sampling"
-    DESCRIPTION = "Load a specific chunk's noise slice from saved committed noise."
+    DESCRIPTION = "Load a specific chunk's noise slice from saved committed noise. Use prepend_ref_frames with NV_VacePrePassReference."
 
     def load_slice(
         self,
         noise_path: str,
         chunk_start_frame: int,
-        chunk_frame_count: int
+        chunk_frame_count: int,
+        prepend_ref_frames: int = 0
     ) -> tuple:
         # Load the committed noise
         data = torch.load(noise_path, weights_only=False)
@@ -283,6 +299,19 @@ class NV_LoadCommittedNoiseSlice:
         print(f"  Video frames {chunk_start_frame}-{chunk_start_frame + chunk_frame_count} "
               f"-> Latent frames {latent_start}-{latent_end}")
         print(f"  Slice shape: {list(chunk_noise.shape)}")
+
+        # Prepend reference frame noise if needed (for NV_VacePrePassReference compatibility)
+        # The reference positions have mask=0 (preserve) and get trimmed after generation,
+        # so the noise content doesn't affect the output — we just need the right shape.
+        if prepend_ref_frames > 0:
+            seed = data.get("seed", 0)
+            ref_noise = torch.randn(
+                chunk_noise.shape[0], chunk_noise.shape[1], prepend_ref_frames,
+                chunk_noise.shape[3], chunk_noise.shape[4],
+                generator=torch.Generator(device='cpu').manual_seed(seed + 1)
+            )
+            chunk_noise = torch.cat([ref_noise, chunk_noise], dim=2)
+            print(f"  Prepended {prepend_ref_frames} reference noise frames -> {list(chunk_noise.shape)}")
 
         # Return as COMMITTED_NOISE format for compatibility with samplers
         return ({
