@@ -418,9 +418,9 @@ class NV_ChunkLoaderVACE:
         }
 
     RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "IMAGE", "IMAGE",
-                    "INT", "INT", "INT", "FLOAT", "FLOAT", "STRING", "STRING", "INT", "INT", "STRING",)
+                    "INT", "INT", "INT", "INT", "INT", "FLOAT", "FLOAT", "STRING", "STRING", "INT", "INT", "STRING",)
     RETURN_NAMES = ("chunk_video", "chunk_ctrl_1", "chunk_ctrl_2", "chunk_ctrl_3", "chunk_ctrl_4",
-                    "chunk_index", "seed", "steps", "cfg", "denoise", "sampler_name", "scheduler",
+                    "chunk_index", "start_frame", "frame_count", "seed", "steps", "cfg", "denoise", "sampler_name", "scheduler",
                     "context_window_size", "context_overlap", "chunk_info",)
     FUNCTION = "load_chunk"
     CATEGORY = "NV_Utils"
@@ -547,8 +547,10 @@ class NV_ChunkLoaderVACE:
         print(f"  Frames: {start_frame} to {end_frame-1} ({chunk_video.shape[0]} frames)")
         print(f"  Controls: {num_controls}")
 
+        frame_count = end_frame - start_frame
+
         return (chunk_video, chunk_controls[0], chunk_controls[1], chunk_controls[2], chunk_controls[3],
-                chunk_index, seed, steps, cfg, denoise, sampler_name, scheduler,
+                chunk_index, start_frame, frame_count, seed, steps, cfg, denoise, sampler_name, scheduler,
                 context_window_size, context_overlap, chunk_info)
 
 
