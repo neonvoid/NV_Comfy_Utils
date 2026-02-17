@@ -1,23 +1,24 @@
 /**
- * Variables Manager Panel - Dockable overlay for getter/setter variable management
+ * Variables Panel — Console-driven variable management with drag-and-drop
  *
- * A viewport-fixed panel that provides an at-a-glance view of all
- * SetVariableNode / GetVariableNode pairs in the workflow.
+ * Inspired by Unreal Engine's "My Blueprint" panel. This is the single
+ * source of truth for variable CRUD operations. Variables are created,
+ * deleted, and renamed here. Getter nodes are placed via drag-and-drop
+ * from the panel onto the canvas.
  *
  * Features:
- * - Lists all variables grouped by name with setter/getter counts
- * - Type display from setter's input connection
- * - Click-to-navigate to any setter or getter node
- * - Orphan detection (getters with no matching setter)
- * - Duplicate setter warnings
+ * - Create / delete / rename variables
+ * - Type-colored indicators (UE Blueprint style)
+ * - Drag variable rows to canvas → creates GetVariableNode
+ * - Drag to node input slot → creates getter + auto-connects
+ * - Source info display (which node feeds each variable)
+ * - Orphan detection (getters with no setter)
  * - Search/filter bar
- * - Rename variable across all nodes
- * - Select all nodes for a variable
  * - Draggable, collapsible, state persisted to localStorage
- * - Sidebar button toggle in ComfyUI menu bar
  */
 
 import { app } from "../../scripts/app.js";
+import { variableManager } from "./variable_manager.js";
 
 const STORAGE_KEY = "NV_VariablesPanel_State";
 const DEFAULT_POSITION = { x: 320, y: 100 };
@@ -30,16 +31,22 @@ class VariablesPanel {
         this.searchInput = null;
         this.variablesSection = null;
         this.orphansSection = null;
-        this.duplicatesSection = null;
         this.isCollapsed = false;
         this.isDragging = false;
         this.dragOffset = { x: 0, y: 0 };
         this.position = { ...DEFAULT_POSITION };
         this.refreshInterval = null;
-        this.isVisible = false; // Hidden by default
+        this.isVisible = false;
         this._lastHash = "";
         this.variableMap = new Map();
         this.expandedVars = new Set();
+
+        // Drag-and-drop state
+        this._varDrag = {
+            active: false,
+            varName: null,
+            ghost: null,
+        };
 
         this.loadState();
         this.createPanel();
@@ -67,7 +74,7 @@ class VariablesPanel {
             const state = {
                 position: this.position,
                 isCollapsed: this.isCollapsed,
-                isVisible: this.isVisible
+                isVisible: this.isVisible,
             };
             localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
         } catch (e) {
@@ -78,7 +85,7 @@ class VariablesPanel {
     // ===== DOM Construction =====
 
     createPanel() {
-        // Main container - viewport fixed
+        // Main container
         this.container = document.createElement("div");
         this.container.id = "nv-variables-panel";
         this.container.style.cssText = `
@@ -98,7 +105,7 @@ class VariablesPanel {
             display: ${this.isVisible ? 'block' : 'none'};
         `;
 
-        // Header (draggable)
+        // Header
         this.header = document.createElement("div");
         this.header.style.cssText = `
             display: flex;
@@ -112,20 +119,27 @@ class VariablesPanel {
         `;
 
         const title = document.createElement("span");
-        title.textContent = "Variables Manager";
+        title.textContent = "Variables";
         title.style.fontWeight = "600";
 
         const headerButtons = document.createElement("div");
         headerButtons.style.cssText = "display: flex; gap: 4px;";
 
-        const refreshBtn = this.createIconButton("↻", "Refresh", () => {
+        // Create Variable button (+)
+        const addBtn = this._createIconButton("+", "Create variable", () => this._showCreateInput());
+        addBtn.style.color = "#4ade80";
+        addBtn.style.fontWeight = "bold";
+        addBtn.style.fontSize = "16px";
+
+        const refreshBtn = this._createIconButton("\u21BB", "Refresh", () => {
             this._lastHash = "";
             this.refresh();
         });
-        this.collapseBtn = this.createIconButton(this.isCollapsed ? "▼" : "▲", "Toggle collapse", () => this.toggleCollapse());
-        const closeBtn = this.createIconButton("×", "Hide panel", () => this.hide());
+        this.collapseBtn = this._createIconButton(this.isCollapsed ? "\u25BC" : "\u25B2", "Toggle collapse", () => this.toggleCollapse());
+        const closeBtn = this._createIconButton("\u00D7", "Hide panel", () => this.hide());
         closeBtn.style.fontSize = "16px";
 
+        headerButtons.appendChild(addBtn);
         headerButtons.appendChild(refreshBtn);
         headerButtons.appendChild(this.collapseBtn);
         headerButtons.appendChild(closeBtn);
@@ -141,9 +155,46 @@ class VariablesPanel {
             display: ${this.isCollapsed ? 'none' : 'block'};
         `;
 
+        // Create variable inline input (hidden by default)
+        this.createInputContainer = document.createElement("div");
+        this.createInputContainer.style.cssText = "padding: 6px 8px; display: none;";
+
+        this.createInput = document.createElement("input");
+        this.createInput.type = "text";
+        this.createInput.placeholder = "New variable name...";
+        this.createInput.style.cssText = `
+            width: 100%;
+            padding: 6px 8px;
+            background: #2a2a2a;
+            border: 1px solid #4ade80;
+            border-radius: 4px;
+            color: #e0e0e0;
+            box-sizing: border-box;
+            font-size: 12px;
+            outline: none;
+        `;
+        this.createInput.addEventListener("keydown", (e) => {
+            if (e.key === "Enter") {
+                this._handleCreateVariable();
+            } else if (e.key === "Escape") {
+                this._hideCreateInput();
+            }
+            e.stopPropagation();
+        });
+        this.createInput.addEventListener("blur", () => {
+            // Small delay so click events can fire first
+            setTimeout(() => this._hideCreateInput(), 150);
+        });
+
+        this.createError = document.createElement("div");
+        this.createError.style.cssText = "color: #f44; font-size: 10px; min-height: 14px; padding: 2px 0 0 0;";
+
+        this.createInputContainer.appendChild(this.createInput);
+        this.createInputContainer.appendChild(this.createError);
+
         // Search bar
         const searchBar = document.createElement("div");
-        searchBar.style.cssText = "padding: 8px;";
+        searchBar.style.cssText = "padding: 6px 8px;";
 
         this.searchInput = document.createElement("input");
         this.searchInput.type = "text";
@@ -159,31 +210,72 @@ class VariablesPanel {
             font-size: 12px;
             outline: none;
         `;
-        this.searchInput.addEventListener("input", () => this.applyFilter(this.searchInput.value));
+        this.searchInput.addEventListener("input", () => this._applyFilter(this.searchInput.value));
         this.searchInput.addEventListener("focus", () => this.searchInput.style.borderColor = "#5af");
         this.searchInput.addEventListener("blur", () => this.searchInput.style.borderColor = "#444");
+        this.searchInput.addEventListener("keydown", (e) => e.stopPropagation());
         searchBar.appendChild(this.searchInput);
 
         // Sections
         this.variablesSection = document.createElement("div");
         this.orphansSection = document.createElement("div");
-        this.duplicatesSection = document.createElement("div");
 
+        this.content.appendChild(this.createInputContainer);
         this.content.appendChild(searchBar);
         this.content.appendChild(this.variablesSection);
         this.content.appendChild(this.orphansSection);
-        this.content.appendChild(this.duplicatesSection);
 
         this.container.appendChild(this.header);
         this.container.appendChild(this.content);
 
         document.body.appendChild(this.container);
 
-        this.setupDragHandlers();
+        this._setupPanelDrag();
+        this._setupVarDragListeners();
         this.refresh();
     }
 
-    createIconButton(icon, tooltip, onClick) {
+    // ===== Create Variable UI =====
+
+    _showCreateInput() {
+        this.createInputContainer.style.display = "block";
+        this.createInput.value = "";
+        this.createError.textContent = "";
+        this.createInput.focus();
+    }
+
+    _hideCreateInput() {
+        this.createInputContainer.style.display = "none";
+        this.createInput.value = "";
+        this.createError.textContent = "";
+    }
+
+    _handleCreateVariable() {
+        const name = this.createInput.value.trim();
+        if (!name) {
+            this.createError.textContent = "Name cannot be empty";
+            return;
+        }
+
+        const existingNames = variableManager.getVariableNames();
+        if (existingNames.includes(name)) {
+            this.createError.textContent = `"${name}" already exists`;
+            return;
+        }
+
+        const setter = variableManager.createVariable(name);
+        if (setter) {
+            this._hideCreateInput();
+            this._lastHash = "";
+            this.refresh();
+        } else {
+            this.createError.textContent = "Failed to create variable";
+        }
+    }
+
+    // ===== Button Helpers =====
+
+    _createIconButton(icon, tooltip, onClick) {
         const btn = document.createElement("button");
         btn.textContent = icon;
         btn.title = tooltip;
@@ -206,7 +298,7 @@ class VariablesPanel {
         return btn;
     }
 
-    createActionButton(text, color, onClick) {
+    _createActionButton(text, color, onClick) {
         const btn = document.createElement("button");
         btn.textContent = text;
         btn.style.cssText = `
@@ -229,7 +321,7 @@ class VariablesPanel {
         return btn;
     }
 
-    createSectionHeader(title, count, warningLevel = 0) {
+    _createSectionHeader(title, count, warningLevel = 0) {
         const header = document.createElement("div");
         header.style.cssText = `
             display: flex;
@@ -245,7 +337,6 @@ class VariablesPanel {
 
         const label = document.createElement("span");
         label.textContent = `${title} (${count})`;
-
         header.appendChild(label);
 
         if (warningLevel > 0) {
@@ -262,127 +353,21 @@ class VariablesPanel {
         return header;
     }
 
-    createNavigateButton(node) {
-        const btn = document.createElement("button");
-        btn.textContent = "→";
-        btn.title = "Go to node";
-        btn.style.cssText = `
-            background: transparent;
-            border: none;
-            color: #666;
-            cursor: pointer;
-            padding: 2px 6px;
-            font-size: 12px;
-            flex-shrink: 0;
-        `;
-        btn.addEventListener("mouseenter", () => btn.style.color = "#aaa");
-        btn.addEventListener("mouseleave", () => btn.style.color = "#666");
-        btn.addEventListener("click", (e) => {
-            e.stopPropagation();
-            this.navigateToNode(node);
-        });
-        return btn;
-    }
-
-    // ===== Data Collection =====
-
-    collectVariables() {
-        if (!app.graph) return new Map();
-
-        const nodes = app.graph._nodes || [];
-        const variableMap = new Map();
-
-        // Pass 1: Collect all setters
-        const setters = nodes.filter(n => n.type === "SetVariableNode");
-        for (const setter of setters) {
-            const name = setter.widgets?.[0]?.value;
-            if (!name || name === "") continue;
-
-            if (!variableMap.has(name)) {
-                variableMap.set(name, {
-                    name,
-                    type: this.resolveType(setter),
-                    isConnected: this.isSetterConnected(setter),
-                    setter: setter,
-                    getters: [],
-                    hasOrphanGetters: false,
-                    hasDuplicateSetters: false,
-                    allSetters: [setter],
-                });
-            } else {
-                const info = variableMap.get(name);
-                info.hasDuplicateSetters = true;
-                info.allSetters.push(setter);
-            }
-        }
-
-        // Pass 2: Collect all getters, match to setters
-        const getters = nodes.filter(n => n.type === "GetVariableNode");
-        for (const getter of getters) {
-            const name = getter.widgets?.[0]?.value;
-            if (!name || name === "") continue;
-
-            if (variableMap.has(name)) {
-                variableMap.get(name).getters.push(getter);
-            } else {
-                variableMap.set(name, {
-                    name,
-                    type: "*",
-                    isConnected: false,
-                    setter: null,
-                    getters: [getter],
-                    hasOrphanGetters: true,
-                    hasDuplicateSetters: false,
-                    allSetters: [],
-                });
-            }
-        }
-
-        return variableMap;
-    }
-
-    resolveType(setter) {
-        if (setter.inputs && setter.inputs[0]) {
-            const inputType = setter.inputs[0].type;
-            return (inputType && inputType !== "*") ? inputType : "unconnected";
-        }
-        return "unconnected";
-    }
-
-    isSetterConnected(setter) {
-        if (!setter.inputs || !setter.inputs[0]) return false;
-        return setter.inputs[0].link != null;
-    }
-
-    computeQuickHash() {
-        if (!app.graph) return "";
-        const nodes = app.graph._nodes || [];
-        let hash = "";
-        for (const n of nodes) {
-            if (n.type === "SetVariableNode" || n.type === "GetVariableNode") {
-                hash += `${n.id}=${n.widgets?.[0]?.value}|${n.inputs?.[0]?.type}|${n.inputs?.[0]?.link},`;
-            }
-        }
-        return hash;
-    }
-
     // ===== Rendering =====
 
     refresh() {
         if (!app.graph) return;
 
-        this.variableMap = this.collectVariables();
-        this.renderVariablesSection();
-        this.renderOrphansSection();
-        this.renderDuplicatesSection();
+        this.variableMap = variableManager.getAllVariables();
+        this._renderVariablesSection();
+        this._renderOrphansSection();
 
-        // Re-apply filter if active
         if (this.searchInput && this.searchInput.value) {
-            this.applyFilter(this.searchInput.value);
+            this._applyFilter(this.searchInput.value);
         }
     }
 
-    renderVariablesSection() {
+    _renderVariablesSection() {
         this.variablesSection.innerHTML = "";
 
         // Filter to healthy variables (have a setter, no duplicates)
@@ -391,28 +376,40 @@ class VariablesPanel {
             if (!info.hasOrphanGetters && !info.hasDuplicateSetters) {
                 healthy.push(info);
             }
+            // Also include duplicates as "variables" since they still have setters
+            if (info.hasDuplicateSetters && !info.hasOrphanGetters) {
+                healthy.push(info);
+            }
         }
 
-        if (healthy.length === 0 && this.variableMap.size === 0) {
-            const header = this.createSectionHeader("Variables", 0);
+        // Deduplicate (in case both conditions matched)
+        const seen = new Set();
+        const unique = healthy.filter(info => {
+            if (seen.has(info.name)) return false;
+            seen.add(info.name);
+            return true;
+        });
+
+        if (unique.length === 0 && this.variableMap.size === 0) {
+            const header = this._createSectionHeader("Variables", 0);
             const empty = document.createElement("div");
-            empty.textContent = "No variables in workflow";
+            empty.textContent = "No variables yet. Click + to create one.";
             empty.style.cssText = "padding: 12px; color: #666; font-style: italic; text-align: center;";
             this.variablesSection.appendChild(header);
             this.variablesSection.appendChild(empty);
             return;
         }
 
-        const header = this.createSectionHeader("Variables", healthy.length);
+        const header = this._createSectionHeader("Variables", unique.length);
         this.variablesSection.appendChild(header);
 
-        for (const info of healthy) {
-            const row = this.createVariableRow(info);
+        for (const info of unique) {
+            const row = this._createVariableRow(info);
             this.variablesSection.appendChild(row);
         }
     }
 
-    renderOrphansSection() {
+    _renderOrphansSection() {
         this.orphansSection.innerHTML = "";
 
         const orphans = [];
@@ -424,68 +421,60 @@ class VariablesPanel {
 
         if (orphans.length === 0) return;
 
-        const header = this.createSectionHeader("Orphans", orphans.length, 1);
+        const header = this._createSectionHeader("Orphans", orphans.length, 1);
         this.orphansSection.appendChild(header);
 
         for (const info of orphans) {
             for (const getter of info.getters) {
-                const row = this.createOrphanRow(info.name, getter);
+                const row = this._createOrphanRow(info.name, getter);
                 this.orphansSection.appendChild(row);
             }
         }
     }
 
-    renderDuplicatesSection() {
-        this.duplicatesSection.innerHTML = "";
-
-        const duplicates = [];
-        for (const [name, info] of this.variableMap) {
-            if (info.hasDuplicateSetters) {
-                duplicates.push(info);
-            }
-        }
-
-        if (duplicates.length === 0) return;
-
-        const header = this.createSectionHeader("Duplicates", duplicates.length, 2);
-        this.duplicatesSection.appendChild(header);
-
-        for (const info of duplicates) {
-            const row = this.createDuplicateRow(info);
-            this.duplicatesSection.appendChild(row);
-        }
-    }
-
-    createVariableRow(info) {
+    _createVariableRow(info) {
         const container = document.createElement("div");
         container.classList.add("nv-var-row");
         container.dataset.varName = info.name.toLowerCase();
         container.style.cssText = `
             margin: 2px 4px;
             border-radius: 4px;
-            border-left: 3px solid #3a7;
             background: #2a2a2a;
             overflow: hidden;
         `;
 
         const isExpanded = this.expandedVars.has(info.name);
 
-        // Main row (clickable to expand/collapse)
+        // --- Main row (draggable + clickable) ---
         const mainRow = document.createElement("div");
         mainRow.style.cssText = `
             display: flex;
             align-items: center;
             padding: 6px 8px;
-            cursor: pointer;
+            cursor: grab;
             transition: background 0.15s;
         `;
-        mainRow.addEventListener("mouseenter", () => mainRow.style.background = "#333");
-        mainRow.addEventListener("mouseleave", () => mainRow.style.background = "transparent");
+        mainRow.addEventListener("mouseenter", () => {
+            if (!this._varDrag.active) mainRow.style.background = "#333";
+        });
+        mainRow.addEventListener("mouseleave", () => {
+            if (!this._varDrag.active) mainRow.style.background = "transparent";
+        });
 
-        // Chevron
-        const chevron = document.createElement("span");
-        chevron.textContent = isExpanded ? "▾" : "▸";
-        chevron.style.cssText = "margin-right: 6px; font-size: 10px; color: #888; flex-shrink: 0;";
+        // Type-colored dot (UE Blueprint style)
+        const typeColor = variableManager.getTypeColor(info.type);
+        const dot = document.createElement("span");
+        dot.style.cssText = `
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            margin-right: 8px;
+            flex-shrink: 0;
+            ${info.isConnected
+                ? `background: ${typeColor};`
+                : `border: 2px solid ${typeColor}; box-sizing: border-box;`
+            }
+        `;
 
         // Variable name
         const nameSpan = document.createElement("span");
@@ -498,23 +487,59 @@ class VariablesPanel {
             white-space: nowrap;
         `;
 
-        mainRow.appendChild(chevron);
-        mainRow.appendChild(nameSpan);
+        // Type badge
+        const typeBadge = document.createElement("span");
+        typeBadge.textContent = info.type === "unconnected" ? "\u2014" : info.type;
+        typeBadge.style.cssText = `
+            font-size: 10px;
+            color: ${typeColor};
+            margin-right: 4px;
+            flex-shrink: 0;
+        `;
 
-        // Type + count info line
+        // Context menu button
+        const menuBtn = document.createElement("button");
+        menuBtn.textContent = "\u22EE";
+        menuBtn.title = "Actions";
+        menuBtn.style.cssText = `
+            background: transparent;
+            border: none;
+            color: #666;
+            cursor: pointer;
+            padding: 0 4px;
+            font-size: 16px;
+            line-height: 1;
+            border-radius: 3px;
+            flex-shrink: 0;
+        `;
+        menuBtn.addEventListener("mouseenter", () => menuBtn.style.color = "#aaa");
+        menuBtn.addEventListener("mouseleave", () => menuBtn.style.color = "#666");
+        menuBtn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            this._showRowContextMenu(info, e);
+        });
+
+        mainRow.appendChild(dot);
+        mainRow.appendChild(nameSpan);
+        mainRow.appendChild(typeBadge);
+        mainRow.appendChild(menuBtn);
+
+        // --- Info line ---
         const infoLine = document.createElement("div");
         infoLine.style.cssText = `
-            padding: 0 8px 4px 22px;
+            padding: 0 8px 4px 26px;
             font-size: 10px;
             color: #888;
         `;
 
-        const typeColor = info.isConnected ? "#5af" : "#aa5";
-        const typeText = info.type;
         const getterCount = info.getters.length;
-        infoLine.innerHTML = `<span style="color:${typeColor}">${typeText}</span> · 1 setter, ${getterCount} getter${getterCount !== 1 ? 's' : ''}`;
+        const sourceInfo = variableManager.getSourceInfo(info.name);
+        const sourceText = sourceInfo
+            ? `${sourceInfo.nodeTitle} \u2192 ${sourceInfo.outputName}`
+            : "no source";
+        infoLine.textContent = `${sourceText} \u00B7 ${getterCount} getter${getterCount !== 1 ? 's' : ''}`;
 
-        // Expandable details
+        // --- Expandable details ---
         const details = document.createElement("div");
         details.style.cssText = `
             display: ${isExpanded ? 'block' : 'none'};
@@ -522,37 +547,59 @@ class VariablesPanel {
             border-top: 1px solid #333;
         `;
 
-        // Toggle expand on main row click
-        mainRow.addEventListener("click", () => {
+        // Chevron for expand/collapse
+        const chevron = document.createElement("span");
+        chevron.textContent = isExpanded ? "\u25BE" : "\u25B8";
+        chevron.style.cssText = "margin-right: 4px; font-size: 10px; color: #888; cursor: pointer; flex-shrink: 0;";
+        chevron.addEventListener("click", (e) => {
+            e.stopPropagation();
             if (this.expandedVars.has(info.name)) {
                 this.expandedVars.delete(info.name);
                 details.style.display = "none";
-                chevron.textContent = "▸";
+                chevron.textContent = "\u25B8";
             } else {
                 this.expandedVars.add(info.name);
                 details.style.display = "block";
-                chevron.textContent = "▾";
+                chevron.textContent = "\u25BE";
             }
         });
 
-        // Setter sub-row
-        if (info.setter) {
-            details.appendChild(this.createNodeSubRow(info.setter, "SET"));
+        // Insert chevron at the start of mainRow (before dot)
+        mainRow.insertBefore(chevron, dot);
+
+        // Source sub-row
+        if (sourceInfo) {
+            const sourceRow = this._createSourceSubRow(sourceInfo);
+            details.appendChild(sourceRow);
         }
 
         // Getter sub-rows
         for (const getter of info.getters) {
-            details.appendChild(this.createNodeSubRow(getter, "GET"));
+            details.appendChild(this._createNodeSubRow(getter, "GET"));
+        }
+
+        // Duplicate setter warning
+        if (info.hasDuplicateSetters) {
+            const warnRow = document.createElement("div");
+            warnRow.style.cssText = "padding: 4px 8px; font-size: 10px; color: #a83;";
+            warnRow.textContent = `!! ${info.allSetters.length} setters (duplicate)`;
+            details.appendChild(warnRow);
         }
 
         // Action buttons
         const actions = document.createElement("div");
         actions.style.cssText = "display: flex; gap: 4px; padding: 4px 8px;";
-
-        actions.appendChild(this.createActionButton("Select All", "#445", () => this.selectAllForVariable(info)));
-        actions.appendChild(this.createActionButton("Rename", "#454", () => this.showRenameDialog(info)));
-
+        actions.appendChild(this._createActionButton("Select All", "#445", () => this._selectAllForVariable(info)));
+        actions.appendChild(this._createActionButton("Rename", "#454", () => this._showRenameDialog(info)));
         details.appendChild(actions);
+
+        // --- Drag-and-drop from main row ---
+        mainRow.addEventListener("mousedown", (e) => {
+            // Only start drag from the row itself, not from buttons
+            if (e.target.tagName === "BUTTON" || e.target === chevron) return;
+            e.preventDefault();
+            this._startVarDrag(info.name, info.type, e);
+        });
 
         container.appendChild(mainRow);
         container.appendChild(infoLine);
@@ -561,7 +608,50 @@ class VariablesPanel {
         return container;
     }
 
-    createNodeSubRow(node, role) {
+    _createSourceSubRow(sourceInfo) {
+        const row = document.createElement("div");
+        row.style.cssText = `
+            display: flex;
+            align-items: center;
+            padding: 3px 8px;
+            margin: 1px 0;
+            border-radius: 3px;
+            transition: background 0.15s;
+        `;
+        row.addEventListener("mouseenter", () => row.style.background = "#383838");
+        row.addEventListener("mouseleave", () => row.style.background = "transparent");
+
+        const roleSpan = document.createElement("span");
+        roleSpan.textContent = "SRC";
+        roleSpan.style.cssText = `
+            color: #f59e0b;
+            font-size: 10px;
+            font-weight: 600;
+            width: 28px;
+            flex-shrink: 0;
+        `;
+
+        const label = document.createElement("span");
+        label.textContent = `${sourceInfo.nodeTitle} \u2192 ${sourceInfo.outputName}`;
+        label.style.cssText = `
+            flex: 1;
+            font-size: 11px;
+            color: #ccc;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        `;
+
+        const navBtn = this._createNavigateButton(sourceInfo.node);
+
+        row.appendChild(roleSpan);
+        row.appendChild(label);
+        row.appendChild(navBtn);
+
+        return row;
+    }
+
+    _createNodeSubRow(node, role) {
         const row = document.createElement("div");
         row.style.cssText = `
             display: flex;
@@ -599,12 +689,12 @@ class VariablesPanel {
 
         row.appendChild(roleSpan);
         row.appendChild(label);
-        row.appendChild(this.createNavigateButton(node));
+        row.appendChild(this._createNavigateButton(node));
 
         return row;
     }
 
-    createOrphanRow(varName, getter) {
+    _createOrphanRow(varName, getter) {
         const row = document.createElement("div");
         row.classList.add("nv-var-row");
         row.dataset.varName = varName.toLowerCase();
@@ -627,7 +717,7 @@ class VariablesPanel {
 
         const label = document.createElement("span");
         const displayName = getter.title || "Get Variable";
-        label.textContent = `GET "${varName}" — NO SETTER`;
+        label.textContent = `"${varName}" \u2014 no setter`;
         label.title = `${displayName} (id:${getter.id})`;
         label.style.cssText = `
             flex: 1;
@@ -640,107 +730,226 @@ class VariablesPanel {
 
         row.appendChild(icon);
         row.appendChild(label);
-        row.appendChild(this.createNavigateButton(getter));
+        row.appendChild(this._createNavigateButton(getter));
 
         return row;
     }
 
-    createDuplicateRow(info) {
-        const container = document.createElement("div");
-        container.classList.add("nv-var-row");
-        container.dataset.varName = info.name.toLowerCase();
-        container.style.cssText = `
-            margin: 2px 4px;
+    _createNavigateButton(node) {
+        const btn = document.createElement("button");
+        btn.textContent = "\u2192";
+        btn.title = "Go to node";
+        btn.style.cssText = `
+            background: transparent;
+            border: none;
+            color: #666;
+            cursor: pointer;
+            padding: 2px 6px;
+            font-size: 12px;
+            flex-shrink: 0;
+        `;
+        btn.addEventListener("mouseenter", () => btn.style.color = "#aaa");
+        btn.addEventListener("mouseleave", () => btn.style.color = "#666");
+        btn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            this._navigateToNode(node);
+        });
+        return btn;
+    }
+
+    // ===== Row Context Menu =====
+
+    _showRowContextMenu(info, event) {
+        // Build a simple dropdown menu at click position
+        const existing = document.getElementById("nv-var-context-menu");
+        if (existing) existing.remove();
+
+        const menu = document.createElement("div");
+        menu.id = "nv-var-context-menu";
+        menu.style.cssText = `
+            position: fixed;
+            left: ${event.clientX}px;
+            top: ${event.clientY}px;
+            background: #1a1a1a;
+            border: 1px solid #444;
+            border-radius: 6px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+            z-index: 10002;
+            min-width: 160px;
+            padding: 4px 0;
+        `;
+
+        const items = [
+            {
+                label: "Go to Source",
+                enabled: !!variableManager.getSourceInfo(info.name),
+                action: () => {
+                    const src = variableManager.getSourceInfo(info.name);
+                    if (src) this._navigateToNode(src.node);
+                }
+            },
+            {
+                label: "Select All Getters",
+                enabled: info.getters.length > 0,
+                action: () => this._selectAllForVariable(info)
+            },
+            null, // separator
+            {
+                label: "Rename",
+                enabled: true,
+                action: () => this._showRenameDialog(info)
+            },
+            {
+                label: "Unassign Source",
+                enabled: !!variableManager.getSourceInfo(info.name),
+                action: () => {
+                    variableManager.unassignSource(info.name);
+                    this._lastHash = "";
+                    this.refresh();
+                }
+            },
+            null, // separator
+            {
+                label: "Delete Variable",
+                enabled: true,
+                color: "#f44",
+                action: () => this._confirmDelete(info)
+            },
+        ];
+
+        for (const item of items) {
+            if (item === null) {
+                const sep = document.createElement("div");
+                sep.style.cssText = "height: 1px; background: #333; margin: 4px 0;";
+                menu.appendChild(sep);
+                continue;
+            }
+
+            const row = document.createElement("div");
+            row.textContent = item.label;
+            row.style.cssText = `
+                padding: 6px 12px;
+                cursor: ${item.enabled ? 'pointer' : 'default'};
+                color: ${!item.enabled ? '#555' : (item.color || '#e0e0e0')};
+                font-size: 12px;
+                transition: background 0.1s;
+            `;
+            if (item.enabled) {
+                row.addEventListener("mouseenter", () => row.style.background = "#333");
+                row.addEventListener("mouseleave", () => row.style.background = "transparent");
+                row.addEventListener("click", () => {
+                    menu.remove();
+                    item.action();
+                });
+            }
+            menu.appendChild(row);
+        }
+
+        document.body.appendChild(menu);
+
+        // Close on click outside
+        const closeMenu = (e) => {
+            if (!menu.contains(e.target)) {
+                menu.remove();
+                document.removeEventListener("mousedown", closeMenu);
+            }
+        };
+        setTimeout(() => document.addEventListener("mousedown", closeMenu), 0);
+    }
+
+    // ===== Delete Confirmation =====
+
+    _confirmDelete(info) {
+        const getterCount = info.getters.length;
+        const msg = `Delete "${info.name}"?\n\nThis will remove the variable and ${getterCount} getter node${getterCount !== 1 ? 's' : ''} from the canvas.`;
+
+        const overlay = document.createElement("div");
+        overlay.style.cssText = `
+            position: fixed;
+            inset: 0;
+            background: rgba(0,0,0,0.5);
+            z-index: 10000;
+        `;
+
+        const dialog = document.createElement("div");
+        dialog.style.cssText = `
+            position: fixed;
+            left: 50%;
+            top: 50%;
+            transform: translate(-50%, -50%);
+            background: #1a1a1a;
+            border: 1px solid #444;
+            border-radius: 8px;
+            padding: 16px;
+            z-index: 10001;
+            min-width: 300px;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.6);
+        `;
+
+        const title = document.createElement("h3");
+        title.textContent = "Delete Variable";
+        title.style.cssText = "margin: 0 0 8px 0; color: #e0e0e0; font-size: 14px;";
+
+        const body = document.createElement("div");
+        body.textContent = `This will remove "${info.name}" and ${getterCount} getter node${getterCount !== 1 ? 's' : ''} from the canvas.`;
+        body.style.cssText = "margin-bottom: 16px; font-size: 12px; color: #999;";
+
+        const buttons = document.createElement("div");
+        buttons.style.cssText = "display: flex; gap: 8px; justify-content: flex-end;";
+
+        const cleanup = () => {
+            document.body.removeChild(dialog);
+            document.body.removeChild(overlay);
+        };
+
+        const cancelBtn = document.createElement("button");
+        cancelBtn.textContent = "Cancel";
+        cancelBtn.style.cssText = `
+            padding: 8px 16px;
+            background: #333;
+            border: none;
             border-radius: 4px;
-            border-left: 3px solid #a83;
-            background: rgba(170, 136, 51, 0.1);
-            overflow: hidden;
+            color: #e0e0e0;
+            cursor: pointer;
+            font-size: 12px;
         `;
+        cancelBtn.addEventListener("click", cleanup);
 
-        const headerRow = document.createElement("div");
-        headerRow.style.cssText = `
-            display: flex;
-            align-items: center;
-            padding: 6px 8px;
+        const deleteBtn = document.createElement("button");
+        deleteBtn.textContent = "Delete";
+        deleteBtn.style.cssText = `
+            padding: 8px 16px;
+            background: #c53030;
+            border: none;
+            border-radius: 4px;
+            color: white;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 500;
         `;
+        deleteBtn.addEventListener("click", () => {
+            variableManager.deleteVariable(info.name);
+            cleanup();
+            this._lastHash = "";
+            this.refresh();
+        });
 
-        const icon = document.createElement("span");
-        icon.textContent = "!!";
-        icon.style.cssText = "color: #a83; font-weight: bold; margin-right: 8px; font-size: 11px; flex-shrink: 0;";
+        overlay.addEventListener("click", cleanup);
 
-        const label = document.createElement("span");
-        label.textContent = `"${info.name}" has ${info.allSetters.length} setters!`;
-        label.style.cssText = "flex: 1; font-size: 11px; color: #ccc;";
+        buttons.appendChild(cancelBtn);
+        buttons.appendChild(deleteBtn);
 
-        headerRow.appendChild(icon);
-        headerRow.appendChild(label);
-        container.appendChild(headerRow);
+        dialog.appendChild(title);
+        dialog.appendChild(body);
+        dialog.appendChild(buttons);
 
-        // List each setter
-        for (const setter of info.allSetters) {
-            container.appendChild(this.createNodeSubRow(setter, "SET"));
-        }
-
-        // List getters too
-        for (const getter of info.getters) {
-            container.appendChild(this.createNodeSubRow(getter, "GET"));
-        }
-
-        return container;
+        document.body.appendChild(overlay);
+        document.body.appendChild(dialog);
     }
 
-    // ===== Search Filter =====
+    // ===== Rename Dialog =====
 
-    applyFilter(text) {
-        const filter = text.toLowerCase().trim();
-        const rows = this.container.querySelectorAll(".nv-var-row");
-
-        for (const row of rows) {
-            const varName = row.dataset.varName || "";
-            if (!filter || varName.includes(filter)) {
-                row.style.display = "";
-            } else {
-                row.style.display = "none";
-            }
-        }
-    }
-
-    // ===== Navigation & Actions =====
-
-    navigateToNode(node) {
-        if (!node || !app.canvas) return;
-        app.canvas.centerOnNode(node);
-        app.canvas.selectNode(node, false);
-        app.canvas.setDirty(true, true);
-    }
-
-    selectAllForVariable(info) {
-        if (!app.canvas) return;
-
-        // Deselect all first
-        app.canvas.deselectAll();
-
-        // Select setter
-        if (info.setter) {
-            app.canvas.selectNode(info.setter, true); // true = add to selection
-        }
-
-        // Select all setters if duplicates
-        for (const setter of info.allSetters) {
-            if (setter !== info.setter) {
-                app.canvas.selectNode(setter, true);
-            }
-        }
-
-        // Select all getters
-        for (const getter of info.getters) {
-            app.canvas.selectNode(getter, true);
-        }
-
-        app.canvas.setDirty(true, true);
-    }
-
-    showRenameDialog(info) {
+    _showRenameDialog(info) {
         const overlay = document.createElement("div");
         overlay.style.cssText = `
             position: fixed;
@@ -778,14 +987,18 @@ class VariablesPanel {
         input.style.cssText = `
             width: 100%;
             padding: 8px;
-            margin-bottom: 16px;
+            margin-bottom: 4px;
             background: #2a2a2a;
             border: 1px solid #444;
             border-radius: 4px;
             color: #e0e0e0;
             box-sizing: border-box;
             font-size: 12px;
+            outline: none;
         `;
+
+        const errorMsg = document.createElement("div");
+        errorMsg.style.cssText = "color: #f44; font-size: 11px; min-height: 16px; margin-bottom: 8px;";
 
         const buttons = document.createElement("div");
         buttons.style.cssText = "display: flex; gap: 8px; justify-content: flex-end;";
@@ -826,24 +1039,24 @@ class VariablesPanel {
                 return;
             }
 
-            // Check for collision
-            if (this.variableMap.has(newName)) {
-                input.style.borderColor = "#a33";
-                input.title = `Variable "${newName}" already exists!`;
+            const success = variableManager.renameVariable(info.name, newName);
+            if (!success) {
+                errorMsg.textContent = `Variable "${newName}" already exists!`;
                 return;
             }
 
-            this.renameVariable(info, newName);
             cleanup();
+            this._lastHash = "";
+            this.refresh();
         });
 
-        // Enter key to confirm
         input.addEventListener("keydown", (e) => {
             if (e.key === "Enter") {
                 renameBtn.click();
             } else if (e.key === "Escape") {
                 cleanup();
             }
+            e.stopPropagation();
         });
 
         overlay.addEventListener("click", cleanup);
@@ -854,6 +1067,7 @@ class VariablesPanel {
         dialog.appendChild(title);
         dialog.appendChild(label);
         dialog.appendChild(input);
+        dialog.appendChild(errorMsg);
         dialog.appendChild(buttons);
 
         document.body.appendChild(overlay);
@@ -862,40 +1076,157 @@ class VariablesPanel {
         input.select();
     }
 
-    renameVariable(info, newName) {
-        // Update all setters
-        for (const setter of info.allSetters) {
-            if (setter.widgets && setter.widgets[0]) {
-                setter.widgets[0].value = newName;
+    // ===== Search Filter =====
+
+    _applyFilter(text) {
+        const filter = text.toLowerCase().trim();
+        const rows = this.container.querySelectorAll(".nv-var-row");
+
+        for (const row of rows) {
+            const varName = row.dataset.varName || "";
+            if (!filter || varName.includes(filter)) {
+                row.style.display = "";
+            } else {
+                row.style.display = "none";
             }
         }
+    }
 
-        // Update all getters
+    // ===== Navigation & Actions =====
+
+    _navigateToNode(node) {
+        if (!node || !app.canvas) return;
+        app.canvas.centerOnNode(node);
+        app.canvas.selectNode(node, false);
+        app.canvas.setDirty(true, true);
+    }
+
+    _selectAllForVariable(info) {
+        if (!app.canvas) return;
+
+        app.canvas.deselectAll();
+
+        // Select all getters
         for (const getter of info.getters) {
-            if (getter.widgets && getter.widgets[0]) {
-                getter.widgets[0].value = newName;
+            app.canvas.selectNode(getter, true);
+        }
+
+        app.canvas.setDirty(true, true);
+    }
+
+    // ===== Drag-and-Drop: Variable from Panel to Canvas =====
+
+    _setupVarDragListeners() {
+        // Global mousemove and mouseup for drag tracking
+        document.addEventListener("mousemove", (e) => {
+            if (!this._varDrag.active) return;
+            this._updateVarDragGhost(e);
+        });
+
+        document.addEventListener("mouseup", (e) => {
+            if (!this._varDrag.active) return;
+            this._endVarDrag(e);
+        });
+    }
+
+    _startVarDrag(varName, varType, event) {
+        this._varDrag.active = true;
+        this._varDrag.varName = varName;
+
+        // Create ghost element
+        const ghost = document.createElement("div");
+        const typeColor = variableManager.getTypeColor(varType);
+        ghost.style.cssText = `
+            position: fixed;
+            left: ${event.clientX + 12}px;
+            top: ${event.clientY - 10}px;
+            padding: 4px 10px;
+            background: #2a2a2a;
+            border: 1px solid ${typeColor};
+            border-radius: 4px;
+            color: #e0e0e0;
+            font-size: 11px;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.5);
+            z-index: 10003;
+            pointer-events: none;
+            white-space: nowrap;
+        `;
+        ghost.innerHTML = `<span style="color:${typeColor}; margin-right: 4px;">\u25CF</span> ${varName}`;
+        document.body.appendChild(ghost);
+        this._varDrag.ghost = ghost;
+    }
+
+    _updateVarDragGhost(event) {
+        if (this._varDrag.ghost) {
+            this._varDrag.ghost.style.left = `${event.clientX + 12}px`;
+            this._varDrag.ghost.style.top = `${event.clientY - 10}px`;
+        }
+    }
+
+    _endVarDrag(event) {
+        const varName = this._varDrag.varName;
+
+        // Remove ghost
+        if (this._varDrag.ghost) {
+            this._varDrag.ghost.remove();
+            this._varDrag.ghost = null;
+        }
+
+        this._varDrag.active = false;
+        this._varDrag.varName = null;
+
+        if (!varName || !app.canvas) return;
+
+        // Check if we dropped over the panel itself (ignore)
+        if (this.container.contains(event.target)) return;
+
+        // Convert screen coordinates to canvas (graph) coordinates
+        let canvasPos;
+        try {
+            canvasPos = app.canvas.convertEventToCanvasOffset(event);
+        } catch (e) {
+            // Fallback: manual conversion using canvas transform
+            const rect = app.canvas.canvas.getBoundingClientRect();
+            const scale = app.canvas.ds.scale;
+            const offset = app.canvas.ds.offset;
+            canvasPos = [
+                (event.clientX - rect.left) / scale - offset[0],
+                (event.clientY - rect.top) / scale - offset[1],
+            ];
+        }
+
+        if (!canvasPos) return;
+
+        // Check if dropped on a node
+        const targetNode = app.graph.getNodeOnPos(canvasPos[0], canvasPos[1]);
+
+        if (targetNode) {
+            // Check if dropped on an input slot
+            const slotIdx = variableManager.findInputSlotAtPos(targetNode, canvasPos[0], canvasPos[1]);
+            if (slotIdx >= 0) {
+                variableManager.createGetterAndConnect(varName, targetNode, slotIdx);
+                this._lastHash = "";
+                this.refresh();
+                return;
             }
         }
 
-        // Trigger type propagation
-        if (info.setter && info.setter.updateGetters) {
-            info.setter.updateGetters();
-        }
-
-        app.graph.setDirtyCanvas(true, false);
+        // Drop on empty canvas — create getter at position
+        variableManager.createGetter(varName, canvasPos);
         this._lastHash = "";
         this.refresh();
     }
 
     // ===== Panel Chrome =====
 
-    setupDragHandlers() {
+    _setupPanelDrag() {
         this.header.addEventListener("mousedown", (e) => {
             if (e.target.tagName === "BUTTON") return;
             this.isDragging = true;
             this.dragOffset = {
                 x: e.clientX - this.position.x,
-                y: e.clientY - this.position.y
+                y: e.clientY - this.position.y,
             };
             e.preventDefault();
         });
@@ -921,7 +1252,7 @@ class VariablesPanel {
     toggleCollapse() {
         this.isCollapsed = !this.isCollapsed;
         this.content.style.display = this.isCollapsed ? 'none' : 'block';
-        this.collapseBtn.textContent = this.isCollapsed ? "▼" : "▲";
+        this.collapseBtn.textContent = this.isCollapsed ? "\u25BC" : "\u25B2";
         this.saveState();
     }
 
@@ -950,7 +1281,7 @@ class VariablesPanel {
     startRefreshLoop() {
         this.refreshInterval = setInterval(() => {
             if (this.isVisible && !this.isCollapsed && app.graph) {
-                const newHash = this.computeQuickHash();
+                const newHash = variableManager.computeQuickHash();
                 if (newHash !== this._lastHash) {
                     this._lastHash = newHash;
                     this.refresh();
@@ -977,7 +1308,7 @@ window.NVVariablesPanel = {
     show: () => variablesPanelInstance?.show(),
     hide: () => variablesPanelInstance?.hide(),
     toggle: () => variablesPanelInstance?.toggle(),
-    getInstance: () => variablesPanelInstance
+    getInstance: () => variablesPanelInstance,
 };
 
 // Register extension
@@ -1002,25 +1333,24 @@ app.registerExtension({
         // Create the panel
         variablesPanelInstance = new VariablesPanel();
 
-        // Add sidebar button to ComfyUI menu bar
+        // Add sidebar button
         try {
             const { ComfyButton } = await import("../../scripts/ui/components/button.js");
 
             const toggleBtn = new ComfyButton({
                 icon: "swap-horizontal",
                 action: () => variablesPanelInstance.toggle(),
-                tooltip: "Variables Manager",
+                tooltip: "Variables",
                 content: "Vars",
-                classList: "comfyui-button comfyui-menu-mobile-collapse"
+                classList: "comfyui-button comfyui-menu-mobile-collapse",
             });
 
             app.menu?.settingsGroup.element.before(toggleBtn.element);
-            console.log("[VariablesPanel] Sidebar button added");
         } catch (e) {
-            console.warn("[VariablesPanel] Could not add sidebar button, using keyboard shortcut only:", e);
+            console.warn("[VariablesPanel] Could not add sidebar button:", e);
         }
 
-        // Keyboard shortcut fallback (Ctrl+Shift+V)
+        // Keyboard shortcut (Ctrl+Shift+V)
         document.addEventListener("keydown", (e) => {
             if (e.ctrlKey && e.shiftKey && e.key === "V") {
                 e.preventDefault();

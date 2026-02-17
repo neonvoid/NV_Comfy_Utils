@@ -1612,41 +1612,6 @@ except Exception as e:
     class NV_Video_Loader_Path:
         pass
 
-# Simple Get Variable Node - Python backend
-class GetVariableNode:
-    """
-    Python backend for Get Variable Node - passes through data from Set Variable Node.
-    This is a minimal implementation that just passes data through.
-    """
-    
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "dummy": (IO.ANY, {"default": None}),
-            }
-        }
-    
-    RETURN_TYPES = (IO.ANY,)
-    RETURN_NAMES = ("value",)
-    FUNCTION = "get_variable"
-    CATEGORY = "KNF_Utils/Variables"
-    
-    @classmethod
-    def VALIDATE_INPUTS(cls, dummy=None):
-        """
-        Validate inputs - allow any type to pass through.
-        The frontend handles the actual type matching.
-        """
-        return True
-    
-    def get_variable(self, dummy=None):
-        """Pass through the dummy input - the real data comes from the frontend connection."""
-        return (dummy,)
-    
-    @classmethod
-    def IS_CHANGED(cls, **kwargs):
-        return float("inf")
 
 
 class LazySwitch:

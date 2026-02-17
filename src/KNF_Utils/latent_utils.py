@@ -11,19 +11,20 @@ import comfy.latent_formats
 
 class NV_PrependReferenceLatent:
     """
-    Prepend a reference image latent to a video latent.
+    Prepend reference latent frame(s) to a video latent.
 
     Use this when:
     - You have an encoded video latent (e.g., for V2V with denoise < 1.0)
-    - You're using WanVaceToVideo with reference_image
+    - You're using WanVaceToVideo with reference_image (1 frame)
+    - You're using NV_VacePrePassReference with multi-frame references (N frames)
     - You need the latent to have the same frame count as VACE conditioning
 
-    The reference frame will be generated along with your video, then you can
-    trim it with TrimVideoLatent after generation.
+    The reference frames will be generated along with your video, then you can
+    trim them with TrimVideoLatent after generation.
 
     Workflow:
         [VAE Encode Video] ─┬─► [NV Prepend Reference Latent] ─► [Sampler] ─► [TrimVideoLatent] ─► [VAE Decode]
-        [VAE Encode Ref]  ──┘
+        [ref_latent output] ┘
     """
 
     @classmethod
@@ -32,7 +33,8 @@ class NV_PrependReferenceLatent:
             "required": {
                 "video_latent": ("LATENT",),
                 "reference_latent": ("LATENT", {
-                    "tooltip": "VAE-encoded reference image (1 frame). Use the same image as WanVaceToVideo's reference_image."
+                    "tooltip": "Reference latent to prepend. Single frame (from VAE Encode) "
+                               "or multi-frame (from NV_VacePrePassReference ref_latent output)."
                 }),
             },
         }
@@ -41,16 +43,11 @@ class NV_PrependReferenceLatent:
     RETURN_NAMES = ("latent", "trim_amount")
     FUNCTION = "prepend"
     CATEGORY = "NV_Utils/latent"
-    DESCRIPTION = "Prepend reference frame to video latent for VACE workflows. Use TrimVideoLatent with trim_amount after generation."
+    DESCRIPTION = "Prepend reference frame(s) to video latent for VACE workflows. Use TrimVideoLatent with trim_amount after generation."
 
     def prepend(self, video_latent, reference_latent):
         video_samples = video_latent["samples"]  # [B, C, T_video, H, W]
         ref_samples = reference_latent["samples"]  # [B, C, T_ref, H, W]
-
-        # Ensure reference is single frame
-        if ref_samples.shape[2] > 1:
-            ref_samples = ref_samples[:, :, :1, :, :]
-            print(f"[NV_PrependReferenceLatent] Reference had {reference_latent['samples'].shape[2]} frames, using only first frame")
 
         # Validate spatial dimensions match
         if ref_samples.shape[3:] != video_samples.shape[3:]:
@@ -63,7 +60,7 @@ class NV_PrependReferenceLatent:
         # Concatenate along temporal dimension
         combined = torch.cat([ref_samples, video_samples], dim=2)
 
-        trim_amount = ref_samples.shape[2]  # Usually 1
+        trim_amount = ref_samples.shape[2]
 
         print(f"[NV_PrependReferenceLatent] Prepended {trim_amount} reference frame(s)")
         print(f"  Video latent: {list(video_samples.shape)} -> Combined: {list(combined.shape)}")
