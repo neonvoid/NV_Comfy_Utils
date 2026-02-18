@@ -594,6 +594,16 @@ class NV_VTokenInject:
             "required": {
                 "model": ("MODEL",),
                 "v_cache": ("V_TOKEN_CACHE",),
+                "latent_prefix_frames": ("INT", {"default": 0, "min": 0, "max": 100, "step": 1,
+                                         "tooltip": "Number of prepended reference latent frames to skip "
+                                                    "(e.g., from NV_VacePrePassReference trim_latent output). "
+                                                    "Context window index_list includes these prefix frames "
+                                                    "before actual video frames."}),
+                "chunk_start_video_frame": ("INT", {"default": 0, "min": 0, "max": 100000, "step": 1,
+                                            "tooltip": "Starting VIDEO frame index for this chunk "
+                                                       "(wire from chunk loader start_frame output). "
+                                                       "Used to map chunk-local indices to global latent "
+                                                       "frame indices that match the V cache keys."}),
             },
         }
 
@@ -603,11 +613,11 @@ class NV_VTokenInject:
     CATEGORY = "NV_Utils/attention"
     DESCRIPTION = (
         "Injects pre-captured V tokens into the chunked high-res pass. "
-        "Each context window gets its matching cached V tokens prepended, "
+        "Each context window gets its matching cached V tokens replaced in-place, "
         "anchoring background element positions."
     )
 
-    def inject(self, model, v_cache):
+    def inject(self, model, v_cache, latent_prefix_frames, chunk_start_video_frame):
         model = model.clone()
         manager = v_cache
 
@@ -616,6 +626,19 @@ class NV_VTokenInject:
             return (model,)
 
         manager.set_mode("inject")
+
+        # Compute chunk's global latent frame offset from video frame start
+        # Wan VAE: latent 0 = 1 video frame, latent k>0 = 4 video frames each
+        # For chunk starting at video frame V: latent offset = (V-1)//4 + 1 if V>0, else 0
+        if chunk_start_video_frame > 0:
+            chunk_latent_offset = ((chunk_start_video_frame - 1) // 4) + 1
+        else:
+            chunk_latent_offset = 0
+
+        prefix_offset = latent_prefix_frames
+
+        print(f"[VTokenInject] Chunk mapping: video_start={chunk_start_video_frame} "
+              f"→ latent_offset={chunk_latent_offset}, prefix={prefix_offset}")
 
         # Build lookup: which frame indices have cached V?
         cached_frames = set(f for _, f in manager.v_cache.keys())
@@ -686,21 +709,41 @@ class NV_VTokenInject:
                 print(f"[VTokenInject] === First inject call ===")
                 print(f"[VTokenInject] grid_sizes: {grid_sizes}")
                 print(f"[VTokenInject] V shape: {v.shape}")
-                print(f"[VTokenInject] Window index_list: "
+                print(f"[VTokenInject] Window index_list (local): "
                       f"{index_list[:8]}{'...' if len(index_list) > 8 else ''} "
                       f"({len(index_list)} frames)")
-                print(f"[VTokenInject] Cached frames: {sorted(cached_frames)}")
+                # Show the global mapping for video frames
+                global_map = []
+                for li in index_list:
+                    if li < prefix_offset:
+                        global_map.append(f"L{li}=ref")
+                    else:
+                        gf = (li - prefix_offset) + chunk_latent_offset
+                        global_map.append(f"L{li}=G{gf}")
+                print(f"[VTokenInject] Local→Global map: "
+                      f"{global_map[:8]}{'...' if len(global_map) > 8 else ''}")
+                print(f"[VTokenInject] Cached frames (global): {sorted(cached_frames)}")
+                print(f"[VTokenInject] Prefix offset: {prefix_offset}, "
+                      f"Chunk latent offset: {chunk_latent_offset}")
                 print(f"[VTokenInject] Strength: {strength}")
                 if current_sigma is not None:
                     print(f"[VTokenInject] sigma: {current_sigma:.4f}")
                 debug_state["first_call"] = False
 
             # Find which cached frames overlap with this window
+            # index_list contains LOCAL indices into the chunk's combined latent tensor:
+            #   [0..prefix-1] = reference prefix frames (NOT video)
+            #   [prefix..] = video frames, where local video index 0 = chunk_latent_offset globally
+            # V cache keys use GLOBAL latent frame indices, so we must map:
+            #   global_latent = (local_idx - prefix_offset) + chunk_latent_offset
             tokens_per_frame = grid_sizes[1] * grid_sizes[2]
-            matching = []  # list of (local_pos, frame_idx) for frames with cached V
-            for pos, frame_idx in enumerate(index_list):
-                if frame_idx in cached_frames and (block_idx, frame_idx) in manager.v_cache:
-                    matching.append((pos, frame_idx))
+            matching = []  # list of (local_pos, global_frame_idx) for frames with cached V
+            for pos, local_idx in enumerate(index_list):
+                if local_idx < prefix_offset:
+                    continue  # skip reference prefix region
+                global_frame = (local_idx - prefix_offset) + chunk_latent_offset
+                if global_frame in cached_frames and (block_idx, global_frame) in manager.v_cache:
+                    matching.append((pos, global_frame))
 
             if not matching:
                 # No cached frames in this window — pass through
@@ -712,8 +755,8 @@ class NV_VTokenInject:
             v_modified = v.clone()
             replaced_count = 0
 
-            for pos, frame_idx in matching:
-                key = (block_idx, frame_idx)
+            for pos, global_frame in matching:
+                key = (block_idx, global_frame)
                 v_cached = manager.v_cache[key].to(device=v.device, dtype=v.dtype)
 
                 # Handle batch size mismatch (e.g., B=1 at capture, B=2 with CFG at inject)
@@ -742,11 +785,11 @@ class NV_VTokenInject:
 
             # Log first injection per step
             if debug_state["step_inject_count"] == 1:
-                matched_frames = [f for _, f in matching]
+                matched_info = [f"L{pos}→G{gf}" for pos, gf in matching]
                 print(f"[VTokenInject] INJECT: window "
-                      f"(frames {index_list[:5]}{'...' if len(index_list) > 5 else ''}) "
+                      f"(local {index_list[:5]}{'...' if len(index_list) > 5 else ''}) "
                       f"block {block_idx}")
-                print(f"[VTokenInject]   Replaced V for frames: {matched_frames} "
+                print(f"[VTokenInject]   Replaced V: {matched_info} "
                       f"({replaced_count} × {tokens_per_frame} tokens, strength={strength})")
 
             # V replaced in-place — K/V lengths unchanged, compatible with all overrides
