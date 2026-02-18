@@ -241,7 +241,11 @@ class NV_VacePrePassReference:
         ).squeeze(0)
 
         # Prepend zero-mask for reference frames (mask=0 = preserve)
-        mask_pad = torch.zeros_like(mask[:, :ref_latent_length, :, :])
+        # Note: can't use zeros_like with slice — ref_latent_length may exceed mask.shape[1]
+        mask_pad = torch.zeros(
+            mask.shape[0], ref_latent_length, mask.shape[2], mask.shape[3],
+            device=mask.device, dtype=mask.dtype
+        )
         mask = torch.cat((mask_pad, mask), dim=1)
 
         # Update total latent length
