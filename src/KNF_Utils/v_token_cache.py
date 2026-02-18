@@ -604,6 +604,24 @@ class NV_VTokenInject:
                                                        "(wire from chunk loader start_frame output). "
                                                        "Used to map chunk-local indices to global latent "
                                                        "frame indices that match the V cache keys."}),
+                "sigma_start": ("FLOAT", {
+                    "default": 1000.0,
+                    "min": 0.0,
+                    "max": 1000.0,
+                    "step": 0.01,
+                    "tooltip": "Start injecting at this sigma and below. 1000.0 = inject from "
+                               "the very first step. Lower values skip early high-noise steps."
+                }),
+                "sigma_end": ("FLOAT", {
+                    "default": 0.0,
+                    "min": 0.0,
+                    "max": 1000.0,
+                    "step": 0.01,
+                    "tooltip": "Stop injecting below this sigma. 0.0 = inject at all steps. "
+                               "Raise to skip late steps where fine detail forms — prevents "
+                               "temporal 'pop' artifacts at injected frame positions. "
+                               "Try 0.3-0.5 to anchor spatial layout without contaminating detail."
+                }),
             },
         }
 
@@ -614,10 +632,12 @@ class NV_VTokenInject:
     DESCRIPTION = (
         "Injects pre-captured V tokens into the chunked high-res pass. "
         "Each context window gets its matching cached V tokens replaced in-place, "
-        "anchoring background element positions."
+        "anchoring background element positions. Use sigma_end to gate injection "
+        "to early denoising steps only (prevents fine-detail artifacts)."
     )
 
-    def inject(self, model, v_cache, latent_prefix_frames, chunk_start_video_frame):
+    def inject(self, model, v_cache, latent_prefix_frames, chunk_start_video_frame,
+               sigma_start, sigma_end):
         model = model.clone()
         manager = v_cache
 
@@ -639,6 +659,8 @@ class NV_VTokenInject:
 
         print(f"[VTokenInject] Chunk mapping: video_start={chunk_start_video_frame} "
               f"→ latent_offset={chunk_latent_offset}, prefix={prefix_offset}")
+        if sigma_end > 0.0 or sigma_start < 1000.0:
+            print(f"[VTokenInject] Sigma gating: inject when {sigma_end} <= sigma <= {sigma_start}")
 
         # Build lookup: which frame indices have cached V?
         cached_frames = set(f for _, f in manager.v_cache.keys())
@@ -663,22 +685,11 @@ class NV_VTokenInject:
             "inject_count": 0,
             "last_sigma": None,
             "step_inject_count": 0,
-            "total_calls": 0,
-            "extended_kv_seen": False,
+            "sigma_gated_count": 0,
         }
 
         def inject_override(original_func, *args, **kwargs):
             q, k, v = args[0], args[1], args[2]
-            debug_state["total_calls"] += 1
-
-            # CHAIN DIAGNOSTIC: detect if this override is ever called with
-            # extended K/V (from AnchorKVCache's inject path)
-            if k.shape[1] > q.shape[1] and not debug_state["extended_kv_seen"]:
-                debug_state["extended_kv_seen"] = True
-                t_opts_diag = kwargs.get("transformer_options", {})
-                bidx = t_opts_diag.get("block_index", -1)
-                print(f"[VTokenInject] CHAIN OK: Extended K/V detected. "
-                      f"q={q.shape[1]}, k={k.shape[1]}, v={v.shape[1]}, block={bidx}")
 
             # Skip cross-attention (K shorter than Q = text tokens as keys).
             # Allow K >= Q: AnchorKVCache prepends anchor tokens to K/V,
@@ -699,11 +710,25 @@ class NV_VTokenInject:
             # Detect new step
             current_sigma = sigmas[0].item() if sigmas is not None and len(sigmas) > 0 else None
             if current_sigma is not None and current_sigma != debug_state["last_sigma"]:
-                print(f"[VTokenInject] Step transition: total_calls={debug_state['total_calls']}, "
-                      f"step_injects={debug_state['step_inject_count']}, "
-                      f"extended_kv_seen={debug_state['extended_kv_seen']}")
+                if debug_state["step_inject_count"] > 0 or debug_state["sigma_gated_count"] > 0:
+                    print(f"[VTokenInject] Step summary: "
+                          f"injected {debug_state['step_inject_count']}, "
+                          f"sigma-gated {debug_state['sigma_gated_count']}")
                 debug_state["last_sigma"] = current_sigma
                 debug_state["step_inject_count"] = 0
+                debug_state["sigma_gated_count"] = 0
+
+            # Sigma gating: only inject when sigma is within [sigma_end, sigma_start].
+            # At high sigma (early steps), V encodes spatial layout — good to anchor.
+            # At low sigma (late steps), V encodes fine detail — should be computed
+            # naturally for temporal consistency (prevents "pop" at injected frames).
+            if current_sigma is not None:
+                if current_sigma > sigma_start or current_sigma < sigma_end:
+                    if debug_state["sigma_gated_count"] == 0 and block_idx == 0:
+                        print(f"[VTokenInject] Sigma gated: σ={current_sigma:.4f} "
+                              f"outside [{sigma_end}, {sigma_start}], skipping injection")
+                    debug_state["sigma_gated_count"] += 1
+                    return _call_next(original_func, args, kwargs)
 
             # No context window = no injection target
             if window is None or grid_sizes is None:
@@ -765,20 +790,6 @@ class NV_VTokenInject:
                 global_frame = (local_idx - prefix_offset) + chunk_latent_offset
                 if global_frame in cached_frames and (block_idx, global_frame) in manager.v_cache:
                     matching.append((pos, global_frame))
-
-            # --- Per-window diagnostic (block 0 only to avoid spam) ---
-            if block_idx == 0:
-                vid_frames_in_window = [(li, (li - prefix_offset) + chunk_latent_offset)
-                                        for li in index_list if li >= prefix_offset]
-                globals_in_window = [gf for _, gf in vid_frames_in_window]
-                hits = [gf for gf in globals_in_window if gf in cached_frames]
-                print(f"[VTokenInject] Window diag: index_list[0]={index_list[0]}, "
-                      f"len={len(index_list)}, "
-                      f"vid_frames={len(vid_frames_in_window)}, "
-                      f"global_range=[{globals_in_window[0] if globals_in_window else '?'}"
-                      f"..{globals_in_window[-1] if globals_in_window else '?'}], "
-                      f"cache_hits={hits}, matches={len(matching)}, "
-                      f"V.shape={v.shape}, anchor_offset={anchor_token_offset}")
 
             if not matching:
                 # No cached frames in this window — pass through
@@ -846,8 +857,11 @@ class NV_VTokenInject:
 
         stats = manager.get_cache_stats()
         chain_info = " (chained with existing override)" if existing_override else ""
+        sigma_info = ""
+        if sigma_end > 0.0 or sigma_start < 1000.0:
+            sigma_info = f", sigma=[{sigma_end}, {sigma_start}]"
         print(f"[VTokenInject] Patched model: {stats['frames']} cached frames, "
-              f"{stats['blocks']} blocks, strength={strength}{chain_info}")
+              f"{stats['blocks']} blocks, strength={strength}{sigma_info}{chain_info}")
 
         return (model,)
 
