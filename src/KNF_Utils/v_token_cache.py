@@ -466,6 +466,13 @@ class NV_VTokenSave:
                                "Relative paths are relative to ComfyUI's working directory."
                 }),
             },
+            "optional": {
+                "dep_latent": ("LATENT", {
+                    "tooltip": "Connect from KSampler/VAEDecode output to force execution order. "
+                               "This input is not used for data — it only ensures VTokenSave "
+                               "runs AFTER the sampler populates the V cache."
+                }),
+            },
         }
 
     RETURN_TYPES = ("STRING",)
@@ -478,7 +485,7 @@ class NV_VTokenSave:
         "inject happen in separate workflows."
     )
 
-    def save(self, v_cache, output_path):
+    def save(self, v_cache, output_path, dep_latent=None):
         manager = v_cache
 
         if not manager.has_cache:
