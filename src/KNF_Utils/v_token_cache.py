@@ -1,0 +1,710 @@
+"""
+V-Token Capture/Inject System for Cross-Chunk Consistency
+
+Captures V (Value) tokens from a small full-resolution pre-render of strategic frames
+(window centers) and injects them into the chunked high-resolution refinement pass.
+This gives each context window a pre-computed "ground truth" V representation for
+its center frame, anchoring the spatial layout of repetitive background elements
+that would otherwise shift between chunks.
+
+Why V-only (not K):
+  V has no RoPE — carries pure content with no positional encoding.
+  K has temporal RoPE baked in, creating position collisions when injected
+  at different temporal positions within a context window.
+
+Architecture:
+  Workflow A (pre-pass):
+    [NV_VTokenCapture] → [KSampler on center frames] → [NV_VTokenSave] → .pt file
+  Workflow B (chunked high-res):
+    [NV_VTokenLoad] → [NV_VTokenInject] → [WAN Context Windows] → [KSampler]
+
+Based on the AttentionSinkManager pattern from attention_sink.py.
+"""
+
+import os
+import torch
+from typing import Optional
+
+
+def _parse_target_blocks(target_blocks_str):
+    """Parse target_blocks string into a set of block indices or None for 'all'."""
+    s = target_blocks_str.strip().lower()
+    if s == "all" or s == "":
+        return None  # None means all blocks
+    try:
+        return set(int(x.strip()) for x in s.split(",") if x.strip())
+    except ValueError:
+        print(f"[VTokenCache] WARNING: Could not parse target_blocks '{target_blocks_str}', using all blocks")
+        return None
+
+
+def _compute_window_centers(total_frames, context_length, context_overlap):
+    """
+    Calculate center frame indices for static standard context windows.
+    Replicates create_windows_static_standard logic from context_windows.py.
+
+    Args:
+        total_frames: Total latent frames in the generation
+        context_length: Frames per context window
+        context_overlap: Overlap between adjacent windows
+
+    Returns:
+        Sorted list of unique center frame indices (latent space)
+    """
+    delta = context_length - context_overlap
+    if delta <= 0:
+        print(f"[VTokenCache] WARNING: context_overlap ({context_overlap}) >= context_length ({context_length}), "
+              f"using delta=1")
+        delta = 1
+
+    centers = []
+    for start_idx in range(0, total_frames, delta):
+        ending = start_idx + context_length
+        if ending >= total_frames:
+            # Last window gets pulled back to fit
+            final_start = max(0, start_idx - (ending - total_frames))
+            center = final_start + context_length // 2
+            centers.append(min(center, total_frames - 1))
+            break
+        center = start_idx + context_length // 2
+        centers.append(center)
+
+    result = sorted(set(centers))
+    return result
+
+
+def _parse_capture_frames(capture_frames_str, total_latent_frames, context_length, context_overlap):
+    """
+    Parse capture_frames input. Returns list of latent frame indices.
+
+    "auto" → compute window centers from context params
+    "3,6,10,16" → explicit latent frame indices
+    """
+    s = capture_frames_str.strip().lower()
+    if s == "auto":
+        frames = _compute_window_centers(total_latent_frames, context_length, context_overlap)
+        print(f"[VTokenCache] Auto window centers: {frames} "
+              f"(total={total_latent_frames}, ctx_len={context_length}, overlap={context_overlap})")
+        return frames
+    try:
+        frames = sorted(set(int(x.strip()) for x in s.split(",") if x.strip()))
+        # Validate frame indices
+        frames = [f for f in frames if 0 <= f < total_latent_frames]
+        if not frames:
+            print(f"[VTokenCache] WARNING: No valid frame indices in '{capture_frames_str}' "
+                  f"(total_latent_frames={total_latent_frames})")
+        return frames
+    except ValueError:
+        print(f"[VTokenCache] WARNING: Could not parse capture_frames '{capture_frames_str}', "
+              f"falling back to auto")
+        return _compute_window_centers(total_latent_frames, context_length, context_overlap)
+
+
+# ============================================================================
+# VTokenManager — Internal state manager
+# ============================================================================
+
+class VTokenManager:
+    """
+    Manages V-token capture and injection state across workflow nodes.
+
+    Storage: (block_idx, frame_idx) → V tensor on CPU
+    Each V tensor shape: [B, tokens_per_frame, D]
+    """
+
+    def __init__(self, target_blocks, capture_frames, strength):
+        self._mode = "idle"  # "idle" | "capture" | "inject"
+        self.target_blocks = target_blocks  # set of int or None (all)
+        self.capture_frames = capture_frames  # list of global latent frame indices
+        self.strength = strength
+
+        # Storage: (block_idx, frame_idx) → V tensor on CPU
+        self.v_cache = {}
+
+        # Computed at capture time
+        self.tokens_per_frame = None
+
+        # Debug tracking
+        self._capture_logged = False
+        self._inject_count = 0
+
+    def set_mode(self, mode):
+        assert mode in ("idle", "capture", "inject"), f"Invalid mode: {mode}"
+        self._mode = mode
+        self._capture_logged = False
+        self._inject_count = 0
+
+        if mode == "capture":
+            self.v_cache.clear()
+            print(f"[VTokenManager] Mode: CAPTURE "
+                  f"(frames={self.capture_frames}, "
+                  f"blocks={'all' if self.target_blocks is None else sorted(self.target_blocks)}, "
+                  f"strength={self.strength})")
+        elif mode == "inject":
+            n_entries = len(self.v_cache)
+            if n_entries == 0:
+                print("[VTokenManager] WARNING: No V tokens cached! Run capture first.")
+            else:
+                n_blocks = len(set(b for b, _ in self.v_cache.keys()))
+                n_frames = len(set(f for _, f in self.v_cache.keys()))
+                sample_key = next(iter(self.v_cache))
+                v_shape = self.v_cache[sample_key].shape
+                print(f"[VTokenManager] Mode: INJECT "
+                      f"({n_entries} entries: {n_blocks} blocks × {n_frames} frames, "
+                      f"V shape per entry: {list(v_shape)}, strength={self.strength})")
+
+    @property
+    def has_cache(self):
+        return len(self.v_cache) > 0
+
+    def get_cache_stats(self):
+        if not self.v_cache:
+            return {"entries": 0, "blocks": 0, "frames": 0, "total_bytes": 0, "total_mb": 0}
+        blocks = sorted(set(b for b, _ in self.v_cache.keys()))
+        frames = sorted(set(f for _, f in self.v_cache.keys()))
+        total_bytes = sum(v.nbytes for v in self.v_cache.values())
+        sample_key = next(iter(self.v_cache))
+        return {
+            "entries": len(self.v_cache),
+            "blocks": len(blocks),
+            "block_indices": blocks,
+            "frames": len(frames),
+            "frame_indices": frames,
+            "v_shape_per_entry": list(self.v_cache[sample_key].shape),
+            "total_bytes": total_bytes,
+            "total_mb": total_bytes / 1024 / 1024,
+        }
+
+    def to_serializable(self):
+        """Convert to a dict that can be saved with torch.save."""
+        return {
+            "v_cache": {
+                f"{block_idx},{frame_idx}": v.cpu()
+                for (block_idx, frame_idx), v in self.v_cache.items()
+            },
+            "config": {
+                "target_blocks": sorted(self.target_blocks) if self.target_blocks is not None else "all",
+                "capture_frames": self.capture_frames,
+                "strength": self.strength,
+                "tokens_per_frame": self.tokens_per_frame,
+            },
+            "stats": self.get_cache_stats(),
+        }
+
+    @classmethod
+    def from_serializable(cls, data):
+        """Reconstruct from a saved dict."""
+        config = data.get("config", {})
+        tb = config.get("target_blocks", "all")
+        target_blocks = None if tb == "all" else set(tb)
+        manager = cls(
+            target_blocks=target_blocks,
+            capture_frames=config.get("capture_frames", []),
+            strength=config.get("strength", 1.0),
+        )
+        manager.tokens_per_frame = config.get("tokens_per_frame", None)
+        for key_str, v in data.get("v_cache", {}).items():
+            block_idx, frame_idx = key_str.split(",")
+            manager.v_cache[(int(block_idx), int(frame_idx))] = v.cpu()
+        return manager
+
+
+# ============================================================================
+# ComfyUI Nodes
+# ============================================================================
+
+class NV_VTokenCapture:
+    """
+    Captures V tokens from a small full-resolution pre-render of strategic frames.
+
+    Connect BEFORE a KSampler that renders only the center frames.
+    The KSampler should use the same denoise/conditions as the chunked pass.
+
+    Workflow A: [Model] → [NV_VTokenCapture] → [KSampler] → [NV_VTokenSave]
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "capture_frames": ("STRING", {
+                    "default": "auto",
+                    "tooltip": "'auto' calculates window center frames from context params, "
+                               "or comma-separated latent frame indices like '3,6,10,16'. "
+                               "Latent frames = video_frames / 4 + 1 for Wan."
+                }),
+                "total_latent_frames": ("INT", {
+                    "default": 21,
+                    "min": 1,
+                    "max": 200,
+                    "step": 1,
+                    "tooltip": "Total latent frames in the full generation. "
+                               "81 video frames = 21 latent frames for Wan."
+                }),
+                "context_length": ("INT", {
+                    "default": 13,
+                    "min": 1,
+                    "max": 81,
+                    "step": 1,
+                    "tooltip": "Context window size (latent frames). Must match your "
+                               "WAN Context Windows node in the chunked workflow. "
+                               "Only used when capture_frames='auto'."
+                }),
+                "context_overlap": ("INT", {
+                    "default": 3,
+                    "min": 0,
+                    "max": 40,
+                    "step": 1,
+                    "tooltip": "Context window overlap (latent frames). Must match your "
+                               "WAN Context Windows node in the chunked workflow. "
+                               "Only used when capture_frames='auto'."
+                }),
+                "target_blocks": ("STRING", {
+                    "default": "all",
+                    "tooltip": "'all' for every transformer block, or comma-separated indices "
+                               "like '0,5,10,15,19'. More blocks = better quality but more "
+                               "disk/RAM (~15MB per block per frame at 1280p)."
+                }),
+                "strength": ("FLOAT", {
+                    "default": 1.0,
+                    "min": 0.0,
+                    "max": 2.0,
+                    "step": 0.05,
+                    "tooltip": "Scale factor for injected V values at injection time. "
+                               ">1 strengthens cached V influence, <1 weakens it. "
+                               "Stored in cache, applied by NV_VTokenInject."
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("MODEL", "V_TOKEN_CACHE")
+    RETURN_NAMES = ("model", "v_cache")
+    FUNCTION = "capture"
+    CATEGORY = "NV_Utils/attention"
+    DESCRIPTION = (
+        "Captures V tokens from strategic frames during a small full-resolution "
+        "pre-render. Connect before a KSampler, then save with NV_VTokenSave. "
+        "The inject node uses these tokens to anchor background consistency "
+        "in the chunked high-res pass."
+    )
+
+    def capture(self, model, capture_frames, total_latent_frames,
+                context_length, context_overlap, target_blocks, strength):
+        model = model.clone()
+        blocks = _parse_target_blocks(target_blocks)
+        frames = _parse_capture_frames(
+            capture_frames, total_latent_frames, context_length, context_overlap
+        )
+
+        if not frames:
+            print("[VTokenCapture] WARNING: No frames to capture. Returning unpatched model.")
+            manager = VTokenManager(blocks, [], strength)
+            return (model, manager)
+
+        manager = VTokenManager(blocks, frames, strength)
+        manager.set_mode("capture")
+
+        # Track which step we're on for capture-at-last-step logic
+        # We capture on EVERY step (V changes each step), last step's V is final
+        # But we only need to keep the last captured values — overwrite each step
+
+        # Check for existing override to chain with
+        existing_override = None
+        if "transformer_options" in model.model_options:
+            existing_override = model.model_options["transformer_options"].get(
+                "optimized_attention_override"
+            )
+
+        def _call_next(original_func, args, kwargs):
+            if existing_override is not None:
+                return existing_override(original_func, *args, **kwargs)
+            return original_func(*args, **kwargs)
+
+        # Debug state
+        debug_state = {
+            "first_call": True,
+            "captures_this_step": 0,
+            "last_sigma": None,
+        }
+
+        def capture_override(original_func, *args, **kwargs):
+            q, k, v = args[0], args[1], args[2]
+
+            # Skip cross-attention (Q and K have different seq_len)
+            if q.shape[1] != k.shape[1]:
+                return _call_next(original_func, args, kwargs)
+
+            t_opts = kwargs.get("transformer_options", {})
+            block_idx = t_opts.get("block_index", -1)
+            grid_sizes = t_opts.get("grid_sizes", None)
+            sigmas = t_opts.get("sigmas", None)
+
+            # Skip non-targeted blocks
+            if blocks is not None and block_idx not in blocks:
+                return _call_next(original_func, args, kwargs)
+
+            # Detect new step via sigma change
+            current_sigma = sigmas[0].item() if sigmas is not None and len(sigmas) > 0 else None
+            if current_sigma is not None and current_sigma != debug_state["last_sigma"]:
+                if debug_state["captures_this_step"] > 0:
+                    print(f"[VTokenCapture] Step complete: captured {debug_state['captures_this_step']} blocks")
+                debug_state["last_sigma"] = current_sigma
+                debug_state["captures_this_step"] = 0
+
+            # Need grid_sizes to compute tokens_per_frame
+            if grid_sizes is None:
+                if debug_state["first_call"]:
+                    print("[VTokenCapture] WARNING: No grid_sizes in transformer_options")
+                    debug_state["first_call"] = False
+                return _call_next(original_func, args, kwargs)
+
+            tokens_per_frame = grid_sizes[1] * grid_sizes[2]
+            manager.tokens_per_frame = tokens_per_frame
+
+            # First call: full state dump
+            if debug_state["first_call"]:
+                print(f"[VTokenCapture] === First capture call ===")
+                print(f"[VTokenCapture] grid_sizes: {grid_sizes} "
+                      f"(T={grid_sizes[0]}, H={grid_sizes[1]}, W={grid_sizes[2]})")
+                print(f"[VTokenCapture] tokens_per_frame: {tokens_per_frame}")
+                print(f"[VTokenCapture] V shape: {v.shape} "
+                      f"(B={v.shape[0]}, seq_len={v.shape[1]}, dim={v.shape[2]})")
+                print(f"[VTokenCapture] dtype: {v.dtype}, device: {v.device}")
+                print(f"[VTokenCapture] Capturing frames: {frames}")
+                expected_seq = len(frames) * tokens_per_frame
+                print(f"[VTokenCapture] Expected seq_len: {len(frames)} frames × "
+                      f"{tokens_per_frame} tokens = {expected_seq} "
+                      f"(actual: {v.shape[1]})")
+                if current_sigma is not None:
+                    print(f"[VTokenCapture] sigma: {current_sigma:.4f}")
+                debug_state["first_call"] = False
+
+            # Capture: slice V tensor per frame and store on CPU
+            # During Pass 1.5, no context windows — V contains all strategic frames
+            # Frame order matches the latent tensor order
+            num_frames_in_tensor = v.shape[1] // tokens_per_frame
+
+            for i, frame_idx in enumerate(frames):
+                if i >= num_frames_in_tensor:
+                    break
+                start = i * tokens_per_frame
+                end = start + tokens_per_frame
+                if end > v.shape[1]:
+                    break
+                manager.v_cache[(block_idx, frame_idx)] = (
+                    v[:, start:end, :].detach().clone().cpu()
+                )
+
+            debug_state["captures_this_step"] += 1
+
+            # Run attention normally — capture doesn't modify anything
+            return _call_next(original_func, args, kwargs)
+
+        # Apply the override
+        if "transformer_options" not in model.model_options:
+            model.model_options["transformer_options"] = {}
+        model.model_options["transformer_options"]["optimized_attention_override"] = capture_override
+
+        block_info = f"blocks {target_blocks}" if blocks is not None else "all blocks"
+        chain_info = " (chained with existing override)" if existing_override else ""
+        print(f"[VTokenCapture] Patched model: {len(frames)} frames to capture, "
+              f"{block_info}, strength={strength}{chain_info}")
+
+        return (model, manager)
+
+
+class NV_VTokenSave:
+    """
+    Saves captured V tokens to a .pt file on disk.
+
+    Connect after the KSampler in Workflow A (capture pass).
+    The saved file can be loaded in Workflow B by NV_VTokenLoad.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "v_cache": ("V_TOKEN_CACHE",),
+                "output_path": ("STRING", {
+                    "default": "v_token_cache.pt",
+                    "tooltip": "File path for saving the V token cache. "
+                               "Relative paths are relative to ComfyUI's working directory."
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("output_path",)
+    FUNCTION = "save"
+    CATEGORY = "NV_Utils/attention"
+    OUTPUT_NODE = True
+    DESCRIPTION = (
+        "Saves captured V tokens to a .pt file. Required when capture and "
+        "inject happen in separate workflows."
+    )
+
+    def save(self, v_cache, output_path):
+        manager = v_cache
+
+        if not manager.has_cache:
+            print("[VTokenSave] WARNING: No V tokens to save! Was capture run?")
+            return (output_path,)
+
+        output_dir = os.path.dirname(output_path)
+        if output_dir and not os.path.exists(output_dir):
+            os.makedirs(output_dir, exist_ok=True)
+
+        data = manager.to_serializable()
+        torch.save(data, output_path)
+
+        size_mb = os.path.getsize(output_path) / (1024 * 1024)
+        stats = manager.get_cache_stats()
+        print(f"[VTokenSave] Saved to {output_path}")
+        print(f"  Entries: {stats['entries']} ({stats['blocks']} blocks × {stats['frames']} frames)")
+        print(f"  Frames: {stats.get('frame_indices', [])}")
+        print(f"  Blocks: {stats.get('block_indices', [])}")
+        print(f"  V shape per entry: {stats.get('v_shape_per_entry', [])}")
+        print(f"  File size: {size_mb:.1f} MB")
+
+        return (output_path,)
+
+
+class NV_VTokenLoad:
+    """
+    Loads V token cache from a .pt file on disk.
+
+    Use in Workflow B to load tokens saved by NV_VTokenSave in Workflow A.
+    Connect output to NV_VTokenInject.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "path": ("STRING", {
+                    "default": "v_token_cache.pt",
+                    "tooltip": "Path to the saved V token cache file."
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("V_TOKEN_CACHE",)
+    RETURN_NAMES = ("v_cache",)
+    FUNCTION = "load"
+    CATEGORY = "NV_Utils/attention"
+    DESCRIPTION = (
+        "Loads V token cache from a .pt file saved by NV_VTokenSave. "
+        "Connect output to NV_VTokenInject."
+    )
+
+    def load(self, path):
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"V token cache not found: {path}")
+
+        data = torch.load(path, map_location='cpu', weights_only=False)
+        manager = VTokenManager.from_serializable(data)
+
+        stats = manager.get_cache_stats()
+        print(f"[VTokenLoad] Loaded from {path}")
+        print(f"  Entries: {stats['entries']} ({stats['blocks']} blocks × {stats['frames']} frames)")
+        print(f"  Frames: {stats.get('frame_indices', [])}")
+        print(f"  Blocks: {stats.get('block_indices', [])}")
+        print(f"  V shape per entry: {stats.get('v_shape_per_entry', [])}")
+        print(f"  Total: {stats['total_mb']:.1f} MB")
+
+        return (manager,)
+
+
+class NV_VTokenInject:
+    """
+    Injects pre-captured V tokens into the chunked high-resolution pass.
+
+    For each context window, looks up which cached frames overlap with the
+    window's frame range and prepends those V tokens to the window's V tensor.
+    This gives each window a pre-computed "ground truth" for its center frame.
+
+    Connect BEFORE context windows and sampler in Workflow B:
+    [NV_VTokenLoad] → [NV_VTokenInject] → [WAN Context Windows] → [KSampler]
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "v_cache": ("V_TOKEN_CACHE",),
+            },
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    RETURN_NAMES = ("model",)
+    FUNCTION = "inject"
+    CATEGORY = "NV_Utils/attention"
+    DESCRIPTION = (
+        "Injects pre-captured V tokens into the chunked high-res pass. "
+        "Each context window gets its matching cached V tokens prepended, "
+        "anchoring background element positions."
+    )
+
+    def inject(self, model, v_cache):
+        model = model.clone()
+        manager = v_cache
+
+        if not manager.has_cache:
+            print("[VTokenInject] WARNING: No V tokens in cache! Was capture/load run?")
+            return (model,)
+
+        manager.set_mode("inject")
+
+        # Build lookup: which frame indices have cached V?
+        cached_frames = set(f for _, f in manager.v_cache.keys())
+        target_blocks = manager.target_blocks
+        strength = manager.strength
+
+        # Check for existing override to chain with
+        existing_override = None
+        if "transformer_options" in model.model_options:
+            existing_override = model.model_options["transformer_options"].get(
+                "optimized_attention_override"
+            )
+
+        def _call_next(original_func, args, kwargs):
+            if existing_override is not None:
+                return existing_override(original_func, *args, **kwargs)
+            return original_func(*args, **kwargs)
+
+        # Debug state
+        debug_state = {
+            "first_call": True,
+            "inject_count": 0,
+            "last_sigma": None,
+            "step_inject_count": 0,
+        }
+
+        def inject_override(original_func, *args, **kwargs):
+            q, k, v = args[0], args[1], args[2]
+
+            # Skip cross-attention
+            if q.shape[1] != k.shape[1]:
+                return _call_next(original_func, args, kwargs)
+
+            t_opts = kwargs.get("transformer_options", {})
+            block_idx = t_opts.get("block_index", -1)
+            window = t_opts.get("context_window", None)
+            grid_sizes = t_opts.get("grid_sizes", None)
+            sigmas = t_opts.get("sigmas", None)
+
+            # Skip non-targeted blocks
+            if target_blocks is not None and block_idx not in target_blocks:
+                return _call_next(original_func, args, kwargs)
+
+            # Detect new step
+            current_sigma = sigmas[0].item() if sigmas is not None and len(sigmas) > 0 else None
+            if current_sigma is not None and current_sigma != debug_state["last_sigma"]:
+                if debug_state["step_inject_count"] > 0:
+                    print(f"[VTokenInject] Step summary: injected into "
+                          f"{debug_state['step_inject_count']} block×window calls")
+                debug_state["last_sigma"] = current_sigma
+                debug_state["step_inject_count"] = 0
+
+            # No context window = no injection target
+            if window is None or grid_sizes is None:
+                if debug_state["first_call"] and block_idx == 0:
+                    reason = "no context_window" if window is None else "no grid_sizes"
+                    print(f"[VTokenInject] Passthrough: {reason}")
+                    debug_state["first_call"] = False
+                return _call_next(original_func, args, kwargs)
+
+            # Get frame indices for this window
+            index_list = getattr(window, "index_list", None)
+            if index_list is None:
+                return _call_next(original_func, args, kwargs)
+
+            # First call: full state dump
+            if debug_state["first_call"]:
+                print(f"[VTokenInject] === First inject call ===")
+                print(f"[VTokenInject] grid_sizes: {grid_sizes}")
+                print(f"[VTokenInject] V shape: {v.shape}")
+                print(f"[VTokenInject] Window index_list: "
+                      f"{index_list[:8]}{'...' if len(index_list) > 8 else ''} "
+                      f"({len(index_list)} frames)")
+                print(f"[VTokenInject] Cached frames: {sorted(cached_frames)}")
+                print(f"[VTokenInject] Strength: {strength}")
+                if current_sigma is not None:
+                    print(f"[VTokenInject] sigma: {current_sigma:.4f}")
+                debug_state["first_call"] = False
+
+            # Find which cached frames overlap with this window
+            matching_frames = [f for f in index_list if f in cached_frames]
+
+            if not matching_frames:
+                # No cached frames in this window — pass through
+                return _call_next(original_func, args, kwargs)
+
+            # Collect cached V tokens for matching frames
+            v_parts = []
+            for frame_idx in matching_frames:
+                key = (block_idx, frame_idx)
+                if key in manager.v_cache:
+                    v_cached = manager.v_cache[key].to(device=v.device, dtype=v.dtype)
+                    if strength != 1.0:
+                        v_cached = v_cached * strength
+                    v_parts.append(v_cached)
+
+            if not v_parts:
+                return _call_next(original_func, args, kwargs)
+
+            # Concatenate all cached V and prepend to current V
+            v_inject = torch.cat(v_parts, dim=1)
+            v_extended = torch.cat([v_inject, v], dim=1)
+
+            debug_state["step_inject_count"] += 1
+            debug_state["inject_count"] += 1
+
+            # Log first injection per step
+            if debug_state["step_inject_count"] == 1:
+                print(f"[VTokenInject] INJECT: window "
+                      f"(frames {index_list[:5]}{'...' if len(index_list) > 5 else ''}) "
+                      f"block {block_idx}")
+                print(f"[VTokenInject]   Matched cached frames: {matching_frames}")
+                print(f"[VTokenInject]   V: {v.shape} -> {v_extended.shape} "
+                      f"(+{v_inject.shape[1]} cached tokens)")
+
+            # Only extend V — Q and K unchanged (asymmetric V injection)
+            new_args = list(args)
+            new_args[2] = v_extended
+
+            return _call_next(original_func, tuple(new_args), kwargs)
+
+        # Apply the override
+        if "transformer_options" not in model.model_options:
+            model.model_options["transformer_options"] = {}
+        model.model_options["transformer_options"]["optimized_attention_override"] = inject_override
+
+        stats = manager.get_cache_stats()
+        chain_info = " (chained with existing override)" if existing_override else ""
+        print(f"[VTokenInject] Patched model: {stats['frames']} cached frames, "
+              f"{stats['blocks']} blocks, strength={strength}{chain_info}")
+
+        return (model,)
+
+
+# ============================================================================
+# Node Registration
+# ============================================================================
+
+NODE_CLASS_MAPPINGS = {
+    "NV_VTokenCapture": NV_VTokenCapture,
+    "NV_VTokenSave": NV_VTokenSave,
+    "NV_VTokenLoad": NV_VTokenLoad,
+    "NV_VTokenInject": NV_VTokenInject,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "NV_VTokenCapture": "NV V-Token Capture",
+    "NV_VTokenSave": "NV V-Token Save",
+    "NV_VTokenLoad": "NV V-Token Load",
+    "NV_VTokenInject": "NV V-Token Inject",
+}
