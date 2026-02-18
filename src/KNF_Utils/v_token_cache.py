@@ -745,6 +745,20 @@ class NV_VTokenInject:
                 if global_frame in cached_frames and (block_idx, global_frame) in manager.v_cache:
                     matching.append((pos, global_frame))
 
+            # --- Per-window diagnostic (block 0 only to avoid spam) ---
+            if block_idx == 0:
+                vid_frames_in_window = [(li, (li - prefix_offset) + chunk_latent_offset)
+                                        for li in index_list if li >= prefix_offset]
+                globals_in_window = [gf for _, gf in vid_frames_in_window]
+                hits = [gf for gf in globals_in_window if gf in cached_frames]
+                print(f"[VTokenInject] Window diag: index_list[0]={index_list[0]}, "
+                      f"len={len(index_list)}, "
+                      f"vid_frames={len(vid_frames_in_window)}, "
+                      f"global_range=[{globals_in_window[0] if globals_in_window else '?'}"
+                      f"..{globals_in_window[-1] if globals_in_window else '?'}], "
+                      f"cache_hits={hits}, matches={len(matching)}, "
+                      f"V.shape={v.shape}")
+
             if not matching:
                 # No cached frames in this window — pass through
                 return _call_next(original_func, args, kwargs)
@@ -766,6 +780,10 @@ class NV_VTokenInject:
                 start = pos * tokens_per_frame
                 end = start + tokens_per_frame
                 if end > v.shape[1] or v_cached.shape[1] != tokens_per_frame:
+                    if block_idx == 0:
+                        print(f"[VTokenInject] GUARD SKIP: pos={pos}, G{global_frame}, "
+                              f"start={start}, end={end}, v.shape[1]={v.shape[1]}, "
+                              f"v_cached.shape[1]={v_cached.shape[1]}, tpf={tokens_per_frame}")
                     continue
 
                 # Blend: strength=1.0 fully replaces, strength=0.5 averages
