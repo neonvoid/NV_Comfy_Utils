@@ -232,33 +232,36 @@ class NV_VTokenCapture:
                     "default": "auto",
                     "tooltip": "'auto' calculates window center frames from context params, "
                                "or comma-separated latent frame indices like '3,6,10,16'. "
-                               "Latent frames = video_frames / 4 + 1 for Wan."
+                               "Latent frames = (video_frames - 1) / 4 + 1 for Wan."
                 }),
-                "total_latent_frames": ("INT", {
-                    "default": 21,
+                "total_video_frames": ("INT", {
+                    "default": 65,
                     "min": 1,
-                    "max": 200,
+                    "max": 1000,
                     "step": 1,
-                    "tooltip": "Total latent frames in the full generation. "
-                               "81 video frames = 21 latent frames for Wan."
+                    "tooltip": "Total video frames in the full generation (e.g. 65, 81). "
+                               "Converted to latent frames internally using Wan formula: "
+                               "(n-1)/4+1. 65 video = 17 latent, 81 video = 21 latent."
                 }),
-                "context_length": ("INT", {
-                    "default": 13,
+                "context_window_size": ("INT", {
+                    "default": 81,
                     "min": 1,
-                    "max": 81,
-                    "step": 1,
-                    "tooltip": "Context window size (latent frames). Must match your "
-                               "WAN Context Windows node in the chunked workflow. "
-                               "Only used when capture_frames='auto'."
+                    "max": 400,
+                    "step": 4,
+                    "tooltip": "Context window size in VIDEO frames. Wire directly from "
+                               "NV Chunk Loader's context_window_size output. Must match "
+                               "your WAN Context Windows node. Only used when "
+                               "capture_frames='auto'. Converted to latent internally."
                 }),
                 "context_overlap": ("INT", {
-                    "default": 3,
+                    "default": 16,
                     "min": 0,
-                    "max": 40,
-                    "step": 1,
-                    "tooltip": "Context window overlap (latent frames). Must match your "
-                               "WAN Context Windows node in the chunked workflow. "
-                               "Only used when capture_frames='auto'."
+                    "max": 200,
+                    "step": 4,
+                    "tooltip": "Context window overlap in VIDEO frames. Wire directly from "
+                               "NV Chunk Loader's context_overlap output. Must match your "
+                               "WAN Context Windows node. Only used when "
+                               "capture_frames='auto'. Converted to latent internally."
                 }),
                 "target_blocks": ("STRING", {
                     "default": "all",
@@ -289,12 +292,22 @@ class NV_VTokenCapture:
         "in the chunked high-res pass."
     )
 
-    def capture(self, model, capture_frames, total_latent_frames,
-                context_length, context_overlap, target_blocks, strength):
+    def capture(self, model, capture_frames, total_video_frames,
+                context_window_size, context_overlap, target_blocks, strength):
         model = model.clone()
         blocks = _parse_target_blocks(target_blocks)
+
+        # Convert video frames to latent frames (Wan VAE: (n-1)//4+1)
+        total_latent_frames = max(((total_video_frames - 1) // 4) + 1, 1)
+        latent_ctx_len = max(((context_window_size - 1) // 4) + 1, 1)
+        latent_ctx_overlap = max(((context_overlap - 1) // 4) + 1, 0)
+        print(f"[VTokenCapture] Video→Latent conversion: "
+              f"total {total_video_frames}→{total_latent_frames}, "
+              f"ctx_len {context_window_size}→{latent_ctx_len}, "
+              f"overlap {context_overlap}→{latent_ctx_overlap}")
+
         frames = _parse_capture_frames(
-            capture_frames, total_latent_frames, context_length, context_overlap
+            capture_frames, total_latent_frames, latent_ctx_len, latent_ctx_overlap
         )
 
         if not frames:
