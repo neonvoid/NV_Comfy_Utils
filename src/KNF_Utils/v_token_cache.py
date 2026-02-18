@@ -696,44 +696,62 @@ class NV_VTokenInject:
                 debug_state["first_call"] = False
 
             # Find which cached frames overlap with this window
-            matching_frames = [f for f in index_list if f in cached_frames]
+            tokens_per_frame = grid_sizes[1] * grid_sizes[2]
+            matching = []  # list of (local_pos, frame_idx) for frames with cached V
+            for pos, frame_idx in enumerate(index_list):
+                if frame_idx in cached_frames and (block_idx, frame_idx) in manager.v_cache:
+                    matching.append((pos, frame_idx))
 
-            if not matching_frames:
+            if not matching:
                 # No cached frames in this window — pass through
                 return _call_next(original_func, args, kwargs)
 
-            # Collect cached V tokens for matching frames
-            v_parts = []
-            for frame_idx in matching_frames:
+            # In-place V replacement: blend cached V into matching frame positions.
+            # This preserves K/V sequence length alignment (no prepend) and is
+            # compatible with AnchorKVCache or any other override in the chain.
+            v_modified = v.clone()
+            replaced_count = 0
+
+            for pos, frame_idx in matching:
                 key = (block_idx, frame_idx)
-                if key in manager.v_cache:
-                    v_cached = manager.v_cache[key].to(device=v.device, dtype=v.dtype)
-                    if strength != 1.0:
-                        v_cached = v_cached * strength
-                    v_parts.append(v_cached)
+                v_cached = manager.v_cache[key].to(device=v.device, dtype=v.dtype)
 
-            if not v_parts:
+                # Handle batch size mismatch (e.g., B=1 at capture, B=2 with CFG at inject)
+                if v_cached.shape[0] < v.shape[0]:
+                    v_cached = v_cached.expand(v.shape[0], -1, -1)
+
+                start = pos * tokens_per_frame
+                end = start + tokens_per_frame
+                if end > v.shape[1] or v_cached.shape[1] != tokens_per_frame:
+                    continue
+
+                # Blend: strength=1.0 fully replaces, strength=0.5 averages
+                if strength >= 1.0:
+                    v_modified[:, start:end, :] = v_cached
+                else:
+                    v_modified[:, start:end, :] = (
+                        (1.0 - strength) * v[:, start:end, :] + strength * v_cached
+                    )
+                replaced_count += 1
+
+            if replaced_count == 0:
                 return _call_next(original_func, args, kwargs)
-
-            # Concatenate all cached V and prepend to current V
-            v_inject = torch.cat(v_parts, dim=1)
-            v_extended = torch.cat([v_inject, v], dim=1)
 
             debug_state["step_inject_count"] += 1
             debug_state["inject_count"] += 1
 
             # Log first injection per step
             if debug_state["step_inject_count"] == 1:
+                matched_frames = [f for _, f in matching]
                 print(f"[VTokenInject] INJECT: window "
                       f"(frames {index_list[:5]}{'...' if len(index_list) > 5 else ''}) "
                       f"block {block_idx}")
-                print(f"[VTokenInject]   Matched cached frames: {matching_frames}")
-                print(f"[VTokenInject]   V: {v.shape} -> {v_extended.shape} "
-                      f"(+{v_inject.shape[1]} cached tokens)")
+                print(f"[VTokenInject]   Replaced V for frames: {matched_frames} "
+                      f"({replaced_count} × {tokens_per_frame} tokens, strength={strength})")
 
-            # Only extend V — Q and K unchanged (asymmetric V injection)
+            # V replaced in-place — K/V lengths unchanged, compatible with all overrides
             new_args = list(args)
-            new_args[2] = v_extended
+            new_args[2] = v_modified
 
             return _call_next(original_func, tuple(new_args), kwargs)
 
