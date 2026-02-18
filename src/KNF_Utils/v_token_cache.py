@@ -663,13 +663,27 @@ class NV_VTokenInject:
             "inject_count": 0,
             "last_sigma": None,
             "step_inject_count": 0,
+            "total_calls": 0,
+            "extended_kv_seen": False,
         }
 
         def inject_override(original_func, *args, **kwargs):
             q, k, v = args[0], args[1], args[2]
+            debug_state["total_calls"] += 1
 
-            # Skip cross-attention
-            if q.shape[1] != k.shape[1]:
+            # CHAIN DIAGNOSTIC: detect if this override is ever called with
+            # extended K/V (from AnchorKVCache's inject path)
+            if k.shape[1] > q.shape[1] and not debug_state["extended_kv_seen"]:
+                debug_state["extended_kv_seen"] = True
+                t_opts_diag = kwargs.get("transformer_options", {})
+                bidx = t_opts_diag.get("block_index", -1)
+                print(f"[VTokenInject] CHAIN OK: Extended K/V detected. "
+                      f"q={q.shape[1]}, k={k.shape[1]}, v={v.shape[1]}, block={bidx}")
+
+            # Skip cross-attention (K shorter than Q = text tokens as keys).
+            # Allow K >= Q: AnchorKVCache prepends anchor tokens to K/V,
+            # making K longer than Q. This is still self-attention.
+            if k.shape[1] < q.shape[1]:
                 return _call_next(original_func, args, kwargs)
 
             t_opts = kwargs.get("transformer_options", {})
@@ -685,9 +699,9 @@ class NV_VTokenInject:
             # Detect new step
             current_sigma = sigmas[0].item() if sigmas is not None and len(sigmas) > 0 else None
             if current_sigma is not None and current_sigma != debug_state["last_sigma"]:
-                if debug_state["step_inject_count"] > 0:
-                    print(f"[VTokenInject] Step summary: injected into "
-                          f"{debug_state['step_inject_count']} block×window calls")
+                print(f"[VTokenInject] Step transition: total_calls={debug_state['total_calls']}, "
+                      f"step_injects={debug_state['step_inject_count']}, "
+                      f"extended_kv_seen={debug_state['extended_kv_seen']}")
                 debug_state["last_sigma"] = current_sigma
                 debug_state["step_inject_count"] = 0
 
@@ -737,6 +751,13 @@ class NV_VTokenInject:
             # V cache keys use GLOBAL latent frame indices, so we must map:
             #   global_latent = (local_idx - prefix_offset) + chunk_latent_offset
             tokens_per_frame = grid_sizes[1] * grid_sizes[2]
+
+            # Detect anchor prefix in V tensor (from AnchorKVCache prepend).
+            # If V has more tokens than expected from the window's frame count,
+            # the excess is anchor tokens prepended by an outer override.
+            expected_window_tokens = len(index_list) * tokens_per_frame
+            anchor_token_offset = max(0, v.shape[1] - expected_window_tokens)
+
             matching = []  # list of (local_pos, global_frame_idx) for frames with cached V
             for pos, local_idx in enumerate(index_list):
                 if local_idx < prefix_offset:
@@ -757,7 +778,7 @@ class NV_VTokenInject:
                       f"global_range=[{globals_in_window[0] if globals_in_window else '?'}"
                       f"..{globals_in_window[-1] if globals_in_window else '?'}], "
                       f"cache_hits={hits}, matches={len(matching)}, "
-                      f"V.shape={v.shape}")
+                      f"V.shape={v.shape}, anchor_offset={anchor_token_offset}")
 
             if not matching:
                 # No cached frames in this window — pass through
@@ -777,13 +798,15 @@ class NV_VTokenInject:
                 if v_cached.shape[0] < v.shape[0]:
                     v_cached = v_cached.expand(v.shape[0], -1, -1)
 
-                start = pos * tokens_per_frame
+                # Account for anchor tokens prepended by AnchorKVCache
+                start = anchor_token_offset + pos * tokens_per_frame
                 end = start + tokens_per_frame
                 if end > v.shape[1] or v_cached.shape[1] != tokens_per_frame:
                     if block_idx == 0:
                         print(f"[VTokenInject] GUARD SKIP: pos={pos}, G{global_frame}, "
                               f"start={start}, end={end}, v.shape[1]={v.shape[1]}, "
-                              f"v_cached.shape[1]={v_cached.shape[1]}, tpf={tokens_per_frame}")
+                              f"v_cached.shape[1]={v_cached.shape[1]}, tpf={tokens_per_frame}, "
+                              f"anchor_offset={anchor_token_offset}")
                     continue
 
                 # Blend: strength=1.0 fully replaces, strength=0.5 averages

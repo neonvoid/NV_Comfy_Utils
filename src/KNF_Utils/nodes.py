@@ -1678,19 +1678,19 @@ class NV_AdaptiveShiftApplier:
     """
     Adaptive Shift Calculator and Applier for WAN Video Models.
 
-    Calculates optimal shift value based on workflow parameters and patches the model.
+    Calculates shift value based on workflow parameters and patches the model.
 
-    Key insight: Shift affects WHERE denoising power is concentrated:
-    - High shift (6-9): More power in early steps → better structure/motion
-    - Low shift (3-5): More power in late steps → better details/textures
+    Shift controls how the noise schedule is distributed via time_snr_shift:
+        sigma = shift * t / (1 + (shift - 1) * t)
 
-    For denoise < 1.0 (vid2vid), structure already exists from source,
-    so LOWER shift is optimal to focus on detail preservation.
+    Higher shift compresses the schedule so most sigma values stay near 1.0,
+    concentrating denoising work in the final steps. The WAN model default
+    is shift=8.0 (registered in supported_models.py). The commonly used
+    override is 5.0 (WanVideoWrapper default).
 
-    Based on research from:
-    - WAN 2.2 MOE architecture (t_moe boundary at 0.875 for t2v, 0.9 for i2v)
-    - WanVideoWrapper shift formula: shifted_sigmas = shift * sigmas / (1 + (shift - 1) * sigmas)
-    - ComfyUI ModelSamplingDiscreteFlow implementation
+    Current auto-calculation uses heuristic offsets from base=5.0 for
+    denoise, controls, i2v, and content type. These need to be replaced
+    with sigma-schedule-grounded formulas -- see SHIFT_SIGMA_ANALYSIS.md.
     """
 
     @classmethod
@@ -1699,24 +1699,6 @@ class NV_AdaptiveShiftApplier:
             "required": {
                 "model": ("MODEL", {
                     "tooltip": "The WAN model to patch with calculated shift"
-                }),
-                "num_frames": ("INT", {
-                    "default": 81,
-                    "min": 1,
-                    "max": 10000,
-                    "tooltip": "Total video frames (used to estimate chunk count)"
-                }),
-                "width": ("INT", {
-                    "default": 1280,
-                    "min": 64,
-                    "max": 4096,
-                    "tooltip": "Video width in pixels"
-                }),
-                "height": ("INT", {
-                    "default": 720,
-                    "min": 64,
-                    "max": 4096,
-                    "tooltip": "Video height in pixels"
                 }),
                 "denoise": ("FLOAT", {
                     "default": 1.0,
@@ -1727,7 +1709,7 @@ class NV_AdaptiveShiftApplier:
                 }),
                 "mode": (["auto", "manual"], {
                     "default": "auto",
-                    "tooltip": "auto=calculate optimal shift, manual=use manual_shift value"
+                    "tooltip": "auto=calculate shift, manual=use manual_shift value"
                 }),
             },
             "optional": {
@@ -1756,13 +1738,10 @@ class NV_AdaptiveShiftApplier:
     RETURN_NAMES = ("model", "calculated_shift")
     FUNCTION = "apply_shift"
     CATEGORY = "NV_Utils/Sampling"
-    DESCRIPTION = "Calculates optimal shift for WAN models based on workflow parameters and applies it to the model."
+    DESCRIPTION = "Calculates shift for WAN models based on workflow parameters and applies it to the model."
 
     def calculate_adaptive_shift(
         self,
-        num_frames: int,
-        width: int,
-        height: int,
         denoise: float,
         num_controls: int = 0,
         avg_control_strength: float = 1.0,
@@ -1770,65 +1749,48 @@ class NV_AdaptiveShiftApplier:
         content_type: str = "balanced"
     ) -> float:
         """
-        Calculate optimal shift based on workflow parameters.
+        Calculate shift based on workflow parameters.
 
-        Key insight: Shift affects WHERE denoising power is concentrated.
-        - High shift → early steps (structure/motion)
-        - Low shift → late steps (details/textures)
-
-        For denoise < 1.0, we skip early steps, so we need LESS shift
-        since structure already exists from source.
+        NOTE: These are heuristic offsets, not derived from sigma schedule math.
+        See SHIFT_SIGMA_ANALYSIS.md for the actual sigma relationships that
+        should inform a future rewrite of this function.
         """
-        # Base shift for standard generation
         base = 5.0
 
-        # NOTE: Video length adjustment was removed.
-        # With context windows, each window only processes ~81 frames regardless of total video length.
-        # Frame count doesn't affect the model's denoising needs - only fusion seam count.
-        # Shift should be based on: resolution, denoise, controls, content type.
-
-        # === RESOLUTION ADJUSTMENT ===
-        # Higher resolution benefits from slightly higher shift
-        resolution_factor = (width * height) / (1920 * 1080)
-        base += 0.3 * max(0, resolution_factor - 1.0)
-
-        # === DENOISE ADJUSTMENT (Critical for vid2vid) ===
-        # Lower denoise = skip early steps = structure exists = need LESS shift
+        # === DENOISE ADJUSTMENT ===
+        # At shift=5 with denoise=0.5, starting sigma is 0.833 (not 0.5!).
+        # The shift transform makes low denoise values much less impactful
+        # than they appear. Reducing shift partially compensates.
         if denoise < 1.0:
-            # Scale: denoise 0.3 → -1.4, denoise 0.7 → -0.6
             denoise_adjustment = -2.0 * (1.0 - denoise)
             base += denoise_adjustment
 
         # === CONTROL ADJUSTMENT ===
-        # More/stronger controls provide structure → need less shift
+        # More/stronger VACE controls provide structure → need less shift.
+        # TODO: Differentiate V2V (structural) vs R2V (style) controls.
         if num_controls > 0:
             control_adjustment = -0.4 * num_controls * avg_control_strength
-            base += max(-2.0, control_adjustment)  # Cap reduction
+            base += max(-2.0, control_adjustment)
 
         # === I2V ADJUSTMENT ===
-        # I2V needs more structural anchoring to first frame
         if is_i2v:
             base += 1.0
 
         # === CONTENT TYPE ADJUSTMENT ===
         content_adjustments = {
             "balanced": 0.0,
-            "action": 1.0,      # Fast motion needs more temporal coherence
-            "static": -0.5,     # Static scenes can use more detail
-            "portrait": 0.5,    # Faces need stability
-            "landscape": 0.5,   # Architecture needs structural coherence
+            "action": 1.0,
+            "static": -0.5,
+            "portrait": 0.5,
+            "landscape": 0.5,
         }
         base += content_adjustments.get(content_type, 0)
 
-        # Clamp to safe range
         return round(max(3.0, min(base, 10.0)), 1)
 
     def apply_shift(
         self,
         model,
-        num_frames: int,
-        width: int,
-        height: int,
         denoise: float,
         mode: str,
         chunk_conditionings=None,
@@ -1852,8 +1814,7 @@ class NV_AdaptiveShiftApplier:
         # Calculate or use manual shift
         if mode == "auto":
             shift = self.calculate_adaptive_shift(
-                num_frames, width, height, denoise,
-                num_controls, avg_control_strength,
+                denoise, num_controls, avg_control_strength,
                 is_i2v, content_type
             )
         else:
@@ -1866,28 +1827,23 @@ class NV_AdaptiveShiftApplier:
         model_sampling = model.get_model_object("model_sampling")
 
         if model_sampling is not None and hasattr(model_sampling, 'set_parameters'):
-            # Existing model sampling - update shift
             model_sampling.set_parameters(shift=shift, multiplier=1000)
             model.add_object_patch("model_sampling", model_sampling)
         else:
-            # Create new ModelSamplingDiscreteFlow with shift
             sampling_base = comfy.model_sampling.ModelSamplingDiscreteFlow
             sampling_type = comfy.model_sampling.CONST
 
             class ModelSamplingAdvanced(sampling_base, sampling_type):
                 pass
 
-            # Get model config for initialization
             model_config = getattr(model.model, 'model_config', None)
             new_model_sampling = ModelSamplingAdvanced(model_config)
             new_model_sampling.set_parameters(shift=shift, multiplier=1000)
             model.add_object_patch("model_sampling", new_model_sampling)
 
-        # Log the shift calculation
+        # Log
         adjustment_details = []
         if mode == "auto":
-            # Note: num_frames logged for info only - doesn't affect shift calculation
-            adjustment_details.append(f"frames={num_frames}")
             if denoise < 1.0:
                 adjustment_details.append(f"denoise={denoise:.2f}")
             if num_controls > 0:
@@ -1898,9 +1854,9 @@ class NV_AdaptiveShiftApplier:
                 adjustment_details.append(f"type={content_type}")
 
             details_str = f" ({', '.join(adjustment_details)})" if adjustment_details else ""
-            print(f"[NV_AdaptiveShiftApplier] Applied shift={shift}{details_str}")
+            print(f"[NV_AdaptiveShiftApplier] shift={shift}{details_str}")
         else:
-            print(f"[NV_AdaptiveShiftApplier] Applied manual shift={shift}")
+            print(f"[NV_AdaptiveShiftApplier] manual shift={shift}")
 
         return (model, shift)
 

@@ -276,6 +276,12 @@ class NV_AnchorKVCache:
                 new_args[1] = k_extended
                 new_args[2] = v_extended
 
+                # CHAIN DIAGNOSTIC: verify the chain to VTokenInject
+                if debug_state["step_inject_count"] == 1:
+                    print(f"[AnchorKVCache] CHAIN: calling _call_next "
+                          f"(has_existing_override={existing_override is not None}, "
+                          f"block={block_idx}, K_ext={k_extended.shape[1]})")
+
                 return _call_next(original_func, tuple(new_args), kwargs)
 
             else:
