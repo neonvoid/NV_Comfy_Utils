@@ -73,6 +73,26 @@ def _compute_window_centers(total_frames, context_length, context_overlap):
     return result
 
 
+def _latent_to_video_frames(latent_indices, total_video_frames):
+    """
+    Map latent frame indices to video frame indices for Wan's 3D VAE.
+
+    Wan's temporal compression is 4:1 with special first frame:
+      Latent 0 → Video frame 0 (1 frame)
+      Latent k (k>0) → Video frames (k-1)*4+1 through k*4 (4 frames each)
+    """
+    video_frames = []
+    for lat_idx in latent_indices:
+        if lat_idx == 0:
+            video_frames.append(0)
+        else:
+            start_vf = (lat_idx - 1) * 4 + 1
+            end_vf = lat_idx * 4 + 1  # exclusive
+            for vf in range(start_vf, min(end_vf, total_video_frames)):
+                video_frames.append(vf)
+    return video_frames
+
+
 def _parse_capture_frames(capture_frames_str, total_latent_frames, context_length, context_overlap):
     """
     Parse capture_frames input. Returns list of latent frame indices.
@@ -704,6 +724,139 @@ class NV_VTokenInject:
         return (model,)
 
 
+class NV_VTokenFrameSlice:
+    """
+    Extracts context window center frames from latent and/or image tensors
+    for the V-token capture pass (Pass 1.5).
+
+    Calculates which frames are context window centers using the same
+    formula as WAN Context Windows (static standard schedule), then
+    slices inputs to just those frames.
+
+    Use this node once per input that needs slicing:
+      - The main upscaled pre-pass latent (connect to 'latent')
+      - Each VACE control video (connect to 'images')
+
+    Wire context_window_size and context_overlap from NV Chunk Loader
+    to ensure settings match the chunked pass.
+
+    Workflow:
+      [Upscaled Latent] → [NV_VTokenFrameSlice] → sliced latent → [KSampler]
+      [Control Video]   → [NV_VTokenFrameSlice] → sliced images → [WanVaceToVideo]
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "total_video_frames": ("INT", {
+                    "default": 65,
+                    "min": 1,
+                    "max": 1000,
+                    "step": 1,
+                    "tooltip": "Total video frames in the full generation (e.g. 65, 81)."
+                }),
+                "context_window_size": ("INT", {
+                    "default": 81,
+                    "min": 1,
+                    "max": 400,
+                    "step": 4,
+                    "tooltip": "Context window size in VIDEO frames. Wire from chunk loader."
+                }),
+                "context_overlap": ("INT", {
+                    "default": 16,
+                    "min": 0,
+                    "max": 200,
+                    "step": 4,
+                    "tooltip": "Context overlap in VIDEO frames. Wire from chunk loader."
+                }),
+                "capture_frames": ("STRING", {
+                    "default": "auto",
+                    "tooltip": "'auto' for window centers, or comma-separated latent frame "
+                               "indices like '6,14'."
+                }),
+            },
+            "optional": {
+                "latent": ("LATENT",),
+                "images": ("IMAGE",),
+            },
+        }
+
+    RETURN_TYPES = ("LATENT", "IMAGE", "STRING", "INT")
+    RETURN_NAMES = ("latent", "images", "frame_info", "num_center_frames")
+    FUNCTION = "slice_frames"
+    CATEGORY = "NV_Utils/attention"
+    DESCRIPTION = (
+        "Extracts context window center frames from latent or image tensors "
+        "for the V-token capture pass (Pass 1.5). Use once per input: "
+        "connect latent for the upscaled pre-pass, or images for VACE controls. "
+        "Wire context settings from NV Chunk Loader."
+    )
+
+    def slice_frames(self, total_video_frames, context_window_size, context_overlap,
+                     capture_frames, latent=None, images=None):
+        # Convert video to latent frames
+        total_latent = max(((total_video_frames - 1) // 4) + 1, 1)
+        latent_ctx_len = max(((context_window_size - 1) // 4) + 1, 1)
+        latent_ctx_overlap = max(((context_overlap - 1) // 4) + 1, 0)
+
+        # Calculate center frames in latent space
+        centers = _parse_capture_frames(
+            capture_frames, total_latent, latent_ctx_len, latent_ctx_overlap
+        )
+
+        info_lines = [
+            f"Video→Latent: total {total_video_frames}→{total_latent}, "
+            f"ctx {context_window_size}→{latent_ctx_len}, "
+            f"overlap {context_overlap}→{latent_ctx_overlap}",
+            f"Center latent frames: {centers}",
+        ]
+
+        # --- Slice LATENT (T dimension in latent frame space) ---
+        sliced_latent = latent
+        if latent is not None and centers:
+            samples = latent["samples"]  # [B, C, T, H, W]
+            valid_centers = [c for c in centers if c < samples.shape[2]]
+            if valid_centers:
+                sliced_samples = samples[:, :, valid_centers, :, :]
+                sliced_latent = {"samples": sliced_samples}
+                # Preserve other latent keys (noise_mask, etc.)
+                for k, v in latent.items():
+                    if k != "samples":
+                        sliced_latent[k] = v
+                info_lines.append(
+                    f"Latent: [{samples.shape[2]}] → [{sliced_samples.shape[2]}] frames "
+                    f"(indices {valid_centers})"
+                )
+            else:
+                info_lines.append(
+                    f"WARNING: No valid latent centers (T={samples.shape[2]}, "
+                    f"centers={centers})"
+                )
+
+        # --- Slice IMAGE (frame dimension, mapped from latent centers) ---
+        sliced_images = images
+        if images is not None and centers:
+            video_indices = _latent_to_video_frames(centers, total_video_frames)
+            valid_indices = [i for i in video_indices if i < images.shape[0]]
+            if valid_indices:
+                sliced_images = images[valid_indices]
+                info_lines.append(
+                    f"Images: [{images.shape[0]}] → [{sliced_images.shape[0]}] frames "
+                    f"(video indices {valid_indices})"
+                )
+            else:
+                info_lines.append(
+                    f"WARNING: No valid video indices (N={images.shape[0]}, "
+                    f"mapped={video_indices})"
+                )
+
+        frame_info = "\n".join(info_lines)
+        print(f"[VTokenFrameSlice] {frame_info}")
+
+        return (sliced_latent, sliced_images, frame_info, len(centers))
+
+
 # ============================================================================
 # Node Registration
 # ============================================================================
@@ -713,6 +866,7 @@ NODE_CLASS_MAPPINGS = {
     "NV_VTokenSave": NV_VTokenSave,
     "NV_VTokenLoad": NV_VTokenLoad,
     "NV_VTokenInject": NV_VTokenInject,
+    "NV_VTokenFrameSlice": NV_VTokenFrameSlice,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -720,4 +874,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NV_VTokenSave": "NV V-Token Save",
     "NV_VTokenLoad": "NV V-Token Load",
     "NV_VTokenInject": "NV V-Token Inject",
+    "NV_VTokenFrameSlice": "NV V-Token Frame Slice",
 }
