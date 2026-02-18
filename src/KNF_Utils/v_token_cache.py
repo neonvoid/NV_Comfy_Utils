@@ -298,6 +298,17 @@ class NV_VTokenCapture:
                                ">1 strengthens cached V influence, <1 weakens it. "
                                "Stored in cache, applied by NV_VTokenInject."
                 }),
+                "latent_prefix_frames": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 100,
+                    "step": 1,
+                    "tooltip": "Number of LATENT frames prepended before the actual video frames "
+                               "(e.g., VACE reference frames from NV_VacePrePassReference). "
+                               "Wire from the 'trim_latent' output of NV_VacePrePassReference. "
+                               "The capture will skip this many frames at the start of the V tensor "
+                               "to avoid capturing reference-region V tokens instead of center frames."
+                }),
             },
         }
 
@@ -313,7 +324,8 @@ class NV_VTokenCapture:
     )
 
     def capture(self, model, capture_frames, total_video_frames,
-                context_window_size, context_overlap, target_blocks, strength):
+                context_window_size, context_overlap, target_blocks, strength,
+                latent_prefix_frames=0):
         model = model.clone()
         blocks = _parse_target_blocks(target_blocks)
 
@@ -337,6 +349,11 @@ class NV_VTokenCapture:
 
         manager = VTokenManager(blocks, frames, strength)
         manager.set_mode("capture")
+
+        # Store prefix offset for the capture closure
+        prefix_offset = latent_prefix_frames
+        if prefix_offset > 0:
+            print(f"[VTokenCapture] Skipping {prefix_offset} prepended reference latent frames in V tensor")
 
         # Track which step we're on for capture-at-last-step logic
         # We capture on EVERY step (V changes each step), last step's V is final
@@ -408,7 +425,7 @@ class NV_VTokenCapture:
                 expected_seq = len(frames) * tokens_per_frame
                 print(f"[VTokenCapture] Expected seq_len: {len(frames)} frames × "
                       f"{tokens_per_frame} tokens = {expected_seq} "
-                      f"(actual: {v.shape[1]})")
+                      f"(actual: {v.shape[1]}, prefix_offset={prefix_offset})")
                 if current_sigma is not None:
                     print(f"[VTokenCapture] sigma: {current_sigma:.4f}")
                 debug_state["first_call"] = False
@@ -416,12 +433,14 @@ class NV_VTokenCapture:
             # Capture: slice V tensor per frame and store on CPU
             # During Pass 1.5, no context windows — V contains all strategic frames
             # Frame order matches the latent tensor order
+            # prefix_offset skips prepended reference frames (e.g., from NV_VacePrePassReference)
             num_frames_in_tensor = v.shape[1] // tokens_per_frame
 
             for i, frame_idx in enumerate(frames):
-                if i >= num_frames_in_tensor:
+                local_pos = i + prefix_offset  # skip reference prefix
+                if local_pos >= num_frames_in_tensor:
                     break
-                start = i * tokens_per_frame
+                start = local_pos * tokens_per_frame
                 end = start + tokens_per_frame
                 if end > v.shape[1]:
                     break
