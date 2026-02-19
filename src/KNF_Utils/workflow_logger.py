@@ -226,7 +226,7 @@ def _parse_logs_for_data(logs: List[Dict[str, Any]]) -> Dict[str, Any]:
         "multi_model_config": r"\[NV_MultiModelSampler\] Model (\d+): steps (\d+)-(\d+), cfg=([\d.]+)",
 
         # === Adaptive Shift ===
-        "adaptive_shift": r"\[NV_AdaptiveShiftApplier\] (?:manual )?shift=([\d.]+)",
+        "adaptive_shift": r"\[NV_AdaptiveShiftApplier\] \w+ shift=([\d.]+)",
 
         # === Chunk Loader ===
         "chunk_loader": r"\[NV_ChunkLoaderVACE\] Loaded chunk (\d+):\s*Frames: (\d+) to (\d+) \((\d+) frames\)",

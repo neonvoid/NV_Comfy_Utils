@@ -1676,21 +1676,25 @@ class LazySwitch:
 
 class NV_AdaptiveShiftApplier:
     """
-    Adaptive Shift Calculator and Applier for WAN Video Models.
+    Sigma-Grounded Shift Calculator for WAN Video Models.
 
-    Calculates shift value based on workflow parameters and patches the model.
-
-    Shift controls how the noise schedule is distributed via time_snr_shift:
+    Calculates and applies shift to the model's sampling configuration.
+    Shift transforms the noise schedule via the Mobius transform:
         sigma = shift * t / (1 + (shift - 1) * t)
 
-    Higher shift compresses the schedule so most sigma values stay near 1.0,
-    concentrating denoising work in the final steps. The WAN model default
-    is shift=8.0 (registered in supported_models.py). The commonly used
-    override is 5.0 (WanVideoWrapper default).
+    Three modes:
+    - auto: Uses base_shift at denoise=1.0. At denoise<1.0, interpolates
+      shift toward 1.0 so effective sigma_start better matches denoise
+      intent. Formula: shift = 1.0 + (base_shift - 1.0) * denoise
+    - sigma_target: Computes exact shift for a desired starting sigma at
+      given denoise. Inverse formula: shift = target*(1-d) / (d*(1-target))
+    - manual: Direct shift value passthrough.
 
-    Current auto-calculation uses heuristic offsets from base=5.0 for
-    denoise, controls, i2v, and content type. These need to be replaced
-    with sigma-schedule-grounded formulas -- see SHIFT_SIGMA_ANALYSIS.md.
+    Key insight: At shift=8 with denoise=0.5, the effective starting sigma
+    is 0.889 (not 0.5). The Mobius transform compresses low-denoise values
+    into a narrow band near sigma=1.0. Auto mode compensates for this.
+
+    See: node_notes/research/2026-02-19_shift_sigma_deep_dive.md
     """
 
     @classmethod
@@ -1698,107 +1702,180 @@ class NV_AdaptiveShiftApplier:
         return {
             "required": {
                 "model": ("MODEL", {
-                    "tooltip": "The WAN model to patch with calculated shift"
+                    "tooltip": "WAN model to patch with calculated shift"
                 }),
                 "denoise": ("FLOAT", {
                     "default": 1.0,
                     "min": 0.0,
                     "max": 1.0,
                     "step": 0.01,
-                    "tooltip": "Denoise strength (1.0=full generation, <1.0=vid2vid refinement)"
+                    "tooltip": "Denoise strength from your sampler (1.0=full generation, <1.0=vid2vid)"
                 }),
-                "mode": (["auto", "manual"], {
+                "mode": (["auto", "sigma_target", "manual"], {
                     "default": "auto",
-                    "tooltip": "auto=calculate shift, manual=use manual_shift value"
+                    "tooltip": "auto=denoise-aware scaling, sigma_target=exact sigma control, manual=direct value"
                 }),
             },
             "optional": {
-                "chunk_conditionings": ("CHUNK_CONDITIONING_LIST", {
-                    "tooltip": "Optional: chunk conditionings to count VACE controls"
+                "base_shift": ("FLOAT", {
+                    "default": 5.0,
+                    "min": 1.0,
+                    "max": 15.0,
+                    "step": 0.1,
+                    "tooltip": "Base shift for auto mode at denoise=1.0 (WAN default=8.0, WanVideoWrapper=5.0)"
+                }),
+                "target_sigma": ("FLOAT", {
+                    "default": 0.5,
+                    "min": 0.01,
+                    "max": 0.99,
+                    "step": 0.01,
+                    "tooltip": "Desired starting sigma after denoise truncation (sigma_target mode only, requires denoise<1.0)"
                 }),
                 "manual_shift": ("FLOAT", {
                     "default": 5.0,
                     "min": 1.0,
                     "max": 15.0,
                     "step": 0.1,
-                    "tooltip": "Manual shift value (only used when mode=manual)"
+                    "tooltip": "Direct shift value (manual mode only)"
                 }),
-                "content_type": (["balanced", "action", "static", "portrait", "landscape"], {
-                    "default": "balanced",
-                    "tooltip": "Content type for fine-tuning shift"
+                "chunk_conditionings": ("CHUNK_CONDITIONING_LIST", {
+                    "tooltip": "Optional: count VACE controls to reduce shift (heuristic: -0.3 per control)"
                 }),
                 "is_i2v": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "Image-to-Video workflow (adds +1.0 to shift for anchoring)"
+                    "tooltip": "Image-to-Video: adds +1.0 shift for first-frame anchoring (heuristic)"
                 }),
             }
         }
 
-    RETURN_TYPES = ("MODEL", "FLOAT")
-    RETURN_NAMES = ("model", "calculated_shift")
+    RETURN_TYPES = ("MODEL", "FLOAT", "STRING")
+    RETURN_NAMES = ("model", "calculated_shift", "shift_info")
     FUNCTION = "apply_shift"
     CATEGORY = "NV_Utils/Sampling"
-    DESCRIPTION = "Calculates shift for WAN models based on workflow parameters and applies it to the model."
+    DESCRIPTION = "Sigma-grounded shift calculator for WAN models. Auto mode scales shift with denoise to prevent schedule compression artifacts."
 
-    def calculate_adaptive_shift(
+    @staticmethod
+    def _sigma_start(shift: float, denoise: float) -> float:
+        """Effective starting sigma after denoise truncation.
+
+        sigma_start = shift * d / (1 + (shift - 1) * d)
+        """
+        if denoise >= 1.0:
+            return 1.0
+        if denoise <= 0.0:
+            return 0.0
+        return shift * denoise / (1.0 + (shift - 1.0) * denoise)
+
+    @staticmethod
+    def _shift_for_sigma(target_sigma: float, denoise: float) -> float:
+        """Inverse: compute shift that yields target_sigma at given denoise.
+
+        Derived from: target = shift * d / (1 + (shift-1)*d)
+        Solving:       shift = target * (1-d) / (d * (1-target))
+        """
+        if denoise >= 1.0 or denoise <= 0.0:
+            return 5.0
+        if target_sigma <= 0.0 or target_sigma >= 1.0:
+            return 5.0
+        return target_sigma * (1.0 - denoise) / (denoise * (1.0 - target_sigma))
+
+    def _calculate_shift(
         self,
+        mode: str,
         denoise: float,
+        base_shift: float = 5.0,
+        target_sigma: float = 0.5,
+        manual_shift: float = 5.0,
         num_controls: int = 0,
         avg_control_strength: float = 1.0,
         is_i2v: bool = False,
-        content_type: str = "balanced"
-    ) -> float:
+    ):
+        """Calculate shift and diagnostic info.
+
+        Returns:
+            (shift, info_dict)
         """
-        Calculate shift based on workflow parameters.
+        info = {"mode": mode, "denoise": denoise}
 
-        NOTE: These are heuristic offsets, not derived from sigma schedule math.
-        See SHIFT_SIGMA_ANALYSIS.md for the actual sigma relationships that
-        should inform a future rewrite of this function.
-        """
-        base = 5.0
+        # === Core shift calculation per mode ===
+        if mode == "manual":
+            shift = manual_shift
+            info["source"] = "manual"
 
-        # === DENOISE ADJUSTMENT ===
-        # At shift=5 with denoise=0.5, starting sigma is 0.833 (not 0.5!).
-        # The shift transform makes low denoise values much less impactful
-        # than they appear. Reducing shift partially compensates.
-        if denoise < 1.0:
-            denoise_adjustment = -2.0 * (1.0 - denoise)
-            base += denoise_adjustment
+        elif mode == "sigma_target":
+            if denoise >= 1.0:
+                shift = base_shift
+                info["source"] = "sigma_target fallback (denoise=1.0, using base_shift)"
+                info["note"] = "sigma_target only meaningful when denoise < 1.0"
+            else:
+                shift = self._shift_for_sigma(target_sigma, denoise)
+                info["source"] = "sigma_target (inverse formula)"
+                info["target_sigma_requested"] = target_sigma
 
-        # === CONTROL ADJUSTMENT ===
-        # More/stronger VACE controls provide structure → need less shift.
-        # TODO: Differentiate V2V (structural) vs R2V (style) controls.
+        else:  # auto
+            if denoise >= 1.0:
+                shift = base_shift
+                info["source"] = "auto (full denoise)"
+            else:
+                # Interpolate: at d=1.0 use base_shift, at d=0.0 approach 1.0
+                shift = 1.0 + (base_shift - 1.0) * denoise
+                info["source"] = "auto (denoise-scaled)"
+
+            info["base_shift"] = base_shift
+
+        # === Heuristic adjustments (documented as such) ===
+        adjustments = []
+
         if num_controls > 0:
-            control_adjustment = -0.4 * num_controls * avg_control_strength
-            base += max(-2.0, control_adjustment)
+            adj = -min(1.5, 0.3 * num_controls * avg_control_strength)
+            shift += adj
+            adjustments.append(f"controls({num_controls}): {adj:+.1f}")
 
-        # === I2V ADJUSTMENT ===
         if is_i2v:
-            base += 1.0
+            shift += 1.0
+            adjustments.append("i2v: +1.0")
 
-        # === CONTENT TYPE ADJUSTMENT ===
-        content_adjustments = {
-            "balanced": 0.0,
-            "action": 1.0,
-            "static": -0.5,
-            "portrait": 0.5,
-            "landscape": 0.5,
+        if adjustments:
+            info["heuristic_adjustments"] = adjustments
+
+        # === Clamp ===
+        shift_raw = shift
+        shift = round(max(2.0, min(shift, 12.0)), 2)
+        if round(shift_raw, 2) != shift:
+            info["clamped_from"] = round(shift_raw, 2)
+
+        # === Diagnostics ===
+        sigma_start = self._sigma_start(shift, denoise)
+        info["shift"] = shift
+        info["effective_sigma_start"] = round(sigma_start, 4)
+        # Percent of schedule above sigma=0.5
+        info["sigma_half_percent"] = round(shift / (shift + 1.0) * 100.0, 1)
+
+        # MoE expert balance (informational, for Wan 2.2 models)
+        # High-noise expert handles sigma > boundary, low-noise handles sigma <= boundary
+        boundary = 0.875
+        pct_high = shift * (1.0 - boundary) / (shift * (1.0 - boundary) + boundary)
+        info["moe_expert_balance"] = {
+            "high_noise_pct": round(pct_high * 100.0, 1),
+            "low_noise_pct": round((1.0 - pct_high) * 100.0, 1),
+            "note": "Only applies to Wan 2.2 MoE models (boundary=0.875)"
         }
-        base += content_adjustments.get(content_type, 0)
 
-        return round(max(3.0, min(base, 10.0)), 1)
+        return shift, info
 
     def apply_shift(
         self,
         model,
         denoise: float,
         mode: str,
-        chunk_conditionings=None,
+        base_shift: float = 5.0,
+        target_sigma: float = 0.5,
         manual_shift: float = 5.0,
-        content_type: str = "balanced",
-        is_i2v: bool = False
+        chunk_conditionings=None,
+        is_i2v: bool = False,
     ):
         """Apply calculated or manual shift to model's sampling configuration."""
+        import json
         import comfy.model_sampling
 
         # Count controls from chunk_conditionings if provided
@@ -1811,19 +1888,22 @@ class NV_AdaptiveShiftApplier:
             elif "control_pixels_info" in first_chunk:
                 num_controls = len(first_chunk["control_pixels_info"])
 
-        # Calculate or use manual shift
-        if mode == "auto":
-            shift = self.calculate_adaptive_shift(
-                denoise, num_controls, avg_control_strength,
-                is_i2v, content_type
-            )
-        else:
-            shift = manual_shift
+        # Calculate shift
+        shift, info = self._calculate_shift(
+            mode=mode,
+            denoise=denoise,
+            base_shift=base_shift,
+            target_sigma=target_sigma,
+            manual_shift=manual_shift,
+            num_controls=num_controls,
+            avg_control_strength=avg_control_strength,
+            is_i2v=is_i2v,
+        )
 
         # Clone model to avoid modifying original
         model = model.clone()
 
-        # Get existing model_sampling or create new one
+        # Patch model_sampling with new shift
         model_sampling = model.get_model_object("model_sampling")
 
         if model_sampling is not None and hasattr(model_sampling, 'set_parameters'):
@@ -1842,23 +1922,11 @@ class NV_AdaptiveShiftApplier:
             model.add_object_patch("model_sampling", new_model_sampling)
 
         # Log
-        adjustment_details = []
-        if mode == "auto":
-            if denoise < 1.0:
-                adjustment_details.append(f"denoise={denoise:.2f}")
-            if num_controls > 0:
-                adjustment_details.append(f"controls={num_controls}")
-            if is_i2v:
-                adjustment_details.append("i2v")
-            if content_type != "balanced":
-                adjustment_details.append(f"type={content_type}")
+        sigma_start = info["effective_sigma_start"]
+        print(f"[NV_AdaptiveShiftApplier] {mode} shift={shift:.2f} | sigma_start={sigma_start:.3f}")
 
-            details_str = f" ({', '.join(adjustment_details)})" if adjustment_details else ""
-            print(f"[NV_AdaptiveShiftApplier] shift={shift}{details_str}")
-        else:
-            print(f"[NV_AdaptiveShiftApplier] manual shift={shift}")
-
-        return (model, shift)
+        shift_info_str = json.dumps(info, indent=2)
+        return (model, shift, shift_info_str)
 
 
 class NV_VideoSampler:
