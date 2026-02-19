@@ -154,13 +154,20 @@ class GeminiVideoCaptioner:
                 "provider": (["Gemini", "OpenRouter"], {"default": "Gemini"}),
                 "model": ([
                     # Gemini models (direct API)
+                    "gemini-2.5-flash",
+                    "gemini-2.5-pro",
+                    "gemini-3-flash-preview",
+                    "gemini-3-pro-preview",
+                    "gemini-3.1-pro-preview",
+                    # Gemini legacy (deprecated, retiring March 2026)
                     "gemini-1.5-flash",
                     "gemini-1.5-pro",
-                    "gemini-2.5-pro",
-                    "gemini-3-pro-preview",
                     # OpenRouter models - video capable
                     "google/gemini-2.5-flash",
                     "google/gemini-2.5-pro",
+                    "google/gemini-3-flash-preview",
+                    "google/gemini-3-pro-preview",
+                    "google/gemini-3.1-pro-preview",
                     # OpenRouter models - image/vision only
                     "qwen/qwen2.5-vl-72b-instruct",
                     "qwen/qwen3-vl-235b-a22b-instruct",
@@ -389,7 +396,7 @@ class GeminiVideoCaptioner:
                     print(f"Cleaned up temporary file after error: {file_path}")
                 except Exception as cleanup_error:
                     print(f"Warning: Could not clean up temporary file {file_path}: {cleanup_error}")
-            return (f"Exception: {str(e)}",)
+            return (f"Exception: {str(e)}", f"Exception: {str(e)}")
     
     def _call_gemini_api(self, file_path, prompt_text, api_key, model, is_temp_file=False):
         """Call Gemini API for video/image captioning."""
@@ -451,7 +458,7 @@ class GeminiVideoCaptioner:
         # Make API request
         print("Sending request to Gemini API...")
         request_start = time.time()
-        response = requests.post(api_url, headers=headers, json=payload, timeout=60)
+        response = requests.post(api_url, headers=headers, json=payload, timeout=300)
         request_time = time.time() - request_start
         
         print(f"API request time: {request_time:.2f}s")
@@ -471,7 +478,14 @@ class GeminiVideoCaptioner:
             if 'candidates' in result and len(result['candidates']) > 0:
                 candidate = result['candidates'][0]
                 if 'content' in candidate and 'parts' in candidate['content']:
-                    caption = candidate['content']['parts'][0]['text']
+                    # Gemini 3 models return thinking parts (thought: true) mixed with text parts.
+                    # Filter to only get actual text parts, not thinking summaries.
+                    text_parts = [p['text'] for p in candidate['content']['parts']
+                                  if 'text' in p and not p.get('thought', False)]
+                    if not text_parts:
+                        # Fallback: if no non-thought parts found, use all text parts
+                        text_parts = [p['text'] for p in candidate['content']['parts'] if 'text' in p]
+                    caption = "\n".join(text_parts)
                     # Clean up temporary file if it was created from tensor
                     if is_temp_file and os.path.exists(file_path):
                         try:
@@ -599,8 +613,8 @@ class GeminiVideoCaptioner:
             # Make API request
             print("Sending request to OpenRouter API...")
             request_start = time.time()
-            response = requests.post("https://openrouter.ai/api/v1/chat/completions", 
-                                   headers=headers, json=payload, timeout=60)
+            response = requests.post("https://openrouter.ai/api/v1/chat/completions",
+                                   headers=headers, json=payload, timeout=300)
             request_time = time.time() - request_start
             
             print(f"API request time: {request_time:.2f}s")
