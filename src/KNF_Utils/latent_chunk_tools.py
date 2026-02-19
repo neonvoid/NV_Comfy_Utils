@@ -15,6 +15,9 @@ Usage:
 
     Stitch workflow (run once after all chunks):
         [NV_LatentChunkStitcher] → stitched latent → [NV_StreamingVAEDecode]
+
+    Boundary refinement (Phase 2, optional):
+        [NV_LatentChunkStitcher] → [NV_BoundaryNoiseMask] → [KSampler low denoise] → [VAE Decode]
 """
 
 import os
@@ -309,13 +312,207 @@ def _compute_blend_weights(num_frames, mode):
         return t  # Fallback to linear
 
 
+class NV_BoundaryNoiseMask:
+    """
+    Create a 5D noise_mask for boundary refinement of stitched latents.
+
+    Takes stitch_info JSON from NV_LatentChunkStitcher and creates a soft-ramp
+    noise_mask that targets chunk boundary regions for re-diffusion. Clean frames
+    surrounding boundaries are preserved (mask=0) and act as implicit conditioning
+    through the model's self-attention — all tokens are processed regardless of
+    mask value.
+
+    The mask is attached directly to the latent dict (NOT via SetLatentNoiseMask,
+    which flattens 5D temporal structure). Output goes straight to KSampler.
+
+    Pipeline:
+        [NV_LatentChunkStitcher] -> [NV_BoundaryNoiseMask] -> [KSampler denoise=0.10-0.20]
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "latent": ("LATENT",),
+                "stitch_info": ("STRING", {
+                    "multiline": True,
+                    "tooltip": "JSON from NV_LatentChunkStitcher stitch_info output. "
+                               "Contains boundary positions and overlap sizes."
+                }),
+                "context_frames": ("INT", {
+                    "default": 4, "min": 0, "max": 16, "step": 1,
+                    "tooltip": "Clean frames on each side of boundary (mask=0.0). "
+                               "Preserved exactly. Anchor spatial layout through attention."
+                }),
+                "ramp_frames": ("INT", {
+                    "default": 4, "min": 0, "max": 16, "step": 1,
+                    "tooltip": "Soft ramp frames on each side. Gradual transition from "
+                               "preserved to fully re-diffused. Prevents hard mask edges."
+                }),
+                "core_extra": ("INT", {
+                    "default": 0, "min": 0, "max": 16, "step": 1,
+                    "tooltip": "Extra fully-masked frames beyond the overlap region on each "
+                               "side. 0 = core is exactly the overlap zone from stitching."
+                }),
+                "ramp_curve": (["cosine", "linear"], {
+                    "default": "cosine",
+                    "tooltip": "Ramp weight curve. Cosine: smooth S-curve (recommended). "
+                               "Linear: straight ramp."
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("LATENT", "STRING")
+    RETURN_NAMES = ("latent", "mask_info")
+    FUNCTION = "create_mask"
+    CATEGORY = "NV_Utils/latent"
+    DESCRIPTION = (
+        "Create boundary refinement noise_mask from stitch_info. Soft ramp targets "
+        "chunk boundaries for re-diffusion while preserving surrounding context. "
+        "Output goes directly to KSampler (do NOT use SetLatentNoiseMask)."
+    )
+
+    def create_mask(self, latent, stitch_info, context_frames, ramp_frames,
+                    core_extra, ramp_curve):
+        samples = latent["samples"]  # [B, C, T, H, W]
+        total_t = samples.shape[2]
+
+        # Parse stitch_info
+        info = json.loads(stitch_info)
+        boundaries = info.get("boundaries", [])
+
+        if not boundaries:
+            print("[BoundaryNoiseMask] No boundaries in stitch_info — returning all-zero mask (no refinement)")
+            out = latent.copy()
+            out["noise_mask"] = torch.zeros(1, 1, total_t, 1, 1)
+            mask_info = json.dumps({"boundaries": [], "total_frames": total_t,
+                                    "masked_frames": 0}, indent=2)
+            return (out, mask_info)
+
+        # Build mask: 0.0 = preserve, 1.0 = fully re-diffuse
+        mask = torch.zeros(total_t)
+        mask_details = []
+
+        for b in boundaries:
+            pos = b["position_latent"]    # Start of blended region in stitched latent
+            overlap = b["overlap_latent"]  # Width of blended region
+
+            # Core region: the blended overlap zone + optional extra on each side
+            core_start = pos - core_extra
+            core_end = pos + overlap + core_extra
+            core_start = max(0, core_start)
+            core_end = min(total_t, core_end)
+
+            # Set core to 1.0
+            mask[core_start:core_end] = 1.0
+
+            # Ramp on the left side (before core)
+            if ramp_frames > 0:
+                ramp_left_start = max(0, core_start - ramp_frames)
+                ramp_left_len = core_start - ramp_left_start
+                if ramp_left_len > 0:
+                    ramp_w = _compute_ramp(ramp_left_len, ramp_curve)
+                    # ramp_w goes 0->1, and we want to ramp up toward the core
+                    for j in range(ramp_left_len):
+                        idx = ramp_left_start + j
+                        mask[idx] = max(mask[idx].item(), ramp_w[j].item())
+
+            # Ramp on the right side (after core)
+            if ramp_frames > 0:
+                ramp_right_end = min(total_t, core_end + ramp_frames)
+                ramp_right_len = ramp_right_end - core_end
+                if ramp_right_len > 0:
+                    ramp_w = _compute_ramp(ramp_right_len, ramp_curve)
+                    # ramp_w goes 0->1, flip it so it ramps down from core
+                    ramp_w = ramp_w.flip(0)
+                    for j in range(ramp_right_len):
+                        idx = core_end + j
+                        mask[idx] = max(mask[idx].item(), ramp_w[j].item())
+
+            # Context frames are already 0.0 (default) — no action needed
+
+            # Track for diagnostics
+            full_left = max(0, core_start - ramp_frames) - context_frames
+            full_right = min(total_t, core_end + ramp_frames) + context_frames
+            mask_details.append({
+                "boundary": b.get("boundary", "?"),
+                "core_range": [int(core_start), int(core_end)],
+                "core_width": int(core_end - core_start),
+                "left_ramp": [int(max(0, core_start - ramp_frames)), int(core_start)],
+                "right_ramp": [int(core_end), int(min(total_t, core_end + ramp_frames))],
+                "context_zone": [int(max(0, full_left)), int(min(total_t, full_right))],
+            })
+
+        # Reshape to 5D: [1, 1, T, 1, 1] — broadcasts over B, C, H, W
+        mask_5d = mask.reshape(1, 1, total_t, 1, 1)
+
+        # Count masked frames for diagnostics
+        masked_any = (mask > 0).sum().item()
+        masked_full = (mask >= 0.99).sum().item()
+
+        print(f"[BoundaryNoiseMask] Created mask for {len(boundaries)} boundaries")
+        print(f"  Total: {total_t} frames, {masked_full} fully masked, "
+              f"{masked_any - masked_full} partially masked, "
+              f"{total_t - masked_any} preserved")
+        print(f"  Config: context={context_frames}, ramp={ramp_frames}, "
+              f"core_extra={core_extra}, curve={ramp_curve}")
+        for d in mask_details:
+            print(f"  {d['boundary']}: core [{d['core_range'][0]}:{d['core_range'][1]}] "
+                  f"({d['core_width']} frames), "
+                  f"ramps [{d['left_ramp'][0]}:{d['left_ramp'][1]}] / "
+                  f"[{d['right_ramp'][0]}:{d['right_ramp'][1]}]")
+
+        # Attach directly to latent dict (skip SetLatentNoiseMask — it flattens 5D)
+        out = latent.copy()
+        out["noise_mask"] = mask_5d
+
+        mask_info = json.dumps({
+            "total_frames": total_t,
+            "masked_full": masked_full,
+            "masked_partial": masked_any - masked_full,
+            "preserved": total_t - masked_any,
+            "config": {
+                "context_frames": context_frames,
+                "ramp_frames": ramp_frames,
+                "core_extra": core_extra,
+                "ramp_curve": ramp_curve,
+            },
+            "boundaries": mask_details,
+            "mask_values": [round(mask[i].item(), 3) for i in range(total_t)],
+        }, indent=2)
+
+        return (out, mask_info)
+
+
+def _compute_ramp(num_frames, mode):
+    """Compute ramp weights with exclusive endpoints (no 0.0 or 1.0).
+
+    For 4 frames: returns ~[0.1, 0.3, 0.7, 0.9] (cosine) or [0.2, 0.4, 0.6, 0.8] (linear).
+    This ensures every ramp frame has a truly intermediate value — the 0.0 and 1.0
+    values belong to the context and core zones respectively.
+    """
+    if num_frames <= 0:
+        return torch.tensor([])
+    if num_frames == 1:
+        return torch.tensor([0.5])
+
+    # Exclusive endpoints: skip the 0.0 and 1.0 at ends
+    t = torch.linspace(0, 1, num_frames + 2)[1:-1]
+    if mode == "cosine":
+        return 0.5 * (1.0 - torch.cos(math.pi * t))
+    else:
+        return t
+
+
 # Node registration
 NODE_CLASS_MAPPINGS = {
     "NV_SaveChunkLatent": NV_SaveChunkLatent,
     "NV_LatentChunkStitcher": NV_LatentChunkStitcher,
+    "NV_BoundaryNoiseMask": NV_BoundaryNoiseMask,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "NV_SaveChunkLatent": "NV Save Chunk Latent",
     "NV_LatentChunkStitcher": "NV Latent Chunk Stitcher",
+    "NV_BoundaryNoiseMask": "NV Boundary Noise Mask",
 }
