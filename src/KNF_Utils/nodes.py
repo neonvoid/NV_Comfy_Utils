@@ -153,7 +153,7 @@ class GeminiVideoCaptioner:
                 "api_key": ("STRING", {"default": ""}),
                 "provider": (["Gemini", "OpenRouter"], {"default": "Gemini"}),
                 "model": ([
-                    # Gemini models (direct API)
+                    # Gemini models (works with both providers - auto-prefixed for OpenRouter)
                     "gemini-2.5-flash",
                     "gemini-2.5-pro",
                     "gemini-3-flash-preview",
@@ -162,13 +162,7 @@ class GeminiVideoCaptioner:
                     # Gemini legacy (deprecated, retiring March 2026)
                     "gemini-1.5-flash",
                     "gemini-1.5-pro",
-                    # OpenRouter models - video capable
-                    "google/gemini-2.5-flash",
-                    "google/gemini-2.5-pro",
-                    "google/gemini-3-flash-preview",
-                    "google/gemini-3-pro-preview",
-                    "google/gemini-3.1-pro-preview",
-                    # OpenRouter models - image/vision only
+                    # OpenRouter only - image/vision models
                     "qwen/qwen2.5-vl-72b-instruct",
                     "qwen/qwen3-vl-235b-a22b-instruct",
                     "meta-llama/llama-3.2-90b-vision-instruct",
@@ -180,7 +174,14 @@ class GeminiVideoCaptioner:
                 "video_tensor": ("IMAGE",),
                 "image_tensor": ("IMAGE",),
                 "max_tokens": ("INT", {"default": 1000, "min": 100, "max": 4000, "step": 100}),
-                "temperature": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 2.0, "step": 0.1}),
+                "temperature": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.1}),
+                # --- Gemini 3+ features (ignored for older models / OpenRouter) ---
+                "system_instruction": ("STRING", {"multiline": True, "default": "",
+                    "tooltip": "System-level instruction for captioning style (Gemini API only). Separate from prompt - use for persistent behavior like 'describe in present tense, include camera movements'."}),
+                "thinking_level": (["auto", "low", "medium", "high"], {"default": "auto",
+                    "tooltip": "Gemini 3 only. Controls reasoning depth. 'low' = fast/cheap, 'high' = deep analysis. 'auto' uses model default. Ignored for Gemini 2.5/1.5 and OpenRouter."}),
+                "media_resolution": (["default", "low", "medium", "high", "ultra_high"], {"default": "default",
+                    "tooltip": "Gemini 3 only (uses v1alpha endpoint). Controls tokens per video frame. 'low' ~66 tok/frame (3hr video capacity), 'high' ~258 tok/frame (better detail). 'default' = no override."}),
             }
         }
 
@@ -189,6 +190,11 @@ class GeminiVideoCaptioner:
     FUNCTION = "caption_video"
     CATEGORY = "KNF_Utils"
     OUTPUT_NODE = True
+    DESCRIPTION = ("Multi-provider video/image captioner supporting Gemini (direct) and OpenRouter APIs. "
+                   "Gemini 3+ models expose additional controls: thinking_level (reasoning depth), "
+                   "media_resolution (tokens per video frame), and system_instruction (persistent style guidance). "
+                   "These fields are ignored for Gemini 2.5/1.5 and OpenRouter. "
+                   "Note: Google recommends temperature=1.0 for Gemini 3 models - lower values may cause looping.")
 
     def get_video_metadata(self, video_path: str) -> Optional[Dict]:
         """Get video metadata using ffprobe."""
@@ -337,7 +343,8 @@ class GeminiVideoCaptioner:
     
     def caption_video(self, prompt_text="Describe this video in detail.", api_key="",
                      provider="Gemini", model="gemini-2.5-pro", fps=30.0, video_tensor=None,
-                     image_tensor=None, max_tokens=1000, temperature=0.7, use_cached_prompt=False):
+                     image_tensor=None, max_tokens=1000, temperature=1.0, use_cached_prompt=False,
+                     system_instruction="", thinking_level="auto", media_resolution="default"):
         """Main function to caption video/image using selected API provider."""
         global _LAST_VALID_CAPTION
 
@@ -376,7 +383,10 @@ class GeminiVideoCaptioner:
         try:
             # Route to appropriate API provider
             if provider == "Gemini":
-                result = self._call_gemini_api(file_path, prompt_text, api_key, model, is_temp_file)
+                result = self._call_gemini_api(file_path, prompt_text, api_key, model, is_temp_file,
+                                               system_instruction=system_instruction,
+                                               thinking_level=thinking_level,
+                                               media_resolution=media_resolution)
             elif provider == "OpenRouter":
                 result = self._call_openrouter_api(file_path, prompt_text, api_key, model,
                                                    max_tokens, temperature, is_temp_file)
@@ -398,8 +408,13 @@ class GeminiVideoCaptioner:
                     print(f"Warning: Could not clean up temporary file {file_path}: {cleanup_error}")
             return (f"Exception: {str(e)}", f"Exception: {str(e)}")
     
-    def _call_gemini_api(self, file_path, prompt_text, api_key, model, is_temp_file=False):
+    def _call_gemini_api(self, file_path, prompt_text, api_key, model, is_temp_file=False,
+                         system_instruction="", thinking_level="auto", media_resolution="default"):
         """Call Gemini API for video/image captioning."""
+        # Strip OpenRouter-style provider prefix (e.g. "google/gemini-2.5-pro" -> "gemini-2.5-pro")
+        if "/" in model:
+            model = model.split("/", 1)[1]
+
         # Get file info for debug
         file_name = Path(file_path).name
         file_size_bytes = os.path.getsize(file_path)
@@ -438,7 +453,10 @@ class GeminiVideoCaptioner:
         headers = {
             "Content-Type": "application/json"
         }
-        
+
+        # Determine if this is a Gemini 3+ model (supports thinking_level, media_resolution)
+        is_gemini3 = any(model.startswith(p) for p in ("gemini-3", "gemini-3."))
+
         payload = {
             "contents": [{
                 "parts": [
@@ -452,8 +470,35 @@ class GeminiVideoCaptioner:
                 ]
             }]
         }
-        
-        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+
+        # System instruction (Gemini API feature, works on all model versions)
+        if system_instruction and system_instruction.strip():
+            payload["system_instruction"] = {
+                "parts": [{"text": system_instruction.strip()}]
+            }
+            print(f"System instruction: {system_instruction[:80]}...")
+
+        # Thinking level (Gemini 3 only)
+        if is_gemini3 and thinking_level != "auto":
+            payload["generationConfig"] = {
+                "thinkingConfig": {
+                    "thinkingLevel": thinking_level
+                }
+            }
+            print(f"Thinking level: {thinking_level}")
+
+        # Media resolution (Gemini 3 only, requires v1alpha endpoint)
+        use_v1alpha = False
+        if is_gemini3 and media_resolution != "default":
+            resolution_value = f"media_resolution_{media_resolution}"
+            if "generationConfig" not in payload:
+                payload["generationConfig"] = {}
+            payload["generationConfig"]["mediaResolution"] = resolution_value
+            use_v1alpha = True
+            print(f"Media resolution: {resolution_value} (using v1alpha endpoint)")
+
+        api_version = "v1alpha" if use_v1alpha else "v1beta"
+        api_url = f"https://generativelanguage.googleapis.com/{api_version}/models/{model}:generateContent?key={api_key}"
         
         # Make API request
         print("Sending request to Gemini API...")
@@ -525,9 +570,13 @@ class GeminiVideoCaptioner:
             error_msg = response.text[:500] if len(response.text) > 500 else response.text
             raise RuntimeError(f"Gemini API error {response.status_code}: {error_msg}")
     
-    def _call_openrouter_api(self, file_path, prompt_text, api_key, model, 
+    def _call_openrouter_api(self, file_path, prompt_text, api_key, model,
                             max_tokens, temperature, is_temp_file=False):
         """Call OpenRouter API for image/video captioning."""
+        # Auto-prefix bare Gemini model names for OpenRouter (e.g. "gemini-2.5-pro" -> "google/gemini-2.5-pro")
+        if "/" not in model and model.startswith("gemini-"):
+            model = f"google/{model}"
+
         try:
             # Get file info for debug
             file_name = Path(file_path).name
