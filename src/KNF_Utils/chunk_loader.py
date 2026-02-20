@@ -414,22 +414,30 @@ class NV_ChunkLoaderVACE:
                 "control_4": ("IMAGE", {
                     "tooltip": "Fourth control video (optional) - will be sliced in sync"
                 }),
+                "latent": ("LATENT", {
+                    "tooltip": "Pre-pass latent (full video). Temporally sliced to chunk range using Wan VAE frame mapping. "
+                               "Use with LatentUpscale to bypass VAE encode of upscaled pixels."
+                }),
             }
         }
 
     RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "IMAGE", "IMAGE",
-                    "INT", "INT", "INT", "INT", "INT", "FLOAT", "FLOAT", "STRING", "STRING", "INT", "INT", "STRING",)
+                    "INT", "INT", "INT", "INT", "INT", "FLOAT", "FLOAT", "STRING", "STRING", "INT", "INT", "STRING",
+                    "LATENT",)
     RETURN_NAMES = ("chunk_video", "chunk_ctrl_1", "chunk_ctrl_2", "chunk_ctrl_3", "chunk_ctrl_4",
                     "chunk_index", "start_frame", "frame_count", "seed", "steps", "cfg", "denoise", "sampler_name", "scheduler",
-                    "context_window_size", "context_overlap", "chunk_info",)
+                    "context_window_size", "context_overlap", "chunk_info",
+                    "chunk_latent",)
     FUNCTION = "load_chunk"
     CATEGORY = "NV_Utils"
-    DESCRIPTION = "Loads video chunk AND control videos for VACE parallel processing. Controls are sliced in sync."
+    DESCRIPTION = "Loads video chunk AND control videos for VACE parallel processing. Controls are sliced in sync. Optional latent input for latent-space upscale path."
 
     def load_chunk(self, video, plan_json_path, chunk_index,
-                   control_1=None, control_2=None, control_3=None, control_4=None):
+                   control_1=None, control_2=None, control_3=None, control_4=None,
+                   latent=None):
         """
         Extract the specified chunk from video and all control videos.
+        Optionally slices a latent tensor using Wan VAE temporal frame mapping.
         """
 
         # Load the plan
@@ -549,9 +557,40 @@ class NV_ChunkLoaderVACE:
 
         frame_count = end_frame - start_frame
 
+        # Slice latent if provided (Wan VAE temporal frame mapping)
+        chunk_latent = None
+        if latent is not None:
+            samples = latent["samples"]  # [B, C, T, H, W]
+            total_latent_frames = samples.shape[2]
+
+            # Wan VAE mapping: video frame V -> latent frame L
+            #   V == 0 -> L = 0 (first frame gets its own latent)
+            #   V > 0  -> L = (V - 1) // 4 + 1
+            if start_frame == 0:
+                latent_start = 0
+            else:
+                latent_start = (start_frame - 1) // 4 + 1
+
+            chunk_latent_frames = (frame_count - 1) // 4 + 1
+            latent_end = min(latent_start + chunk_latent_frames, total_latent_frames)
+
+            # Pre-sliced detection: if latent temporal frames already match chunk
+            if total_latent_frames == chunk_latent_frames:
+                chunk_latent = latent  # pass through as-is
+                print(f"  Latent: pre-sliced ({total_latent_frames} frames)")
+            else:
+                chunk_samples = samples[:, :, latent_start:latent_end, :, :].clone()
+                chunk_latent = latent.copy()
+                chunk_latent["samples"] = chunk_samples
+                # Remove noise_mask if present — shape won't match sliced latent
+                chunk_latent.pop("noise_mask", None)
+                print(f"  Latent: sliced frames {latent_start}-{latent_end-1} "
+                      f"({chunk_samples.shape[2]} latent frames from {total_latent_frames} total)")
+
         return (chunk_video, chunk_controls[0], chunk_controls[1], chunk_controls[2], chunk_controls[3],
                 chunk_index, start_frame, frame_count, seed, steps, cfg, denoise, sampler_name, scheduler,
-                context_window_size, context_overlap, chunk_info)
+                context_window_size, context_overlap, chunk_info,
+                chunk_latent)
 
 
 # Node registration
