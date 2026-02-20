@@ -188,21 +188,25 @@ class NV_StreamingVAEDecode:
         print(f"[NV_StreamingVAEDecode] Concatenating {total_frames} frames on CPU...")
         output = torch.cat(decoded_frames, dim=2)
 
-        # Apply VAE's output processing (clamp to [0,1])
-        output = vae.process_output(output.float())
+        # Free decoded_frames BEFORE creating float32 copy to reduce peak RAM
+        del decoded_frames
 
-        # Convert to ComfyUI image format: [B, C, T, H, W] -> [B, T, H, W, C]
-        # Standard VAEDecode does .movedim(1, -1) which moves C to the end
-        output = output.movedim(1, -1)
+        # Apply VAE's output processing in-place to avoid ~8GB of temporaries
+        # Standard process_output is: torch.clamp((image + 1.0) / 2.0, min=0.0, max=1.0)
+        # Using in-place ops avoids 3 intermediate full-size allocations
+        output = output.float()
+        output.add_(1.0).div_(2.0).clamp_(0.0, 1.0)
 
-        # If batch dim exists with temporal, reshape to [B*T, H, W, C]
+        # Convert to ComfyUI image format: [B, C, T, H, W] -> [B*T, H, W, C]
+        # Use permute + contiguous instead of movedim + reshape to do it in one copy
         if len(output.shape) == 5:
-            output = output.reshape(-1, output.shape[-3], output.shape[-2], output.shape[-1])
+            B, C, T, H, W = output.shape
+            output = output.permute(0, 2, 3, 4, 1).contiguous().reshape(B * T, H, W, C)
+        else:
+            output = output.movedim(1, -1)
 
         print(f"[NV_StreamingVAEDecode] Done. Output shape: {output.shape}")
 
-        # Clean up
-        del decoded_frames
         torch.cuda.empty_cache()
 
         return (output,)
