@@ -105,11 +105,11 @@ class NV_LoadLatentReference:
             },
         }
 
-    RETURN_TYPES = ("LATENT_REFERENCE",)
-    RETURN_NAMES = ("latent_reference",)
+    RETURN_TYPES = ("LATENT_REFERENCE", "LATENT",)
+    RETURN_NAMES = ("latent_reference", "latent",)
     FUNCTION = "load"
     CATEGORY = "NV_Utils/sampling"
-    DESCRIPTION = "Load latent reference for guided chunked sampling."
+    DESCRIPTION = "Load latent reference for guided chunked sampling. Also outputs standard LATENT for VAE decoding."
 
     def load(self, reference_path):
         if not os.path.exists(reference_path):
@@ -121,7 +121,10 @@ class NV_LoadLatentReference:
         print(f"  Shape: {data.get('shape', 'unknown')}")
         print(f"  Metadata: {data.get('metadata', {})}")
 
-        return (data,)
+        # Standard LATENT output for VAE decoding
+        latent = {"samples": data["latents"].float()}
+
+        return (data, latent,)
 
 
 class NV_ApplyLatentGuidance:
