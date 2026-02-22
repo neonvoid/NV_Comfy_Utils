@@ -22,24 +22,35 @@ WEB_DIRECTORY = "./web"
 # Does nothing if SLACK_BOT_TOKEN and SLACK_ERROR_CHANNEL are not set
 from .src.KNF_Utils import slack_error_handler
 
-# ---- Monkey-patch: fix dtype mismatch in context_windows.set_step ----
-# ComfyUI stores sample_sigmas as float32, but third-party samplers (e.g. RES4LYF)
-# may pass timestep as float64. torch.isclose() requires matching dtypes.
+# ---- Monkey-patch: fix context_windows.set_step for third-party samplers ----
+# Two issues with ComfyUI's set_step when used with RK samplers (e.g. RES4LYF):
+#   1. Dtype mismatch: sample_sigmas is float32, RES4LYF passes timestep as float64.
+#      torch.isclose() requires matching dtypes.
+#   2. Sub-step sigmas: Multi-stage RK methods evaluate the model at intermediate
+#      sub-sigmas (e.g., midpoints) that don't exist in the original sigma schedule.
+#      The original set_step raises an exception when no exact match is found.
+# Fix: match dtype, then fall back to nearest sigma when no exact match exists.
 # See: node_notes/archive/bugfixes/CONTEXT_WINDOW_DTYPE_MISMATCH_FIX.md
 try:
     import torch
     from comfy.context_windows import IndexListContextHandler
 
-    _original_set_step = IndexListContextHandler.set_step
-
     def _patched_set_step(self, timestep: torch.Tensor, model_options: dict):
         sample_sigmas = model_options["transformer_options"]["sample_sigmas"]
-        if sample_sigmas.dtype != timestep.dtype:
-            model_options["transformer_options"]["sample_sigmas"] = sample_sigmas.to(timestep.dtype)
-        return _original_set_step(self, timestep, model_options)
+        ts = timestep[0].to(sample_sigmas.dtype)
+
+        # Try exact match first (original behavior)
+        mask = torch.isclose(sample_sigmas, ts, rtol=0.0001)
+        matches = torch.nonzero(mask)
+        if torch.numel(matches) > 0:
+            self._step = int(matches[0].item())
+            return
+
+        # No exact match — RK sub-step sigma. Use nearest schedule entry.
+        self._step = int(torch.argmin(torch.abs(sample_sigmas - ts)).item())
 
     IndexListContextHandler.set_step = _patched_set_step
-    print("[NV_Comfy_Utils] Patched context_windows.IndexListContextHandler.set_step (dtype fix)")
+    print("[NV_Comfy_Utils] Patched context_windows.IndexListContextHandler.set_step (dtype + substep fix)")
 except Exception as e:
     print(f"[NV_Comfy_Utils] Warning: could not patch context_windows set_step: {e}")
 
