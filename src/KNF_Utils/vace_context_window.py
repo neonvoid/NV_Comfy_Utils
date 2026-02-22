@@ -34,6 +34,21 @@ LONG_VIDEO_THRESHOLD = 55
 _VACE_ORIGINALS_CACHE = {}
 
 
+def clear_vace_cache():
+    """
+    Explicitly free all cached VACE tensors from GPU/CPU memory.
+
+    Called automatically when a new sampling run starts (from the patcher node),
+    ensuring tensors from previous runs don't leak memory.
+    """
+    global _VACE_ORIGINALS_CACHE
+    if _VACE_ORIGINALS_CACHE:
+        num_entries = len(_VACE_ORIGINALS_CACHE)
+        _VACE_ORIGINALS_CACHE.clear()
+        torch.cuda.empty_cache()
+        print(f"[VACE Slicer] Cleared cache ({num_entries} entries freed)")
+
+
 def _slice_tensor_manual(tensor, index_list, dim, target_device, target_dtype):
     """
     Manually slice a tensor along a dimension using index_list.
@@ -298,6 +313,9 @@ class NV_VACEContextWindowPatcher:
 
     def patch(self, model):
         import comfy.patcher_extension
+
+        # Clear any stale VACE cache from previous runs to free GPU memory
+        clear_vace_cache()
 
         model = model.clone()
 

@@ -99,9 +99,38 @@ class NV_StreamingVAEDecode:
         device = vae.device
         vae_dtype = vae.vae_dtype
 
-        # CRITICAL: Clear GPU memory before starting
-        # After sampling, there may be residual memory that needs to be freed
-        torch.cuda.empty_cache()
+        # Clear the VACE slicer cache - it holds GPU tensors from sampling
+        # that are no longer needed during VAE decode
+        try:
+            from custom_nodes.NV_Comfy_Utils.src.KNF_Utils.vace_context_window import clear_vace_cache
+            clear_vace_cache()
+        except ImportError:
+            pass
+
+        # Estimate GPU memory needed for decoder intermediates.
+        # The WAN VAE decoder upsamples spatially in multiple stages, so peak
+        # intermediate memory scales with the spatial area of the latent.
+        # At the final decoder stage, tensors are [B, 128, T, H*8, W*8] and
+        # multiple exist simultaneously for residual connections.
+        _, _, _, h_lat, w_lat = z.shape
+        spatial_area = h_lat * w_lat
+        # Base estimate: ~2 GB for standard 44x80 latent, scales linearly
+        base_spatial = 44 * 80
+        memory_headroom = int(2.5 * (1024 ** 3) * (spatial_area / base_spatial))
+        # Add VAE model size
+        vae_model_size = vae.patcher.model_size()
+        memory_needed = memory_headroom + vae_model_size
+
+        # Ask ComfyUI to free enough memory for VAE decode + intermediates.
+        # This forces unloading the large diffusion model if needed.
+        free_mem = model_management.get_free_memory(device)
+        if free_mem < memory_needed:
+            print(f"[NV_StreamingVAEDecode] Requesting {memory_needed / (1024**3):.1f} GB free "
+                  f"(have {free_mem / (1024**3):.1f} GB, need headroom for {h_lat}x{w_lat} latent)")
+            model_management.free_memory(memory_needed, device)
+            torch.cuda.empty_cache()
+        else:
+            torch.cuda.empty_cache()
 
         # Load the VAE model to GPU
         model_management.load_model_gpu(vae.patcher)
