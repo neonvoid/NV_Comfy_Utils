@@ -119,10 +119,11 @@ class NV_LatentChunkStitcher:
                                "Must match your pixel-space stitcher / chunk planner overlap. "
                                "Converted to latent frames internally using Wan's temporal compression."
                 }),
-                "blend_mode": (["linear", "cosine"],  {
+                "blend_mode": (["linear", "cosine", "hamming"],  {
                     "default": "linear",
                     "tooltip": "Blend weight curve. Linear: straight ramp. "
-                               "Cosine: smooth S-curve (same as Hann)."
+                               "Cosine: smooth S-curve (same as Hann). "
+                               "Hamming: S-curve with ~0.08 floor (never fully commits to either side)."
                 }),
                 "prefix": ("STRING", {
                     "default": "chunk",
@@ -308,6 +309,8 @@ def _compute_blend_weights(num_frames, mode):
         return t
     elif mode == "cosine":
         return 0.5 * (1.0 - torch.cos(math.pi * t))
+    elif mode == "hamming":
+        return 0.54 - 0.46 * torch.cos(math.pi * t)
     else:
         return t  # Fallback to linear
 
