@@ -68,8 +68,10 @@ Distribute the target word count based on these priorities:
 | Condition | Environment | Subject(s) | Temporal | Materials |
 |-----------|-------------|------------|----------|-----------|
 | 1 subject, low motion | 25% | 30% | 15% | 30% |
+| 1 subject, low/medium motion | 25% | 30% | 20% | 25% |
 | 1 subject, high motion | 20% | 25% | 30% | 25% |
 | 2+ subjects, low motion | 20% | 35% | 15% | 30% |
+| 2+ subjects, low/medium motion | 20% | 35% | 20% | 25% |
 | 2+ subjects, high motion | 15% | 30% | 30% | 25% |
 | No subjects (environment only) | 40% | 0% | 25% | 35% |
 
@@ -219,18 +221,19 @@ def _select_denoise_notes(denoise_strength):
 
 def _select_budget_row_label(subject_count, motion_intensity):
     """Return the human-readable label for the active word budget row."""
+    motion_label = {"low": "low", "medium": "low/medium", "high": "high"}.get(motion_intensity, motion_intensity)
     if subject_count == 0:
         return "No subjects (environment only)"
     elif subject_count == 1:
         if motion_intensity == "high":
             return "1 subject, high motion"
         else:
-            return "1 subject, low motion"
+            return f"1 subject, {motion_label} motion"
     else:
         if motion_intensity == "high":
             return "2+ subjects, high motion"
         else:
-            return "2+ subjects, low motion"
+            return f"2+ subjects, {motion_label} motion"
 
 
 def _build_temporal_note(video_duration):

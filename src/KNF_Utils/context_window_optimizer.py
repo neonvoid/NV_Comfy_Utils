@@ -1,22 +1,23 @@
 """
-NV Context Window Optimizer - Compute optimal overlap for multi-pass pipelines.
+NV Context Window Optimizer - Compute optimal overlap to offset window boundaries.
 
-When running a multi-pass V2V pipeline (generation → refinement passes), using
-the same context window settings for every pass causes boundary positions to
-align. Artifacts at those boundaries compound across passes.
+Context windows create periodic boundaries where adjacent windows are blended.
+When two sampling runs share the same temporal space (multi-pass refinement,
+re-sampling with different settings, etc.), using identical context window
+parameters causes boundaries to align. Artifacts at those positions compound.
 
-This node computes the optimal context_overlap for the current pass such that
-its window boundaries land as far as possible from the previous pass's boundaries.
+This node computes the optimal context_overlap such that window boundaries
+land as far as possible from a reference stride's boundary positions.
 
 Math:
-  Given previous stride S_prev and current context_length CL (both in latent frames),
-  for each candidate stride S, the minimum distance from any previous-pass boundary is:
-      min_dist = min(S % S_prev, S_prev - S % S_prev)
-  We pick the S that maximizes min_dist. The theoretical optimum is floor(S_prev / 2),
+  Given a reference stride S_ref and context_length CL (both in latent frames),
+  for each candidate stride S, the minimum distance from any reference boundary is:
+      min_dist = min(S % S_ref, S_ref - S % S_ref)
+  We pick the S that maximizes min_dist. The theoretical optimum is floor(S_ref / 2),
   achieved when the two strides are coprime and offset by ~half a stride.
 
 Usage:
-  [This Node] → context_overlap output → [WAN Context Windows (Manual)] context_overlap input
+  [This Node] context_overlap --> [WAN Context Windows (Manual)] context_overlap
 """
 
 import math
@@ -31,7 +32,7 @@ def _pixel_to_latent(pixel_frames):
 
 def _latent_to_pixel(latent_frames):
     """Convert latent frames back to the minimum pixel value that maps to it.
-    Inverse of ((px - 1) // 4) + 1 = L  →  px = 4 * (L - 1) + 1"""
+    Inverse of ((px - 1) // 4) + 1 = L  -->  px = 4 * (L - 1) + 1"""
     if latent_frames <= 0:
         return 0
     return 4 * (latent_frames - 1) + 1
@@ -39,24 +40,25 @@ def _latent_to_pixel(latent_frames):
 
 class NV_ContextWindowOptimizer:
     """
-    Compute optimal context_overlap for a refinement pass to maximize
-    boundary offset from a previous pass's context window positions.
+    Compute optimal context_overlap that maximizes boundary offset from
+    a reference context window configuration.
+
+    Use case: any time two sampling runs share temporal space and you want
+    their context window boundaries to NOT align. Common scenarios:
+      - Multi-pass V2V refinement (pass N vs pass N+1)
+      - Re-sampling the same video with different settings
+      - Any workflow where context window boundary artifacts are visible
 
     Connect the context_overlap output directly to WAN Context Windows (Manual).
-    The latent_stride and min_boundary_distance outputs are diagnostic.
 
-    ┌─────────────────────────────────────────────────────────────────┐
-    │  Example:                                                       │
-    │                                                                 │
-    │  Previous pass: CL=81, CO=30  → latent stride=13               │
-    │  This pass:     CL=81         → optimizer finds CO=53           │
-    │    → latent stride=7, min boundary distance=6 (92% of optimal)  │
-    │                                                                 │
-    │  Pass 2 boundaries: 0  13  26  39  52  65  78 ...               │
-    │  Pass 3 boundaries: 0   7  14  21  28  35  42 ...               │
-    │                          ↑       ↑       ↑                      │
-    │                 distance: 6   5   6   6   5   6                 │
-    └─────────────────────────────────────────────────────────────────┘
+    Example:
+      Reference:  CL=81, CO=30  (latent stride=13)
+      Optimized:  CL=81         --> CO=53 (latent stride=7)
+        min boundary distance = 6 latent frames (92% of optimal)
+
+      Reference boundaries: 0  13  26  39  52  65  78 ...
+      Optimized boundaries: 0   7  14  21  28  35  42 ...
+                   distance:    6   5   6   6   5   6
     """
 
     @classmethod
@@ -65,16 +67,18 @@ class NV_ContextWindowOptimizer:
             "required": {
                 "context_length": ("INT", {
                     "default": 81, "min": 5, "max": 513, "step": 4,
-                    "tooltip": "Context window length for THIS pass (pixel frames). "
-                               "Same value you set in WAN Context Windows."
+                    "tooltip": "Context window length you plan to use (pixel frames). "
+                               "Same value you'll set in WAN Context Windows."
                 }),
-                "prev_context_length": ("INT", {
+                "reference_context_length": ("INT", {
                     "default": 81, "min": 5, "max": 513, "step": 4,
-                    "tooltip": "Context window length from the PREVIOUS pass (pixel frames)."
+                    "tooltip": "Context window length of the run whose boundaries "
+                               "you want to avoid (pixel frames)."
                 }),
-                "prev_context_overlap": ("INT", {
+                "reference_context_overlap": ("INT", {
                     "default": 30, "min": 0, "max": 200, "step": 1,
-                    "tooltip": "Context window overlap from the PREVIOUS pass (pixel frames)."
+                    "tooltip": "Context window overlap of the run whose boundaries "
+                               "you want to avoid (pixel frames)."
                 }),
             },
             "optional": {
@@ -95,53 +99,53 @@ class NV_ContextWindowOptimizer:
     RETURN_NAMES = (
         "context_overlap",          # Pixel frames - plug directly into WAN CW node
         "latent_stride",            # Diagnostic: stride in latent frames
-        "min_boundary_distance",    # Diagnostic: worst-case distance from prev boundary
+        "min_boundary_distance",    # Diagnostic: worst-case distance from ref boundary
         "offset_quality",           # Diagnostic: 0.0-1.0 (1.0 = boundaries at exact midpoints)
         "summary",                  # Human-readable summary string
     )
     FUNCTION = "optimize"
     CATEGORY = "NV_Utils/context_windows"
     DESCRIPTION = (
-        "Computes optimal context_overlap for a refinement pass to maximize "
-        "boundary offset from the previous pass. Outputs pixel-frame overlap "
+        "Computes optimal context_overlap to maximize boundary offset from a "
+        "reference context window configuration. Outputs pixel-frame overlap "
         "ready to plug into WAN Context Windows (Manual)."
     )
 
     def optimize(
         self,
         context_length,
-        prev_context_length,
-        prev_context_overlap,
+        reference_context_length,
+        reference_context_overlap,
         min_overlap_latent=4,
         max_overlap_latent=0,
     ):
         # Convert to latent frames (WAN VAE temporal compression)
         cl_lat = _pixel_to_latent(context_length)
-        prev_cl_lat = _pixel_to_latent(prev_context_length)
-        prev_co_lat = _pixel_to_latent(prev_context_overlap) if prev_context_overlap > 0 else 0
-        prev_stride = prev_cl_lat - prev_co_lat
+        ref_cl_lat = _pixel_to_latent(reference_context_length)
+        ref_co_lat = _pixel_to_latent(reference_context_overlap) if reference_context_overlap > 0 else 0
+        ref_stride = ref_cl_lat - ref_co_lat
 
-        # Edge case: previous pass had no meaningful stride
-        if prev_stride <= 0:
+        # Edge case: reference had no meaningful stride (overlap >= length)
+        if ref_stride <= 0:
             default_co = _latent_to_pixel(max(cl_lat // 3, 1))
             return (
                 default_co,
                 cl_lat - _pixel_to_latent(default_co),
                 0,
                 0.0,
-                f"Previous stride <= 0 (overlap >= length). Using default overlap={default_co}px."
+                f"Reference stride <= 0 (overlap >= length). Using default overlap={default_co}px."
             )
 
-        # Edge case: previous pass didn't use context windows (stride >= video)
-        # Any overlap works, return default
-        if prev_stride >= cl_lat:
+        # Edge case: reference stride larger than our context length
+        # No boundary alignment risk - any overlap works
+        if ref_stride >= cl_lat:
             default_overlap = _latent_to_pixel(max(cl_lat // 3, 1))
             return (
                 default_overlap,
                 cl_lat - _pixel_to_latent(default_overlap),
-                prev_stride,
+                ref_stride,
                 1.0,
-                f"Previous stride ({prev_stride}lat) >= current CL ({cl_lat}lat). "
+                f"Reference stride ({ref_stride}lat) >= context length ({cl_lat}lat). "
                 f"No boundary alignment risk. Using default overlap={default_overlap}px."
             )
 
@@ -163,8 +167,8 @@ class NV_ContextWindowOptimizer:
         best_min_dist = -1
 
         for s in range(min_stride, max_stride + 1):
-            remainder = s % prev_stride
-            min_dist = min(remainder, prev_stride - remainder)
+            remainder = s % ref_stride
+            min_dist = min(remainder, ref_stride - remainder)
 
             if min_dist > best_min_dist:
                 best_min_dist = min_dist
@@ -182,18 +186,14 @@ class NV_ContextWindowOptimizer:
         latent_overlap = cl_lat - best_stride
         pixel_overlap = _latent_to_pixel(latent_overlap) if latent_overlap > 0 else 0
 
-        # Quality score: 1.0 = boundaries exactly at midpoints of previous windows
-        max_possible_dist = prev_stride / 2.0
+        # Quality score: 1.0 = boundaries exactly at midpoints of reference windows
+        max_possible_dist = ref_stride / 2.0
         offset_quality = best_min_dist / max_possible_dist if max_possible_dist > 0 else 0.0
-
-        # Verify the pixel→latent round-trip
-        verify_lat = _pixel_to_latent(pixel_overlap)
-        verify_stride = cl_lat - verify_lat
 
         # Build summary
         lines = [
-            f"Previous pass: CL={prev_cl_lat}lat CO={prev_co_lat}lat stride={prev_stride}lat",
-            f"This pass:     CL={cl_lat}lat CO={latent_overlap}lat stride={best_stride}lat",
+            f"Reference: CL={ref_cl_lat}lat CO={ref_co_lat}lat stride={ref_stride}lat",
+            f"Optimized: CL={cl_lat}lat CO={latent_overlap}lat stride={best_stride}lat",
             f"Min boundary distance: {best_min_dist} latent frames ({offset_quality:.0%} of optimal {math.floor(max_possible_dist)})",
             f">> Set context_overlap = {pixel_overlap} in WAN Context Windows node",
         ]
