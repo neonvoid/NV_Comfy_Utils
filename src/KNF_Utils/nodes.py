@@ -386,7 +386,9 @@ class GeminiVideoCaptioner:
                 result = self._call_gemini_api(file_path, prompt_text, api_key, model, is_temp_file,
                                                system_instruction=system_instruction,
                                                thinking_level=thinking_level,
-                                               media_resolution=media_resolution)
+                                               media_resolution=media_resolution,
+                                               max_tokens=max_tokens,
+                                               temperature=temperature)
             elif provider == "OpenRouter":
                 result = self._call_openrouter_api(file_path, prompt_text, api_key, model,
                                                    max_tokens, temperature, is_temp_file)
@@ -409,7 +411,8 @@ class GeminiVideoCaptioner:
             return (f"Exception: {str(e)}", f"Exception: {str(e)}")
     
     def _call_gemini_api(self, file_path, prompt_text, api_key, model, is_temp_file=False,
-                         system_instruction="", thinking_level="auto", media_resolution="default"):
+                         system_instruction="", thinking_level="auto", media_resolution="default",
+                         max_tokens=1000, temperature=1.0):
         """Call Gemini API for video/image captioning."""
         # Strip OpenRouter-style provider prefix (e.g. "google/gemini-2.5-pro" -> "gemini-2.5-pro")
         if "/" in model:
@@ -496,6 +499,13 @@ class GeminiVideoCaptioner:
             payload["generationConfig"]["mediaResolution"] = resolution_value
             use_v1alpha = True
             print(f"Media resolution: {resolution_value} (using v1alpha endpoint)")
+
+        # Max tokens and temperature (all Gemini models)
+        if "generationConfig" not in payload:
+            payload["generationConfig"] = {}
+        payload["generationConfig"]["maxOutputTokens"] = max_tokens
+        payload["generationConfig"]["temperature"] = temperature
+        print(f"Generation config: maxOutputTokens={max_tokens}, temperature={temperature}")
 
         api_version = "v1alpha" if use_v1alpha else "v1beta"
         api_url = f"https://generativelanguage.googleapis.com/{api_version}/models/{model}:generateContent?key={api_key}"
@@ -984,52 +994,48 @@ class CustomVideoSaver:
             
             print(f"[CustomVideoSaver] Original data: dtype={original_dtype}, range=[{original_min:.6f}, {original_max:.6f}]")
             
-            # Convert to uint8 with color preservation
+            # Determine conversion parameters (actual conversion done per-frame to save memory)
             # Determine if data is in [0,1] range (with possible overflow) or [0,255] range
             # ComfyUI tensors are typically [0,1] but can have slight overflow from processing
             # Use threshold of 2.0 to distinguish: if max < 2.0, assume [0,1] data
             is_normalized = original_max < 2.0
+            is_float = original_dtype == np.float32 or original_dtype == np.float64
 
-            if preserve_colors:
-                if original_dtype == np.float32 or original_dtype == np.float64:
-                    if is_normalized:
-                        # Normalized float data [0,1] (with possible overflow) -> [0,255]
-                        video_array = np.clip(video_array * 255.0 + 0.5, 0, 255).astype(np.uint8)
-                    else:
-                        # Already in [0,255] range
-                        video_array = np.clip(video_array + 0.5, 0, 255).astype(np.uint8)
-                else:
-                    video_array = np.clip(video_array, 0, 255).astype(np.uint8)
-            else:
-                if original_dtype == np.float32 or original_dtype == np.float64:
-                    if is_normalized:
-                        video_array = np.clip(video_array * 255.0, 0, 255).astype(np.uint8)
-                    else:
-                        video_array = np.clip(video_array, 0, 255).astype(np.uint8)
-                else:
-                    video_array = np.clip(video_array, 0, 255).astype(np.uint8)
-            
             # Get video dimensions
             num_frames, height, width, channels = video_array.shape
 
-            # FFmpeg rgb24 expects exactly 3 channels - handle RGBA and grayscale
-            if channels == 4:
-                print(f"[CustomVideoSaver] Converting RGBA to RGB (dropping alpha channel)")
-                video_array = video_array[:, :, :, :3]
+            # FFmpeg rgb24 expects exactly 3 channels - track for per-frame conversion
+            convert_rgba = channels == 4
+            convert_gray = channels == 1
+            if convert_rgba:
+                print(f"[CustomVideoSaver] Will convert RGBA to RGB (dropping alpha channel)")
                 channels = 3
-            elif channels == 1:
-                print(f"[CustomVideoSaver] Converting grayscale to RGB")
-                video_array = np.repeat(video_array, 3, axis=-1)
+            elif convert_gray:
+                print(f"[CustomVideoSaver] Will convert grayscale to RGB")
                 channels = 3
             elif channels != 3:
                 print(f"[CustomVideoSaver] Warning: Unexpected channel count {channels}, attempting to continue")
 
-            # Debug: Check uint8 data after conversion
-            uint8_min, uint8_max = video_array.min(), video_array.max()
-            print(f"[CustomVideoSaver] After uint8 conversion: range=[{uint8_min}, {uint8_max}]")
-            if uint8_max == 0:
+            # Debug: Check first frame conversion
+            sample_frame = video_array[0]
+            if is_float:
+                if is_normalized:
+                    if preserve_colors:
+                        sample_u8 = np.clip(sample_frame * 255.0 + 0.5, 0, 255).astype(np.uint8)
+                    else:
+                        sample_u8 = np.clip(sample_frame * 255.0, 0, 255).astype(np.uint8)
+                else:
+                    if preserve_colors:
+                        sample_u8 = np.clip(sample_frame + 0.5, 0, 255).astype(np.uint8)
+                    else:
+                        sample_u8 = np.clip(sample_frame, 0, 255).astype(np.uint8)
+            else:
+                sample_u8 = np.clip(sample_frame, 0, 255).astype(np.uint8)
+            print(f"[CustomVideoSaver] After uint8 conversion (frame 0): range=[{sample_u8.min()}, {sample_u8.max()}]")
+            if sample_u8.max() == 0:
                 print(f"[CustomVideoSaver] WARNING: All pixel values are 0! Video will be black.")
-                print(f"[CustomVideoSaver] First frame sample (center pixel): {video_array[0, height//2, width//2, :]}")
+                print(f"[CustomVideoSaver] First frame sample (center pixel): {sample_u8[height//2, width//2, :]}")
+            del sample_u8
 
             print(f"[CustomVideoSaver] Processing {num_frames} frames of {width}x{height} with {channels} channels")
             print(f"[CustomVideoSaver] Using FFmpeg with codec: {codec} (CRF: {quality}, Preset: {preset})")
@@ -1131,27 +1137,42 @@ class CustomVideoSaver:
             write_failed = False
             last_error = None
             
-            for i, frame in enumerate(video_array):
+            for i in range(frame_count):
                 # Progress update every 10 frames
                 if i > 0 and i % 10 == 0:
                     progress = (i / frame_count) * 100
                     print(f"[CustomVideoSaver] Progress: {progress:.1f}% ({i}/{frame_count})")
-                
+
                 # Check if process is still alive
                 if process.poll() is not None:
                     print(f"[CustomVideoSaver] FFmpeg process died at frame {i}")
                     write_failed = True
                     break
-                
+
+                # Per-frame float32->uint8 conversion (avoids allocating full copy)
+                frame = video_array[i]
+                if is_float:
+                    if is_normalized:
+                        if preserve_colors:
+                            frame = np.clip(frame * 255.0 + 0.5, 0, 255).astype(np.uint8)
+                        else:
+                            frame = np.clip(frame * 255.0, 0, 255).astype(np.uint8)
+                    else:
+                        if preserve_colors:
+                            frame = np.clip(frame + 0.5, 0, 255).astype(np.uint8)
+                        else:
+                            frame = np.clip(frame, 0, 255).astype(np.uint8)
+                else:
+                    frame = np.clip(frame, 0, 255).astype(np.uint8)
+
+                # Handle channel conversion
+                if convert_rgba:
+                    frame = frame[:, :, :3]
+                elif convert_gray:
+                    frame = np.repeat(frame, 3, axis=-1)
+
                 # Ensure frame is contiguous in memory
                 frame = np.ascontiguousarray(frame)
-                
-                # Validate frame data
-                if preserve_colors:
-                    frame_min, frame_max = frame.min(), frame.max()
-                    if frame_min < 0 or frame_max > 255:
-                        print(f"[CustomVideoSaver] Warning: Frame {i} has invalid range [{frame_min}, {frame_max}]")
-                        frame = np.clip(frame, 0, 255).astype(np.uint8)
                 
                 # Write raw RGB data
                 try:
@@ -1276,44 +1297,13 @@ class CustomVideoSaver:
 
             print(f"[CustomVideoSaver] Original data: dtype={original_dtype}, range=[{original_min:.6f}, {original_max:.6f}]")
 
-            # Determine if data is in [0,1] range (with possible overflow) or [0,255] range
-            # ComfyUI tensors are typically [0,1] but can have slight overflow from processing
-            # Use threshold of 2.0 to distinguish: if max < 2.0, assume [0,1] data
+            # Determine conversion parameters (actual conversion done per-frame to save memory)
             is_normalized = original_max < 2.0
+            is_float = original_dtype == np.float32 or original_dtype == np.float64
+            is_16bit = original_dtype in [np.uint16, np.int16]
+            scale_16bit = is_16bit and original_max > 255
 
-            # Color preservation mode: use high-precision conversion
-            if preserve_colors:
-                # Use high-precision conversion to preserve color accuracy
-                if original_dtype == np.float32 or original_dtype == np.float64:
-                    if is_normalized:
-                        # Normalized float data [0,1] (with possible overflow) -> [0,255]
-                        video_array = np.clip(video_array * 255.0 + 0.5, 0, 255).astype(np.uint8)
-                    else:
-                        # Float data in [0,255] range - preserve as much precision as possible
-                        video_array = np.clip(video_array + 0.5, 0, 255).astype(np.uint8)
-                elif original_dtype == np.uint8:
-                    # Already in correct format - no conversion needed
-                    video_array = video_array.astype(np.uint8)
-                elif original_dtype in [np.uint16, np.int16]:
-                    # 16-bit data - scale down to 8-bit while preserving color information
-                    if original_max > 255:
-                        video_array = np.clip(video_array / 256.0, 0, 255).astype(np.uint8)
-                    else:
-                        video_array = np.clip(video_array, 0, 255).astype(np.uint8)
-                else:
-                    # Other integer types - convert with clipping
-                    video_array = np.clip(video_array, 0, 255).astype(np.uint8)
-            else:
-                # Standard conversion mode (faster but less precise)
-                if original_dtype == np.float32 or original_dtype == np.float64:
-                    if is_normalized:
-                        video_array = np.clip(video_array * 255.0, 0, 255).astype(np.uint8)
-                    else:
-                        video_array = np.clip(video_array, 0, 255).astype(np.uint8)
-                else:
-                    video_array = np.clip(video_array, 0, 255).astype(np.uint8)
-            
-            # Get video dimensions
+            # Get video dimensions (before any conversion)
             num_frames, height, width, channels = video_array.shape
             
             print(f"[CustomVideoSaver] Processing {num_frames} frames of {width}x{height} with {channels} channels")
@@ -1364,18 +1354,30 @@ class CustomVideoSaver:
                     print(f"  3. Invalid output path or permissions")
                     return False
             
-            # Write frames with careful color space handling
-            for i, frame in enumerate(video_array):
+            # Write frames with per-frame conversion (avoids allocating full uint8 copy)
+            for i in range(num_frames):
+                frame = video_array[i]
+
+                # Per-frame float32/16bit -> uint8 conversion
+                if is_float:
+                    if is_normalized:
+                        if preserve_colors:
+                            frame = np.clip(frame * 255.0 + 0.5, 0, 255).astype(np.uint8)
+                        else:
+                            frame = np.clip(frame * 255.0, 0, 255).astype(np.uint8)
+                    else:
+                        if preserve_colors:
+                            frame = np.clip(frame + 0.5, 0, 255).astype(np.uint8)
+                        else:
+                            frame = np.clip(frame, 0, 255).astype(np.uint8)
+                elif scale_16bit:
+                    frame = np.clip(frame / 256.0, 0, 255).astype(np.uint8)
+                else:
+                    frame = np.clip(frame, 0, 255).astype(np.uint8)
+
                 # Ensure frame is contiguous in memory for better performance
                 frame = np.ascontiguousarray(frame)
-                
-                # Validate color data before conversion
-                if preserve_colors:
-                    frame_min, frame_max = frame.min(), frame.max()
-                    if frame_min < 0 or frame_max > 255:
-                        print(f"[CustomVideoSaver] Warning: Frame {i} has values outside [0,255] range: [{frame_min}, {frame_max}]")
-                        frame = np.clip(frame, 0, 255)
-                
+
                 # Handle different channel configurations with color preservation
                 if channels == 3:
                     # RGB to BGR conversion for OpenCV (preserves all color data)
@@ -1390,18 +1392,7 @@ class CustomVideoSaver:
                     # Unknown channel count, try to preserve as-is
                     print(f"[CustomVideoSaver] Warning: Unknown channel count {channels}, using as-is")
                     frame_bgr = frame
-                
-                # Ensure the frame is in the correct format for the codec
-                if frame_bgr.dtype != np.uint8:
-                    frame_bgr = frame_bgr.astype(np.uint8)
-                
-                # Final validation for color preservation
-                if preserve_colors:
-                    bgr_min, bgr_max = frame_bgr.min(), frame_bgr.max()
-                    if bgr_min < 0 or bgr_max > 255:
-                        print(f"[CustomVideoSaver] Warning: BGR frame {i} has invalid values: [{bgr_min}, {bgr_max}]")
-                        frame_bgr = np.clip(frame_bgr, 0, 255).astype(np.uint8)
-                
+
                 out.write(frame_bgr)
             
             # Release video writer
