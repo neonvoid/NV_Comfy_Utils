@@ -88,12 +88,17 @@ class NV_ContextWindowOptimizer:
     as possible from a reference configuration, preferring more overlap
     when distances are tied.
 
+    IMPORTANT: This node only optimizes overlap. Set context_length to
+    what your GPU can handle at the current pass resolution. VRAM for WAN
+    attention scales with (CL_latent × H_latent × W_latent)^2 — a CL that
+    worked at a lower resolution pass may OOM at higher resolution.
+
     Wire your control video (IMAGE) or total_frames to provide the video length.
     The node brute-forces every candidate stride and picks the one with the
     best boundary separation. Ties favor more overlap (better blending).
 
     Outputs context_overlap in pixel frames, ready to plug into
-    WAN Context Windows (Manual).
+    NV WAN Context Windows or WAN Context Windows (Manual).
     """
 
     @classmethod
@@ -102,18 +107,21 @@ class NV_ContextWindowOptimizer:
             "required": {
                 "context_length": ("INT", {
                     "default": 81, "min": 5, "max": 513, "step": 4,
-                    "tooltip": "Context window length you plan to use (pixel frames). "
-                               "Same value you'll set in WAN Context Windows."
+                    "tooltip": "Context window length for THIS pass (pixel frames). "
+                               "Set this to the CL your GPU can handle at the "
+                               "current pass resolution. This node only optimizes "
+                               "overlap — it does not change context_length."
                 }),
                 "reference_context_length": ("INT", {
                     "default": 81, "min": 5, "max": 513, "step": 4,
-                    "tooltip": "Context window length of the run whose boundaries "
-                               "you want to avoid (pixel frames)."
+                    "tooltip": "Context window length of the PREVIOUS pass whose "
+                               "boundaries you want to avoid (pixel frames). "
+                               "This was the CL used at the previous resolution."
                 }),
                 "reference_context_overlap": ("INT", {
                     "default": 30, "min": 0, "max": 200, "step": 1,
-                    "tooltip": "Context window overlap of the run whose boundaries "
-                               "you want to avoid (pixel frames)."
+                    "tooltip": "Context window overlap of the PREVIOUS pass whose "
+                               "boundaries you want to avoid (pixel frames)."
                 }),
             },
             "optional": {
@@ -148,10 +156,11 @@ class NV_ContextWindowOptimizer:
     FUNCTION = "optimize"
     CATEGORY = "NV_Utils/context_windows"
     DESCRIPTION = (
-        "Computes optimal context_overlap to maximize boundary offset from a "
-        "reference context window configuration. Optimizes purely for quality: "
-        "max boundary distance, then max overlap. Wire your control video to "
-        "the IMAGE input for automatic frame count detection."
+        "Computes optimal context_overlap to maximize boundary distance from a "
+        "previous pass's window boundaries. Only adjusts overlap — set "
+        "context_length to what your GPU can handle at the current resolution "
+        "(VRAM scales quadratically with CL × spatial resolution). Wire your "
+        "control video to the IMAGE input for automatic frame count detection."
     )
 
     def optimize(

@@ -127,11 +127,18 @@ function makeButton(text, title) {
 
 /**
  * Encode all loaded frames into a WebM video blob using MediaRecorder.
- * Uses captureStream(0) for manual frame pushing at the target FPS timing.
+ * Uses captureStream(0) for manual frame pushing.
+ * Note: MediaRecorder records wall-clock time between requestFrame() calls,
+ * so we use the actual frameDuration to get correct playback speed.
  */
-async function exportToWebM(player) {
+async function exportToWebM(player, progressCb) {
     const { frames, totalFrames, fps, imageWidth, imageHeight } = player;
-    if (!totalFrames || !frames[0]) return null;
+    console.log(`[NV_PreviewAnimation] exportToWebM: ${totalFrames} frames, ${fps} fps, ${imageWidth}x${imageHeight}`);
+
+    if (!totalFrames || !frames[0]) {
+        console.warn("[NV_PreviewAnimation] exportToWebM: no frames loaded");
+        return null;
+    }
 
     const offscreen = document.createElement("canvas");
     offscreen.width = imageWidth;
@@ -140,11 +147,21 @@ async function exportToWebM(player) {
 
     const stream = offscreen.captureStream(0);
     const videoTrack = stream.getVideoTracks()[0];
+    console.log("[NV_PreviewAnimation] captureStream created, videoTrack:", !!videoTrack);
+
+    if (!videoTrack) {
+        console.error("[NV_PreviewAnimation] No video track from captureStream — browser may not support this");
+        return null;
+    }
 
     let mimeType = "video/webm; codecs=vp9";
     if (!MediaRecorder.isTypeSupported(mimeType)) {
-        mimeType = "video/webm";
+        mimeType = "video/webm; codecs=vp8";
+        if (!MediaRecorder.isTypeSupported(mimeType)) {
+            mimeType = "video/webm";
+        }
     }
+    console.log("[NV_PreviewAnimation] Using mimeType:", mimeType);
 
     const recorder = new MediaRecorder(stream, {
         mimeType,
@@ -152,19 +169,31 @@ async function exportToWebM(player) {
     });
 
     const chunks = [];
-    recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+    recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) chunks.push(e.data);
+        console.log(`[NV_PreviewAnimation] ondataavailable: chunk ${chunks.length}, size=${e.data.size}`);
+    };
+
+    recorder.onerror = (e) => {
+        console.error("[NV_PreviewAnimation] MediaRecorder error:", e);
+    };
+
+    const frameDuration = 1000 / fps;
+    console.log(`[NV_PreviewAnimation] frameDuration=${frameDuration.toFixed(1)}ms, total encode time ~${((totalFrames * frameDuration) / 1000).toFixed(1)}s`);
 
     return new Promise((resolve) => {
         recorder.onstop = () => {
-            resolve(new Blob(chunks, { type: "video/webm" }));
+            const blob = new Blob(chunks, { type: "video/webm" });
+            console.log(`[NV_PreviewAnimation] Encoding complete: ${chunks.length} chunks, blob size=${(blob.size / 1024).toFixed(1)}KB`);
+            resolve(blob);
         };
 
-        recorder.start();
-        const frameDuration = 1000 / fps;
+        recorder.start(100); // request data every 100ms for progress visibility
         let i = 0;
 
         function nextFrame() {
             if (i >= totalFrames) {
+                console.log("[NV_PreviewAnimation] All frames pushed, stopping recorder...");
                 recorder.stop();
                 return;
             }
@@ -172,11 +201,16 @@ async function exportToWebM(player) {
             if (img) {
                 offCtx.drawImage(img, 0, 0, offscreen.width, offscreen.height);
                 videoTrack.requestFrame();
+            } else {
+                console.warn(`[NV_PreviewAnimation] Frame ${i} is null/missing, skipping`);
             }
+
+            if (progressCb) progressCb(i + 1, totalFrames);
             i++;
             setTimeout(nextFrame, frameDuration);
         }
 
+        console.log("[NV_PreviewAnimation] Starting frame encoding loop...");
         nextFrame();
     });
 }
@@ -467,9 +501,17 @@ app.registerExtension({
                     callback: async () => {
                         const wasPlaying = player.playing;
                         if (wasPlaying) stopPlayback(player);
-                        player.frameLabel.textContent = "Encoding WebM...";
 
-                        const blob = await exportToWebM(player);
+                        console.log("[NV_PreviewAnimation] Save as WebM clicked");
+                        const startTime = performance.now();
+
+                        const blob = await exportToWebM(player, (done, total) => {
+                            player.frameLabel.textContent = `Encoding ${done}/${total}...`;
+                        });
+
+                        const elapsed = ((performance.now() - startTime) / 1000).toFixed(1);
+                        console.log(`[NV_PreviewAnimation] Export finished in ${elapsed}s, blob=${blob ? (blob.size / 1024).toFixed(1) + 'KB' : 'null'}`);
+
                         if (blob) {
                             const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
                             downloadBlob(blob, `NV_preview_${timestamp}.webm`);
