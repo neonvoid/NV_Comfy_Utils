@@ -33,6 +33,7 @@ class NV_BBoxCreator:
                 # bbox_data is hidden visually by JS but needs to be optional (not hidden)
                 # so it creates a widget that can be serialized and sent to backend
                 "bbox_data": ("STRING", {"default": "{}"}),
+                "mask": ("MASK", {"tooltip": "Optional mask to overlay on the canvas as a semi-transparent tint, useful for visualizing existing masked areas while drawing boxes."}),
             },
         }
 
@@ -42,7 +43,7 @@ class NV_BBoxCreator:
     CATEGORY = "NV_Utils/mask"
     OUTPUT_NODE = True  # Required to send preview back to frontend
 
-    def create_bbox(self, images, aspect_ratio, custom_ratio="16:9", bbox_data="{}"):
+    def create_bbox(self, images, aspect_ratio, custom_ratio="16:9", bbox_data="{}", mask=None):
         """
         Create a mask from the bounding box drawn by the user.
 
@@ -52,10 +53,12 @@ class NV_BBoxCreator:
             custom_ratio: Custom ratio string (e.g., "21:9")
             bbox_data: JSON string with bbox coordinates from frontend
                        Format: {"positive": [...], "negative": [...]}
+            mask: Optional mask tensor to overlay on the canvas preview
 
         Returns:
             dict with UI preview and mask result
         """
+        overlay_mask = mask  # Save before local 'mask' variable shadows it
         B, H, W, C = images.shape
 
         # Parse bbox data from frontend JSON
@@ -173,25 +176,30 @@ class NV_BBoxCreator:
             bbox_height = 0
 
         # Send first frame as preview to frontend (for canvas display)
-        preview_image = self._encode_preview(images[0])
+        preview_image = self._encode_preview(images[0], mask=overlay_mask)
 
         return {
             "ui": {"bg_image": [preview_image]},
             "result": (mask, positive_boxes, negative_boxes, ratio_str, ratio_value, bbox_width, bbox_height)
         }
 
-    def _encode_preview(self, image_tensor):
+    def _encode_preview(self, image_tensor, mask=None):
         """
         Encode image tensor to base64 JPEG for frontend display.
 
         Args:
             image_tensor: Single image tensor [H, W, C] in range [0, 1]
+            mask: Optional mask tensor [N, H, W] or [H, W] to overlay
 
         Returns:
             Base64 encoded JPEG string
         """
         # Convert [H, W, C] tensor to numpy array
         img_np = (image_tensor.cpu().numpy() * 255).astype(np.uint8)
+
+        # Overlay mask if provided
+        if mask is not None:
+            img_np = self._overlay_mask(img_np, mask, frame_index=0)
 
         # Create PIL Image
         pil_img = Image.fromarray(img_np)
@@ -200,6 +208,51 @@ class NV_BBoxCreator:
         buffer = BytesIO()
         pil_img.save(buffer, format="JPEG", quality=85)
         return base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+    @staticmethod
+    def _overlay_mask(img_array, mask_tensor, frame_index=0, color=(0, 180, 255), alpha=0.35):
+        """Composite a mask as a semi-transparent colored overlay on the image.
+
+        Args:
+            img_array: uint8 numpy array [H, W, 3]
+            mask_tensor: torch tensor [N, H, W] or [H, W]
+            frame_index: which frame to extract from the mask batch
+            color: RGB tuple for the overlay tint
+            alpha: overlay opacity (0=invisible, 1=opaque)
+
+        Returns:
+            uint8 numpy array [H, W, 3] with mask overlay composited
+        """
+        # Extract the correct frame from the mask batch
+        if mask_tensor.dim() == 3:
+            fi = min(frame_index, mask_tensor.shape[0] - 1)
+            frame_mask = mask_tensor[fi].cpu().numpy()
+        elif mask_tensor.dim() == 2:
+            frame_mask = mask_tensor.cpu().numpy()
+        else:
+            return img_array
+
+        # Normalize to 0-1 if needed
+        if frame_mask.max() > 1.0:
+            frame_mask = frame_mask / 255.0
+
+        # Resize mask if dimensions don't match image
+        h, w = img_array.shape[:2]
+        mh, mw = frame_mask.shape[:2]
+        if mh != h or mw != w:
+            mask_t = torch.from_numpy(frame_mask).float().unsqueeze(0).unsqueeze(0)
+            mask_t = torch.nn.functional.interpolate(mask_t, size=(h, w), mode='bilinear', align_corners=False)
+            frame_mask = mask_t.squeeze().numpy()
+
+        # Create binary mask (threshold at 0.5)
+        binary = (frame_mask > 0.5).astype(np.float32)
+
+        # Composite: img * (1 - alpha*mask) + color * (alpha*mask)
+        overlay = img_array.astype(np.float32)
+        for c in range(3):
+            overlay[:, :, c] = overlay[:, :, c] * (1.0 - alpha * binary) + color[c] * (alpha * binary)
+
+        return np.clip(overlay, 0, 255).astype(np.uint8)
 
 
 NODE_CLASS_MAPPINGS = {
