@@ -6,9 +6,18 @@ When two sampling runs share the same temporal space (multi-pass refinement,
 re-sampling with different settings, etc.), using identical context window
 parameters causes boundaries to align. Artifacts at those positions compound.
 
+NOTE - Iterative latent upscale finding:
+  When performing iterative latent upscaling (e.g. 0.25x >> 0.5x >> 1.0x),
+  using the same context window settings across passes causes boundary positions
+  to land in the same places. Noise artifacts at those boundaries compound with
+  each successive pass. This node offsets the boundaries between passes to
+  prevent that compounding.
+
 This node computes the optimal context_overlap such that window boundaries
 land as far as possible from a reference stride's boundary positions, using
-the actual video length to brute-force all real boundary pairs.
+the actual video length to brute-force all real boundary pairs. Among
+candidates with equal boundary distance, it prefers more overlap for
+better blending quality.
 
 Usage:
   Wire your control video (IMAGE) into this node. It extracts the frame count
@@ -62,8 +71,6 @@ def _actual_min_distance(n_latent, stride, ref_stride):
         return n_latent  # No overlap possible
 
     min_dist = n_latent
-    # For each of our boundaries, binary-search-ish against sorted refs
-    # (refs are already sorted since we generate them in order)
     for a in ours:
         for b in refs:
             d = abs(a - b)
@@ -77,13 +84,13 @@ def _actual_min_distance(n_latent, stride, ref_stride):
 
 class NV_ContextWindowOptimizer:
     """
-    Compute optimal context_overlap that maximizes boundary offset from
-    a reference context window configuration, using the actual video length
-    to evaluate all real boundary pairs.
+    Compute optimal context_overlap for maximum quality: boundaries as far
+    as possible from a reference configuration, preferring more overlap
+    when distances are tied.
 
     Wire your control video (IMAGE) or total_frames to provide the video length.
-    The node brute-forces every candidate stride against the reference and picks
-    the one where the closest boundary pair is as far apart as possible.
+    The node brute-forces every candidate stride and picks the one with the
+    best boundary separation. Ties favor more overlap (better blending).
 
     Outputs context_overlap in pixel frames, ready to plug into
     WAN Context Windows (Manual).
@@ -119,15 +126,11 @@ class NV_ContextWindowOptimizer:
                     "tooltip": "Total pixel frames in the video. Set to 0 to use the IMAGE "
                                "input instead. If both are provided, IMAGE takes precedence."
                 }),
-                "min_overlap_latent": ("INT", {
-                    "default": 4, "min": 1, "max": 20, "step": 1,
-                    "tooltip": "Minimum acceptable overlap in latent frames. "
-                               "Lower = fewer windows but thinner blending zone."
-                }),
-                "max_overlap_latent": ("INT", {
-                    "default": 0, "min": 0, "max": 20, "step": 1,
-                    "tooltip": "Maximum overlap in latent frames (0 = no limit). "
-                               "Set this to cap the number of windows for faster renders."
+                "min_overlap": ("INT", {
+                    "default": 13, "min": 0, "max": 200, "step": 1,
+                    "tooltip": "Minimum acceptable overlap in pixel frames. "
+                               "Ensures blending zones don't get too thin. "
+                               "(13px = 4 latent frames)"
                 }),
             },
         }
@@ -145,9 +148,9 @@ class NV_ContextWindowOptimizer:
     CATEGORY = "NV_Utils/context_windows"
     DESCRIPTION = (
         "Computes optimal context_overlap to maximize boundary offset from a "
-        "reference context window configuration. Wire your control video to the "
-        "IMAGE input for automatic frame count detection. Outputs pixel-frame "
-        "overlap ready to plug into WAN Context Windows (Manual)."
+        "reference context window configuration. Optimizes purely for quality: "
+        "max boundary distance, then max overlap. Wire your control video to "
+        "the IMAGE input for automatic frame count detection."
     )
 
     def optimize(
@@ -157,8 +160,7 @@ class NV_ContextWindowOptimizer:
         reference_context_overlap,
         images=None,
         total_frames=0,
-        min_overlap_latent=4,
-        max_overlap_latent=0,
+        min_overlap=13,
     ):
         # Resolve frame count: IMAGE tensor shape[0] takes precedence
         if images is not None:
@@ -169,7 +171,7 @@ class NV_ContextWindowOptimizer:
             # No frame count provided - fall back to heuristic mode
             return self._optimize_heuristic(
                 context_length, reference_context_length,
-                reference_context_overlap, min_overlap_latent, max_overlap_latent
+                reference_context_overlap, min_overlap
             )
 
         # Convert everything to latent frames
@@ -178,6 +180,9 @@ class NV_ContextWindowOptimizer:
         ref_cl_lat = _pixel_to_latent(reference_context_length)
         ref_co_lat = _pixel_to_latent(reference_context_overlap) if reference_context_overlap > 0 else 0
         ref_stride = ref_cl_lat - ref_co_lat
+
+        # Convert pixel overlap bound to latent
+        min_co_lat = _pixel_to_latent(min_overlap) if min_overlap > 0 else 0
 
         # Edge case: video fits in a single context window
         if n_latent <= cl_lat:
@@ -198,16 +203,15 @@ class NV_ContextWindowOptimizer:
                 f"Reference stride <= 0 (overlap >= length). Using default."
             )
 
-        # Determine stride search range
-        max_stride = cl_lat - min_overlap_latent
-        if max_overlap_latent > 0:
-            min_stride = max(1, cl_lat - max_overlap_latent)
-        else:
-            min_stride = 1
+        # Stride search range: stride = cl_lat - overlap
+        # max_stride = cl_lat - min_overlap (least overlap allowed)
+        # min_stride = 1 (most overlap = cl_lat - 1)
+        max_stride = cl_lat - min_co_lat
+        min_stride = 1
         if max_stride < min_stride:
             max_stride = min_stride
 
-        # Brute-force: for each candidate stride, compute TRUE min pairwise distance
+        # Brute-force: max boundary distance, tiebreak = more overlap (smaller stride)
         best_stride = None
         best_min_dist = -1
 
@@ -218,8 +222,8 @@ class NV_ContextWindowOptimizer:
                 best_min_dist = min_dist
                 best_stride = s
             elif min_dist == best_min_dist and best_stride is not None:
-                # Tie-break: prefer larger stride (fewer windows, faster)
-                if s > best_stride:
+                # Tie-break: prefer smaller stride = more overlap = better blending
+                if s < best_stride:
                     best_stride = s
 
         if best_stride is None:
@@ -239,18 +243,17 @@ class NV_ContextWindowOptimizer:
         opt_bounds = _get_boundaries(n_latent, best_stride)
         ref_bounds = _get_boundaries(n_latent, ref_stride)
 
-        summary_lines = [
+        summary = " | ".join([
             f"Video: {n_pixel}px = {n_latent} latent frames",
             f"Reference: CL={ref_cl_lat}lat CO={ref_co_lat}lat stride={ref_stride}lat "
             f"({len(ref_bounds)} boundaries at {ref_bounds})",
             f"Optimized: CL={cl_lat}lat CO={latent_overlap}lat stride={best_stride}lat "
-            f"({len(opt_bounds)} boundaries)",
-            f"True min boundary distance: {best_min_dist} latent frames "
+            f"({len(opt_bounds)} boundaries at {opt_bounds})",
+            f"Min boundary distance: {best_min_dist}lat "
             f"({offset_quality:.0%} of optimal {math.floor(max_possible_dist)})",
-            f"Windows: {num_windows} | "
+            f"Windows: {num_windows}",
             f">> Set context_overlap = {pixel_overlap} in WAN CW node",
-        ]
-        summary = " | ".join(summary_lines)
+        ])
 
         print(f"[CW Optimizer] {summary}")
 
@@ -268,8 +271,7 @@ class NV_ContextWindowOptimizer:
         context_length,
         reference_context_length,
         reference_context_overlap,
-        min_overlap_latent,
-        max_overlap_latent,
+        min_overlap,
     ):
         """Fallback when no frame count is available. Uses first-boundary heuristic."""
         cl_lat = _pixel_to_latent(context_length)
@@ -277,13 +279,15 @@ class NV_ContextWindowOptimizer:
         ref_co_lat = _pixel_to_latent(reference_context_overlap) if reference_context_overlap > 0 else 0
         ref_stride = ref_cl_lat - ref_co_lat
 
+        min_co_lat = _pixel_to_latent(min_overlap) if min_overlap > 0 else 0
+
         if ref_stride <= 0:
             default_co_lat = max(cl_lat // 3, 1)
             return (_latent_to_pixel(default_co_lat), cl_lat - default_co_lat, 0, 0.0, 0,
                     "No frame count provided and reference stride <= 0. Using default.")
 
-        max_stride = cl_lat - min_overlap_latent
-        min_stride = max(1, cl_lat - max_overlap_latent) if max_overlap_latent > 0 else 1
+        max_stride = cl_lat - min_co_lat
+        min_stride = 1
         if max_stride < min_stride:
             max_stride = min_stride
 
@@ -296,7 +300,8 @@ class NV_ContextWindowOptimizer:
                 best_min_dist = min_dist
                 best_stride = s
             elif min_dist == best_min_dist and best_stride is not None:
-                if s > best_stride:
+                # Tie-break: prefer smaller stride = more overlap
+                if s < best_stride:
                     best_stride = s
 
         if best_stride is None:
