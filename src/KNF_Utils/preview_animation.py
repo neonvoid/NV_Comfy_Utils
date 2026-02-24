@@ -28,7 +28,6 @@ class NV_PreviewAnimation:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "images": ("IMAGE", {"tooltip": "Image batch to animate [B, H, W, C]"}),
                 "fps": ("FLOAT", {
                     "default": 8.0,
                     "min": 0.1,
@@ -38,6 +37,7 @@ class NV_PreviewAnimation:
                 }),
             },
             "optional": {
+                "images": ("IMAGE", {"tooltip": "Image batch to animate [B, H, W, C]"}),
                 "masks": ("MASK", {"tooltip": "Optional mask batch to overlay as alpha"}),
                 "quality": ("INT", {
                     "default": 85,
@@ -55,7 +55,7 @@ class NV_PreviewAnimation:
     CATEGORY = "NV_Utils/Preview"
     DESCRIPTION = "Fast animated preview using individual JPEG frames + JS flipbook player"
 
-    def preview(self, images, fps, masks=None, quality=85):
+    def preview(self, fps, images=None, masks=None, quality=85):
         filename_prefix = "NVAnimPreview" + self.prefix_append
         full_output_folder, filename, counter, subfolder, _ = \
             folder_paths.get_save_image_path(filename_prefix, self.output_dir)
