@@ -127,9 +127,9 @@ function makeButton(text, title) {
 
 /**
  * Encode all loaded frames into a WebM video blob using MediaRecorder.
- * Uses captureStream(0) for manual frame pushing.
- * Note: MediaRecorder records wall-clock time between requestFrame() calls,
- * so we use the actual frameDuration to get correct playback speed.
+ * Uses captureStream() in auto-capture mode (draws trigger capture).
+ * Cross-browser: avoids requestFrame() which is Chrome-only.
+ * Note: encoding runs in ~real-time since MediaRecorder uses wall-clock timing.
  */
 async function exportToWebM(player, progressCb) {
     const { frames, totalFrames, fps, imageWidth, imageHeight } = player;
@@ -145,14 +145,10 @@ async function exportToWebM(player, progressCb) {
     offscreen.height = imageHeight;
     const offCtx = offscreen.getContext("2d");
 
-    const stream = offscreen.captureStream(0);
-    const videoTrack = stream.getVideoTracks()[0];
-    console.log("[NV_PreviewAnimation] captureStream created, videoTrack:", !!videoTrack);
-
-    if (!videoTrack) {
-        console.error("[NV_PreviewAnimation] No video track from captureStream — browser may not support this");
-        return null;
-    }
+    // Auto-capture mode: stream captures whenever canvas is drawn to.
+    // This avoids requestFrame() which only exists in Chrome.
+    const stream = offscreen.captureStream();
+    console.log("[NV_PreviewAnimation] captureStream created (auto mode)");
 
     let mimeType = "video/webm; codecs=vp9";
     if (!MediaRecorder.isTypeSupported(mimeType)) {
@@ -171,7 +167,6 @@ async function exportToWebM(player, progressCb) {
     const chunks = [];
     recorder.ondataavailable = (e) => {
         if (e.data.size > 0) chunks.push(e.data);
-        console.log(`[NV_PreviewAnimation] ondataavailable: chunk ${chunks.length}, size=${e.data.size}`);
     };
 
     recorder.onerror = (e) => {
@@ -188,19 +183,23 @@ async function exportToWebM(player, progressCb) {
             resolve(blob);
         };
 
-        recorder.start(100); // request data every 100ms for progress visibility
-        let i = 0;
+        // Draw first frame, then start recording
+        offCtx.drawImage(frames[0], 0, 0, offscreen.width, offscreen.height);
+        recorder.start(100);
+        let i = 1;
 
         function nextFrame() {
             if (i >= totalFrames) {
-                console.log("[NV_PreviewAnimation] All frames pushed, stopping recorder...");
-                recorder.stop();
+                // Small delay before stopping to let last frame encode
+                setTimeout(() => {
+                    console.log("[NV_PreviewAnimation] All frames pushed, stopping recorder...");
+                    recorder.stop();
+                }, 50);
                 return;
             }
             const img = frames[i];
             if (img) {
                 offCtx.drawImage(img, 0, 0, offscreen.width, offscreen.height);
-                videoTrack.requestFrame();
             } else {
                 console.warn(`[NV_PreviewAnimation] Frame ${i} is null/missing, skipping`);
             }
@@ -210,8 +209,9 @@ async function exportToWebM(player, progressCb) {
             setTimeout(nextFrame, frameDuration);
         }
 
+        if (progressCb) progressCb(1, totalFrames);
         console.log("[NV_PreviewAnimation] Starting frame encoding loop...");
-        nextFrame();
+        setTimeout(nextFrame, frameDuration);
     });
 }
 
