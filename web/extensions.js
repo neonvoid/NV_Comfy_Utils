@@ -12,4 +12,5 @@ import "./bbox_creator.js";
 import "./floating_panel.js";
 import "./variables_panel.js";
 import "./download_video.js";
+import "./preview_animation.js";
 console.log("[NV_Comfy_Utils] All extensions loaded successfully"); 

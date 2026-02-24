@@ -135,13 +135,14 @@ class NV_ContextWindowOptimizer:
             },
         }
 
-    RETURN_TYPES = ("INT", "INT", "INT", "FLOAT", "INT", "STRING")
+    RETURN_TYPES = ("INT", "INT", "INT", "FLOAT", "INT", "FLOAT", "STRING")
     RETURN_NAMES = (
         "context_overlap",          # Pixel frames - plug directly into WAN CW node
         "latent_stride",            # Diagnostic: stride in latent frames
         "min_boundary_distance",    # True worst-case distance from any ref boundary
         "offset_quality",           # 0.0-1.0 (1.0 = no boundary pair closer than half ref stride)
         "num_windows",              # How many context windows this config produces
+        "compute_multiplier",       # Total latent work vs single pass (num_windows * cl / n)
         "summary",                  # Human-readable summary string
     )
     FUNCTION = "optimize"
@@ -187,7 +188,7 @@ class NV_ContextWindowOptimizer:
         # Edge case: video fits in a single context window
         if n_latent <= cl_lat:
             return (
-                0, cl_lat, n_latent, 1.0, 1,
+                0, cl_lat, n_latent, 1.0, 1, 1.0,
                 f"Video ({n_pixel}px={n_latent}lat) fits in one window "
                 f"(CL={cl_lat}lat). No context windows needed."
             )
@@ -197,9 +198,10 @@ class NV_ContextWindowOptimizer:
             default_co_lat = max(cl_lat // 3, 1)
             default_stride = cl_lat - default_co_lat
             num_win = self._count_windows(n_latent, cl_lat, default_co_lat)
+            cm = (num_win * cl_lat / n_latent) if n_latent > 0 else 1.0
             return (
                 _latent_to_pixel(default_co_lat),
-                default_stride, 0, 0.0, num_win,
+                default_stride, 0, 0.0, num_win, round(cm, 3),
                 f"Reference stride <= 0 (overlap >= length). Using default."
             )
 
@@ -239,6 +241,10 @@ class NV_ContextWindowOptimizer:
         max_possible_dist = ref_stride / 2.0
         offset_quality = min(best_min_dist / max_possible_dist, 1.0) if max_possible_dist > 0 else 0.0
 
+        # Compute multiplier: total latent frames processed vs video length
+        # 1.0 = no overlap (each frame processed once), higher = more redundant work
+        compute_mult = (num_windows * cl_lat / n_latent) if n_latent > 0 else 1.0
+
         # Build boundary map for summary
         opt_bounds = _get_boundaries(n_latent, best_stride)
         ref_bounds = _get_boundaries(n_latent, ref_stride)
@@ -251,7 +257,7 @@ class NV_ContextWindowOptimizer:
             f"({len(opt_bounds)} boundaries at {opt_bounds})",
             f"Min boundary distance: {best_min_dist}lat "
             f"({offset_quality:.0%} of optimal {math.floor(max_possible_dist)})",
-            f"Windows: {num_windows}",
+            f"Windows: {num_windows} (compute: {compute_mult:.2f}x)",
             f">> Set context_overlap = {pixel_overlap} in WAN CW node",
         ])
 
@@ -263,6 +269,7 @@ class NV_ContextWindowOptimizer:
             best_min_dist,
             round(offset_quality, 3),
             num_windows,
+            round(compute_mult, 3),
             summary,
         )
 
@@ -283,7 +290,7 @@ class NV_ContextWindowOptimizer:
 
         if ref_stride <= 0:
             default_co_lat = max(cl_lat // 3, 1)
-            return (_latent_to_pixel(default_co_lat), cl_lat - default_co_lat, 0, 0.0, 0,
+            return (_latent_to_pixel(default_co_lat), cl_lat - default_co_lat, 0, 0.0, 0, 0.0,
                     "No frame count provided and reference stride <= 0. Using default.")
 
         max_stride = cl_lat - min_co_lat
@@ -321,7 +328,7 @@ class NV_ContextWindowOptimizer:
             f"Wire IMAGE input for exact optimization."
         )
         print(f"[CW Optimizer] {summary}")
-        return (pixel_overlap, best_stride, best_min_dist, round(offset_quality, 3), 0, summary)
+        return (pixel_overlap, best_stride, best_min_dist, round(offset_quality, 3), 0, 0.0, summary)
 
     @staticmethod
     def _count_windows(n_latent, cl_lat, co_lat):
