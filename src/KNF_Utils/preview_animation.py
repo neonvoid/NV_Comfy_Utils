@@ -86,7 +86,7 @@ class NV_PreviewAnimation:
                 pil_images.append(Image.fromarray(mask_np))
 
         else:
-            return {"ui": {"images": [], "fps": [fps], "frame_count": [0]}}
+            return {"ui": {"frames": [], "fps": [fps], "frame_count": [0]}}
 
         # Save each frame as individual JPEG
         num_frames = len(pil_images)
@@ -112,7 +112,7 @@ class NV_PreviewAnimation:
 
         return {
             "ui": {
-                "images": results,
+                "frames": results,
                 "fps": [fps],
                 "frame_count": [num_frames],
             }

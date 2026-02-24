@@ -125,6 +125,79 @@ function makeButton(text, title) {
 }
 
 
+/**
+ * Encode all loaded frames into a WebM video blob using MediaRecorder.
+ * Uses captureStream(0) for manual frame pushing at the target FPS timing.
+ */
+async function exportToWebM(player) {
+    const { frames, totalFrames, fps, imageWidth, imageHeight } = player;
+    if (!totalFrames || !frames[0]) return null;
+
+    const offscreen = document.createElement("canvas");
+    offscreen.width = imageWidth;
+    offscreen.height = imageHeight;
+    const offCtx = offscreen.getContext("2d");
+
+    const stream = offscreen.captureStream(0);
+    const videoTrack = stream.getVideoTracks()[0];
+
+    let mimeType = "video/webm; codecs=vp9";
+    if (!MediaRecorder.isTypeSupported(mimeType)) {
+        mimeType = "video/webm";
+    }
+
+    const recorder = new MediaRecorder(stream, {
+        mimeType,
+        videoBitsPerSecond: 8_000_000,
+    });
+
+    const chunks = [];
+    recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+
+    return new Promise((resolve) => {
+        recorder.onstop = () => {
+            resolve(new Blob(chunks, { type: "video/webm" }));
+        };
+
+        recorder.start();
+        const frameDuration = 1000 / fps;
+        let i = 0;
+
+        function nextFrame() {
+            if (i >= totalFrames) {
+                recorder.stop();
+                return;
+            }
+            const img = frames[i];
+            if (img) {
+                offCtx.drawImage(img, 0, 0, offscreen.width, offscreen.height);
+                videoTrack.requestFrame();
+            }
+            i++;
+            setTimeout(nextFrame, frameDuration);
+        }
+
+        nextFrame();
+    });
+}
+
+/**
+ * Trigger a browser file download from a Blob.
+ */
+function downloadBlob(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.setAttribute("download", filename);
+    document.body.append(a);
+    a.click();
+    requestAnimationFrame(() => {
+        a.remove();
+        URL.revokeObjectURL(url);
+    });
+}
+
+
 app.registerExtension({
     name: "NV_Comfy_Utils.PreviewAnimation",
 
@@ -331,14 +404,14 @@ app.registerExtension({
 
             const player = this._animPlayer;
             if (!player) return;
-            if (!message?.images?.length) return;
+            if (!message?.frames?.length) return;
 
             // Stop any existing playback
             stopPlayback(player);
 
             // Read metadata
             const fps = message.fps?.[0] ?? 8.0;
-            const frameCount = message.frame_count?.[0] ?? message.images.length;
+            const frameCount = message.frame_count?.[0] ?? message.frames.length;
 
             player.fps = fps;
             player.totalFrames = frameCount;
@@ -353,7 +426,7 @@ app.registerExtension({
             // Preload all frames
             player.frames = new Array(frameCount).fill(null);
 
-            message.images.forEach((imgData, i) => {
+            message.frames.forEach((imgData, i) => {
                 const img = new Image();
                 img.onload = () => {
                     player.frames[i] = img;
@@ -378,6 +451,54 @@ app.registerExtension({
                 };
                 img.src = frameUrl(imgData);
             });
+        };
+
+        // ── Right-click context menu ──
+        const getExtraMenuOptions = nodeType.prototype.getExtraMenuOptions;
+        nodeType.prototype.getExtraMenuOptions = function (canvas, options) {
+            getExtraMenuOptions?.apply(this, arguments);
+
+            const player = this._animPlayer;
+            if (!player || !player.totalFrames) return;
+
+            options.unshift(
+                {
+                    content: `Save as WebM Video (${player.totalFrames} frames)`,
+                    callback: async () => {
+                        const wasPlaying = player.playing;
+                        if (wasPlaying) stopPlayback(player);
+                        player.frameLabel.textContent = "Encoding WebM...";
+
+                        const blob = await exportToWebM(player);
+                        if (blob) {
+                            const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+                            downloadBlob(blob, `NV_preview_${timestamp}.webm`);
+                        }
+
+                        updateLabels(player);
+                        if (wasPlaying) startPlayback(player);
+                    },
+                },
+                {
+                    content: "Save Current Frame",
+                    callback: () => {
+                        const { canvas: c, currentFrame } = player;
+                        c.toBlob((blob) => {
+                            if (blob) {
+                                downloadBlob(blob, `NV_frame_${currentFrame}.png`);
+                            }
+                        }, "image/png");
+                    },
+                },
+                {
+                    content: "Open Current Frame in New Tab",
+                    callback: () => {
+                        const dataUrl = player.canvas.toDataURL("image/png");
+                        window.open(dataUrl, "_blank");
+                    },
+                },
+                null // separator
+            );
         };
 
         // ── Cleanup on node removal ──
