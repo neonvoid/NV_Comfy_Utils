@@ -33,6 +33,8 @@ class FloatingPanel {
         this.dragOffset = { x: 0, y: 0 };
         this.position = { ...DEFAULT_POSITION };
         this.customPatterns = [];
+        this.groupOrder = []; // Persisted array of group titles for manual ordering
+        this.isDraggingGroup = false; // True during group row drag-and-drop
         this.refreshInterval = null;
         this.isVisible = true;
 
@@ -49,6 +51,7 @@ class FloatingPanel {
                 this.position = state.position || { ...DEFAULT_POSITION };
                 this.isCollapsed = state.isCollapsed || false;
                 this.customPatterns = state.customPatterns || [];
+                this.groupOrder = state.groupOrder || [];
                 this.isVisible = state.isVisible !== false;
             }
         } catch (e) {
@@ -62,6 +65,7 @@ class FloatingPanel {
                 position: this.position,
                 isCollapsed: this.isCollapsed,
                 customPatterns: this.customPatterns,
+                groupOrder: this.groupOrder,
                 isVisible: this.isVisible
             };
             localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
@@ -140,9 +144,18 @@ class FloatingPanel {
             display: ${this.isCollapsed ? 'none' : 'block'};
         `;
 
-        // Groups section
+        // Groups section (with reset order button)
         const groupsSection = this.createSection("Groups", "groupsList");
         this.groupsList = groupsSection.list;
+
+        const resetOrderBtn = this.createIconButton("⟳", "Reset to position order", () => {
+            this.groupOrder = [];
+            this.saveState();
+            this.refreshGroups();
+        });
+        resetOrderBtn.style.fontSize = "11px";
+        resetOrderBtn.style.padding = "0 4px";
+        groupsSection.header.appendChild(resetOrderBtn);
 
         // Custom patterns section
         const patternsSection = this.createSection("Custom Patterns", "patternsList");
@@ -244,7 +257,9 @@ class FloatingPanel {
             text-transform: uppercase;
             letter-spacing: 0.5px;
         `;
-        header.textContent = title;
+        const headerLabel = document.createElement("span");
+        headerLabel.textContent = title;
+        header.appendChild(headerLabel);
 
         const list = document.createElement("div");
         list.id = listId;
@@ -253,7 +268,7 @@ class FloatingPanel {
         container.appendChild(header);
         container.appendChild(list);
 
-        return { container, list };
+        return { container, header, list };
     }
 
     createToggleRow(name, isActive, onToggle, onNavigate = null, onRemove = null) {
@@ -408,7 +423,7 @@ class FloatingPanel {
     }
 
     refreshGroups() {
-        if (!app.graph) return;
+        if (!app.graph || this.isDraggingGroup) return;
 
         const groups = app.graph._groups || [];
         this.groupsList.innerHTML = "";
@@ -421,15 +436,34 @@ class FloatingPanel {
             return;
         }
 
-        // Sort groups by position (top-left first)
-        const sortedGroups = [...groups].sort((a, b) => {
-            const aY = Math.floor(a._pos[1] / 30);
-            const bY = Math.floor(b._pos[1] / 30);
-            if (aY === bY) {
-                return Math.floor(a._pos[0] / 30) - Math.floor(b._pos[0] / 30);
-            }
-            return aY - bY;
-        });
+        // Sort groups: use custom order if available, fall back to position sort
+        let sortedGroups;
+        if (this.groupOrder.length > 0) {
+            const orderMap = new Map(this.groupOrder.map((title, i) => [title, i]));
+            sortedGroups = [...groups].sort((a, b) => {
+                const aTitle = a.title || "Untitled Group";
+                const bTitle = b.title || "Untitled Group";
+                const aIdx = orderMap.has(aTitle) ? orderMap.get(aTitle) : Infinity;
+                const bIdx = orderMap.has(bTitle) ? orderMap.get(bTitle) : Infinity;
+                if (aIdx !== bIdx) return aIdx - bIdx;
+                // Tie-break: position sort for groups not in custom order
+                const aY = Math.floor(a._pos[1] / 30);
+                const bY = Math.floor(b._pos[1] / 30);
+                if (aY === bY) {
+                    return Math.floor(a._pos[0] / 30) - Math.floor(b._pos[0] / 30);
+                }
+                return aY - bY;
+            });
+        } else {
+            sortedGroups = [...groups].sort((a, b) => {
+                const aY = Math.floor(a._pos[1] / 30);
+                const bY = Math.floor(b._pos[1] / 30);
+                if (aY === bY) {
+                    return Math.floor(a._pos[0] / 30) - Math.floor(b._pos[0] / 30);
+                }
+                return aY - bY;
+            });
+        }
 
         for (const group of sortedGroups) {
             // Recompute nodes in group
@@ -438,9 +472,10 @@ class FloatingPanel {
             }
 
             const hasActiveNodes = (group._nodes || []).some(n => n.mode === MODE_ALWAYS);
+            const groupTitle = group.title || "Untitled Group";
 
             const row = this.createToggleRow(
-                group.title || "Untitled Group",
+                groupTitle,
                 hasActiveNodes,
                 (enable) => this.toggleGroup(group, enable),
                 () => this.navigateToGroup(group)
@@ -450,6 +485,85 @@ class FloatingPanel {
             if (group.color) {
                 row.style.borderLeft = `3px solid ${group.color}`;
             }
+
+            // Make row draggable for reordering
+            row.draggable = true;
+            row.dataset.groupTitle = groupTitle;
+            row.style.cursor = "grab";
+
+            row.addEventListener("dragstart", (e) => {
+                this.isDraggingGroup = true;
+                this._draggedGroupTitle = groupTitle;
+                row.style.opacity = "0.4";
+                e.dataTransfer.effectAllowed = "move";
+                e.dataTransfer.setData("text/plain", groupTitle);
+            });
+
+            row.addEventListener("dragend", () => {
+                this.isDraggingGroup = false;
+                row.style.opacity = "1";
+                // Remove any lingering drop indicators
+                this.groupsList.querySelectorAll("[data-group-title]").forEach(el => {
+                    el.style.borderTop = "";
+                    el.style.borderBottom = "";
+                });
+            });
+
+            row.addEventListener("dragover", (e) => {
+                e.preventDefault();
+                e.dataTransfer.dropEffect = "move";
+                // Show drop indicator
+                const rect = row.getBoundingClientRect();
+                const midY = rect.top + rect.height / 2;
+                this.groupsList.querySelectorAll("[data-group-title]").forEach(el => {
+                    el.style.borderTop = "";
+                    el.style.borderBottom = "";
+                });
+                if (e.clientY < midY) {
+                    row.style.borderTop = "2px solid #5af";
+                } else {
+                    row.style.borderBottom = "2px solid #5af";
+                }
+            });
+
+            row.addEventListener("dragleave", () => {
+                row.style.borderTop = "";
+                row.style.borderBottom = "";
+            });
+
+            row.addEventListener("drop", (e) => {
+                e.preventDefault();
+                row.style.borderTop = "";
+                row.style.borderBottom = "";
+
+                const draggedTitle = this._draggedGroupTitle;
+                const targetTitle = groupTitle;
+                if (!draggedTitle || draggedTitle === targetTitle) return;
+
+                // Build current visual order from DOM
+                const currentOrder = Array.from(
+                    this.groupsList.querySelectorAll("[data-group-title]")
+                ).map(el => el.dataset.groupTitle);
+
+                const fromIdx = currentOrder.indexOf(draggedTitle);
+                const toIdx = currentOrder.indexOf(targetTitle);
+                if (fromIdx === -1 || toIdx === -1) return;
+
+                // Determine insert position based on mouse position
+                const rect = row.getBoundingClientRect();
+                const insertAfter = e.clientY >= rect.top + rect.height / 2;
+
+                // Remove dragged item and reinsert
+                currentOrder.splice(fromIdx, 1);
+                let insertIdx = currentOrder.indexOf(targetTitle);
+                if (insertAfter) insertIdx++;
+                currentOrder.splice(insertIdx, 0, draggedTitle);
+
+                this.groupOrder = currentOrder;
+                this.saveState();
+                this.isDraggingGroup = false;
+                this.refreshGroups();
+            });
 
             this.groupsList.appendChild(row);
         }
