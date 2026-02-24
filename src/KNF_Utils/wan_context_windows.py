@@ -72,9 +72,11 @@ def make_boundary_aware_fuse(base_fuse_func, ref_stride):
     blending). At positions far from reference boundaries, weights are unchanged
     from the base method.
 
-    The blend_radius is handler.context_overlap -- the zone where windows overlap
-    and blending occurs. Within this radius of any reference boundary, the weight
-    is lerped toward flat.
+    The blend_radius starts as handler.context_overlap (the zone where windows
+    overlap and blending occurs), then is capped to ref_stride // 2 to prevent
+    adjacent reference boundary zones from overlapping. Without this cap, dense
+    reference boundaries would modify nearly all frames, destroying the pyramid
+    weighting that gives center frames priority.
 
     Args:
         base_fuse_func: Original fuse function (pyramid, flat, overlap-linear).
@@ -108,8 +110,13 @@ def make_boundary_aware_fuse(base_fuse_func, ref_stride):
             weights = list(base)
 
         # Blend radius: within this distance of a ref boundary, lerp toward flat.
-        # context_overlap is the natural choice -- it's where windows overlap.
+        # Start with context_overlap (the zone where windows overlap), then cap
+        # to half the reference stride so affected zones from adjacent reference
+        # boundaries don't overlap. Without this cap, dense reference boundaries
+        # (e.g. stride=7 with blend_radius=5) modify ~88% of all frames,
+        # effectively turning pyramid into flat blending everywhere.
         blend_radius = handler.context_overlap if handler is not None else length // 4
+        blend_radius = min(blend_radius, max(ref_stride // 2, 1))
         if blend_radius <= 0:
             return base
 
@@ -232,10 +239,13 @@ class NV_WanContextWindows:
                 base_fuse_func = FUSE_MAPPING[fuse_method]
                 wrapped_func = make_boundary_aware_fuse(base_fuse_func, ref_stride)
                 fuse = ContextFuseMethod(name=fuse_method, func=wrapped_func)
+                # Log effective blend_radius for diagnostics
+                effective_blend = min(co_lat, max(ref_stride // 2, 1))
                 logger.info(
                     f"[NV_WanContextWindows] Boundary-aware fuse: "
                     f"base={fuse_method}, ref_stride={ref_stride}lat "
-                    f"(ref_cl={ref_cl_lat}, ref_co={ref_co_lat})"
+                    f"(ref_cl={ref_cl_lat}, ref_co={ref_co_lat}), "
+                    f"blend_radius={effective_blend}lat"
                 )
             else:
                 fuse = get_matching_fuse_method(fuse_method)

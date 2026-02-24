@@ -94,8 +94,9 @@ class NV_ContextWindowOptimizer:
     worked at a lower resolution pass may OOM at higher resolution.
 
     Wire your control video (IMAGE) or total_frames to provide the video length.
-    The node brute-forces every candidate stride and picks the one with the
-    best boundary separation. Ties favor more overlap (better blending).
+    The node picks the smallest stride (most overlap) that avoids exact
+    boundary collision with the reference pass. More overlap = gentler
+    pyramid blending = fewer artifacts, even at the cost of boundary distance.
 
     Outputs context_overlap in pixel frames, ready to plug into
     NV WAN Context Windows or WAN Context Windows (Manual).
@@ -222,24 +223,35 @@ class NV_ContextWindowOptimizer:
         if max_stride < min_stride:
             max_stride = min_stride
 
-        # Brute-force: max boundary distance, tiebreak = more overlap (smaller stride)
+        # Overlap-first: pick smallest stride (most overlap) that doesn't have
+        # exact boundary collision (min_dist > 0). Empirical finding: larger blend
+        # zones matter more than boundary distance — a gentle pyramid over 9 frames
+        # masks disagreements better than a steep pyramid over 5 frames, even if
+        # boundaries align slightly closer to reference positions.
+        # Fallback: if ALL strides collide, pick the one with max boundary distance.
         best_stride = None
         best_min_dist = -1
+        fallback_stride = None
+        fallback_min_dist = -1
 
         for s in range(min_stride, max_stride + 1):
             min_dist = _actual_min_distance(n_latent, s, ref_stride)
 
-            if min_dist > best_min_dist:
-                best_min_dist = min_dist
+            # Track best boundary distance as fallback
+            if min_dist > fallback_min_dist or (
+                min_dist == fallback_min_dist and fallback_stride is not None and s < fallback_stride
+            ):
+                fallback_min_dist = min_dist
+                fallback_stride = s
+
+            # Primary: first non-colliding stride = most overlap
+            if best_stride is None and min_dist > 0:
                 best_stride = s
-            elif min_dist == best_min_dist and best_stride is not None:
-                # Tie-break: prefer smaller stride = more overlap = better blending
-                if s < best_stride:
-                    best_stride = s
+                best_min_dist = min_dist
 
         if best_stride is None:
-            best_stride = max(1, max_stride)
-            best_min_dist = 0
+            best_stride = fallback_stride if fallback_stride is not None else max(1, max_stride)
+            best_min_dist = fallback_min_dist if fallback_min_dist >= 0 else 0
 
         # Compute outputs
         latent_overlap = cl_lat - best_stride
@@ -307,22 +319,31 @@ class NV_ContextWindowOptimizer:
         if max_stride < min_stride:
             max_stride = min_stride
 
+        # Overlap-first: smallest stride with non-colliding boundaries
         best_stride = None
         best_min_dist = -1
+        fallback_stride = None
+        fallback_min_dist = -1
+
         for s in range(min_stride, max_stride + 1):
             remainder = s % ref_stride
             min_dist = min(remainder, ref_stride - remainder)
-            if min_dist > best_min_dist:
-                best_min_dist = min_dist
+
+            # Track best distance as fallback
+            if min_dist > fallback_min_dist or (
+                min_dist == fallback_min_dist and fallback_stride is not None and s < fallback_stride
+            ):
+                fallback_min_dist = min_dist
+                fallback_stride = s
+
+            # Primary: first non-colliding stride
+            if best_stride is None and min_dist > 0:
                 best_stride = s
-            elif min_dist == best_min_dist and best_stride is not None:
-                # Tie-break: prefer smaller stride = more overlap
-                if s < best_stride:
-                    best_stride = s
+                best_min_dist = min_dist
 
         if best_stride is None:
-            best_stride = max(1, max_stride)
-            best_min_dist = 0
+            best_stride = fallback_stride if fallback_stride is not None else max(1, max_stride)
+            best_min_dist = fallback_min_dist if fallback_min_dist >= 0 else 0
 
         latent_overlap = cl_lat - best_stride
         pixel_overlap = _latent_to_pixel(latent_overlap) if latent_overlap > 0 else 0
