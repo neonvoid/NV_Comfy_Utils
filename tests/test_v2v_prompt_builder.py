@@ -19,6 +19,7 @@ def builder():
 @pytest.fixture
 def default_required():
     return {
+        "task_mode": "full_restyle",
         "trigger_word": "ohwx",
         "style_description": "cinematic film grain with warm tones",
         "subject_count": 1,
@@ -26,6 +27,21 @@ def default_required():
         "denoise_strength": 0.65,
         "word_count_min": 80,
         "word_count_max": 120,
+    }
+
+
+@pytest.fixture
+def cs_required():
+    """Default required args for character_swap mode."""
+    return {
+        "task_mode": "character_swap",
+        "trigger_word": "GO1DNITE",
+        "style_description": "",
+        "subject_count": 1,
+        "motion_intensity": "high",
+        "denoise_strength": 1.0,
+        "word_count_min": 200,
+        "word_count_max": 300,
     }
 
 
@@ -57,6 +73,7 @@ def test_input_types_structure():
     required = input_types["required"]
     optional = input_types["optional"]
 
+    assert "task_mode" in required
     assert "trigger_word" in required
     assert "style_description" in required
     assert "subject_count" in required
@@ -382,3 +399,98 @@ def test_select_denoise_notes_boundaries():
 def test_build_chunked_section_single():
     """Single mode returns empty string."""
     assert _build_chunked_section("single", 0, "") == ""
+
+
+# ---------------------------------------------------------------------------
+# Task mode: character_swap
+# ---------------------------------------------------------------------------
+
+def test_character_swap_system_role(builder, cs_required):
+    """character_swap system role mentions character replacement / inpainting."""
+    system_instruction, _, _ = builder.build_prompt(**cs_required)
+    assert "character replacement" in system_instruction.lower() or "inpainting" in system_instruction.lower()
+
+
+def test_character_swap_word_budget_columns(builder, cs_required):
+    """character_swap word budget uses Character/Pose columns, not Environment/Materials."""
+    system_instruction, _, _ = builder.build_prompt(**cs_required)
+    assert "Character" in system_instruction
+    assert "Pose/Action" in system_instruction
+
+
+def test_character_swap_output_format_ordering(builder, cs_required):
+    """character_swap output format leads with character identity."""
+    system_instruction, _, _ = builder.build_prompt(**cs_required)
+    # Character identity should appear before scene context in the output format ordering
+    char_pos = system_instruction.find("Character identity")
+    scene_pos = system_instruction.find("Scene context for spatial")
+    assert char_pos != -1 and scene_pos != -1
+    assert char_pos < scene_pos
+
+
+def test_character_swap_trigger_word_in_system(builder, cs_required):
+    """Trigger word appears in character_swap system instruction."""
+    system_instruction, _, _ = builder.build_prompt(**cs_required)
+    assert "GO1DNITE" in system_instruction
+
+
+def test_character_swap_prompt_has_replace_target(builder, cs_required):
+    """character_swap prompt template uses 'Replace Target' label."""
+    _, prompt_text, _ = builder.build_prompt(
+        **cs_required,
+        scene_subjects="blonde man in blank tank top",
+    )
+    assert "Replace Target" in prompt_text
+    assert "blonde man in blank tank top" in prompt_text
+
+
+def test_character_swap_prompt_says_character_replacement(builder, cs_required):
+    """character_swap prompt template says 'character replacement caption'."""
+    _, prompt_text, _ = builder.build_prompt(**cs_required)
+    assert "character replacement" in prompt_text.lower()
+
+
+def test_character_swap_character_tokens(builder, cs_required):
+    """character_swap uses 'Character Replacement Tokens' section header."""
+    system_instruction, _, _ = builder.build_prompt(
+        **cs_required,
+        character_tokens="GO1DNITE: Knight in golden armor with red cape",
+    )
+    assert "Character Replacement Tokens" in system_instruction
+    assert "GO1DNITE" in system_instruction
+    assert "golden armor" in system_instruction
+
+
+def test_character_swap_no_tokens_no_section(builder, cs_required):
+    """No character tokens = no Character Replacement Tokens section."""
+    system_instruction, _, _ = builder.build_prompt(**cs_required)
+    assert "Character Replacement Tokens" not in system_instruction
+
+
+def test_character_swap_debug_info_shows_mode(builder, cs_required):
+    """Debug info shows task mode for character_swap."""
+    _, _, debug_info = builder.build_prompt(**cs_required)
+    assert "Task Mode: character_swap" in debug_info
+
+
+def test_full_restyle_debug_info_shows_mode(builder, default_required):
+    """Debug info shows task mode for full_restyle."""
+    _, _, debug_info = builder.build_prompt(**default_required)
+    assert "Task Mode: full_restyle" in debug_info
+
+
+def test_full_restyle_unchanged_regression(builder, default_required):
+    """full_restyle mode still produces V2V style transfer language."""
+    system_instruction, prompt_text, _ = builder.build_prompt(**default_required)
+    assert "style LoRA" in system_instruction.lower() or "style transfer" in system_instruction.lower()
+    assert "V2V caption" in prompt_text
+
+
+def test_character_swap_chunked_works(builder, cs_required):
+    """Chunked processing works with character_swap mode."""
+    _, prompt_text, _ = builder.build_prompt(
+        **cs_required,
+        processing_mode="chunked",
+        chunk_index=0,
+    )
+    assert "establishing baseline" in prompt_text.lower() or "first chunk" in prompt_text.lower()

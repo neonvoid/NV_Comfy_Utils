@@ -6,6 +6,8 @@ parameters. Designed to feed directly into GeminiVideoCaptioner (or any LLM
 captioner that accepts system_instruction + prompt_text).
 
 Supports:
+- Task mode selection: 'full_restyle' (scene-wide style transfer) or
+  'character_swap' (targeted character replacement via inpainting)
 - Automatic word budget selection based on subject count and motion intensity
 - Denoise-strength-aware analysis priority weighting
 - Chunked processing mode with temporal continuity from previous chunk captions
@@ -143,6 +145,140 @@ but be aware it is part of a longer video sequence."""
 
 
 # ---------------------------------------------------------------------------
+# Character Swap mode template constants
+# ---------------------------------------------------------------------------
+
+_CS_SYSTEM_ROLE = """\
+You are a video analysis assistant guiding character replacement in a \
+video inpainting pipeline. Analyze the input video to produce a \
+character-focused description that enables the inpainting model to \
+replace the target subject with a LoRA-trained character while \
+preserving the scene environment, motion, and composition."""
+
+_CS_ANALYSIS_PRIORITIES = """\
+## Analysis Priorities
+
+- **Character identity**: Describe the replacement character using the exact \
+LoRA trigger word and character token. Detail their physical attributes, \
+clothing, accessories, and distinguishing features so the model renders the \
+correct identity.{denoise_structural_note}
+- **Pose and motion continuity**: The replacement character must match the \
+original subject's body position, gestures, gait, and motion arc. Describe \
+the pose precisely — limb positions, weight distribution, facing direction.{denoise_surface_note}
+- **Scene integration**: Provide enough environment context that the replacement \
+looks naturally placed — lighting direction on the character, depth and scale \
+relative to surroundings, ground contact, and any occluding objects.
+- **Temporal consistency**: The character's appearance must remain stable across \
+frames. Flag moments where occlusion, fast motion, or angle changes could \
+break identity continuity.{temporal_note}
+{motion_priority_clause}"""
+
+_CS_OUTPUT_CONSTRAINTS = """\
+## Output Constraints
+
+- Lead with the replacement character — trigger word first, then appearance details.
+- Include scene context only as needed for spatial grounding, not as primary content.
+- Do not over-describe the unchanged environment — focus the word budget on the \
+character's appearance, pose, and actions.
+- Describe the character's pose and action within the scene, not the scene itself.
+- Use the character token name consistently throughout — never fall back to generic \
+pronouns after the initial introduction.
+- Absorb the replacement target description naturally — describe what the \
+replacement character is doing in that position, not what they are replacing.
+- Use plain, technical language — no poetic flourishes, metaphors, or dramatic framing.
+- Do not infer narrative, emotion, or intent beyond observable action.
+- Do not add details that are not clearly visible.
+- Be precise and factual."""
+
+_CS_WORD_BUDGET = """\
+## Word Budget Allocation
+
+Distribute the target word count based on these priorities:
+
+| Condition | Character | Pose/Action | Scene Context | Temporal |
+|-----------|-----------|-------------|---------------|----------|
+| 1 subject, low motion | 50% | 15% | 20% | 15% |
+| 1 subject, low/medium motion | 45% | 20% | 15% | 20% |
+| 1 subject, high motion | 40% | 25% | 10% | 25% |
+| 2+ subjects, low motion | 45% | 15% | 20% | 20% |
+| 2+ subjects, low/medium motion | 40% | 20% | 15% | 25% |
+| 2+ subjects, high motion | 35% | 25% | 15% | 25% |
+| No subjects (environment only) | 40% | 0% | 25% | 35% |
+
+**Active row for this video**: {budget_row_label}
+
+These are guidelines, not rigid constraints. Prioritize whatever aspect of the \
+character is most critical for a convincing replacement."""
+
+_CS_OUTPUT_FORMAT = """\
+## Output Format
+
+{word_count_min}-{word_count_max} words of flowing prose. \
+{trigger_word_clause}
+
+Cover in this order:
+1. Character identity (trigger word + appearance details)
+2. Pose, action, and motion arc
+3. Scene context for spatial grounding
+4. Temporal risk areas for identity consistency"""
+
+_CS_PROMPT_TEMPLATE = """\
+Analyze this video and generate a character replacement caption using these parameters:
+
+**Trigger Word**: {trigger_word_display}
+**Style**: {style_display}
+**Replace Target**: {subjects_display}
+**Scene Context**:
+- Setting: {setting_display}
+- Props: {props_display}
+**Video Duration**: {duration_display}
+**Camera**: {camera_display}
+**Subject Count**: {subject_count}
+**Motion Intensity**: {motion_intensity}
+**Denoise Strength**: {denoise_strength}
+**Target Word Count**: {word_count_min}-{word_count_max} words
+{chunked_section}"""
+
+_CS_CHARACTER_RECOGNITION = """\
+## Character Replacement Tokens
+
+Use these exact token names when describing the replacement character:
+
+| Token | Description |
+|-------|-------------|
+{character_table_rows}
+
+Always use the character token for the replacement subject. The token must \
+appear as the first identifier when introducing the character."""
+
+
+# ---------------------------------------------------------------------------
+# Mode template registry
+# ---------------------------------------------------------------------------
+
+_MODE_TEMPLATES = {
+    "full_restyle": {
+        "system_role": _SYSTEM_ROLE,
+        "analysis_priorities": _SYSTEM_ANALYSIS_PRIORITIES,
+        "output_constraints": _SYSTEM_OUTPUT_CONSTRAINTS,
+        "word_budget": _SYSTEM_WORD_BUDGET,
+        "output_format": _SYSTEM_OUTPUT_FORMAT,
+        "prompt_template": _PROMPT_TEMPLATE,
+        "character_recognition": _SYSTEM_CHARACTER_RECOGNITION,
+    },
+    "character_swap": {
+        "system_role": _CS_SYSTEM_ROLE,
+        "analysis_priorities": _CS_ANALYSIS_PRIORITIES,
+        "output_constraints": _CS_OUTPUT_CONSTRAINTS,
+        "word_budget": _CS_WORD_BUDGET,
+        "output_format": _CS_OUTPUT_FORMAT,
+        "prompt_template": _CS_PROMPT_TEMPLATE,
+        "character_recognition": _CS_CHARACTER_RECOGNITION,
+    },
+}
+
+
+# ---------------------------------------------------------------------------
 # Helper functions
 # ---------------------------------------------------------------------------
 
@@ -271,6 +407,10 @@ class NV_V2VPromptBuilder:
     def INPUT_TYPES(cls):
         return {
             "required": {
+                "task_mode": (list(_MODE_TEMPLATES.keys()), {
+                    "default": "full_restyle",
+                    "tooltip": "Prompt generation mode. 'full_restyle' = full scene V2V style transfer. 'character_swap' = targeted character replacement via inpainting."
+                }),
                 "trigger_word": ("STRING", {
                     "default": "",
                     "tooltip": "LoRA trigger word that begins every output caption (e.g., 'ohwx', 'N1TEF1TESTLY3'). Leave empty if no trigger word needed."
@@ -371,16 +511,16 @@ class NV_V2VPromptBuilder:
     FUNCTION = "build_prompt"
     CATEGORY = "NV_Utils/Prompt"
     DESCRIPTION = (
-        "Assemble a structured V2V LoRA captioning prompt from individual parameters. "
+        "Assemble a structured V2V captioning prompt from individual parameters. "
+        "Supports multiple task modes: 'full_restyle' for scene-wide style transfer, "
+        "'character_swap' for targeted character replacement via inpainting. "
         "Outputs system_instruction and prompt_text that connect directly to "
-        "Multi-API Video Captioner. Supports denoise-aware analysis priorities, "
-        "word budget allocation, character token tables, and chunked processing "
-        "mode for temporal continuity."
+        "Multi-API Video Captioner."
     )
 
-    def build_prompt(self, trigger_word, style_description, subject_count,
-                     motion_intensity, denoise_strength, word_count_min,
-                     word_count_max, **kwargs):
+    def build_prompt(self, task_mode, trigger_word, style_description,
+                     subject_count, motion_intensity, denoise_strength,
+                     word_count_min, word_count_max, **kwargs):
         # Extract optional inputs
         scene_subjects = kwargs.get("scene_subjects", "").strip()
         scene_setting = kwargs.get("scene_setting", "").strip()
@@ -400,6 +540,9 @@ class NV_V2VPromptBuilder:
         if word_count_min > word_count_max:
             word_count_min, word_count_max = word_count_max, word_count_min
 
+        # Resolve mode templates
+        templates = _MODE_TEMPLATES.get(task_mode, _MODE_TEMPLATES["full_restyle"])
+
         # ----- Build system_instruction -----
         if custom_system_override:
             # Substitute known placeholders in override text
@@ -412,6 +555,7 @@ class NV_V2VPromptBuilder:
             )
         else:
             system_instruction = self._assemble_system_instruction(
+                templates=templates,
                 trigger_word=trigger_word,
                 subject_count=subject_count,
                 motion_intensity=motion_intensity,
@@ -424,6 +568,7 @@ class NV_V2VPromptBuilder:
 
         # ----- Build prompt_text -----
         prompt_text = self._assemble_prompt_text(
+            templates=templates,
             trigger_word=trigger_word,
             style_description=style_description,
             scene_subjects=scene_subjects,
@@ -449,6 +594,7 @@ class NV_V2VPromptBuilder:
 
         debug_info = (
             f"=== NV_V2VPromptBuilder Debug ===\n"
+            f"Task Mode: {task_mode}\n"
             f"Trigger Word: {trigger_word or '(none)'}\n"
             f"Style: {style_description[:60] or '(none)'}\n"
             f"Subjects: {subject_count} | Motion: {motion_intensity} | Denoise: {denoise_strength}\n"
@@ -463,22 +609,23 @@ class NV_V2VPromptBuilder:
             f"Prompt Text Length: {len(prompt_text)} chars"
         )
 
-        print(f"[NV_V2VPromptBuilder] Built prompt ({len(system_instruction)} chars system, {len(prompt_text)} chars prompt)")
+        print(f"[NV_V2VPromptBuilder] Built {task_mode} prompt ({len(system_instruction)} chars system, {len(prompt_text)} chars prompt)")
 
         return (system_instruction, prompt_text, debug_info)
 
-    def _assemble_system_instruction(self, trigger_word, subject_count,
-                                     motion_intensity, denoise_strength,
-                                     word_count_min, word_count_max,
-                                     character_tokens, video_duration):
-        """Assemble the full system instruction from template sections."""
+    def _assemble_system_instruction(self, templates, trigger_word,
+                                     subject_count, motion_intensity,
+                                     denoise_strength, word_count_min,
+                                     word_count_max, character_tokens,
+                                     video_duration):
+        """Assemble the full system instruction from mode-specific template sections."""
         denoise_notes = _select_denoise_notes(denoise_strength)
         motion_clause = _select_motion_clause(motion_intensity)
         temporal_note = _build_temporal_note(video_duration)
         budget_label = _select_budget_row_label(subject_count, motion_intensity)
 
         # Section 2: Analysis Priorities
-        analysis_priorities = _SYSTEM_ANALYSIS_PRIORITIES.format(
+        analysis_priorities = templates["analysis_priorities"].format(
             denoise_structural_note=denoise_notes["structural_note"],
             denoise_surface_note=denoise_notes["surface_note"],
             temporal_note=temporal_note,
@@ -486,13 +633,13 @@ class NV_V2VPromptBuilder:
         )
 
         # Section 4: Word Budget
-        word_budget = _SYSTEM_WORD_BUDGET.format(budget_row_label=budget_label)
+        word_budget = templates["word_budget"].format(budget_row_label=budget_label)
 
         # Section 5: Character Recognition (conditional)
         char_table_rows = _build_character_table(character_tokens)
         character_section = ""
         if char_table_rows:
-            character_section = "\n\n" + _SYSTEM_CHARACTER_RECOGNITION.format(
+            character_section = "\n\n" + templates["character_recognition"].format(
                 character_table_rows=char_table_rows
             )
 
@@ -502,7 +649,7 @@ class NV_V2VPromptBuilder:
         else:
             trigger_clause = "Begin directly with the scene description. No trigger word is needed."
 
-        output_format = _SYSTEM_OUTPUT_FORMAT.format(
+        output_format = templates["output_format"].format(
             word_count_min=word_count_min,
             word_count_max=word_count_max,
             trigger_word_clause=trigger_clause,
@@ -510,9 +657,9 @@ class NV_V2VPromptBuilder:
 
         # Assemble all sections
         sections = [
-            _SYSTEM_ROLE,
+            templates["system_role"],
             analysis_priorities,
-            _SYSTEM_OUTPUT_CONSTRAINTS,
+            templates["output_constraints"],
             word_budget,
             output_format,
         ]
@@ -528,19 +675,20 @@ class NV_V2VPromptBuilder:
 
         return result
 
-    def _assemble_prompt_text(self, trigger_word, style_description,
-                              scene_subjects, scene_setting, scene_props,
-                              camera_behavior, video_duration, subject_count,
+    def _assemble_prompt_text(self, templates, trigger_word,
+                              style_description, scene_subjects,
+                              scene_setting, scene_props, camera_behavior,
+                              video_duration, subject_count,
                               motion_intensity, denoise_strength,
                               word_count_min, word_count_max,
                               processing_mode, chunk_index,
                               previous_chunk_prompt):
-        """Assemble the per-video prompt text."""
+        """Assemble the per-video prompt text using mode-specific template."""
         chunked_section = _build_chunked_section(
             processing_mode, chunk_index, previous_chunk_prompt
         )
 
-        prompt_text = _PROMPT_TEMPLATE.format(
+        prompt_text = templates["prompt_template"].format(
             trigger_word_display=trigger_word or "(none)",
             style_display=style_description or "(not specified — observe and describe the visual style)",
             subjects_display=scene_subjects or "(observe and describe)",

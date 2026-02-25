@@ -2,6 +2,12 @@ import { app } from "../../scripts/app.js";
 
 // Clone With Connections — Alt+Shift+Drag to clone a node while preserving input connections.
 // Normal Alt+Drag behavior is unchanged (clone without connections).
+//
+// How it works:
+//   The ComfyUI Vue frontend handles Alt+Drag cloning via LGraphCanvas.cloneNodes() →
+//   _deserializeItems() → graph.add(). We use a capture-phase pointerdown listener to
+//   detect Alt+Shift, capture the original node's input connections, then temporarily
+//   hook graph.add so that when the clone is added, we re-establish those connections.
 
 const LOG_PREFIX = "[CloneWithConnections]";
 
@@ -56,82 +62,87 @@ function restoreInputConnections(clone, connections, graph) {
     console.log(LOG_PREFIX, `Restored ${restored}/${connections.length} input connections`);
 }
 
+// Convert pointer event to canvas-space coordinates
+function eventToCanvasPos(e, canvas) {
+    // Method 1: Use graph_mouse (set by processMouseMove, very close to click position)
+    if (canvas.graph_mouse) {
+        return canvas.graph_mouse;
+    }
+    // Method 2: Manual conversion via DragAndScale
+    const ds = canvas.ds;
+    const canvasEl = canvas.canvas;
+    if (ds && canvasEl) {
+        const rect = canvasEl.getBoundingClientRect();
+        const x = (e.clientX - rect.left - ds.offset[0]) / ds.scale;
+        const y = (e.clientY - rect.top - ds.offset[1]) / ds.scale;
+        return [x, y];
+    }
+    return null;
+}
+
 app.registerExtension({
     name: "NV_Comfy_Utils.CloneWithConnections",
 
     setup() {
-        // State for the pending connection copy (set on Alt+Shift mousedown, consumed on graph.add)
-        let pending = null;
+        // Track shift key state independently (pointerdown event doesn't always
+        // reflect shiftKey reliably across all browsers/compositors)
+        let shiftHeld = false;
+        document.addEventListener("keydown", (e) => { if (e.key === "Shift") shiftHeld = true; }, true);
+        document.addEventListener("keyup", (e) => { if (e.key === "Shift") shiftHeld = false; }, true);
+        window.addEventListener("blur", () => { shiftHeld = false; });
 
-        const origProcessMouseDown = LGraphCanvas.prototype.processMouseDown;
-        LGraphCanvas.prototype.processMouseDown = function (e) {
-            // Clean up any leftover hook from a previous Alt+Shift click that never dragged
-            if (pending) {
-                this.graph.add = pending.origAdd;
-                pending = null;
-            }
+        // Capture-phase pointerdown fires BEFORE the Vue handler that triggers cloneNodes.
+        // We use it to detect Alt+Shift, find the node, and hook graph.add.
+        document.addEventListener("pointerdown", function (e) {
+            if (!e.altKey || !shiftHeld || e.ctrlKey) return;
 
-            // Alt+Shift+Click (no Ctrl) on a node → prepare to copy connections after clone
-            if (
-                e.altKey &&
-                e.shiftKey &&
-                !e.ctrlKey &&
-                LiteGraph.alt_drag_do_clone_nodes &&
-                this.allow_interaction
-            ) {
-                // Convert screen coords to canvas space
-                let canvasPos;
-                if (typeof this.convertEventToCanvasOffset === "function") {
-                    canvasPos = this.convertEventToCanvasOffset(e);
-                } else if (this.ds && typeof this.ds.convertOffsetToCanvas === "function") {
-                    canvasPos = this.ds.convertOffsetToCanvas(e.offsetX, e.offsetY);
-                } else {
-                    canvasPos = this.graph_mouse;
+            const canvas = app.canvas;
+            const graph = app.graph;
+            if (!canvas || !graph) return;
+
+            // Find the node under the cursor
+            const pos = eventToCanvasPos(e, canvas);
+            if (!pos) return;
+
+            const node = graph.getNodeOnPos(pos[0], pos[1]);
+            if (!node) return;
+
+            const connections = captureInputConnections(node, graph);
+            if (connections.length === 0) return;
+
+            console.log(
+                LOG_PREFIX,
+                `Captured ${connections.length} input connections from "${node.type}" (id=${node.id})`
+            );
+
+            // Hook graph.add — the clone path (cloneNodes → _deserializeItems) calls
+            // graph.add(node) synchronously for each deserialized node.
+            const origAdd = graph.add;
+            const nodeType = node.type;
+
+            const hookFn = function (newNode, ...args) {
+                const result = origAdd.call(graph, newNode, ...args);
+
+                // Only restore connections if this is actually the clone (matching type)
+                if (newNode.type === nodeType) {
+                    console.log(LOG_PREFIX, "Clone detected, restoring input connections...");
+                    restoreInputConnections(newNode, connections, graph);
+                    graph.setDirtyCanvas(true, true);
                 }
 
-                if (canvasPos) {
-                    const node = this.graph.getNodeOnPos(canvasPos[0], canvasPos[1]);
+                return result;
+            };
 
-                    if (node) {
-                        const connections = captureInputConnections(node, this.graph);
+            graph.add = hookFn;
 
-                        if (connections.length > 0) {
-                            const graph = this.graph;
-                            const origAdd = graph.add;
-
-                            pending = { origAdd };
-
-                            // Temporarily hook graph.add to intercept the clone being added
-                            graph.add = function (newNode, skipComputeOrder) {
-                                // Restore immediately
-                                graph.add = pending.origAdd;
-                                pending = null;
-
-                                // Call the real graph.add
-                                const result = origAdd.call(graph, newNode, skipComputeOrder);
-
-                                // Copy input connections to the clone
-                                console.log(LOG_PREFIX, "Clone added, restoring input connections...");
-                                restoreInputConnections(newNode, connections, graph);
-
-                                // Force visual redraw of new links (gotcha #22)
-                                graph.setDirtyCanvas(true, true);
-
-                                return result;
-                            };
-
-                            console.log(
-                                LOG_PREFIX,
-                                `Captured ${connections.length} input connections from "${node.type}" (id=${node.id})`
-                            );
-                        }
-                    }
+            // Clean up after the current event loop tick — all synchronous graph.add
+            // calls from _deserializeItems will have completed by then.
+            setTimeout(() => {
+                if (graph.add === hookFn) {
+                    graph.add = origAdd;
                 }
-            }
-
-            // Call original processMouseDown (native alt-clone runs inside)
-            return origProcessMouseDown.call(this, e);
-        };
+            }, 0);
+        }, true); // capture phase — fires before Vue component handlers
 
         console.log(LOG_PREFIX, "Alt+Shift+Drag clone-with-connections ready");
     },
