@@ -189,6 +189,12 @@ class NV_WanContextWindows:
                     "tooltip": "Context overlap (pixel frames) of the reference pass "
                                "whose boundaries you want to smooth."
                 }),
+                "bypass": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "When True, bypasses context windowing entirely — "
+                               "full video is processed in a single pass. "
+                               "Wire from NV WAN VRAM Estimator → fits_without_context_windows."
+                }),
             },
         }
 
@@ -214,7 +220,16 @@ class NV_WanContextWindows:
         freenoise,
         reference_context_length=None,
         reference_context_overlap=None,
+        bypass=False,
     ):
+        # --- 0. Bypass: pass model through with NO handler attached ---
+        if bypass:
+            logger.info(
+                "[NV_WanContextWindows] Bypass active — no context handler attached. "
+                "Full video will be processed in a single pass."
+            )
+            return (model,)
+
         # --- 1. Pixel to latent conversion (same as core WAN CW node) ---
         cl_lat = _pixel_to_latent(context_length)
         co_lat = max(((context_overlap - 1) // 4) + 1, 0) if context_overlap > 0 else 0

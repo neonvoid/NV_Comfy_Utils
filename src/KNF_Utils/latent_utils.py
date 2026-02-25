@@ -115,13 +115,92 @@ class NV_LatentTemporalConcat:
         return (out_latent,)
 
 
+class NV_LatentInfo:
+    """
+    Inspect a latent tensor and output its metadata.
+
+    Reports raw tensor shape and pixel-space dimensions using configurable
+    compression factors. Useful for debugging shape mismatches (e.g., VACE
+    conditioning with different frame counts).
+
+    Temporal formula (video): pixel_frames = (latent_frames - 1) * temporal_compression + 1
+    This matches WAN / HunyuanVideo VAE behavior where the first frame is not temporally compressed.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "latent": ("LATENT",),
+                "spatial_compression": ("INT", {
+                    "default": 8,
+                    "min": 1,
+                    "max": 64,
+                    "step": 1,
+                    "tooltip": "Spatial downscale ratio of the VAE. 8 for WAN 2.1 / HunyuanVideo, 16 for WAN 2.2 / LTXV / Flux2."
+                }),
+                "temporal_compression": ("INT", {
+                    "default": 4,
+                    "min": 1,
+                    "max": 16,
+                    "step": 1,
+                    "tooltip": "Temporal downscale ratio of the VAE. 4 for WAN / HunyuanVideo, 8 for Cosmos."
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("INT", "INT", "INT", "INT", "INT", "BOOLEAN", "STRING")
+    RETURN_NAMES = ("width", "height", "frames", "batch_size", "channels", "is_video", "info_string")
+    FUNCTION = "inspect"
+    CATEGORY = "NV_Utils/latent"
+    DESCRIPTION = "Inspect a latent tensor and output pixel-space resolution, frame count, and shape metadata."
+
+    def inspect(self, latent, spatial_compression, temporal_compression):
+        samples = latent["samples"]
+        shape = list(samples.shape)
+        ndim = len(shape)
+
+        is_video = ndim == 5  # [B, C, T, H, W]
+        batch_size = shape[0]
+        channels = shape[1]
+
+        if is_video:
+            latent_t, latent_h, latent_w = shape[2], shape[3], shape[4]
+            pixel_w = latent_w * spatial_compression
+            pixel_h = latent_h * spatial_compression
+            pixel_frames = (latent_t - 1) * temporal_compression + 1
+
+            info = (
+                f"Video Latent: {shape}\n"
+                f"Pixel: {pixel_w}x{pixel_h}, {pixel_frames} frames\n"
+                f"Compression: {spatial_compression}x spatial, {temporal_compression}x temporal"
+            )
+        else:
+            latent_h, latent_w = shape[-2], shape[-1]
+            pixel_w = latent_w * spatial_compression
+            pixel_h = latent_h * spatial_compression
+            pixel_frames = 0
+
+            info = (
+                f"Image Latent: {shape}\n"
+                f"Pixel: {pixel_w}x{pixel_h}\n"
+                f"Compression: {spatial_compression}x spatial"
+            )
+
+        print(f"[NV_LatentInfo] {info}")
+
+        return (pixel_w, pixel_h, pixel_frames, batch_size, channels, is_video, info)
+
+
 # Node registration
 NODE_CLASS_MAPPINGS = {
     "NV_PrependReferenceLatent": NV_PrependReferenceLatent,
     "NV_LatentTemporalConcat": NV_LatentTemporalConcat,
+    "NV_LatentInfo": NV_LatentInfo,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "NV_PrependReferenceLatent": "NV Prepend Reference Latent",
     "NV_LatentTemporalConcat": "NV Latent Temporal Concat",
+    "NV_LatentInfo": "NV Latent Info",
 }
