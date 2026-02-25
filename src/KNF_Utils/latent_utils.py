@@ -196,11 +196,12 @@ class NV_LatentTemporalSlice:
     """
     Slice a range of frames from a video latent.
 
-    Specify the range in pixel frames (1-indexed). The node converts to latent
-    indices internally and snaps to valid VAE temporal boundaries (tc*n + 1).
+    Specify skip and cap in pixel frames (0-indexed, matching VHS conventions).
+    The node converts to latent indices and snaps to valid VAE temporal
+    boundaries (tc*n + 1).
 
     Use case: you have a 321-frame encoded latent but want to test your workflow
-    with just the first 81 frames — slice them out so everything matches.
+    with just the first 81 frames — set frame_load_cap=81.
 
     Valid frame counts for tc=4: 1, 5, 9, 13, 17, 21, 25, ... (4n+1)
     The snap option controls rounding when your request doesn't land on a boundary.
@@ -211,19 +212,19 @@ class NV_LatentTemporalSlice:
         return {
             "required": {
                 "latent": ("LATENT",),
-                "start_frame": ("INT", {
-                    "default": 1,
-                    "min": 1,
-                    "max": 100000,
-                    "step": 1,
-                    "tooltip": "First pixel frame to include (1-indexed). Snaps to the latent frame that contains it."
-                }),
-                "end_frame": ("INT", {
+                "skip_first_frames": ("INT", {
                     "default": 0,
                     "min": 0,
                     "max": 100000,
                     "step": 1,
-                    "tooltip": "Last pixel frame to include (1-indexed, inclusive). 0 = last frame."
+                    "tooltip": "Number of pixel frames to skip from the start (0-indexed, same as VHS Load Video)."
+                }),
+                "frame_load_cap": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 100000,
+                    "step": 1,
+                    "tooltip": "Maximum pixel frames to keep. 0 = all remaining frames (same as VHS Load Video)."
                 }),
                 "temporal_compression": ("INT", {
                     "default": 4,
@@ -243,9 +244,9 @@ class NV_LatentTemporalSlice:
     RETURN_NAMES = ("latent", "pixel_frame_count", "info")
     FUNCTION = "slice_temporal"
     CATEGORY = "NV_Utils/latent"
-    DESCRIPTION = "Slice a frame range from a video latent. Specify range in pixel frames; auto-snaps to VAE temporal boundaries (tc*n+1)."
+    DESCRIPTION = "Slice a frame range from a video latent. Uses VHS-style skip/cap in pixel frames; auto-snaps to VAE temporal boundaries (tc*n+1)."
 
-    def slice_temporal(self, latent, start_frame, end_frame, temporal_compression, snap):
+    def slice_temporal(self, latent, skip_first_frames, frame_load_cap, temporal_compression, snap):
         samples = latent["samples"]
         tc = temporal_compression
 
@@ -257,20 +258,22 @@ class NV_LatentTemporalSlice:
         latent_t = samples.shape[2]
         total_pixel_frames = (latent_t - 1) * tc + 1
 
-        # end_frame=0 means last frame
-        if end_frame <= 0:
-            end_frame = total_pixel_frames
+        # Clamp skip to valid range
+        skip_first_frames = max(0, min(skip_first_frames, total_pixel_frames - 1))
 
-        # Clamp to valid pixel range
-        start_frame = max(1, min(start_frame, total_pixel_frames))
-        end_frame = max(start_frame, min(end_frame, total_pixel_frames))
+        # Snap skip to latent boundary (round to the latent frame containing the skip point)
+        start_latent = skip_first_frames // tc
+        actual_skip = start_latent * tc
 
-        # Snap start to the latent frame that contains start_frame
-        start_latent = (start_frame - 1) // tc
-        actual_start = start_latent * tc + 1
+        # Remaining pixel frames after skip
+        remaining_latent = latent_t - start_latent
+        remaining_pixel = (remaining_latent - 1) * tc + 1
 
-        # Desired pixel frame count from actual start to requested end
-        desired_count = end_frame - actual_start + 1
+        # Desired count: frame_load_cap=0 means all remaining
+        if frame_load_cap <= 0:
+            desired_count = remaining_pixel
+        else:
+            desired_count = min(frame_load_cap, remaining_pixel)
 
         # Find the valid counts bracketing desired_count
         # Valid counts: k*tc + 1 for k = 0, 1, 2, ...
@@ -301,12 +304,13 @@ class NV_LatentTemporalSlice:
 
         sliced = samples[:, :, start_latent:end_latent, :, :]
 
-        actual_pixel_end = actual_start + chosen_count - 1
         snapped = desired_count != chosen_count
 
         # Build info string
         info_lines = [
-            f"Requested: pixel frames {start_frame}\u2013{end_frame} of {total_pixel_frames}",
+            f"Input: {total_pixel_frames} pixel frames ({latent_t} latent)",
+            f"Skip: {skip_first_frames} requested \u2192 {actual_skip} actual (latent boundary)",
+            f"Cap: {frame_load_cap if frame_load_cap > 0 else 'all'} requested \u2192 {chosen_count} actual",
         ]
         if snapped:
             snap_dir = snap.split(" ")[0]
@@ -316,8 +320,7 @@ class NV_LatentTemporalSlice:
             )
         info_lines.extend([
             f"Latent slice: [{start_latent}:{end_latent}] of {latent_t}",
-            f"Result: pixel frames {actual_start}\u2013{actual_pixel_end} ({chosen_count} frames)",
-            f"Output shape: {list(sliced.shape)}",
+            f"Output: {chosen_count} pixel frames, shape {list(sliced.shape)}",
         ])
         info = "\n".join(info_lines)
 

@@ -94,6 +94,7 @@ class WanConfig:
     num_layers: int
     head_dim: int
     patch_size: tuple  # (t, h, w)
+    in_dim: int  # input channels (16 for latent)
     is_vace: bool
     vace_layers: int
     vace_in_dim: int
@@ -121,6 +122,7 @@ def extract_wan_config(model) -> Optional[WanConfig]:
             num_layers=dm.num_layers,
             head_dim=dm.dim // dm.num_heads,
             patch_size=tuple(dm.patch_size),
+            in_dim=getattr(dm, 'in_dim', 16),
             is_vace=hasattr(dm, 'vace_blocks'),
             vace_layers=getattr(dm, 'vace_layers', 0) or 0,
             vace_in_dim=getattr(dm, 'vace_in_dim', 0) or 0,
@@ -162,22 +164,31 @@ class VRAMBreakdown:
     ffn_peak: int
     cross_attn_peak: int
     residuals: int
+    patch_embed_fp32_peak: int  # fp32 Conv3d intermediate during patchify
     vace_overhead: int
     latent_tensor: int
     text_conditioning: int
     vace_conditioning: int
     comfyui_overhead: int
     safety_margin_bytes: int
+    # Cross-reference: ComfyUI's own memory_required() estimate (activations only)
+    comfyui_memory_required: int = 0
 
     @property
     def layer_peak(self) -> int:
+        """Peak within a single transformer block (attention or FFN phase)."""
         return max(self.self_attn_peak, self.ffn_peak) + self.residuals
+
+    @property
+    def activation_peak(self) -> int:
+        """Largest activation phase: max of transformer block peak vs patch embedding fp32 peak."""
+        return max(self.layer_peak, self.patch_embed_fp32_peak)
 
     @property
     def subtotal(self) -> int:
         return (
             self.model_weights
-            + self.layer_peak
+            + self.activation_peak
             + self.vace_overhead
             + self.latent_tensor
             + self.text_conditioning
@@ -204,13 +215,19 @@ def estimate_inference_peak(
     use_vace: bool = False,
     num_vace_inputs: int = 1,
     use_cfg: bool = True,
-    safety_margin_pct: float = 15.0,
+    safety_margin_pct: float = 20.0,
+    model=None,
 ) -> VRAMBreakdown:
     """Estimate peak VRAM for one denoising step from model config.
 
     Under torch.no_grad(), only ONE layer's activations are live at a time.
     The peak is dominated by the largest single-layer phase (attention or FFN)
     plus persistent tensors (weights, latent, conditioning).
+
+    Key insight: the peak activation phase is max(transformer_block_peak,
+    patch_embed_fp32_peak). The transformer block peak is dominated by the
+    FFN phase due to GELU doubling: during nn.GELU, both input and output
+    [B, seq, ffn_dim] coexist.
     """
     bpe = comfy.model_management.dtype_size(model_dtype)
     batch = 2 if use_cfg else 1
@@ -224,18 +241,39 @@ def estimate_inference_peak(
     # Sequence length after patchify (Conv3d with stride=patch_size)
     seq_len = (T_lat // max(patch_t, 1)) * (H_lat // max(patch_h, 1)) * (W_lat // max(patch_w, 1))
 
-    # --- Self-attention peak ---
-    # Q, K, V, output all [batch, seq_len, dim]
-    # Note: WanSelfAttention computes Q first, then K separately (lines 69-81)
-    # to allow GC between them, but at the attention call Q+K+V+O coexist
+    # ---------------------------------------------------------------
+    # Self-attention phase peak
+    # ---------------------------------------------------------------
+    # At the optimized_attention() call, these tensors coexist:
+    #   x_outer (hidden state from block): [B, seq, dim]        = 1 unit
+    #   x_attn  (addcmul result, attn input): [B, seq, dim]     = 1 unit
+    #   Q: [B, seq, dim]                                         = 1 unit
+    #   K: [B, seq, dim]                                         = 1 unit
+    #   V (self.v(x) computed inline): [B, seq, dim]             = 1 unit
+    # Total: 5 units of [B, seq, dim]. For flash/SDPA, no attention matrix.
+    # For sub-quadratic, chunk overhead adds ~multiplier.
+    # We report self_attn_peak as the Q+K+V+O portion (4 units) with backend
+    # multiplier, and residuals as the persistent x_outer + x_attn (2 units).
     self_attn_peak = int(4 * batch * seq_len * config.dim * bpe * backend.multiplier)
 
-    # --- FFN peak ---
-    # Linear(dim → ffn_dim) + GELU + Linear(ffn_dim → dim)
-    # Peak: intermediate [B, seq, ffn_dim] + input [B, seq, dim]
-    ffn_peak = int(batch * seq_len * (config.ffn_dim + config.dim) * bpe)
+    # ---------------------------------------------------------------
+    # FFN phase peak (THIS IS TYPICALLY THE DOMINANT PHASE)
+    # ---------------------------------------------------------------
+    # Sequential: Linear(dim→ffn_dim) → GELU → Linear(ffn_dim→dim)
+    # During nn.GELU(approximate='tanh'), both input AND output of shape
+    # [B, seq, ffn_dim] coexist (GELU is NOT in-place).
+    # Plus x_outer persists from the block.
+    #
+    # Peak during GELU:
+    #   x_outer: [B, seq, dim]           = dim
+    #   gelu_input: [B, seq, ffn_dim]    = ffn_dim
+    #   gelu_output: [B, seq, ffn_dim]   = ffn_dim
+    # Total: (dim + 2*ffn_dim) * batch * seq * bpe
+    ffn_peak = int(batch * seq_len * (2 * config.ffn_dim + config.dim) * bpe)
 
-    # --- Cross-attention peak ---
+    # ---------------------------------------------------------------
+    # Cross-attention peak
+    # ---------------------------------------------------------------
     # Q from hidden [B, seq, dim], K/V from text [B, text_len, dim]
     # Text context is small (~512 tokens, +257 for i2v CLIP)
     text_len = 512 + (257 if config.model_type == 'i2v' else 0)
@@ -243,38 +281,80 @@ def estimate_inference_peak(
         batch * (2 * seq_len * config.dim + 2 * text_len * config.dim + seq_len * config.dim) * bpe
     )
 
-    # --- Residuals always live during a block ---
-    # x (hidden state) + normalized variant + time embedding projection
+    # ---------------------------------------------------------------
+    # Residuals: tensors persisting OUTSIDE the attention/FFN call
+    # ---------------------------------------------------------------
+    # x_outer (block hidden state) + addcmul/norm intermediate + time embeddings
+    # x_outer: [B, seq, dim], attn/FFN input: [B, seq, dim]
     residuals = int(batch * seq_len * config.dim * bpe * 2 + batch * 6 * config.dim * bpe)
 
-    # --- VACE overhead (VaceWanModel keeps extra tensors alive) ---
+    # ---------------------------------------------------------------
+    # fp32 patch embedding phase (transient but can be large)
+    # ---------------------------------------------------------------
+    # WanModel.forward_orig line 555: x = self.patch_embedding(x.float()).to(x.dtype)
+    # Conv3d runs in fp32, then .to(dtype) converts. During conversion both coexist:
+    #   fp32 output: [B, dim, T_p, H_p, W_p] * 4 bytes
+    #   bf16 copy:   [B, dim, T_p, H_p, W_p] * bpe bytes
+    #   fp32 input:  [B, in_dim, T, H_lat, W_lat] * 4 bytes (small)
+    fp32_conv_output = batch * config.dim * seq_len * 4  # fp32
+    dtype_copy = batch * config.dim * seq_len * bpe  # bf16 copy during .to()
+    fp32_input = batch * config.in_dim * T_lat * H_lat * W_lat * 4 if hasattr(config, 'in_dim') else 0
+    patch_embed_fp32_peak = int(fp32_conv_output + dtype_copy + fp32_input)
+
+    # ---------------------------------------------------------------
+    # VACE overhead (VaceWanModel keeps extra tensors alive during block loop)
+    # ---------------------------------------------------------------
     vace_overhead = 0
     if use_vace and config.is_vace and config.vace_layers > 0:
-        # x_orig: kept alive for all blocks [batch, seq_len, dim]
+        # x_orig: kept alive for ALL blocks [batch, seq_len, dim]
         x_orig_mem = batch * seq_len * config.dim * bpe
-        # c list: num_vace_inputs tensors of [batch, seq_len, dim]
+        # c list: num_vace_inputs tensors of [batch, seq_len, dim] each
         c_list_mem = num_vace_inputs * batch * seq_len * config.dim * bpe
         # c_skip: temp per vace block [batch, seq_len, dim]
         c_skip_mem = batch * seq_len * config.dim * bpe
-        # Vace block runs its own attention+FFN (same size as a regular block)
+        # Vace block runs its own attention+FFN at same peak as a regular block
         vace_block_peak = max(self_attn_peak, ffn_peak) + residuals
-        vace_overhead = int(x_orig_mem + c_list_mem + c_skip_mem + vace_block_peak)
+        # vace_patch_embedding also runs in fp32 (line 775 of model.py)
+        vace_patch_embed = num_vace_inputs * batch * config.dim * seq_len * 4  # fp32 intermediate
+        vace_overhead = int(x_orig_mem + c_list_mem + c_skip_mem + vace_block_peak + vace_patch_embed)
 
-    # --- Conditioning tensors ---
+    # ---------------------------------------------------------------
+    # Conditioning tensors (persistent during sampling)
+    # ---------------------------------------------------------------
     # Latent: [batch, 16, T_lat, H_lat, W_lat]
     latent_tensor = int(batch * 16 * T_lat * H_lat * W_lat * bpe)
 
     # Text embeddings: [batch, text_len, dim]
     text_conditioning = int(batch * text_len * config.dim * bpe)
 
-    # VACE conditioning: vace_frames [1, 32, T, H_lat, W_lat] + vace_mask [1, 64, T, H_lat, W_lat]
+    # VACE conditioning: vace_frames [N, 32, T, H_lat, W_lat] + vace_mask [N, 64, T, H_lat, W_lat]
     vace_conditioning = 0
     if use_vace:
         vace_conditioning = int(num_vace_inputs * (32 + 64) * T_lat * H_lat * W_lat * bpe)
 
-    # --- Overhead ---
-    # ComfyUI reserves ~600-800MB on Windows for model management, CUDA context, etc.
-    comfyui_overhead = int(700 * 1024 * 1024)
+    # ---------------------------------------------------------------
+    # CUDA/ComfyUI overhead (scales with workload)
+    # ---------------------------------------------------------------
+    # Base: CUDA context + ComfyUI model management (~700-1000 MB on Windows)
+    # Plus: CUDA caching allocator fragmentation (~8% of working set).
+    # The allocator holds freed blocks in a cache, and fragmentation from
+    # varying-sized allocations means reserved >> allocated (typically 1.2-1.3x).
+    base_overhead = int(800 * 1024 * 1024)  # 800 MB base
+    # Estimate working set (everything except weights, which don't fragment much)
+    activation_working_set = max(self_attn_peak, ffn_peak) + residuals + latent_tensor + text_conditioning + vace_overhead
+    fragmentation_overhead = int(activation_working_set * 0.10)  # 10% fragmentation
+    comfyui_overhead = base_overhead + fragmentation_overhead
+
+    # ---------------------------------------------------------------
+    # Cross-reference: ComfyUI's own memory_required() estimate
+    # ---------------------------------------------------------------
+    comfyui_memory_required = 0
+    if model is not None:
+        try:
+            input_shape = [batch, 16, T_lat, H_lat, W_lat]
+            comfyui_memory_required = int(model.model.memory_required(input_shape))
+        except Exception:
+            pass
 
     # Build breakdown
     breakdown = VRAMBreakdown(
@@ -283,15 +363,17 @@ def estimate_inference_peak(
         ffn_peak=ffn_peak,
         cross_attn_peak=cross_attn_peak,
         residuals=residuals,
+        patch_embed_fp32_peak=patch_embed_fp32_peak,
         vace_overhead=vace_overhead,
         latent_tensor=latent_tensor,
         text_conditioning=text_conditioning,
         vace_conditioning=vace_conditioning,
         comfyui_overhead=comfyui_overhead,
         safety_margin_bytes=0,  # computed below
+        comfyui_memory_required=comfyui_memory_required,
     )
 
-    # Safety margin applied to subtotal (not ComfyUI overhead)
+    # Safety margin applied to subtotal (not overhead)
     margin = int(breakdown.subtotal * safety_margin_pct / 100.0)
     breakdown.safety_margin_bytes = margin
 
@@ -313,12 +395,13 @@ def format_report(
     model_dtype: torch.dtype,
     use_cfg: bool,
     fits: bool,
+    measured_peak_bytes: int = 0,
 ) -> str:
     """Build a human-readable VRAM estimation report."""
     lines = []
-    lines.append("=" * 56)
+    lines.append("=" * 60)
     lines.append("  WAN VRAM Estimation Report")
-    lines.append("=" * 56)
+    lines.append("=" * 60)
 
     if config is not None:
         T_lat = _pixel_to_latent(total_pixel_frames)
@@ -336,10 +419,10 @@ def format_report(
         if config.is_vace:
             lines.append(f"  VACE layers: {config.vace_layers}")
         lines.append(f"  Attention: {backend.name} [{backend.complexity}]"
-                      f"{f' (×{backend.multiplier})' if backend.multiplier != 1.0 else ''}")
+                      f"{f' (x{backend.multiplier})' if backend.multiplier != 1.0 else ''}")
         lines.append("")
-        lines.append(f"  Resolution: {width}×{height} (latent {W_lat}×{H_lat})")
-        lines.append(f"  Frames: {total_pixel_frames} pixel → {T_lat} latent")
+        lines.append(f"  Resolution: {width}x{height} (latent {W_lat}x{H_lat})")
+        lines.append(f"  Frames: {total_pixel_frames} pixel -> {T_lat} latent")
         lines.append(f"  Sequence length: {seq_len:,} tokens")
         lines.append(f"  CFG: {'Yes (batch=2)' if use_cfg else 'No (batch=1)'}")
     else:
@@ -352,9 +435,10 @@ def format_report(
     items = [
         ("Model weights", breakdown.model_weights),
         ("Self-attention peak", breakdown.self_attn_peak),
-        ("FFN peak", breakdown.ffn_peak),
+        ("FFN peak (w/ GELU 2x)", breakdown.ffn_peak),
         ("Cross-attention", breakdown.cross_attn_peak),
-        ("Residuals", breakdown.residuals),
+        ("Residuals (x + norm)", breakdown.residuals),
+        ("Patch embed fp32 peak", breakdown.patch_embed_fp32_peak),
     ]
     if breakdown.vace_overhead > 0:
         items.append(("VACE overhead", breakdown.vace_overhead))
@@ -365,19 +449,46 @@ def format_report(
     if breakdown.vace_conditioning > 0:
         items.append(("VACE conditioning", breakdown.vace_conditioning))
     items += [
-        ("ComfyUI overhead", breakdown.comfyui_overhead),
+        ("CUDA/ComfyUI overhead", breakdown.comfyui_overhead),
         ("Safety margin", breakdown.safety_margin_bytes),
     ]
 
     for label, val in items:
-        lines.append(f"    {label:<24s} {fb(val):>12s}")
+        lines.append(f"    {label:<26s} {fb(val):>12s}")
 
-    lines.append(f"    {'─' * 38}")
+    lines.append(f"    {'─' * 40}")
 
     # Indicate which phase dominates
-    dominant = "attention" if breakdown.self_attn_peak >= breakdown.ffn_peak else "FFN"
-    lines.append(f"    Layer bottleneck: {dominant}")
-    lines.append(f"    {'TOTAL ESTIMATED':<24s} {fb(breakdown.total):>12s}")
+    dominant_layer = "attention" if breakdown.self_attn_peak >= breakdown.ffn_peak else "FFN+GELU"
+    dominant_phase = "transformer" if breakdown.layer_peak >= breakdown.patch_embed_fp32_peak else "patch_embed_fp32"
+    lines.append(f"    Layer bottleneck: {dominant_layer}")
+    lines.append(f"    Activation bottleneck: {dominant_phase}")
+    lines.append(f"    {'TOTAL ESTIMATED':<26s} {fb(breakdown.total):>12s}")
+
+    # Cross-references
+    lines.append("")
+    lines.append("  --- Cross-References ---")
+    if breakdown.comfyui_memory_required > 0:
+        cmr_gb = breakdown.comfyui_memory_required / (1024 ** 3)
+        our_act = breakdown.activation_peak / (1024 ** 3)
+        ratio = our_act / cmr_gb if cmr_gb > 0 else 0
+        lines.append(f"    ComfyUI memory_required(): {fb(breakdown.comfyui_memory_required)} (activations only)")
+        lines.append(f"    Our activation estimate:   {fb(breakdown.activation_peak)}")
+        lines.append(f"    Ratio (ours / ComfyUI):    {ratio:.2f}x")
+        lines.append(f"    Note: ComfyUI uses 1.5x safety when batching")
+
+    if measured_peak_bytes > 0:
+        measured_gb = measured_peak_bytes / (1024 ** 3)
+        est_gb = breakdown.total_gb
+        accuracy = (est_gb / measured_gb * 100) if measured_gb > 0 else 0
+        lines.append("")
+        lines.append(f"  >>> MEASURED peak VRAM:  {measured_gb:.2f} GB")
+        lines.append(f"  >>> ESTIMATED:           {est_gb:.2f} GB")
+        lines.append(f"  >>> Accuracy:            {accuracy:.0f}%")
+        if est_gb < measured_gb:
+            lines.append(f"  >>> UNDERESTIMATE by {measured_gb - est_gb:.2f} GB")
+        else:
+            lines.append(f"  >>> Overestimate by {est_gb - measured_gb:.2f} GB (conservative)")
 
     available_gb = available_vram_bytes / (1024 ** 3)
     headroom = available_vram_bytes - breakdown.total
@@ -385,12 +496,12 @@ def format_report(
     lines.append(f"  Available VRAM: {available_gb:.1f} GB")
     lines.append(f"  Headroom: {format_bytes(headroom) if headroom >= 0 else '-' + format_bytes(-headroom)}")
     lines.append("")
-    lines.append("=" * 56)
+    lines.append("=" * 60)
     if fits:
-        lines.append("  FITS — full video in single pass (no context windows)")
+        lines.append("  FITS - full video in single pass (no context windows)")
     else:
-        lines.append("  DOES NOT FIT — context windows required")
-    lines.append("=" * 56)
+        lines.append("  DOES NOT FIT - context windows required")
+    lines.append("=" * 60)
 
     return "\n".join(lines)
 
@@ -455,8 +566,10 @@ class NV_WanVRAMEstimator:
                     "tooltip": "Number of VACE conditioning inputs."
                 }),
                 "safety_margin_percent": ("FLOAT", {
-                    "default": 15.0, "min": 0.0, "max": 50.0, "step": 1.0,
-                    "tooltip": "Safety margin added to estimate (percentage of subtotal)."
+                    "default": 20.0, "min": 0.0, "max": 50.0, "step": 1.0,
+                    "tooltip": "Safety margin added to estimate (percentage of subtotal). "
+                               "20%% accounts for CUDA allocator fragmentation and "
+                               "transient intermediates not captured analytically."
                 }),
                 "use_cfg": ("BOOLEAN", {
                     "default": True,
@@ -493,7 +606,7 @@ class NV_WanVRAMEstimator:
         available_vram_gb=0.0,
         use_vace=False,
         num_vace_inputs=1,
-        safety_margin_percent=15.0,
+        safety_margin_percent=20.0,
         use_cfg=True,
     ):
         # --- Resolve frame count (IMAGE overrides total_frames) ---
@@ -531,6 +644,7 @@ class NV_WanVRAMEstimator:
                 num_vace_inputs=num_vace_inputs,
                 use_cfg=use_cfg,
                 safety_margin_pct=safety_margin_percent,
+                model=model,
             )
         else:
             # Non-WAN fallback: use ComfyUI's generic memory_required()
@@ -550,13 +664,22 @@ class NV_WanVRAMEstimator:
                 ffn_peak=0,
                 cross_attn_peak=0,
                 residuals=0,
+                patch_embed_fp32_peak=0,
                 vace_overhead=0,
                 latent_tensor=0,
                 text_conditioning=0,
                 vace_conditioning=0,
-                comfyui_overhead=int(700 * 1024 * 1024),
+                comfyui_overhead=int(800 * 1024 * 1024),
                 safety_margin_bytes=int(generic_bytes * safety_margin_percent / 100.0),
             )
+
+        # --- Check if we can get actual measured peak from previous runs ---
+        measured_peak = 0
+        if torch.cuda.is_available():
+            try:
+                measured_peak = torch.cuda.max_memory_allocated()
+            except Exception:
+                pass
 
         fits = breakdown.total <= available_vram_bytes
         headroom_bytes = available_vram_bytes - breakdown.total
@@ -572,6 +695,7 @@ class NV_WanVRAMEstimator:
             model_dtype=model_dtype,
             use_cfg=use_cfg,
             fits=fits,
+            measured_peak_bytes=measured_peak,
         )
 
         # Print to console and show in UI
@@ -922,7 +1046,7 @@ class NV_WanConfigOptimizer:
                 "num_vace_inputs": ("INT", {"default": 1, "min": 1, "max": 8}),
                 "use_cfg": ("BOOLEAN", {"default": True}),
                 "safety_margin_percent": ("FLOAT", {
-                    "default": 15.0, "min": 0.0, "max": 50.0, "step": 1.0,
+                    "default": 20.0, "min": 0.0, "max": 50.0, "step": 1.0,
                 }),
             },
         }
@@ -1066,15 +1190,233 @@ class NV_WanConfigOptimizer:
 
 
 # ---------------------------------------------------------------------------
+# VRAM Profiler — Empirical validation via actual forward pass
+# ---------------------------------------------------------------------------
+
+def _profile_forward_pass(model, total_pixel_frames, height, width, use_cfg, model_dtype):
+    """Run a single forward pass on dummy data and measure actual peak VRAM.
+
+    This creates minimal dummy inputs, resets CUDA peak memory stats, runs
+    one denoising step through the model, and returns the measured peak.
+
+    Returns (measured_peak_bytes, error_message). On success, error_message is empty.
+    """
+    if not torch.cuda.is_available():
+        return 0, "CUDA not available"
+
+    try:
+        device = comfy.model_management.get_torch_device()
+        T_lat = _pixel_to_latent(total_pixel_frames)
+        H_lat = height // 8
+        W_lat = width // 8
+        batch = 2 if use_cfg else 1
+
+        # Create dummy inputs matching what calc_cond_batch would pass
+        dummy_latent = torch.randn(
+            batch, 16, T_lat, H_lat, W_lat,
+            device=device, dtype=model_dtype
+        )
+        dummy_timestep = torch.tensor([999.0] * batch, device=device, dtype=torch.float32)
+
+        # Minimal conditioning: just cross_attn (text embeddings)
+        config = extract_wan_config(model)
+        dim = config.dim if config else 2048
+        text_len = 512
+        dummy_context = torch.randn(batch, text_len, dim, device=device, dtype=model_dtype)
+
+        # Build conditioning dict matching ComfyUI's format
+        c = {
+            'c_crossattn': dummy_context,
+            'transformer_options': {},
+        }
+
+        # Ensure model is on GPU
+        comfy.model_management.load_model_gpu(model)
+
+        # Reset peak stats and run forward pass
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+
+        with torch.no_grad():
+            try:
+                _ = model.model.apply_model(dummy_latent, dummy_timestep, **c)
+            except Exception as e:
+                # Some models need specific conditioning — fall back to just
+                # measuring with whatever we can
+                return 0, f"Forward pass failed: {e}"
+
+        torch.cuda.synchronize()
+        peak = torch.cuda.max_memory_allocated()
+
+        # Clean up
+        del dummy_latent, dummy_timestep, dummy_context, c
+        torch.cuda.empty_cache()
+
+        return peak, ""
+
+    except Exception as e:
+        return 0, f"Profiling error: {e}"
+
+
+class NV_WanVRAMProfiler:
+    """
+    Empirical VRAM profiler — runs one actual forward pass and measures peak VRAM.
+
+    Use this to VALIDATE the analytical estimator. Connect both this node and
+    NV WAN VRAM Estimator to the same model + parameters, then compare the
+    estimated_peak_gb vs measured_peak_gb.
+
+    WARNING: This node runs an actual forward pass on dummy data. It takes
+    a few seconds and temporarily allocates GPU memory. Run it BEFORE your
+    actual generation to measure, not during.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL", {
+                    "tooltip": "WAN model to profile. Must be loadable onto GPU."
+                }),
+                "total_frames": ("INT", {
+                    "default": 81, "min": 1, "max": 10000, "step": 1,
+                    "tooltip": "Total pixel frames to profile with."
+                }),
+                "height": ("INT", {
+                    "default": 480, "min": 64, "max": 4096, "step": 16,
+                }),
+                "width": ("INT", {
+                    "default": 832, "min": 64, "max": 4096, "step": 16,
+                }),
+            },
+            "optional": {
+                "use_cfg": ("BOOLEAN", {"default": True}),
+                "safety_margin_percent": ("FLOAT", {
+                    "default": 20.0, "min": 0.0, "max": 50.0, "step": 1.0,
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("FLOAT", "FLOAT", "FLOAT", "STRING",)
+    RETURN_NAMES = (
+        "measured_peak_gb",
+        "estimated_peak_gb",
+        "calibration_factor",
+        "profile_report",
+    )
+    OUTPUT_NODE = True
+    FUNCTION = "profile"
+    CATEGORY = "NV_Utils"
+    DESCRIPTION = (
+        "Runs one forward pass on dummy data to measure actual peak VRAM. "
+        "Compare measured_peak_gb with the estimator's output to validate accuracy. "
+        "calibration_factor = measured / estimated — use this to adjust safety margins."
+    )
+
+    def profile(
+        self,
+        model,
+        total_frames,
+        height,
+        width,
+        use_cfg=True,
+        safety_margin_percent=20.0,
+    ):
+        config = extract_wan_config(model)
+        model_dtype = get_model_dtype(model)
+        weight_bytes = get_model_size(model)
+        backend = detect_attention_backend()
+
+        # Analytical estimate
+        if config is not None:
+            breakdown = estimate_inference_peak(
+                config=config,
+                model_weight_bytes=weight_bytes,
+                model_dtype=model_dtype,
+                total_pixel_frames=total_frames,
+                height=height,
+                width=width,
+                backend=backend,
+                use_cfg=use_cfg,
+                safety_margin_pct=safety_margin_percent,
+                model=model,
+            )
+            estimated_gb = breakdown.total_gb
+        else:
+            estimated_gb = 0.0
+
+        # Empirical measurement
+        measured_bytes, error = _profile_forward_pass(
+            model, total_frames, height, width, use_cfg, model_dtype
+        )
+        measured_gb = measured_bytes / (1024 ** 3) if measured_bytes > 0 else 0.0
+
+        # Calibration factor
+        calibration = measured_gb / estimated_gb if estimated_gb > 0 and measured_gb > 0 else 0.0
+
+        # Build report
+        lines = []
+        lines.append("=" * 60)
+        lines.append("  WAN VRAM Profiler — Empirical Measurement")
+        lines.append("=" * 60)
+
+        if error:
+            lines.append(f"  ERROR: {error}")
+            lines.append("")
+            lines.append("  The forward pass could not complete. This may be because:")
+            lines.append("  - The model requires specific conditioning (VACE, i2v CLIP)")
+            lines.append("  - Not enough VRAM to run even one forward pass")
+            lines.append("  - Model is not fully loaded")
+            lines.append("")
+            lines.append(f"  Analytical estimate: {estimated_gb:.2f} GB")
+        else:
+            T_lat = _pixel_to_latent(total_frames)
+            lines.append(f"  Config: {width}x{height} @ {total_frames}px ({T_lat} latent)")
+            lines.append(f"  CFG: {'Yes (batch=2)' if use_cfg else 'No (batch=1)'}")
+            lines.append(f"  Backend: {backend.name}")
+            lines.append("")
+            lines.append(f"  MEASURED peak:    {measured_gb:.2f} GB")
+            lines.append(f"  ESTIMATED peak:   {estimated_gb:.2f} GB")
+            lines.append(f"  Difference:       {measured_gb - estimated_gb:+.2f} GB")
+            lines.append(f"  Calibration:      {calibration:.2f}x")
+            lines.append("")
+            if calibration > 1.1:
+                lines.append(f"  UNDERESTIMATE: Increase safety_margin to ~{(calibration - 1) * 100:.0f}%")
+            elif calibration < 0.9:
+                lines.append(f"  OVERESTIMATE: Could reduce safety_margin")
+            else:
+                lines.append(f"  ACCURATE: Estimate is within 10% of measured")
+            lines.append("")
+            lines.append(f"  Use calibration_factor ({calibration:.2f}) to adjust estimates:")
+            lines.append(f"  adjusted_estimate = estimated * {calibration:.2f}")
+
+        lines.append("=" * 60)
+        report = "\n".join(lines)
+        print(report)
+
+        return {
+            "ui": {"text": [report]},
+            "result": (
+                round(measured_gb, 3),
+                round(estimated_gb, 3),
+                round(calibration, 3),
+                report,
+            ),
+        }
+
+
+# ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
 
 NODE_CLASS_MAPPINGS = {
     "NV_WanVRAMEstimator": NV_WanVRAMEstimator,
     "NV_WanConfigOptimizer": NV_WanConfigOptimizer,
+    "NV_WanVRAMProfiler": NV_WanVRAMProfiler,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "NV_WanVRAMEstimator": "NV WAN VRAM Estimator",
     "NV_WanConfigOptimizer": "NV WAN Config Optimizer",
+    "NV_WanVRAMProfiler": "NV WAN VRAM Profiler",
 }
