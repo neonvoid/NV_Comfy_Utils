@@ -463,6 +463,15 @@ class NV_BoundaryNoiseMask:
         total_t = samples.shape[2]
 
         # Parse stitch_info
+        if not stitch_info or not stitch_info.strip():
+            print("[BoundaryNoiseMask] No stitch_info provided — returning all-zero mask (no refinement). "
+                  "Wire stitch_info from NV_LatentChunkStitcher.")
+            out = latent.copy()
+            out["noise_mask"] = torch.zeros(1, 1, total_t, 1, 1)
+            mask_info = json.dumps({"boundaries": [], "total_frames": total_t,
+                                    "masked_frames": 0}, indent=2)
+            return (out, self.RECOMMENDED_DENOISE, mask_info)
+
         info = json.loads(stitch_info)
         boundaries = info.get("boundaries", [])
 

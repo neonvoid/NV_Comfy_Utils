@@ -189,6 +189,28 @@ class NV_SweepPlanner:
                 "tooltip": f"One value per line for string parameter {i} (e.g., file paths or sampler names)"
             })
 
+        # Step split parameter (for multi-model sampler sequential mode)
+        inputs["optional"]["step_split_name"] = ("STRING", {
+            "default": "",
+            "tooltip": "Parameter name for step split output (e.g., 'model_steps'). Leave empty to disable."
+        })
+        inputs["optional"]["step_split_total_steps"] = ("INT", {
+            "default": 20, "min": 2, "max": 10000, "step": 1,
+            "tooltip": "Total steps to split between models. Should match your sampler's 'steps' value."
+        })
+        inputs["optional"]["step_split_start"] = ("INT", {
+            "default": 4, "min": 1, "max": 9999, "step": 1,
+            "tooltip": "Minimum steps for model 1 (sweep start)"
+        })
+        inputs["optional"]["step_split_end"] = ("INT", {
+            "default": 16, "min": 1, "max": 9999, "step": 1,
+            "tooltip": "Maximum steps for model 1 (sweep end)"
+        })
+        inputs["optional"]["step_split_increment"] = ("INT", {
+            "default": 2, "min": 1, "max": 1000, "step": 1,
+            "tooltip": "Step increment for model 1's step count"
+        })
+
         return inputs
 
     RETURN_TYPES = ("STRING", "INT", "STRING",)
@@ -257,8 +279,45 @@ class NV_SweepPlanner:
                     "values": values,
                 })
 
+        # Collect step split parameter (auto-generates "high,low" strings)
+        step_split_params = []
+        step_split_name = kwargs.get("step_split_name", "")
+        if step_split_name and step_split_name.strip():
+            total = kwargs.get("step_split_total_steps", 20)
+            start = kwargs.get("step_split_start", 4)
+            end = kwargs.get("step_split_end", 16)
+            increment = kwargs.get("step_split_increment", 2)
+
+            # Generate model_1 step values using the same numeric range logic
+            try:
+                model1_values = generate_numeric_values(float(start), float(end), float(increment), "int")
+            except ValueError as e:
+                raise ValueError(f"Step split: {e}")
+
+            # Build "model1,model2" strings where model2 = total - model1
+            split_values = []
+            for m1 in model1_values:
+                m2 = total - m1
+                if m2 > 0:
+                    split_values.append(f"{m1},{m2}")
+
+            if len(split_values) == 0:
+                raise ValueError(
+                    f"Step split: No valid splits generated. "
+                    f"Ensure model 1 steps ({start}-{end}) are less than total ({total})."
+                )
+
+            step_split_params.append({
+                "slot": "step_split_1",
+                "name": step_split_name.strip(),
+                "total_steps": total,
+                "model1_range": [start, end],
+                "increment": increment,
+                "values": split_values,
+            })
+
         # Validate we have at least one parameter
-        all_params = numeric_params + string_params
+        all_params = numeric_params + string_params + step_split_params
         if len(all_params) == 0:
             raise ValueError("At least one parameter must be defined. Fill in param_1_name and param_1_start/end/increment.")
 
@@ -318,6 +377,15 @@ class NV_SweepPlanner:
                 "type": "string",
                 "values": p["values"],
             }
+        for p in step_split_params:
+            parameters_section[p["slot"]] = {
+                "name": p["name"],
+                "type": "step_split",
+                "total_steps": p["total_steps"],
+                "model1_range": p["model1_range"],
+                "increment": p["increment"],
+                "values": p["values"],
+            }
 
         # Build the plan
         plan = {
@@ -363,6 +431,13 @@ class NV_SweepPlanner:
 
         for p in string_params:
             summary_lines.append(f"  {p['name']} (string): {', '.join(p['values'])}")
+        for p in step_split_params:
+            preview = ", ".join(p["values"][:5])
+            if len(p["values"]) > 5:
+                preview += f", ... ({len(p['values'])} total)"
+            summary_lines.append(
+                f"  {p['name']} (step_split, total={p['total_steps']}): {preview}"
+            )
 
         summary_lines.extend([
             "",

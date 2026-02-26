@@ -45,10 +45,11 @@ class NV_SweepIterationLoader:
             },
         }
 
-    # Output types: 8 numeric (as FLOAT since ComfyUI will accept for both), 2 string, plus metadata
+    # Output types: 8 numeric (as FLOAT since ComfyUI will accept for both), 2 string, 1 step_split, plus metadata
     RETURN_TYPES = (
         "FLOAT", "FLOAT", "FLOAT", "FLOAT", "FLOAT", "FLOAT", "FLOAT", "FLOAT",  # param_1-8_value
         "STRING", "STRING",  # string_param_1-2_value
+        "STRING",  # step_split_1_value
         "INT", "INT",  # iteration_id, total_iterations
         "STRING", "STRING", "STRING",  # iteration_label, output_suffix, all_params_json
     )
@@ -56,6 +57,7 @@ class NV_SweepIterationLoader:
         "param_1_value", "param_2_value", "param_3_value", "param_4_value",
         "param_5_value", "param_6_value", "param_7_value", "param_8_value",
         "string_param_1_value", "string_param_2_value",
+        "step_split_1_value",
         "iteration_id", "total_iterations",
         "iteration_label", "output_suffix", "all_params_json",
     )
@@ -122,6 +124,13 @@ class NV_SweepIterationLoader:
                 if param_name and param_name in params:
                     string_values[i-1] = str(params[param_name])
 
+        # Extract step split parameter value
+        step_split_value = ""
+        if "step_split_1" in parameters:
+            param_name = parameters["step_split_1"].get("name", "")
+            if param_name and param_name in params:
+                step_split_value = str(params[param_name])
+
         # Build all_params_json
         all_params_json = json.dumps(params, indent=2)
 
@@ -132,6 +141,7 @@ class NV_SweepIterationLoader:
             numeric_values[0], numeric_values[1], numeric_values[2], numeric_values[3],
             numeric_values[4], numeric_values[5], numeric_values[6], numeric_values[7],
             string_values[0], string_values[1],
+            step_split_value,
             iteration_index, total_iterations,
             label, output_suffix, all_params_json,
         )
@@ -164,6 +174,7 @@ class NV_SweepIterationLoaderInt:
     RETURN_TYPES = (
         "INT", "INT", "INT", "INT", "INT", "INT", "INT", "INT",  # param_1-8_value as INT
         "STRING", "STRING",  # string_param_1-2_value
+        "STRING",  # step_split_1_value
         "INT", "INT",  # iteration_id, total_iterations
         "STRING", "STRING", "STRING",  # iteration_label, output_suffix, all_params_json
     )
@@ -171,6 +182,7 @@ class NV_SweepIterationLoaderInt:
         "param_1_value", "param_2_value", "param_3_value", "param_4_value",
         "param_5_value", "param_6_value", "param_7_value", "param_8_value",
         "string_param_1_value", "string_param_2_value",
+        "step_split_1_value",
         "iteration_id", "total_iterations",
         "iteration_label", "output_suffix", "all_params_json",
     )
@@ -232,6 +244,13 @@ class NV_SweepIterationLoaderInt:
                 if param_name and param_name in params:
                     string_values[i-1] = str(params[param_name])
 
+        # Extract step split parameter value
+        step_split_value = ""
+        if "step_split_1" in parameters:
+            param_name = parameters["step_split_1"].get("name", "")
+            if param_name and param_name in params:
+                step_split_value = str(params[param_name])
+
         # Build all_params_json
         all_params_json = json.dumps(params, indent=2)
 
@@ -242,6 +261,7 @@ class NV_SweepIterationLoaderInt:
             int_values[0], int_values[1], int_values[2], int_values[3],
             int_values[4], int_values[5], int_values[6], int_values[7],
             string_values[0], string_values[1],
+            step_split_value,
             iteration_index, total_iterations,
             label, output_suffix, all_params_json,
         )

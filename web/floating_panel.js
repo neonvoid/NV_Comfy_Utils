@@ -87,11 +87,12 @@ class FloatingPanel {
             border: 1px solid #444;
             border-radius: 8px;
             box-shadow: 0 4px 12px rgba(0,0,0,0.5);
-            z-index: 10000;
+            z-index: 100001;
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
             font-size: 12px;
             color: #e0e0e0;
             user-select: none;
+            pointer-events: auto;
             display: ${this.isVisible ? 'block' : 'none'};
         `;
 

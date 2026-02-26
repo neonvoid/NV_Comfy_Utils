@@ -45,11 +45,13 @@ def clear_global_state():
     _mod._LAST_REFINED.clear()
     _mod._LAST_PROMPT_HASH = ""
     _mod._SESSION_COST = 0.0
+    _mod._MEDIA_CACHE.clear()
     yield
     _mod._CONVERSATION_HISTORY.clear()
     _mod._LAST_REFINED.clear()
     _mod._LAST_PROMPT_HASH = ""
     _mod._SESSION_COST = 0.0
+    _mod._MEDIA_CACHE.clear()
 
 
 @pytest.fixture
@@ -613,3 +615,93 @@ def test_mode_in_debug_info(refiner, default_args):
     with patch.object(_mod, "_call_gemini_text", return_value=_mr("refined")):
         result = refiner.refine(**default_args)
         assert "Mode: refiner" in result[3]
+
+
+# ---------------------------------------------------------------------------
+# use_cached keyed lookup (Bug fix)
+# ---------------------------------------------------------------------------
+
+def test_use_cached_wrong_key_falls_through(refiner, default_args):
+    """use_cached=True with a different prompt should NOT return stale cache."""
+    # Populate cache for prompt A
+    with patch.object(_mod, "_call_gemini_text", return_value=_mr("cached for A")):
+        refiner.refine(**default_args)
+
+    # Switch to prompt B with use_cached=True — should call API, not return A's cache
+    default_args["initial_prompt"] = "Completely different prompt"
+    default_args["use_cached"] = True
+    with patch.object(_mod, "_call_gemini_text", return_value=_mr("fresh for B")) as mock:
+        result = refiner.refine(**default_args)
+        assert mock.called
+        assert result[0] == "fresh for B"
+
+
+def test_use_cached_returns_conversation_log(refiner, default_args):
+    """use_cached=True returns the real conversation log, not a placeholder."""
+    with patch.object(_mod, "_call_gemini_text", return_value=_mr("refined v1")):
+        refiner.refine(**default_args)
+
+    default_args["use_cached"] = True
+    result = refiner.refine(**default_args)
+    # Should contain actual turn content, not just a placeholder
+    assert "Turn 1" in result[2]
+
+
+# ---------------------------------------------------------------------------
+# Media caching (Bug fix)
+# ---------------------------------------------------------------------------
+
+def test_media_cache_hit_skips_prepare(refiner, default_args):
+    """Second call with same media tensor skips _prepare_media."""
+    tensor = torch.ones(4, 64, 64, 3)
+    default_args["video_tensor"] = tensor
+
+    # First call: _prepare_media is called
+    with patch.object(_mod, "_prepare_media", return_value=("b64", "video/mp4", "video info")) as mock_prep, \
+         patch.object(_mod, "_call_gemini_text", return_value=_mr("caption v1")):
+        refiner.refine(**default_args)
+        assert mock_prep.call_count == 1
+
+    # Second call with same tensor: _prepare_media should NOT be called
+    default_args["user_instruction"] = "Refine the caption"
+    with patch.object(_mod, "_prepare_media", return_value=("b64", "video/mp4", "video info")) as mock_prep, \
+         patch.object(_mod, "_call_gemini_text", return_value=_mr("caption v2")):
+        result = refiner.refine(**default_args)
+        assert mock_prep.call_count == 0
+        assert result[0] == "caption v2"
+
+
+def test_media_cache_miss_on_different_tensor(refiner, default_args):
+    """Different media tensor triggers fresh _prepare_media call."""
+    tensor_a = torch.zeros(4, 32, 32, 3)
+    default_args["video_tensor"] = tensor_a
+
+    with patch.object(_mod, "_prepare_media", return_value=("b64a", "video/mp4", "info a")) as mock_prep, \
+         patch.object(_mod, "_call_gemini_text", return_value=_mr("caption a")):
+        refiner.refine(**default_args)
+        assert mock_prep.call_count == 1
+
+    # Different tensor (different shape = different hash)
+    tensor_b = torch.ones(8, 64, 64, 3)
+    default_args["video_tensor"] = tensor_b
+    default_args["user_instruction"] = "New instruction"
+    with patch.object(_mod, "_prepare_media", return_value=("b64b", "video/mp4", "info b")) as mock_prep, \
+         patch.object(_mod, "_call_gemini_text", return_value=_mr("caption b")):
+        refiner.refine(**default_args)
+        assert mock_prep.call_count == 1  # Called again for new tensor
+
+
+# ---------------------------------------------------------------------------
+# VideoWriter open check (Bug fix)
+# ---------------------------------------------------------------------------
+
+def test_video_writer_failure_raises():
+    """VideoWriter that fails to open raises RuntimeError."""
+    import numpy as np
+    mock_writer = MagicMock()
+    mock_writer.isOpened.return_value = False
+
+    with patch("cv2.VideoWriter", return_value=mock_writer), \
+         patch("cv2.VideoWriter_fourcc", return_value=0):
+        with pytest.raises(RuntimeError, match="cv2.VideoWriter failed to open"):
+            _mod._tensor_to_video(torch.rand(4, 64, 64, 3), fps=30)

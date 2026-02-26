@@ -35,6 +35,8 @@ _LAST_REFINED: dict[str, str] = {}
 _LAST_PROMPT_HASH: str = ""
 # Cumulative session cost tracking
 _SESSION_COST: float = 0.0
+# Single-entry media cache: media_hash -> (base64_data, mime_type, info_str)
+_MEDIA_CACHE: dict[str, tuple[str, str, str]] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +100,7 @@ def _tensor_to_video(video_tensor, fps=30):
     else:
         raise ValueError(f"Expected 4D or 5D video tensor, got {video_tensor.shape}")
 
-    if video_array.max() <= 1.0:
+    if video_array.dtype in (np.float32, np.float64, np.float16):
         video_array = (video_array * 255).astype(np.uint8)
     else:
         video_array = video_array.astype(np.uint8)
@@ -108,6 +110,11 @@ def _tensor_to_video(video_tensor, fps=30):
     height, width = video_array.shape[1:3]
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(temp_path, fourcc, fps, (width, height))
+    if not out.isOpened():
+        raise RuntimeError(
+            f"cv2.VideoWriter failed to open: {temp_path} "
+            f"(codec=mp4v, {width}x{height} @ {fps}fps). "
+            f"Check OpenCV video codec support.")
     for frame in video_array:
         out.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
     out.release()
@@ -123,7 +130,7 @@ def _tensor_to_image(image_tensor):
     else:
         raise ValueError(f"Expected 3D or 4D image tensor, got {image_tensor.shape}")
 
-    if image_array.max() <= 1.0:
+    if image_array.dtype in (np.float32, np.float64, np.float16):
         image_array = (image_array * 255).astype(np.uint8)
     else:
         image_array = image_array.astype(np.uint8)
@@ -613,50 +620,14 @@ class NV_PromptRefiner:
         initial_prompt = initial_prompt.strip()
         user_instruction = user_instruction.strip()
 
-        # --- Use cached result (skip API call entirely) ---
-        if use_cached and _LAST_REFINED:
-            # Return the most recent cached result without calling API
-            cached = next(iter(_LAST_REFINED.values()))
-            print(f"[NV_PromptRefiner] Using cached result ({len(cached)} chars)")
-            return (cached, system_instruction,
-                    "(using cached result — no API call)",
-                    f"Cached: {len(cached)} chars / ~{len(cached.split())} words")
-
-        # --- Validate inputs ---
+        # --- Validate initial_prompt (needed for conversation key) ---
         if not initial_prompt:
             return ("(no initial prompt provided)", system_instruction,
                     "(no conversation)", "Error: initial_prompt is empty")
-        if not user_instruction:
-            # No instruction = pass through unchanged
-            return (initial_prompt, system_instruction,
-                    "(no instruction — passing through initial prompt)",
-                    "Pass-through: no user_instruction provided")
-        if not api_key:
-            return ("(no API key)", system_instruction,
-                    "(no conversation)", "Error: api_key is empty")
 
-        # --- Prepare media (if provided) ---
-        media_tuple = None
-        media_info = "none"
-        if image_tensor is not None or video_tensor is not None:
-            try:
-                result = _prepare_media(image_tensor, video_tensor, fps)
-                if result is not None:
-                    media_tuple = (result[0], result[1])  # (base64_data, mime_type)
-                    media_info = result[2]  # info string
-                    print(f"[NV_PromptRefiner] Media prepared: {media_info}")
-            except Exception as e:
-                print(f"[NV_PromptRefiner] Warning: media preparation failed: {e}")
-                media_info = f"failed: {e}"
-
-        has_media = media_tuple is not None
-        mode = "captioner" if has_media else "refiner"
-
-        # --- Conversation state management ---
+        # --- Conversation key (computed early for use_cached + auto-reset) ---
         prompt_hash = _hash_prompt(initial_prompt)
-
-        # Include media hash in conversation key when media is present
-        # so auto-reset triggers when video/image changes
+        media_hash = ""
         if image_tensor is not None or video_tensor is not None:
             media_hash = _hash_media(image_tensor if image_tensor is not None else video_tensor)
             conversation_key = _hash_prompt(initial_prompt + media_hash)
@@ -667,6 +638,7 @@ class NV_PromptRefiner:
         if conversation_key != _LAST_PROMPT_HASH:
             _CONVERSATION_HISTORY.clear()
             _LAST_REFINED.clear()
+            _MEDIA_CACHE.clear()
             _LAST_PROMPT_HASH = conversation_key
 
         # Manual reset
@@ -675,6 +647,48 @@ class NV_PromptRefiner:
             if conversation_key in _LAST_REFINED:
                 del _LAST_REFINED[conversation_key]
             print("[NV_PromptRefiner] Conversation history cleared")
+
+        # --- Use cached result (skip API call entirely) ---
+        if use_cached and conversation_key in _LAST_REFINED:
+            cached = _LAST_REFINED[conversation_key]
+            print(f"[NV_PromptRefiner] Using cached result ({len(cached)} chars)")
+            return (cached, system_instruction,
+                    _format_conversation_log(_CONVERSATION_HISTORY.get(conversation_key, [])),
+                    f"Cached: {len(cached)} chars / ~{len(cached.split())} words")
+
+        # --- Validate remaining inputs ---
+        if not user_instruction:
+            return (initial_prompt, system_instruction,
+                    "(no instruction — passing through initial prompt)",
+                    "Pass-through: no user_instruction provided")
+        if not api_key:
+            return ("(no API key)", system_instruction,
+                    "(no conversation)", "Error: api_key is empty")
+
+        # --- Prepare media (if provided, with caching) ---
+        media_tuple = None
+        media_info = "none"
+        if image_tensor is not None or video_tensor is not None:
+            if media_hash in _MEDIA_CACHE:
+                cached_b64, cached_mime, cached_info = _MEDIA_CACHE[media_hash]
+                media_tuple = (cached_b64, cached_mime)
+                media_info = cached_info + " (cached)"
+                print(f"[NV_PromptRefiner] Media cache hit: {media_info}")
+            else:
+                try:
+                    result = _prepare_media(image_tensor, video_tensor, fps)
+                    if result is not None:
+                        media_tuple = (result[0], result[1])
+                        media_info = result[2]
+                        _MEDIA_CACHE.clear()
+                        _MEDIA_CACHE[media_hash] = (result[0], result[1], result[2])
+                        print(f"[NV_PromptRefiner] Media prepared and cached: {media_info}")
+                except Exception as e:
+                    print(f"[NV_PromptRefiner] Warning: media preparation failed: {e}")
+                    media_info = f"failed: {e}"
+
+        has_media = media_tuple is not None
+        mode = "captioner" if has_media else "refiner"
 
         # Get or create conversation for this context
         history = _CONVERSATION_HISTORY.get(conversation_key, [])
