@@ -105,7 +105,7 @@ class NV_PreNoiseLatent:
     DESCRIPTION = (
         "Add calibrated noise to a clean upscaled latent for cascaded refinement. "
         "Ensures consistent noise across chunk boundaries. "
-        "Outputs expanded_steps and start_at_step for KSamplerAdvanced(add_noise=disable)."
+        "Wire expanded_steps, start_at_step, and shift_used to NV_MultiModelSampler."
     )
 
     def execute(self, latent, model, denoise, steps, seed,
@@ -178,9 +178,9 @@ class NV_PreNoiseLatent:
             "freenoise_applied": freenoise_applied,
             "latent_shape": list(samples.shape),
             "usage": (
-                "Wire expanded_steps → KSamplerAdvanced 'steps', "
-                "start_at_step → KSamplerAdvanced 'start_at_step', "
-                "set add_noise=disable"
+                "Wire expanded_steps → NV_MultiModelSampler 'steps' (and 'end_at_step'), "
+                "start_at_step → 'start_at_step', "
+                "shift_used → 'shift_override', set add_noise=disable"
             ),
         }, indent=2)
 

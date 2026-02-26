@@ -1,20 +1,20 @@
 """
-NV Multi-Model Sampler v2
+NV Multi-Model Sampler v3
 
-A clean, KSampler-like node that supports multi-model sequential/boundary sampling.
-Designed to work alongside ComfyUI native nodes (WAN Context Windows, WanVaceToVideo).
+A KSampler-like node that supports multi-model sequential sampling and
+cascaded pipeline integration (pre-noised latents, shift override, step ranges).
 
 Modes:
 - single: Standard KSampler behavior (uses model only)
-- sequential: Divides steps among models (e.g., model_1 does steps 0-6, model_2 does 7-13, etc.)
-- boundary: Switches models based on sigma thresholds (noise level)
+- sequential: Divides steps among models (e.g., model_1 does steps 0-6, model_2 does 7-13)
 
-Chunk Consistency Features:
+Cascaded Pipeline Features:
+- shift_override: Patches model sigma schedule (wire from NV_PreNoiseLatent)
+- add_noise: Disable for pre-noised latents
+- start_at_step / end_at_step: Sub-range execution for partial denoising
 - committed_noise: Pre-generated noise for consistent chunked processing
-- enable_shift_t: RoPE temporal offset for position awareness
 """
 
-import torch
 import comfy.sample
 import comfy.samplers
 import comfy.model_sampling
@@ -22,17 +22,14 @@ import comfy.utils
 import latent_preview
 from nodes import common_ksampler
 
-from .chunk_utils import video_to_latent_frames
-
 
 class NV_MultiModelSampler:
     """
     Multi-model sampler with KSampler-compatible interface.
 
-    Supports three sampling modes:
+    Supports two sampling modes:
     - single: Identical to KSampler (ignores model_2, model_3)
     - sequential: Chains models by step count
-    - boundary: Switches models by sigma (noise) thresholds
     """
 
     @classmethod
@@ -57,13 +54,9 @@ class NV_MultiModelSampler:
                     "tooltip": "Overrides sampler dropdown when connected (e.g., from Sweep Loader). Must be a valid sampler name."}),
                 "scheduler_override": ("STRING", {"forceInput": True,
                     "tooltip": "Overrides scheduler dropdown when connected (e.g., from Sweep Loader). Must be a valid scheduler name."}),
-                "mode": (["single", "sequential", "boundary"], {"default": "single"}),
+                "mode": (["single", "sequential"], {"default": "single"}),
                 "model_steps": ("STRING", {"default": "", "multiline": False,
                     "tooltip": "Sequential mode: comma-separated steps per model (e.g., '7,7,6' for 20 steps). Empty = auto-divide."}),
-                "model_boundaries": ("STRING", {"default": "0.875,0.5", "multiline": False,
-                    "tooltip": "Boundary mode: sigma thresholds (0-1). Model switches when sigma drops below threshold."}),
-                "model_cfg_scales": ("STRING", {"default": "", "multiline": False,
-                    "tooltip": "Per-model CFG overrides (e.g., '7.0,5.0,3.0'). Empty = use main cfg."}),
                 # Cascaded pipeline options (wire from NV_PreNoiseLatent outputs)
                 "shift_override": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 20.0, "step": 0.5,
                     "tooltip": (
@@ -83,14 +76,10 @@ class NV_MultiModelSampler:
                     )}),
                 "end_at_step": ("INT", {"default": 0, "min": 0, "max": 10000,
                     "tooltip": "Stop at this step (0=run to end). For cascaded: wire expanded_steps here."}),
-                # Chunk consistency options
+                # Chunk consistency
                 "committed_noise": ("COMMITTED_NOISE", {
                     "tooltip": "Pre-generated noise with FreeNoise correlation (from NV_CommittedNoise). If provided, seed is ignored."
                 }),
-                "enable_shift_t": ("BOOLEAN", {"default": False,
-                    "tooltip": "Apply RoPE temporal offset so model knows absolute position in video."}),
-                "shift_t_frames": ("INT", {"default": 0, "min": 0, "max": 10000,
-                    "tooltip": "Temporal position in VIDEO frames (auto-converted to latent frames). Use when processing a specific chunk."}),
             }
         }
 
@@ -98,14 +87,14 @@ class NV_MultiModelSampler:
     RETURN_NAMES = ("latent",)
     FUNCTION = "sample"
     CATEGORY = "NV_Utils/sampling"
-    DESCRIPTION = "KSampler with multi-model support. Use 'single' for standard sampling, 'sequential' to chain models by steps, 'boundary' to switch by noise level."
+    DESCRIPTION = "KSampler with multi-model and cascaded pipeline support. Use 'single' for standard sampling, 'sequential' to chain models by steps."
 
     def sample(self, model, positive, negative, latent_image, seed, steps, cfg,
                sampler_name, scheduler, denoise, model_2=None, model_3=None,
                sampler_name_override=None, scheduler_override=None,
-               mode="single", model_steps="", model_boundaries="0.875,0.5",
-               model_cfg_scales="", committed_noise=None, enable_shift_t=False,
-               shift_t_frames=0):
+               mode="single", model_steps="", shift_override=0.0,
+               add_noise="enable", start_at_step=0, end_at_step=0,
+               committed_noise=None):
 
         # ============= Override sampler/scheduler from STRING inputs =============
         if sampler_name_override is not None and sampler_name_override.strip():
@@ -128,25 +117,13 @@ class NV_MultiModelSampler:
             print(f"[NV_MultiModelSampler] Scheduler override: {scheduler} → {scheduler_override}")
             scheduler = scheduler_override
 
-        # ============= RoPE Temporal Position Alignment (shift_t) =============
-        if enable_shift_t and shift_t_frames > 0:
-            shift_t_latent = video_to_latent_frames(shift_t_frames)
-            model = model.clone()
-            model.set_model_rope_options(
-                scale_x=1.0, shift_x=0.0,
-                scale_y=1.0, shift_y=0.0,
-                scale_t=1.0, shift_t=float(shift_t_latent)
-            )
-            print(f"[NV_MultiModelSampler] Applied RoPE shift_t={shift_t_latent} latent frames "
-                  f"(from {shift_t_frames} video frames)")
-
-            # Also apply to secondary models if provided
+        # ============= Shift Override (patches model_sampling sigma schedule) =============
+        if shift_override > 0.0:
+            model = self._apply_shift_override(model, shift_override)
             if model_2 is not None:
-                model_2 = model_2.clone()
-                model_2.set_model_rope_options(1.0, 0.0, 1.0, 0.0, 1.0, float(shift_t_latent))
+                model_2 = self._apply_shift_override(model_2, shift_override)
             if model_3 is not None:
-                model_3 = model_3.clone()
-                model_3.set_model_rope_options(1.0, 0.0, 1.0, 0.0, 1.0, float(shift_t_latent))
+                model_3 = self._apply_shift_override(model_3, shift_override)
 
         # Collect available models
         models = [model]
@@ -155,94 +132,114 @@ class NV_MultiModelSampler:
         if model_3 is not None:
             models.append(model_3)
 
-        # Parse cfg scales
-        cfg_scales = self._parse_cfg_scales(model_cfg_scales, cfg, len(models))
+        # Resolve cascaded pipeline params
+        disable_noise = (add_noise == "disable")
+        start_step = start_at_step if start_at_step > 0 else None
+        last_step = end_at_step if end_at_step > 0 else None
+
+        if disable_noise or start_step is not None:
+            print(f"[NV_MultiModelSampler] Cascaded mode: add_noise={add_noise}, "
+                  f"start_at_step={start_step}, end_at_step={last_step}, "
+                  f"shift_override={shift_override if shift_override > 0 else 'model default'}")
 
         # Route to appropriate sampling method
         if mode == "single" or len(models) == 1:
             return self._sample_single(
                 model, positive, negative, latent_image,
                 seed, steps, cfg, sampler_name, scheduler, denoise,
-                committed_noise=committed_noise
+                committed_noise=committed_noise,
+                disable_noise=disable_noise,
+                start_step=start_step, last_step=last_step
             )
         elif mode == "sequential":
             return self._sample_sequential(
                 models, positive, negative, latent_image,
-                seed, steps, cfg_scales, sampler_name, scheduler, denoise,
-                model_steps, committed_noise=committed_noise
-            )
-        elif mode == "boundary":
-            return self._sample_boundary(
-                models, positive, negative, latent_image,
-                seed, steps, cfg_scales, sampler_name, scheduler, denoise,
-                model_boundaries, committed_noise=committed_noise
+                seed, steps, cfg, sampler_name, scheduler, denoise,
+                model_steps, committed_noise=committed_noise,
+                disable_noise=disable_noise,
+                start_step=start_step, last_step=last_step
             )
         else:
             # Fallback to single
             return self._sample_single(
                 model, positive, negative, latent_image,
                 seed, steps, cfg, sampler_name, scheduler, denoise,
-                committed_noise=committed_noise
+                committed_noise=committed_noise,
+                disable_noise=disable_noise,
+                start_step=start_step, last_step=last_step
             )
 
     def _sample_single(self, model, positive, negative, latent_image,
                        seed, steps, cfg, sampler_name, scheduler, denoise,
-                       committed_noise=None):
-        """Standard KSampler behavior - with optional committed noise support."""
-        if committed_noise is not None:
+                       committed_noise=None, disable_noise=False,
+                       start_step=None, last_step=None):
+        """Standard KSampler behavior - with optional committed noise and cascaded pipeline support."""
+        if committed_noise is not None and not disable_noise:
             return self._ksampler_with_noise(
                 model, committed_noise["noise"], seed, steps, cfg, sampler_name, scheduler,
-                positive, negative, latent_image, denoise=denoise
+                positive, negative, latent_image, denoise=denoise,
+                start_step=start_step, last_step=last_step
             )
         return common_ksampler(
             model, seed, steps, cfg, sampler_name, scheduler,
-            positive, negative, latent_image, denoise=denoise
+            positive, negative, latent_image, denoise=denoise,
+            disable_noise=disable_noise,
+            start_step=start_step, last_step=last_step
         )
 
     def _sample_sequential(self, models, positive, negative, latent_image,
-                           seed, steps, cfg_scales, sampler_name, scheduler,
-                           denoise, model_steps_str, committed_noise=None):
+                           seed, steps, cfg, sampler_name, scheduler,
+                           denoise, model_steps_str, committed_noise=None,
+                           disable_noise=False, start_step=None, last_step=None):
         """
         Chain models by step count.
 
         Each model processes a portion of the total steps, passing the latent
         to the next model. Later models use disable_noise=True to continue
         from the previous model's output.
-        """
-        # Parse step distribution
-        step_distribution = self._parse_step_distribution(model_steps_str, steps, len(models))
 
-        print(f"[NV_MultiModelSampler] Sequential mode: {len(models)} models")
+        When start_step/last_step are provided (cascaded pipeline), the step
+        distribution is applied within that sub-range.
+        """
+        # Determine effective step range
+        effective_start = start_step if start_step is not None else 0
+        effective_end = last_step if last_step is not None else steps
+        effective_steps = effective_end - effective_start
+
+        # Parse step distribution over the effective range
+        step_distribution = self._parse_step_distribution(model_steps_str, effective_steps, len(models))
+
+        print(f"[NV_MultiModelSampler] Sequential mode: {len(models)} models, "
+              f"range [{effective_start}..{effective_end}]")
         print(f"[NV_MultiModelSampler] Step distribution: {step_distribution}")
         if committed_noise is not None:
             print(f"[NV_MultiModelSampler] Using committed noise (seed={committed_noise['seed']})")
 
         current_latent = latent_image
-        current_step = 0
+        current_step = effective_start
 
         # Get committed noise tensor if provided
         noise_tensor = committed_noise["noise"] if committed_noise is not None else None
 
-        for i, (model, model_steps, cfg) in enumerate(zip(models, step_distribution, cfg_scales)):
+        for i, (model, model_steps) in enumerate(zip(models, step_distribution)):
             if model_steps <= 0:
                 continue
 
-            start_step = current_step
-            end_step = current_step + model_steps
+            seg_start = current_step
+            seg_end = current_step + model_steps
 
-            # First model gets noise, subsequent models continue without noise
-            disable_noise = (i > 0)
+            # First model: respect caller's disable_noise; subsequent always disable
+            seg_disable_noise = disable_noise if i == 0 else True
 
-            print(f"[NV_MultiModelSampler] Model {i+1}: steps {start_step}-{end_step}, cfg={cfg}, disable_noise={disable_noise}")
+            print(f"[NV_MultiModelSampler] Model {i+1}: steps {seg_start}-{seg_end}, cfg={cfg}, disable_noise={seg_disable_noise}")
 
-            if noise_tensor is not None and not disable_noise:
-                # Use committed noise for first model
+            if noise_tensor is not None and not seg_disable_noise:
                 result = self._ksampler_with_noise(
                     model, noise_tensor, seed, steps, cfg, sampler_name, scheduler,
                     positive, negative, current_latent,
                     denoise=denoise,
-                    start_step=start_step,
-                    last_step=end_step,
+                    start_step=seg_start,
+                    last_step=seg_end,
                     force_full_denoise=(i == len(models) - 1)
                 )
             else:
@@ -250,80 +247,14 @@ class NV_MultiModelSampler:
                     model, seed, steps, cfg, sampler_name, scheduler,
                     positive, negative, current_latent,
                     denoise=denoise,
-                    disable_noise=disable_noise,
-                    start_step=start_step,
-                    last_step=end_step,
+                    disable_noise=seg_disable_noise,
+                    start_step=seg_start,
+                    last_step=seg_end,
                     force_full_denoise=(i == len(models) - 1)
                 )
 
             current_latent = result[0]
-            current_step = end_step
-
-        return (current_latent,)
-
-    def _sample_boundary(self, models, positive, negative, latent_image,
-                         seed, steps, cfg_scales, sampler_name, scheduler,
-                         denoise, model_boundaries_str, committed_noise=None):
-        """
-        Switch models based on sigma (noise level) thresholds.
-
-        Sigma starts at 1.0 (full noise) and decreases toward 0.0 (clean image).
-        When sigma drops below a threshold, the next model takes over.
-
-        Example: boundaries="0.875,0.5" with 3 models
-        - Model 1: sigma 1.0 -> 0.875 (initial high-noise denoising)
-        - Model 2: sigma 0.875 -> 0.5 (mid-range refinement)
-        - Model 3: sigma 0.5 -> 0.0 (final detail pass)
-        """
-        # Parse boundaries
-        boundaries = self._parse_boundaries(model_boundaries_str, len(models))
-
-        print(f"[NV_MultiModelSampler] Boundary mode: {len(models)} models")
-        print(f"[NV_MultiModelSampler] Sigma boundaries: {boundaries}")
-        if committed_noise is not None:
-            print(f"[NV_MultiModelSampler] Using committed noise (seed={committed_noise['seed']})")
-
-        # Calculate step ranges from boundaries
-        # We need to map sigma thresholds to step indices
-        step_ranges = self._boundaries_to_steps(boundaries, steps, denoise)
-
-        print(f"[NV_MultiModelSampler] Calculated step ranges: {step_ranges}")
-
-        # Get committed noise tensor if provided
-        noise_tensor = committed_noise["noise"] if committed_noise is not None else None
-
-        current_latent = latent_image
-
-        for i, (model, (start_step, end_step), cfg) in enumerate(zip(models, step_ranges, cfg_scales)):
-            if start_step >= end_step:
-                continue
-
-            disable_noise = (i > 0)
-
-            print(f"[NV_MultiModelSampler] Model {i+1}: steps {start_step}-{end_step}, cfg={cfg}")
-
-            if noise_tensor is not None and not disable_noise:
-                # Use committed noise for first model
-                result = self._ksampler_with_noise(
-                    model, noise_tensor, seed, steps, cfg, sampler_name, scheduler,
-                    positive, negative, current_latent,
-                    denoise=denoise,
-                    start_step=start_step,
-                    last_step=end_step,
-                    force_full_denoise=(i == len(models) - 1)
-                )
-            else:
-                result = common_ksampler(
-                    model, seed, steps, cfg, sampler_name, scheduler,
-                    positive, negative, current_latent,
-                    denoise=denoise,
-                    disable_noise=disable_noise,
-                    start_step=start_step,
-                    last_step=end_step,
-                    force_full_denoise=(i == len(models) - 1)
-                )
-
-            current_latent = result[0]
+            current_step = seg_end
 
         return (current_latent,)
 
@@ -362,17 +293,41 @@ class NV_MultiModelSampler:
             disable_pbar=disable_pbar, seed=seed
         )
 
-        out = latent.copy()
-        out.pop("downscale_ratio_spacial", None)
-        out["samples"] = samples
+        # Build clean output dict (defensive: drop stale temporal-dependent keys)
+        out = {"samples": samples}
+        for key in ("downscale_ratio_spacial", "latent_format_version_0"):
+            if key in latent:
+                out[key] = latent[key]
         return (out,)
+
+    @staticmethod
+    def _apply_shift_override(model, shift):
+        """
+        Clone model and patch its model_sampling with a new shift value.
+
+        Uses the same pattern as ComfyUI's ModelSamplingFlux node:
+        creates a new ModelSamplingAdvanced(ModelSamplingFlux, CONST) and
+        calls set_parameters(shift=...).
+        """
+        m = model.clone()
+        sampling_base = comfy.model_sampling.ModelSamplingFlux
+        sampling_type = comfy.model_sampling.CONST
+
+        class ModelSamplingAdvanced(sampling_base, sampling_type):
+            pass
+
+        model_sampling = ModelSamplingAdvanced(model.model.model_config)
+        model_sampling.set_parameters(shift=shift)
+        m.add_object_patch("model_sampling", model_sampling)
+        old_shift = getattr(model.get_model_object("model_sampling"), "shift", "?")
+        print(f"[NV_MultiModelSampler] Shift override: {old_shift} → {shift}")
+        return m
 
     def _parse_step_distribution(self, model_steps_str, total_steps, num_models):
         """Parse step distribution string or auto-divide steps."""
         if model_steps_str.strip():
             try:
                 parts = [int(x.strip()) for x in model_steps_str.split(",") if x.strip()]
-                # Pad with zeros if not enough values
                 while len(parts) < num_models:
                     parts.append(0)
                 return parts[:num_models]
@@ -384,71 +339,9 @@ class NV_MultiModelSampler:
         remainder = total_steps % num_models
         distribution = []
         for i in range(num_models):
-            # Distribute remainder across first models
             extra = 1 if i < remainder else 0
             distribution.append(base_steps + extra)
         return distribution
-
-    def _parse_boundaries(self, boundaries_str, num_models):
-        """Parse sigma boundary thresholds."""
-        boundaries = [1.0]  # Always start at 1.0
-
-        if boundaries_str.strip():
-            try:
-                parts = [float(x.strip()) for x in boundaries_str.split(",") if x.strip()]
-                boundaries.extend(parts)
-            except ValueError:
-                pass
-
-        # Ensure we have enough boundaries (one fewer than models, plus implicit 0.0 at end)
-        # For N models, we need N-1 explicit boundaries
-        while len(boundaries) < num_models:
-            # Auto-generate evenly spaced boundaries
-            last = boundaries[-1] if boundaries else 1.0
-            boundaries.append(last / 2)
-
-        boundaries.append(0.0)  # Always end at 0.0
-        return boundaries[:num_models + 1]
-
-    def _boundaries_to_steps(self, boundaries, total_steps, denoise):
-        """
-        Convert sigma boundaries to step ranges.
-
-        Sigma decreases approximately linearly with steps (scheduler-dependent).
-        This is a simplified approximation - actual sigma schedule varies by scheduler.
-        """
-        step_ranges = []
-
-        for i in range(len(boundaries) - 1):
-            upper_sigma = boundaries[i]
-            lower_sigma = boundaries[i + 1]
-
-            # Map sigma to step (linear approximation)
-            # sigma=1.0 -> step=0, sigma=0.0 -> step=total_steps
-            start_step = int((1.0 - upper_sigma) * total_steps)
-            end_step = int((1.0 - lower_sigma) * total_steps)
-
-            # Clamp to valid range
-            start_step = max(0, min(start_step, total_steps))
-            end_step = max(0, min(end_step, total_steps))
-
-            step_ranges.append((start_step, end_step))
-
-        return step_ranges
-
-    def _parse_cfg_scales(self, cfg_scales_str, default_cfg, num_models):
-        """Parse per-model CFG scales or use default."""
-        if cfg_scales_str.strip():
-            try:
-                parts = [float(x.strip()) for x in cfg_scales_str.split(",") if x.strip()]
-                # Pad with default if not enough values
-                while len(parts) < num_models:
-                    parts.append(default_cfg)
-                return parts[:num_models]
-            except ValueError:
-                pass
-
-        return [default_cfg] * num_models
 
 
 # Node mappings for registration
