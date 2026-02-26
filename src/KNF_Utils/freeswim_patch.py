@@ -3,13 +3,16 @@ NV_FreeSwimPatch — Inward Sliding-Window Spatial Attention Mask
 
 Based on FreeSwim (arXiv:2511.14712). At resolutions above training (e.g.,
 1080p on Wan 14B trained at 720p), each query's spatial attention is diluted
-over more tokens than training. This node restricts each query to an
-80×45 patch-token window (= 720p training resolution) via FlexAttention's
-block-sparse mask.
+over more tokens than training. This node restricts each query to a
+training-resolution-sized patch-token window via FlexAttention's block-sparse
+mask.
 
 Edge tokens get shifted-inward windows so they see a full training-size
 receptive field. Temporal dimension is completely unrestricted — orthogonal
 to context windows.
+
+Patch token dimensions are auto-derived: pixels ÷ VAE_compression ÷ patch_size.
+The patch_size is read from the model at runtime (fallback: (1,2,2) for WAN).
 
 Hook point: optimized_attention_override in transformer_options, which
 intercepts Q/K/V BEFORE the attention dot product
@@ -25,6 +28,31 @@ except ImportError:
     FLEX_ATTENTION_AVAILABLE = False
     print("[FreeSwimPatch] WARNING: FlexAttention not available (PyTorch 2.5+ required). "
           "Node will pass through without masking.")
+
+# Training resolution presets: (width_px, height_px)
+_TRAINING_PRESETS = {
+    "720p - Wan 2.1 14B (1280x720)": (1280, 720),
+    "480p - Wan 2.1 1.3B (832x480)": (832, 480),
+    "custom": None,
+}
+
+# VAE spatial compression factor (standard for WAN / most diffusion models)
+_VAE_SPATIAL_COMPRESSION = 8
+
+
+def _pixels_to_patch_tokens(px, vae_compression, spatial_patch_size):
+    """Convert pixel dimension to patch-token count: px ÷ VAE ÷ patch_size."""
+    return px // vae_compression // spatial_patch_size
+
+
+def _extract_spatial_patch_size(model):
+    """Read spatial patch_size from the diffusion model. Returns (h_patch, w_patch)."""
+    try:
+        dm = model.model.diffusion_model
+        ps = dm.patch_size  # tuple like (1, 2, 2)
+        return (ps[1], ps[2])
+    except Exception:
+        return (2, 2)  # WAN default
 
 
 def _make_mask_mod(H_p, W_p, hw, hh, num_anchor):
@@ -84,21 +112,26 @@ class NV_FreeSwimPatch:
                     "default": True,
                     "tooltip": "Toggle on/off for A/B testing. When disabled, model passes through unmodified."
                 }),
-                "training_width": ("INT", {
-                    "default": 80,
-                    "min": 1,
-                    "max": 512,
-                    "step": 1,
-                    "tooltip": "Training resolution width in PATCH tokens (not pixels, not latent). "
-                               "Wan 14B at 720p: 1280÷8÷2 = 80. Conv3d patch_size=(1,2,2) halves spatial dims."
+                "training_resolution": (list(_TRAINING_PRESETS.keys()), {
+                    "default": "720p - Wan 2.1 14B (1280x720)",
+                    "tooltip": "Training resolution of the model. Patch token window is auto-derived. "
+                               "Select 'custom' to specify pixel dimensions manually."
                 }),
-                "training_height": ("INT", {
-                    "default": 45,
-                    "min": 1,
-                    "max": 512,
-                    "step": 1,
-                    "tooltip": "Training resolution height in PATCH tokens. "
-                               "Wan 14B at 720p: 720÷8÷2 = 45. Conv3d patch_size=(1,2,2) halves spatial dims."
+                "custom_width": ("INT", {
+                    "default": 1280,
+                    "min": 64,
+                    "max": 4096,
+                    "step": 8,
+                    "tooltip": "Custom training width in PIXELS. Only used when training_resolution='custom'. "
+                               "Patch tokens are computed automatically: pixels ÷ 8 (VAE) ÷ patch_size (from model)."
+                }),
+                "custom_height": ("INT", {
+                    "default": 720,
+                    "min": 64,
+                    "max": 4096,
+                    "step": 8,
+                    "tooltip": "Custom training height in PIXELS. Only used when training_resolution='custom'. "
+                               "Patch tokens are computed automatically: pixels ÷ 8 (VAE) ÷ patch_size (from model)."
                 }),
             },
         }
@@ -113,7 +146,7 @@ class NV_FreeSwimPatch:
         "No-op at or below training resolution. Based on FreeSwim (arXiv:2511.14712)."
     )
 
-    def patch(self, model, enabled, training_width, training_height):
+    def patch(self, model, enabled, training_resolution, custom_width, custom_height):
         if not enabled:
             return (model,)
 
@@ -121,10 +154,23 @@ class NV_FreeSwimPatch:
             print("[FreeSwimPatch] FlexAttention unavailable — returning model unmodified.")
             return (model,)
 
+        # Resolve training resolution in pixels
+        preset = _TRAINING_PRESETS.get(training_resolution)
+        if preset is not None:
+            width_px, height_px = preset
+        else:
+            width_px, height_px = custom_width, custom_height
+
+        # Extract patch_size from model and convert pixels → patch tokens
+        ps_h, ps_w = _extract_spatial_patch_size(model)
+        tw = _pixels_to_patch_tokens(width_px, _VAE_SPATIAL_COMPRESSION, ps_w)
+        th = _pixels_to_patch_tokens(height_px, _VAE_SPATIAL_COMPRESSION, ps_h)
+
+        print(f"[FreeSwimPatch] {width_px}x{height_px} px → {tw}x{th} patch tokens "
+              f"(VAE÷{_VAE_SPATIAL_COMPRESSION}, patch_size=({ps_h},{ps_w}))")
+
         model = model.clone()
 
-        tw = training_width
-        th = training_height
         hw = tw // 2  # half-width for window centering
         hh = th // 2  # half-height for window centering
 

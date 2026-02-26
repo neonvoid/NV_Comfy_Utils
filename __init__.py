@@ -54,4 +54,29 @@ try:
 except Exception as e:
     print(f"[NV_Comfy_Utils] Warning: could not patch context_windows set_step: {e}")
 
+# ---- Register custom samplers into KSampler dropdown ----
+# Adds RF-Solver-2 and Flow-Solver-3 (rectified flow ODE-native solvers)
+# Uses the same registration pattern as RES4LYF (__init__.py lines 40-56)
+try:
+    from .src.KNF_Utils.custom_samplers import sample_nv_rf_solver_2, sample_nv_flow_solver_3
+    from comfy.samplers import KSampler, k_diffusion_sampling
+
+    _nv_samplers = {
+        "nv_rf_solver_2": sample_nv_rf_solver_2,
+        "nv_flow_solver_3": sample_nv_flow_solver_3,
+    }
+    _added = 0
+    for _name, _fn in _nv_samplers.items():
+        if _name not in KSampler.SAMPLERS:
+            try:
+                _idx = KSampler.SAMPLERS.index("uni_pc_bh2")
+                KSampler.SAMPLERS.insert(_idx + 1, _name)
+            except ValueError:
+                KSampler.SAMPLERS.append(_name)
+            setattr(k_diffusion_sampling, f"sample_{_name}", _fn)
+            _added += 1
+    if _added > 0:
+        print(f"[NV_Comfy_Utils] Registered {_added} custom sampler(s): {', '.join(_nv_samplers.keys())}")
+except Exception as e:
+    print(f"[NV_Comfy_Utils] Warning: could not register custom samplers: {e}")
 

@@ -52,6 +52,10 @@ class NV_MultiModelSampler:
             "optional": {
                 "model_2": ("MODEL",),
                 "model_3": ("MODEL",),
+                "sampler_name_override": ("STRING", {"forceInput": True,
+                    "tooltip": "Overrides sampler dropdown when connected (e.g., from Sweep Loader). Must be a valid sampler name."}),
+                "scheduler_override": ("STRING", {"forceInput": True,
+                    "tooltip": "Overrides scheduler dropdown when connected (e.g., from Sweep Loader). Must be a valid scheduler name."}),
                 "mode": (["single", "sequential", "boundary"], {"default": "single"}),
                 "model_steps": ("STRING", {"default": "", "multiline": False,
                     "tooltip": "Sequential mode: comma-separated steps per model (e.g., '7,7,6' for 20 steps). Empty = auto-divide."}),
@@ -78,9 +82,31 @@ class NV_MultiModelSampler:
 
     def sample(self, model, positive, negative, latent_image, seed, steps, cfg,
                sampler_name, scheduler, denoise, model_2=None, model_3=None,
+               sampler_name_override=None, scheduler_override=None,
                mode="single", model_steps="", model_boundaries="0.875,0.5",
                model_cfg_scales="", committed_noise=None, enable_shift_t=False,
                shift_t_frames=0):
+
+        # ============= Override sampler/scheduler from STRING inputs =============
+        if sampler_name_override is not None and sampler_name_override.strip():
+            sampler_name_override = sampler_name_override.strip()
+            if sampler_name_override not in comfy.samplers.KSampler.SAMPLERS:
+                raise ValueError(
+                    f"Invalid sampler_name_override '{sampler_name_override}'. "
+                    f"Valid samplers: {', '.join(comfy.samplers.KSampler.SAMPLERS)}"
+                )
+            print(f"[NV_MultiModelSampler] Sampler override: {sampler_name} → {sampler_name_override}")
+            sampler_name = sampler_name_override
+
+        if scheduler_override is not None and scheduler_override.strip():
+            scheduler_override = scheduler_override.strip()
+            if scheduler_override not in comfy.samplers.KSampler.SCHEDULERS:
+                raise ValueError(
+                    f"Invalid scheduler_override '{scheduler_override}'. "
+                    f"Valid schedulers: {', '.join(comfy.samplers.KSampler.SCHEDULERS)}"
+                )
+            print(f"[NV_MultiModelSampler] Scheduler override: {scheduler} → {scheduler_override}")
+            scheduler = scheduler_override
 
         # ============= RoPE Temporal Position Alignment (shift_t) =============
         if enable_shift_t and shift_t_frames > 0:
