@@ -222,17 +222,54 @@ class NV_LatentChunkStitcher:
         for idx, filename in files:
             filepath = os.path.join(chunk_directory, filename)
             data = torch.load(filepath, map_location="cpu", weights_only=False)
-            samples = data["samples"].float()  # Upcast from fp16 to fp32
+
+            # Handle multiple save formats:
+            #  1. NV_SaveChunkLatent dict: {"samples": tensor, "chunk_index": int, ...}
+            #  2. NV_SaveLatentReference dict: {"latents": tensor, "metadata": {...}}
+            #  3. Raw tensor saved directly: torch.save(tensor, path)
+            #  4. Other dicts: search for first 5D tensor
+            if isinstance(data, torch.Tensor):
+                samples = data.float()
+                chunk_meta = {}
+            elif isinstance(data, dict):
+                if "samples" in data:
+                    samples = data["samples"].float()
+                elif "latents" in data:
+                    samples = data["latents"].float()
+                elif "latent_tensor" in data:
+                    samples = data["latent_tensor"].float()
+                else:
+                    # Last resort: find the first 5D tensor in the dict
+                    samples = None
+                    for k, v in data.items():
+                        if isinstance(v, torch.Tensor) and v.ndim == 5:
+                            samples = v.float()
+                            print(f"  [LatentChunkStitcher] WARNING: No 'samples' key in {filename}, "
+                                  f"using key '{k}' (shape {list(v.shape)})")
+                            break
+                    if samples is None:
+                        raise KeyError(
+                            f"Cannot find latent tensor in {filename}. "
+                            f"Available keys: {list(data.keys())}. "
+                            f"Expected 'samples' key from NV_SaveChunkLatent."
+                        )
+                chunk_meta = data if isinstance(data, dict) else {}
+            else:
+                raise TypeError(
+                    f"Unexpected data type in {filename}: {type(data)}. "
+                    f"Expected dict or tensor."
+                )
+
             chunks.append(samples)
             # Get video frame count if saved, otherwise estimate from latent
-            vid_frames = data.get("chunk_video_frames", 0)
+            vid_frames = chunk_meta.get("chunk_video_frames", 0) if isinstance(chunk_meta, dict) else 0
             if vid_frames <= 0:
                 vid_frames = (samples.shape[2] - 1) * 4 + 1  # Estimated
             chunk_video_frames_list.append(vid_frames)
             print(f"  {filename}: shape {list(samples.shape)}, "
-                  f"chunk_index={data.get('chunk_index', idx)}, "
+                  f"chunk_index={chunk_meta.get('chunk_index', idx) if isinstance(chunk_meta, dict) else idx}, "
                   f"video_frames={vid_frames}"
-                  f"{'(est)' if 'chunk_video_frames' not in data else ''}")
+                  f"{'(est)' if not (isinstance(chunk_meta, dict) and 'chunk_video_frames' in chunk_meta) else ''}")
 
         num_chunks = len(chunks)
 
