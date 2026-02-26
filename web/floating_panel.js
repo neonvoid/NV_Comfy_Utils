@@ -756,7 +756,7 @@ class FloatingPanel {
             border: 1px solid #444;
             border-radius: 8px;
             padding: 16px;
-            z-index: 10001;
+            z-index: 100002;
             min-width: 300px;
             box-shadow: 0 8px 24px rgba(0,0,0,0.6);
         `;
@@ -884,7 +884,7 @@ class FloatingPanel {
             position: fixed;
             inset: 0;
             background: rgba(0,0,0,0.5);
-            z-index: 10000;
+            z-index: 100001;
         `;
         overlay.addEventListener("click", () => {
             document.body.removeChild(dialog);
@@ -943,12 +943,18 @@ app.registerExtension({
     async setup() {
         console.log("[FloatingPanel] Setting up...");
 
-        // Wait for app to be ready
+        // Wait for app to be ready, with timeout to avoid infinite hang
         if (!app.graph) {
-            await new Promise(resolve => {
+            await new Promise((resolve, reject) => {
+                let elapsed = 0;
                 const check = setInterval(() => {
+                    elapsed += 100;
                     if (app.graph) {
                         clearInterval(check);
+                        resolve();
+                    } else if (elapsed > 15000) {
+                        clearInterval(check);
+                        console.warn("[FloatingPanel] Timed out waiting for app.graph after 15s, proceeding anyway");
                         resolve();
                     }
                 }, 100);
@@ -956,7 +962,13 @@ app.registerExtension({
         }
 
         // Create the panel
-        floatingPanelInstance = new FloatingPanel();
+        try {
+            floatingPanelInstance = new FloatingPanel();
+            console.log("[FloatingPanel] Panel created, visible:", floatingPanelInstance.isVisible);
+        } catch (e) {
+            console.error("[FloatingPanel] Failed to create panel:", e);
+            return;
+        }
 
         // Add keyboard shortcut (Ctrl+Shift+P to toggle)
         document.addEventListener("keydown", (e) => {
@@ -970,16 +982,27 @@ app.registerExtension({
         try {
             const { ComfyButton } = await import("../../scripts/ui/components/button.js");
 
-            const toggleBtn = new ComfyButton({
-                icon: "toggle-switch",
-                action: () => floatingPanelInstance.toggle(),
-                tooltip: "Quick Toggle (Ctrl+Shift+P)",
-                content: "Toggle",
-                classList: "comfyui-button comfyui-menu-mobile-collapse"
-            });
+            if (!ComfyButton) {
+                console.warn("[FloatingPanel] ComfyButton is undefined (deprecated API removed)");
+            } else {
+                const toggleBtn = new ComfyButton({
+                    icon: "toggle-switch",
+                    action: () => floatingPanelInstance.toggle(),
+                    tooltip: "Quick Toggle (Ctrl+Shift+P)",
+                    content: "Toggle",
+                    classList: "comfyui-button comfyui-menu-mobile-collapse"
+                });
 
-            app.menu?.settingsGroup.element.before(toggleBtn.element);
-            console.log("[FloatingPanel] Sidebar button added");
+                if (app.menu?.settingsGroup?.element) {
+                    app.menu.settingsGroup.element.before(toggleBtn.element);
+                    console.log("[FloatingPanel] Sidebar button added via settingsGroup");
+                } else if (app.menu?.element) {
+                    app.menu.element.appendChild(toggleBtn.element);
+                    console.log("[FloatingPanel] Sidebar button added via menu.element fallback");
+                } else {
+                    console.warn("[FloatingPanel] No menu anchor found - button not added. Use Ctrl+Shift+P to toggle.");
+                }
+            }
         } catch (e) {
             console.warn("[FloatingPanel] Could not add sidebar button:", e);
         }
