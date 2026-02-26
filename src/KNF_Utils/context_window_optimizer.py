@@ -30,11 +30,12 @@ Usage:
 import math
 
 
+from .chunk_utils import video_to_latent_frames as _vtl_impl
+
+
 def _pixel_to_latent(pixel_frames):
     """Convert WAN pixel frames to latent frames: ((px - 1) // 4) + 1"""
-    if pixel_frames <= 0:
-        return 0
-    return ((pixel_frames - 1) // 4) + 1
+    return _vtl_impl(pixel_frames)
 
 
 def _latent_to_pixel(latent_frames):

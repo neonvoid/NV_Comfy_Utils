@@ -1,20 +1,13 @@
 """
-NV Chunk Stitcher
+DEPRECATED: NV Chunk Stitcher (Pixel-Space)
 
-Stitches processed video chunks back together with crossfade blending.
-Loads chunk videos from disk and applies smooth transitions at overlap regions.
+Pixel-space chunk stitching has been superseded by latent-space stitching
+(NV_LatentChunkStitcher + NV_BoundaryNoiseMask). Pixel blending averages
+two decoded images which causes ghosting at boundaries. Latent blending
+gives the VAE decoder one coherent input.
 
-Key Features:
-- Linear crossfade blending (same algorithm as v1 NV_VideoSampler, but on final pixels)
-- NO re-encoding through VAE - pure pixel operation
-- Loads chunks from numbered video files (chunk_0.mp4, chunk_1.mp4, etc.)
-- Outputs stitched video frames ready for saving
-
-Usage:
-1. Process all chunks on separate GPUs/machines
-2. Save each output as chunk_0.mp4, chunk_1.mp4, etc. in a shared directory
-3. Run NV_ChunkStitcher to combine them
-4. Save the final stitched output
+Use instead:
+  [NV_SaveChunkLatent] -> [NV_LatentChunkStitcher] -> [NV_BoundaryNoiseMask]
 """
 
 import os
@@ -22,6 +15,13 @@ import json
 import math
 import torch
 import numpy as np
+
+from .chunk_utils import (
+    is_wan_aligned,
+    nearest_wan_aligned,
+    validate_wan_alignment,
+    compute_blend_weights,
+)
 
 
 # ============================================================================

@@ -40,9 +40,12 @@ logger = logging.getLogger(__name__)
 # Helpers
 # ---------------------------------------------------------------------------
 
+from .chunk_utils import video_to_latent_frames as _vtl_impl
+
+
 def _pixel_to_latent(pixel_frames):
     """Convert WAN pixel frames to latent frames: max(((px - 1) // 4) + 1, 1)"""
-    return max(((pixel_frames - 1) // 4) + 1, 1)
+    return max(_vtl_impl(pixel_frames), 1)
 
 
 def _get_ref_boundaries(full_length, ref_stride):

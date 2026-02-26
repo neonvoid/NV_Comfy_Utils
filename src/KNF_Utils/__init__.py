@@ -134,11 +134,12 @@ from .vace_prepass_reference import (
     NODE_DISPLAY_NAME_MAPPINGS as VACE_PREPASS_DISPLAY_NAME_MAPPINGS
 )
 
-# Import co-denoise chunk sampler (per-step co-denoising with overlap blending)
-from .co_denoise_sampler import (
-    NODE_CLASS_MAPPINGS as CO_DENOISE_CLASS_MAPPINGS,
-    NODE_DISPLAY_NAME_MAPPINGS as CO_DENOISE_DISPLAY_NAME_MAPPINGS
-)
+# DEPRECATED: co-denoise chunk sampler — hardcodes Euler, inferior to latent-space stitching.
+# Kept on disk for reference. Use NV_LatentChunkStitcher + NV_BoundaryNoiseMask instead.
+# from .co_denoise_sampler import (
+#     NODE_CLASS_MAPPINGS as CO_DENOISE_CLASS_MAPPINGS,
+#     NODE_DISPLAY_NAME_MAPPINGS as CO_DENOISE_DISPLAY_NAME_MAPPINGS
+# )
 
 # Import anchor KV cache node (context window cross-window consistency)
 from .anchor_kv_cache import (
@@ -265,7 +266,7 @@ NODE_CLASS_MAPPINGS = {
     **BBOX_SAVER_CLASS_MAPPINGS,
     **GEN_TIMER_CLASS_MAPPINGS,
     **VACE_PREPASS_CLASS_MAPPINGS,
-    **CO_DENOISE_CLASS_MAPPINGS,
+    # **CO_DENOISE_CLASS_MAPPINGS,  # DEPRECATED
     **ANCHOR_KV_CLASS_MAPPINGS,
     **V_TOKEN_CLASS_MAPPINGS,
     **PROMPT_LIBRARY_CLASS_MAPPINGS,
@@ -308,7 +309,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     **BBOX_SAVER_DISPLAY_NAME_MAPPINGS,
     **GEN_TIMER_DISPLAY_NAME_MAPPINGS,
     **VACE_PREPASS_DISPLAY_NAME_MAPPINGS,
-    **CO_DENOISE_DISPLAY_NAME_MAPPINGS,
+    # **CO_DENOISE_DISPLAY_NAME_MAPPINGS,  # DEPRECATED
     **ANCHOR_KV_DISPLAY_NAME_MAPPINGS,
     **V_TOKEN_DISPLAY_NAME_MAPPINGS,
     **PROMPT_LIBRARY_DISPLAY_NAME_MAPPINGS,

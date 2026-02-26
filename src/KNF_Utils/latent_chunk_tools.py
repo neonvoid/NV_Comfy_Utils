@@ -5,27 +5,36 @@ Saves per-chunk denoised latents to disk and stitches them with latent-space
 crossfade blending. Replaces pixel-space blending (Hann/Hamming after VAE decode)
 with latent-space blending (before VAE decode).
 
-Key insight: pixel blend averages two decoded images → ghosting at boundaries.
-Latent blend gives the VAE decoder one blended input → one coherent image.
+Key insight: pixel blend averages two decoded images -> ghosting at boundaries.
+Latent blend gives the VAE decoder one blended input -> one coherent image.
 Same principle as latent interpolation in image generation.
 
 Usage:
     Per-chunk workflow (sweep loader):
-        [KSampler] → [NV_SaveChunkLatent] → chunk_N.pt
+        [KSampler] -> [NV_SaveChunkLatent] -> chunk_N.pt
 
     Stitch workflow (run once after all chunks):
-        [NV_LatentChunkStitcher] → stitched latent → [NV_StreamingVAEDecode]
+        [NV_LatentChunkStitcher] -> stitched latent -> [NV_StreamingVAEDecode]
 
-    Boundary refinement (Phase 2, optional):
-        [NV_LatentChunkStitcher] → [NV_BoundaryNoiseMask] → [KSampler low denoise] → [VAE Decode]
+    Boundary refinement (optional):
+        [NV_LatentChunkStitcher] -> [NV_BoundaryNoiseMask] -> [KSampler denoise=0.10-0.20]
+
+v2.0: plan_json_path auto-reads overlap from chunk plan; boundary mask auto-computes
+      context/ramp from overlap size.
 """
 
 import os
 import re
-import math
 import json
 import torch
 import comfy.model_management
+
+from .chunk_utils import (
+    compute_blend_weights,
+    compute_ramp_weights,
+    compute_latent_overlap,
+    video_to_latent_frames,
+)
 
 
 class NV_SaveChunkLatent:
@@ -102,7 +111,8 @@ class NV_LatentChunkStitcher:
     Load all chunk latents from a directory and blend overlapping regions
     in latent space. Output a single stitched latent for streaming VAE decode.
 
-    Replaces pixel-space chunk stitching with latent-space blending.
+    v2.0: Wire plan_json_path from the chunk planner to auto-read overlap
+    and blend mode. No manual overlap entry needed.
     """
 
     @classmethod
@@ -113,27 +123,35 @@ class NV_LatentChunkStitcher:
                     "default": "chunk_latents",
                     "tooltip": "Directory containing chunk_N.pt files from NV_SaveChunkLatent."
                 }),
-                "overlap_video_frames": ("INT", {
-                    "default": 32, "min": 0, "max": 256, "step": 1,
-                    "tooltip": "Overlap in VIDEO frames between adjacent chunks. "
-                               "Must match your pixel-space stitcher / chunk planner overlap. "
-                               "Converted to latent frames internally using Wan's temporal compression."
-                }),
-                "blend_mode": (["linear", "cosine", "hamming"],  {
-                    "default": "linear",
-                    "tooltip": "Blend weight curve. Linear: straight ramp. "
-                               "Cosine: smooth S-curve (same as Hann). "
-                               "Hamming: S-curve with ~0.08 floor (never fully commits to either side)."
-                }),
                 "prefix": ("STRING", {
                     "default": "chunk",
                     "tooltip": "Filename prefix to match. Loads {prefix}_0.pt, {prefix}_1.pt, etc."
+                }),
+            },
+            "optional": {
+                "plan_json_path": ("STRING", {
+                    "default": "",
+                    "tooltip": "Path to chunk_plan.json from NV_ParallelChunkPlanner. "
+                               "Auto-reads overlap_video_frames and blend_mode from plan. "
+                               "Overrides manual settings when provided."
+                }),
+                "overlap_video_frames": ("INT", {
+                    "default": 0, "min": 0, "max": 256, "step": 1,
+                    "tooltip": "Overlap in VIDEO frames between adjacent chunks. "
+                               "0 = read from plan_json_path. "
+                               "Must match the chunk planner overlap setting."
+                }),
+                "blend_mode": (["cosine", "linear", "hamming"], {
+                    "default": "cosine",
+                    "tooltip": "Blend weight curve. Cosine: smooth S-curve (recommended). "
+                               "Linear: straight ramp. "
+                               "Hamming: S-curve with ~0.08 floor."
                 }),
                 "overlap_latent_adjust": ("INT", {
                     "default": 0, "min": -4, "max": 4, "step": 1,
                     "tooltip": "Manual adjustment to computed latent overlap. The auto-computed "
                                "overlap accounts for Wan's first-frame encoding asymmetry, but "
-                               "may be off by ±1 for edge cases. Positive = wider blend zone."
+                               "may be off by +/-1 for edge cases. Positive = wider blend zone."
                 }),
             },
         }
@@ -144,11 +162,43 @@ class NV_LatentChunkStitcher:
     CATEGORY = "NV_Utils/latent"
     DESCRIPTION = (
         "Load chunk latents from disk and stitch with latent-space crossfade blending. "
-        "Output a single stitched latent for streaming VAE decode."
+        "Wire plan_json_path from the chunk planner for auto-config, or set overlap manually."
     )
 
-    def stitch(self, chunk_directory, overlap_video_frames, blend_mode, prefix,
-               overlap_latent_adjust=0):
+    def stitch(self, chunk_directory, prefix, plan_json_path="",
+               overlap_video_frames=0, blend_mode="cosine", overlap_latent_adjust=0):
+
+        # === Step 0: Read plan JSON if provided ===
+        if plan_json_path and os.path.isfile(plan_json_path):
+            with open(plan_json_path, 'r') as f:
+                plan = json.load(f)
+            print(f"[LatentChunkStitcher] Loaded plan from {plan_json_path} (v{plan.get('version', '?')})")
+
+            # Auto-read overlap from plan
+            if overlap_video_frames <= 0:
+                # v2.0 plans have latent_stitch_config
+                stitch_cfg = plan.get("latent_stitch_config", {})
+                if stitch_cfg.get("overlap_video_frames", 0) > 0:
+                    overlap_video_frames = stitch_cfg["overlap_video_frames"]
+                    print(f"  Auto-read overlap: {overlap_video_frames} video frames (from latent_stitch_config)")
+                elif plan.get("overlap_frames", 0) > 0:
+                    # v1.x fallback
+                    overlap_video_frames = plan["overlap_frames"]
+                    print(f"  Auto-read overlap: {overlap_video_frames} video frames (from overlap_frames)")
+
+            # Auto-read blend mode from plan
+            stitch_cfg = plan.get("latent_stitch_config", {})
+            if stitch_cfg.get("blend_mode"):
+                blend_mode = stitch_cfg["blend_mode"]
+                print(f"  Auto-read blend_mode: {blend_mode}")
+        elif plan_json_path:
+            print(f"[LatentChunkStitcher] Warning: plan_json_path '{plan_json_path}' not found, using manual settings")
+
+        # Validate we have overlap
+        if overlap_video_frames <= 0:
+            print("[LatentChunkStitcher] Warning: overlap_video_frames=0. "
+                  "Wire plan_json_path or set overlap manually for proper blending.")
+
         # === Step 1: Discover and load chunk files ===
         pattern = re.compile(rf"^{re.escape(prefix)}_(\d+)\.pt$")
         files = []
@@ -213,12 +263,10 @@ class NV_LatentChunkStitcher:
         # do NOT overlap by exactly (N-1)//4+1 latent frames. The second chunk's
         # first-frame bonus adds ~1 extra latent frame.
         #
-        # Precise per-boundary formula:
+        # Precise per-boundary formula (via compute_latent_overlap):
         #   combined_video = video_A + video_B - overlap_video
         #   combined_latent = (combined_video - 1) // 4 + 1
         #   overlap_latent = latent_A + latent_B - combined_latent
-        #
-        # This accounts for the first-frame asymmetry automatically.
 
         boundaries = []
         result = chunks[0]
@@ -226,28 +274,25 @@ class NV_LatentChunkStitcher:
         for i in range(1, num_chunks):
             chunk = chunks[i]
 
-            # Compute per-boundary overlap from chunk video frame counts
-            latent_a = result.shape[2]  # Accumulated result (acts as "chunk A")
-            latent_b = chunk.shape[2]
-            # For accumulated result, use the running video frame count
-            # For the first boundary, this is just chunk 0's video frames
-            # For subsequent boundaries, we track the accumulated total
+            # Compute running video frame count for accumulated result
             if i == 1:
                 video_a = chunk_video_frames_list[0]
             else:
-                # After previous stitches, accumulated video = sum of unique portions
                 video_a = sum(chunk_video_frames_list[:i]) - (i - 1) * overlap_video_frames
             video_b = chunk_video_frames_list[i]
 
-            combined_video = video_a + video_b - overlap_video_frames
-            combined_latent = (combined_video - 1) // 4 + 1
-            overlap_latent = latent_a + latent_b - combined_latent + overlap_latent_adjust
+            # Use shared utility for precise overlap computation
+            overlap_latent = compute_latent_overlap(
+                video_a, video_b, overlap_video_frames, adjust=overlap_latent_adjust
+            )
 
-            # Clamp to valid range
+            # Additional clamping against actual tensor sizes
+            latent_a = result.shape[2]
+            latent_b = chunk.shape[2]
             overlap_latent = max(1, min(overlap_latent, latent_a, latent_b))
 
             # Compute blend weights for this boundary
-            w = _compute_blend_weights(overlap_latent, blend_mode)
+            w = compute_blend_weights(overlap_latent, blend_mode)
             w = w.reshape(1, 1, -1, 1, 1)
 
             # Extract overlap regions
@@ -265,7 +310,7 @@ class NV_LatentChunkStitcher:
             result = torch.cat([result_unique, blended, chunk_unique], dim=2)
 
             boundaries.append({
-                "boundary": f"{i-1}↔{i}",
+                "boundary": f"{i-1}<->{i}",
                 "position_latent": boundary_pos,
                 "overlap_latent": overlap_latent,
                 "video_a": video_a,
@@ -274,7 +319,7 @@ class NV_LatentChunkStitcher:
             })
 
             adj_str = f" (adjust={overlap_latent_adjust:+d})" if overlap_latent_adjust != 0 else ""
-            print(f"  Boundary {i-1}↔{i}: overlap={overlap_latent} latent frames{adj_str}, "
+            print(f"  Boundary {i-1}<->{i}: overlap={overlap_latent} latent frames{adj_str}, "
                   f"blended at position {boundary_pos}, "
                   f"result now {result.shape[2]} frames")
 
@@ -298,23 +343,6 @@ class NV_LatentChunkStitcher:
         return (out_latent, num_chunks, info)
 
 
-def _compute_blend_weights(num_frames, mode):
-    """Compute blend weights from 0 (keep chunk A) to 1 (keep chunk B)."""
-    if num_frames <= 1:
-        return torch.ones(max(1, num_frames))
-
-    t = torch.linspace(0, 1, num_frames)
-
-    if mode == "linear":
-        return t
-    elif mode == "cosine":
-        return 0.5 * (1.0 - torch.cos(math.pi * t))
-    elif mode == "hamming":
-        return 0.54 - 0.46 * torch.cos(math.pi * t)
-    else:
-        return t  # Fallback to linear
-
-
 class NV_BoundaryNoiseMask:
     """
     Create a 5D noise_mask for boundary refinement of stitched latents.
@@ -322,11 +350,14 @@ class NV_BoundaryNoiseMask:
     Takes stitch_info JSON from NV_LatentChunkStitcher and creates a soft-ramp
     noise_mask that targets chunk boundary regions for re-diffusion. Clean frames
     surrounding boundaries are preserved (mask=0) and act as implicit conditioning
-    through the model's self-attention — all tokens are processed regardless of
+    through the model's self-attention -- all tokens are processed regardless of
     mask value.
 
     The mask is attached directly to the latent dict (NOT via SetLatentNoiseMask,
     which flattens 5D temporal structure). Output goes straight to KSampler.
+
+    auto_compute mode: derives context_frames, ramp_frames, core_extra from
+    the overlap size in stitch_info. No manual parameter tuning needed.
 
     Pipeline:
         [NV_LatentChunkStitcher] -> [NV_BoundaryNoiseMask] -> [KSampler denoise=0.10-0.20]
@@ -342,20 +373,30 @@ class NV_BoundaryNoiseMask:
                     "tooltip": "JSON from NV_LatentChunkStitcher stitch_info output. "
                                "Contains boundary positions and overlap sizes."
                 }),
+            },
+            "optional": {
+                "auto_compute": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Auto-compute context, ramp, and core_extra from overlap size. "
+                               "When True, manual values below are ignored."
+                }),
                 "context_frames": ("INT", {
                     "default": 4, "min": 0, "max": 16, "step": 1,
                     "tooltip": "Clean frames on each side of boundary (mask=0.0). "
-                               "Preserved exactly. Anchor spatial layout through attention."
+                               "Preserved exactly. Anchor spatial layout through attention. "
+                               "Ignored when auto_compute=True."
                 }),
                 "ramp_frames": ("INT", {
                     "default": 4, "min": 0, "max": 16, "step": 1,
                     "tooltip": "Soft ramp frames on each side. Gradual transition from "
-                               "preserved to fully re-diffused. Prevents hard mask edges."
+                               "preserved to fully re-diffused. Prevents hard mask edges. "
+                               "Ignored when auto_compute=True."
                 }),
                 "core_extra": ("INT", {
                     "default": 0, "min": 0, "max": 16, "step": 1,
                     "tooltip": "Extra fully-masked frames beyond the overlap region on each "
-                               "side. 0 = core is exactly the overlap zone from stitching."
+                               "side. 0 = core is exactly the overlap zone from stitching. "
+                               "Ignored when auto_compute=True."
                 }),
                 "ramp_curve": (["cosine", "linear"], {
                     "default": "cosine",
@@ -365,18 +406,22 @@ class NV_BoundaryNoiseMask:
             },
         }
 
-    RETURN_TYPES = ("LATENT", "STRING")
-    RETURN_NAMES = ("latent", "mask_info")
+    RETURN_TYPES = ("LATENT", "FLOAT", "STRING")
+    RETURN_NAMES = ("latent", "recommended_denoise", "mask_info")
     FUNCTION = "create_mask"
     CATEGORY = "NV_Utils/latent"
     DESCRIPTION = (
-        "Create boundary refinement noise_mask from stitch_info. Soft ramp targets "
-        "chunk boundaries for re-diffusion while preserving surrounding context. "
-        "Output goes directly to KSampler (do NOT use SetLatentNoiseMask)."
+        "Create boundary refinement noise_mask from stitch_info. With auto_compute=True, "
+        "derives context/ramp from overlap size automatically. Outputs recommended_denoise "
+        "(0.12) for the KSampler. Output goes directly to KSampler (do NOT use SetLatentNoiseMask)."
     )
 
-    def create_mask(self, latent, stitch_info, context_frames, ramp_frames,
-                    core_extra, ramp_curve):
+    # Sweet spot from research: 0.10-0.20 range, 0.12 optimal
+    RECOMMENDED_DENOISE = 0.12
+
+    def create_mask(self, latent, stitch_info, auto_compute=True,
+                    context_frames=4, ramp_frames=4, core_extra=0,
+                    ramp_curve="cosine"):
         samples = latent["samples"]  # [B, C, T, H, W]
         total_t = samples.shape[2]
 
@@ -390,7 +435,17 @@ class NV_BoundaryNoiseMask:
             out["noise_mask"] = torch.zeros(1, 1, total_t, 1, 1)
             mask_info = json.dumps({"boundaries": [], "total_frames": total_t,
                                     "masked_frames": 0}, indent=2)
-            return (out, mask_info)
+            return (out, self.RECOMMENDED_DENOISE, mask_info)
+
+        # Auto-compute parameters from overlap size
+        if auto_compute and boundaries:
+            # Use the average overlap across all boundaries
+            avg_overlap = sum(b["overlap_latent"] for b in boundaries) // len(boundaries)
+            context_frames = max(2, avg_overlap // 3)
+            ramp_frames = max(2, avg_overlap // 3)
+            core_extra = 0
+            print(f"[BoundaryNoiseMask] Auto-computed from overlap={avg_overlap}: "
+                  f"context={context_frames}, ramp={ramp_frames}, core_extra={core_extra}")
 
         # Build mask: 0.0 = preserve, 1.0 = fully re-diffuse
         mask = torch.zeros(total_t)
@@ -414,7 +469,7 @@ class NV_BoundaryNoiseMask:
                 ramp_left_start = max(0, core_start - ramp_frames)
                 ramp_left_len = core_start - ramp_left_start
                 if ramp_left_len > 0:
-                    ramp_w = _compute_ramp(ramp_left_len, ramp_curve)
+                    ramp_w = compute_ramp_weights(ramp_left_len, ramp_curve)
                     # ramp_w goes 0->1, and we want to ramp up toward the core
                     for j in range(ramp_left_len):
                         idx = ramp_left_start + j
@@ -425,7 +480,7 @@ class NV_BoundaryNoiseMask:
                 ramp_right_end = min(total_t, core_end + ramp_frames)
                 ramp_right_len = ramp_right_end - core_end
                 if ramp_right_len > 0:
-                    ramp_w = _compute_ramp(ramp_right_len, ramp_curve)
+                    ramp_w = compute_ramp_weights(ramp_right_len, ramp_curve)
                     # ramp_w goes 0->1, flip it so it ramps down from core
                     ramp_w = ramp_w.flip(0)
                     for j in range(ramp_right_len):
@@ -458,7 +513,9 @@ class NV_BoundaryNoiseMask:
               f"{masked_any - masked_full} partially masked, "
               f"{total_t - masked_any} preserved")
         print(f"  Config: context={context_frames}, ramp={ramp_frames}, "
-              f"core_extra={core_extra}, curve={ramp_curve}")
+              f"core_extra={core_extra}, curve={ramp_curve}"
+              f"{' (auto-computed)' if auto_compute else ''}")
+        print(f"  Recommended denoise: {self.RECOMMENDED_DENOISE}")
         for d in mask_details:
             print(f"  {d['boundary']}: core [{d['core_range'][0]}:{d['core_range'][1]}] "
                   f"({d['core_width']} frames), "
@@ -474,6 +531,8 @@ class NV_BoundaryNoiseMask:
             "masked_full": masked_full,
             "masked_partial": masked_any - masked_full,
             "preserved": total_t - masked_any,
+            "auto_compute": auto_compute,
+            "recommended_denoise": self.RECOMMENDED_DENOISE,
             "config": {
                 "context_frames": context_frames,
                 "ramp_frames": ramp_frames,
@@ -484,27 +543,7 @@ class NV_BoundaryNoiseMask:
             "mask_values": [round(mask[i].item(), 3) for i in range(total_t)],
         }, indent=2)
 
-        return (out, mask_info)
-
-
-def _compute_ramp(num_frames, mode):
-    """Compute ramp weights with exclusive endpoints (no 0.0 or 1.0).
-
-    For 4 frames: returns ~[0.1, 0.3, 0.7, 0.9] (cosine) or [0.2, 0.4, 0.6, 0.8] (linear).
-    This ensures every ramp frame has a truly intermediate value — the 0.0 and 1.0
-    values belong to the context and core zones respectively.
-    """
-    if num_frames <= 0:
-        return torch.tensor([])
-    if num_frames == 1:
-        return torch.tensor([0.5])
-
-    # Exclusive endpoints: skip the 0.0 and 1.0 at ends
-    t = torch.linspace(0, 1, num_frames + 2)[1:-1]
-    if mode == "cosine":
-        return 0.5 * (1.0 - torch.cos(math.pi * t))
-    else:
-        return t
+        return (out, self.RECOMMENDED_DENOISE, mask_info)
 
 
 # Node registration

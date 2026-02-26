@@ -26,12 +26,7 @@ import comfy.samplers
 import comfy.utils
 import latent_preview
 
-
-def video_to_latent_frames(video_frames: int) -> int:
-    """Convert video frame count to latent frame count (Wan 4:1 compression)."""
-    if video_frames <= 0:
-        return 0
-    return (video_frames - 1) // 4 + 1
+from .chunk_utils import video_to_latent_frames
 
 
 def get_frame_token_indices(frame_start: int, frame_end: int,

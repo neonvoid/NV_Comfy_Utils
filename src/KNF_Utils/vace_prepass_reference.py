@@ -143,6 +143,12 @@ class NV_VacePrePassReference:
         ref_latent = streaming_vae_encode(vae, repeated[:, :, :, :3])
         # ref_latent shape: [1, 16, ref_latent_length, H/8, W/8]
 
+        # Save 16ch encoded reference for the ref_latent output (used by
+        # NV_PrependReferenceLatent in V2V workflows). Must be real encoded
+        # content, NOT zeros — zeros create a massive latent-space discontinuity
+        # at the reference/video boundary that causes noise bleed artifacts.
+        ref_latent_16ch = ref_latent.clone()
+
         # Free pixel-space reference tensors
         del repeated, sampled_refs
 
@@ -274,20 +280,18 @@ class NV_VacePrePassReference:
         )
         out_latent = {"samples": latent}
 
-        # Reference-only latent: zero frames matching the prepended reference region.
-        # Use this with NV_LatentTemporalConcat to prepend to a custom denoised latent
-        # when bypassing the main latent output (e.g., low-denoise input latent workflows).
-        ref_only_latent = torch.zeros(
-            [batch_size, 16, ref_latent_length, height // 8, width // 8],
-            device=intermediate_device
-        )
-        out_ref_latent = {"samples": ref_only_latent}
+        # Reference-only latent: real VAE-encoded reference frames for prepending
+        # to a custom denoised latent in V2V workflows. Using real content (not zeros)
+        # prevents latent-space discontinuity at the ref/video boundary that causes
+        # noise bleed artifacts in the first frames after trimming.
+        out_ref_latent = {"samples": ref_latent_16ch.to(intermediate_device)}
+        del ref_latent_16ch
 
         print(f"[NV_VacePrePassReference] Done.")
         print(f"  VACE latent shape: {control_video_latent.shape}")
         print(f"  VACE mask shape: {mask.shape}")
         print(f"  Output latent shape: {latent.shape}")
-        print(f"  ref_latent shape: {ref_only_latent.shape} (prepend to custom latent input)")
+        print(f"  ref_latent shape: {out_ref_latent['samples'].shape} (VAE-encoded reference for V2V prepend)")
         print(f"  trim_latent: {trim_latent} (reference latent frames to trim from output)")
 
         return (positive, negative, out_latent, out_ref_latent, trim_latent)

@@ -1,18 +1,12 @@
 """
-NV Co-Denoise Chunk Sampler (Full-Length Input Design)
+DEPRECATED: NV Co-Denoise Chunk Sampler
 
-Per-step co-denoising for chunked video generation. Accepts full-length
-conditioning and latent from a single WanVaceToVideo call, internally
-computes chunk boundaries, slices VACE conditioning per chunk, runs
-per-step Euler co-denoising with overlap blending, and outputs a single
-merged latent.
+This node has been deprecated. It hardcodes Euler stepping regardless of the
+sampler_name input, and has not produced competitive results compared to the
+latent-space chunk stitching pipeline.
 
-Eliminates the need for per-chunk WanVaceToVideo nodes, ChunkPack chains,
-or external chunk stitching. The same mechanism that makes native context
-windows consistent (per-step prediction blending) applied at the chunk level.
-
-Supports multi-model sequential/boundary sampling, committed noise,
-and automatic per-chunk RoPE shift_t.
+Use instead:
+  [NV_SaveChunkLatent] -> [NV_LatentChunkStitcher] -> [NV_BoundaryNoiseMask]
 """
 
 import torch
@@ -27,22 +21,19 @@ import comfy.utils
 import comfy.model_management
 import latent_preview
 
+from .chunk_utils import video_to_latent_frames, compute_blend_weights
+
 
 # ============================================================================
-# Blend helpers
+# Blend helpers (kept for internal use, delegates to chunk_utils)
 # ============================================================================
 
 def _hann_weights(length, device=None):
-    if length <= 1:
-        return torch.ones(max(1, length), device=device)
-    t = torch.linspace(0, 1, length, device=device)
-    return 0.5 * (1.0 - torch.cos(math.pi * t))
+    return compute_blend_weights(length, "hann", device)
 
 
 def _linear_weights(length, device=None):
-    if length <= 1:
-        return torch.ones(max(1, length), device=device)
-    return torch.linspace(0, 1, length, device=device)
+    return compute_blend_weights(length, "linear", device)
 
 
 _BLEND_FNS = {
@@ -82,17 +73,6 @@ def _blend_overlaps(chunks_x, overlap, blend_mode, tdim=2):
 
         chunks_x[i][tuple(sl_a)] = blended
         chunks_x[i + 1][tuple(sl_b)] = blended
-
-
-# ============================================================================
-# Utility
-# ============================================================================
-
-def video_to_latent_frames(video_frames):
-    """Convert video frame count to latent frame count (Wan 4:1 compression)."""
-    if video_frames <= 0:
-        return 0
-    return (video_frames - 1) // 4 + 1
 
 
 # ============================================================================

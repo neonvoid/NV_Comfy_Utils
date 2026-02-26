@@ -145,11 +145,13 @@ def get_model_dtype(model) -> torch.dtype:
         return torch.float16
 
 
+from .chunk_utils import video_to_latent_frames as _vtl
+from .chunk_utils import nearest_wan_aligned as _nwa
+
+
 def _pixel_to_latent(pixel_frames):
     """WAN pixel→latent conversion: max(((px - 1) // 4) + 1, 1)"""
-    if pixel_frames <= 0:
-        return 0
-    return max(((pixel_frames - 1) // 4) + 1, 1)
+    return max(_vtl(pixel_frames), 1) if pixel_frames > 0 else 0
 
 
 # ---------------------------------------------------------------------------
@@ -575,15 +577,23 @@ class NV_WanVRAMEstimator:
                     "default": True,
                     "tooltip": "Whether CFG is used (doubles batch dimension for activations)."
                 }),
+                "run_profiler": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Run one forward pass on dummy data to measure actual peak VRAM. "
+                               "Takes ~5-10s. Compares measured vs estimated and outputs a "
+                               "calibration_factor you can use to tune safety margins."
+                }),
             },
         }
 
-    RETURN_TYPES = ("BOOLEAN", "FLOAT", "FLOAT", "FLOAT", "STRING",)
+    RETURN_TYPES = ("BOOLEAN", "FLOAT", "FLOAT", "FLOAT", "FLOAT", "FLOAT", "STRING",)
     RETURN_NAMES = (
         "fits_without_context_windows",
         "estimated_peak_gb",
         "available_vram_gb",
         "headroom_gb",
+        "measured_peak_gb",
+        "calibration_factor",
         "vram_report",
     )
     OUTPUT_NODE = True
@@ -608,6 +618,7 @@ class NV_WanVRAMEstimator:
         num_vace_inputs=1,
         safety_margin_percent=20.0,
         use_cfg=True,
+        run_profiler=False,
     ):
         # --- Resolve frame count (IMAGE overrides total_frames) ---
         if images is not None:
@@ -673,9 +684,18 @@ class NV_WanVRAMEstimator:
                 safety_margin_bytes=int(generic_bytes * safety_margin_percent / 100.0),
             )
 
-        # --- Check if we can get actual measured peak from previous runs ---
+        # --- Optional profiler: run one forward pass to measure actual peak ---
         measured_peak = 0
-        if torch.cuda.is_available():
+        profiler_error = ""
+        if run_profiler:
+            logger.info("[WAN VRAM Estimator] Running profiler — one forward pass on dummy data...")
+            measured_peak, profiler_error = _profile_forward_pass(
+                model, total_frames, height, width, use_cfg, model_dtype
+            )
+            if profiler_error:
+                logger.warning(f"[WAN VRAM Estimator] Profiler: {profiler_error}")
+        elif torch.cuda.is_available():
+            # Fall back to reading peak from any previous CUDA work in this session
             try:
                 measured_peak = torch.cuda.max_memory_allocated()
             except Exception:
@@ -698,12 +718,21 @@ class NV_WanVRAMEstimator:
             measured_peak_bytes=measured_peak,
         )
 
+        # Append profiler status to report
+        if run_profiler:
+            if profiler_error:
+                report += f"\n  Profiler error: {profiler_error}"
+            else:
+                report += "\n  Profiler: measured via single forward pass (dummy data)"
+
         # Print to console and show in UI
         print(report)
 
         estimated_gb = round(breakdown.total_gb, 3)
         avail_gb = round(available_vram_bytes / (1024 ** 3), 3)
         headroom_gb = round(headroom_bytes / (1024 ** 3), 3)
+        measured_gb = round(measured_peak / (1024 ** 3), 3) if measured_peak > 0 else 0.0
+        calibration = round(measured_gb / estimated_gb, 3) if estimated_gb > 0 and measured_gb > 0 else 0.0
 
         return {
             "ui": {"text": [report]},
@@ -712,6 +741,8 @@ class NV_WanVRAMEstimator:
                 estimated_gb,
                 avail_gb,
                 headroom_gb,
+                measured_gb,
+                calibration,
                 report,
             ),
         }
@@ -724,7 +755,7 @@ class NV_WanVRAMEstimator:
 # WAN temporal alignment: valid frame counts are 4k+1
 def _align_wan_frames(n):
     """Round down to nearest valid WAN frame count (4k+1)."""
-    return max(1, ((n - 1) // 4) * 4 + 1)
+    return max(1, _nwa(n))
 
 
 # Common aspect ratios as (name, w/h ratio)
@@ -1258,153 +1289,6 @@ def _profile_forward_pass(model, total_pixel_frames, height, width, use_cfg, mod
         return 0, f"Profiling error: {e}"
 
 
-class NV_WanVRAMProfiler:
-    """
-    Empirical VRAM profiler — runs one actual forward pass and measures peak VRAM.
-
-    Use this to VALIDATE the analytical estimator. Connect both this node and
-    NV WAN VRAM Estimator to the same model + parameters, then compare the
-    estimated_peak_gb vs measured_peak_gb.
-
-    WARNING: This node runs an actual forward pass on dummy data. It takes
-    a few seconds and temporarily allocates GPU memory. Run it BEFORE your
-    actual generation to measure, not during.
-    """
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "model": ("MODEL", {
-                    "tooltip": "WAN model to profile. Must be loadable onto GPU."
-                }),
-                "total_frames": ("INT", {
-                    "default": 81, "min": 1, "max": 10000, "step": 1,
-                    "tooltip": "Total pixel frames to profile with."
-                }),
-                "height": ("INT", {
-                    "default": 480, "min": 64, "max": 4096, "step": 16,
-                }),
-                "width": ("INT", {
-                    "default": 832, "min": 64, "max": 4096, "step": 16,
-                }),
-            },
-            "optional": {
-                "use_cfg": ("BOOLEAN", {"default": True}),
-                "safety_margin_percent": ("FLOAT", {
-                    "default": 20.0, "min": 0.0, "max": 50.0, "step": 1.0,
-                }),
-            },
-        }
-
-    RETURN_TYPES = ("FLOAT", "FLOAT", "FLOAT", "STRING",)
-    RETURN_NAMES = (
-        "measured_peak_gb",
-        "estimated_peak_gb",
-        "calibration_factor",
-        "profile_report",
-    )
-    OUTPUT_NODE = True
-    FUNCTION = "profile"
-    CATEGORY = "NV_Utils"
-    DESCRIPTION = (
-        "Runs one forward pass on dummy data to measure actual peak VRAM. "
-        "Compare measured_peak_gb with the estimator's output to validate accuracy. "
-        "calibration_factor = measured / estimated — use this to adjust safety margins."
-    )
-
-    def profile(
-        self,
-        model,
-        total_frames,
-        height,
-        width,
-        use_cfg=True,
-        safety_margin_percent=20.0,
-    ):
-        config = extract_wan_config(model)
-        model_dtype = get_model_dtype(model)
-        weight_bytes = get_model_size(model)
-        backend = detect_attention_backend()
-
-        # Analytical estimate
-        if config is not None:
-            breakdown = estimate_inference_peak(
-                config=config,
-                model_weight_bytes=weight_bytes,
-                model_dtype=model_dtype,
-                total_pixel_frames=total_frames,
-                height=height,
-                width=width,
-                backend=backend,
-                use_cfg=use_cfg,
-                safety_margin_pct=safety_margin_percent,
-                model=model,
-            )
-            estimated_gb = breakdown.total_gb
-        else:
-            estimated_gb = 0.0
-
-        # Empirical measurement
-        measured_bytes, error = _profile_forward_pass(
-            model, total_frames, height, width, use_cfg, model_dtype
-        )
-        measured_gb = measured_bytes / (1024 ** 3) if measured_bytes > 0 else 0.0
-
-        # Calibration factor
-        calibration = measured_gb / estimated_gb if estimated_gb > 0 and measured_gb > 0 else 0.0
-
-        # Build report
-        lines = []
-        lines.append("=" * 60)
-        lines.append("  WAN VRAM Profiler — Empirical Measurement")
-        lines.append("=" * 60)
-
-        if error:
-            lines.append(f"  ERROR: {error}")
-            lines.append("")
-            lines.append("  The forward pass could not complete. This may be because:")
-            lines.append("  - The model requires specific conditioning (VACE, i2v CLIP)")
-            lines.append("  - Not enough VRAM to run even one forward pass")
-            lines.append("  - Model is not fully loaded")
-            lines.append("")
-            lines.append(f"  Analytical estimate: {estimated_gb:.2f} GB")
-        else:
-            T_lat = _pixel_to_latent(total_frames)
-            lines.append(f"  Config: {width}x{height} @ {total_frames}px ({T_lat} latent)")
-            lines.append(f"  CFG: {'Yes (batch=2)' if use_cfg else 'No (batch=1)'}")
-            lines.append(f"  Backend: {backend.name}")
-            lines.append("")
-            lines.append(f"  MEASURED peak:    {measured_gb:.2f} GB")
-            lines.append(f"  ESTIMATED peak:   {estimated_gb:.2f} GB")
-            lines.append(f"  Difference:       {measured_gb - estimated_gb:+.2f} GB")
-            lines.append(f"  Calibration:      {calibration:.2f}x")
-            lines.append("")
-            if calibration > 1.1:
-                lines.append(f"  UNDERESTIMATE: Increase safety_margin to ~{(calibration - 1) * 100:.0f}%")
-            elif calibration < 0.9:
-                lines.append(f"  OVERESTIMATE: Could reduce safety_margin")
-            else:
-                lines.append(f"  ACCURATE: Estimate is within 10% of measured")
-            lines.append("")
-            lines.append(f"  Use calibration_factor ({calibration:.2f}) to adjust estimates:")
-            lines.append(f"  adjusted_estimate = estimated * {calibration:.2f}")
-
-        lines.append("=" * 60)
-        report = "\n".join(lines)
-        print(report)
-
-        return {
-            "ui": {"text": [report]},
-            "result": (
-                round(measured_gb, 3),
-                round(estimated_gb, 3),
-                round(calibration, 3),
-                report,
-            ),
-        }
-
-
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
@@ -1412,11 +1296,9 @@ class NV_WanVRAMProfiler:
 NODE_CLASS_MAPPINGS = {
     "NV_WanVRAMEstimator": NV_WanVRAMEstimator,
     "NV_WanConfigOptimizer": NV_WanConfigOptimizer,
-    "NV_WanVRAMProfiler": NV_WanVRAMProfiler,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "NV_WanVRAMEstimator": "NV WAN VRAM Estimator",
     "NV_WanConfigOptimizer": "NV WAN Config Optimizer",
-    "NV_WanVRAMProfiler": "NV WAN VRAM Profiler",
 }

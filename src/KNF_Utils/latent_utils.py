@@ -66,8 +66,22 @@ class NV_PrependReferenceLatent:
         print(f"  Video latent: {list(video_samples.shape)} -> Combined: {list(combined.shape)}")
         print(f"  Use TrimVideoLatent with trim_amount={trim_amount} after generation")
 
-        out_latent = video_latent.copy()
-        out_latent["samples"] = combined
+        # Build clean output latent — only carry forward keys that are safe
+        # after changing the temporal dimension. noise_mask and batch_index
+        # are tied to the original temporal size and become stale/misaligned
+        # after prepending, causing noise bleed artifacts at frame boundaries.
+        out_latent = {"samples": combined}
+
+        # Preserve keys that are NOT temporal-dependent
+        safe_keys = {"downscale_ratio_spacial", "latent_format_version_0"}
+        for key in video_latent:
+            if key == "samples":
+                continue
+            if key in safe_keys:
+                out_latent[key] = video_latent[key]
+            else:
+                print(f"  [NV_PrependReferenceLatent] Dropped stale key '{key}' "
+                      f"(temporal dimension changed)")
 
         return (out_latent, trim_amount)
 
@@ -109,8 +123,18 @@ class NV_LatentTemporalConcat:
 
         print(f"[NV_LatentTemporalConcat] {list(samples_a.shape)} + {list(samples_b.shape)} -> {list(combined.shape)}")
 
-        out_latent = latent_a.copy()
-        out_latent["samples"] = combined
+        # Build clean output — drop temporal-dependent metadata (noise_mask,
+        # batch_index) since the temporal dimension has changed.
+        out_latent = {"samples": combined}
+        safe_keys = {"downscale_ratio_spacial", "latent_format_version_0"}
+        for key in latent_a:
+            if key == "samples":
+                continue
+            if key in safe_keys:
+                out_latent[key] = latent_a[key]
+            else:
+                print(f"  [NV_LatentTemporalConcat] Dropped stale key '{key}' "
+                      f"(temporal dimension changed)")
 
         return (out_latent,)
 
@@ -326,8 +350,18 @@ class NV_LatentTemporalSlice:
 
         print(f"[NV_LatentTemporalSlice] {info}")
 
-        out_latent = latent.copy()
-        out_latent["samples"] = sliced
+        # Build clean output — drop temporal-dependent metadata (noise_mask,
+        # batch_index) since the temporal dimension has changed.
+        out_latent = {"samples": sliced}
+        safe_keys = {"downscale_ratio_spacial", "latent_format_version_0"}
+        for key in latent:
+            if key == "samples":
+                continue
+            if key in safe_keys:
+                out_latent[key] = latent[key]
+            else:
+                print(f"  [NV_LatentTemporalSlice] Dropped stale key '{key}' "
+                      f"(temporal dimension changed)")
 
         return (out_latent, chosen_count, info)
 

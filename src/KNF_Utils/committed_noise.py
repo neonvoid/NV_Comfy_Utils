@@ -15,12 +15,7 @@ import torch
 import comfy.sample
 import os
 
-
-def video_to_latent_frames(video_frames: int) -> int:
-    """Convert video frame count to latent frame count (Wan 4:1 compression)."""
-    if video_frames <= 0:
-        return 0
-    return (video_frames - 1) // 4 + 1
+from .chunk_utils import video_to_latent_frames
 
 
 def apply_freenoise_temporal_correlation(
