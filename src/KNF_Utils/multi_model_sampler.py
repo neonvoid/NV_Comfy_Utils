@@ -17,6 +17,7 @@ Chunk Consistency Features:
 import torch
 import comfy.sample
 import comfy.samplers
+import comfy.model_sampling
 import comfy.utils
 import latent_preview
 from nodes import common_ksampler
@@ -63,6 +64,25 @@ class NV_MultiModelSampler:
                     "tooltip": "Boundary mode: sigma thresholds (0-1). Model switches when sigma drops below threshold."}),
                 "model_cfg_scales": ("STRING", {"default": "", "multiline": False,
                     "tooltip": "Per-model CFG overrides (e.g., '7.0,5.0,3.0'). Empty = use main cfg."}),
+                # Cascaded pipeline options (wire from NV_PreNoiseLatent outputs)
+                "shift_override": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 20.0, "step": 0.5,
+                    "tooltip": (
+                        "Override model shift for sigma schedule. 0=use model default. "
+                        "Wire from NV_PreNoiseLatent shift_used output to keep in sync. "
+                        "LUVE recommends: Stage 1 shift=7-8, Stage 3 shift=3-4."
+                    )}),
+                "add_noise": (["enable", "disable"], {"default": "enable",
+                    "tooltip": (
+                        "Disable noise injection when latent is already pre-noised "
+                        "(e.g., from NV_PreNoiseLatent in cascaded pipeline)."
+                    )}),
+                "start_at_step": ("INT", {"default": 0, "min": 0, "max": 10000,
+                    "tooltip": (
+                        "Skip to this step in the schedule (0=start from beginning). "
+                        "Wire from NV_PreNoiseLatent start_at_step output for cascaded pipeline."
+                    )}),
+                "end_at_step": ("INT", {"default": 0, "min": 0, "max": 10000,
+                    "tooltip": "Stop at this step (0=run to end). For cascaded: wire expanded_steps here."}),
                 # Chunk consistency options
                 "committed_noise": ("COMMITTED_NOISE", {
                     "tooltip": "Pre-generated noise with FreeNoise correlation (from NV_CommittedNoise). If provided, seed is ignored."

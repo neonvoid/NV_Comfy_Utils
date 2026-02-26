@@ -66,9 +66,9 @@ def sample_nv_rf_solver_2(model, x, sigmas, extra_args=None, callback=None,
             x_probe = x + delta_t * d
             sigma_probe = sigma + delta_t
             # Clamp: don't let probe sigma go below next sigma
-            sigma_probe = max(float(sigma_probe), float(sigma_next))
+            sigma_probe = x.new_tensor(max(float(sigma_probe), float(sigma_next)))
             denoised_probe = model(
-                x_probe, x.new_full([x.shape[0]], sigma_probe), **extra_args
+                x_probe, sigma_probe.expand(x.shape[0]), **extra_args
             )
             d_probe = to_d(x_probe, sigma_probe, denoised_probe)
 

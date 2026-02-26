@@ -97,9 +97,9 @@ class NV_PreNoiseLatent:
             }
         }
 
-    RETURN_TYPES = ("LATENT", "INT", "INT", "FLOAT", "FLOAT", "STRING")
+    RETURN_TYPES = ("LATENT", "INT", "INT", "FLOAT", "FLOAT", "FLOAT", "STRING")
     RETURN_NAMES = ("latent", "expanded_steps", "start_at_step",
-                    "start_sigma", "signal_preserved_pct", "info")
+                    "shift_used", "start_sigma", "signal_preserved_pct", "info")
     FUNCTION = "execute"
     CATEGORY = "NV_Utils/Chunked Pipeline"
     DESCRIPTION = (
@@ -192,7 +192,7 @@ class NV_PreNoiseLatent:
               f"freenoise={'yes' if freenoise_applied else 'no'}")
 
         return (out, expanded_steps, start_at_step,
-                start_sigma, signal_preserved, info)
+                shift, start_sigma, signal_preserved, info)
 
 
 NODE_CLASS_MAPPINGS = {
