@@ -110,8 +110,12 @@ class NV_ParallelChunkPlanner:
             "optional": {
                 # VRAM-aware auto-computation
                 "model": ("MODEL", {
-                    "tooltip": "WAN model for VRAM-aware auto-computation of max_frames_per_worker. "
+                    "tooltip": "Primary WAN model for VRAM-aware auto-computation of max_frames_per_worker. "
                                "Required when max_frames_per_worker=0."
+                }),
+                "model_2": ("MODEL", {
+                    "tooltip": "Second WAN model (e.g. WAN 2.2 dual-model pipeline). "
+                               "Both models' weights are budgeted in VRAM estimation."
                 }),
                 "available_vram_gb": ("FLOAT", {
                     "default": 0.0,
@@ -195,8 +199,14 @@ class NV_ParallelChunkPlanner:
     )
 
     def _auto_compute_max_frames(self, model, height, width, available_vram_bytes,
-                                 use_vace, use_cfg):
-        """Auto-compute max frames that fit in VRAM using the VRAM estimator."""
+                                 use_vace, use_cfg, model_2=None):
+        """Auto-compute max frames that fit in VRAM using the VRAM estimator.
+
+        When model_2 is provided (e.g. WAN 2.2 dual-model pipeline), both models'
+        weights are budgeted. The multi-model sampler runs one model at a time, but
+        ComfyUI keeps idle model weights resident in VRAM to avoid reload latency.
+        Peak = max(active_1_peak + idle_2_weights, active_2_peak + idle_1_weights).
+        """
         try:
             from .wan_vram_estimator import (
                 extract_wan_config,
@@ -215,12 +225,26 @@ class NV_ParallelChunkPlanner:
             dtype = get_model_dtype(model)
             weight_bytes = get_model_size(model)
 
-            # Build estimator function with all params bound except frame count
-            def estimate_fn(pixel_frames):
+            # Dual-model: get second model's config and weights
+            config_2 = None
+            weight_bytes_2 = 0
+            dtype_2 = None
+            if model_2 is not None:
+                config_2 = extract_wan_config(model_2)
+                weight_bytes_2 = get_model_size(model_2)
+                dtype_2 = get_model_dtype(model_2)
+                if config_2 is None:
+                    # model_2 is non-WAN — still budget its weights
+                    logger.info(
+                        f"[ChunkPlanner] model_2 is non-WAN, budgeting {weight_bytes_2 / (1024**3):.2f}GB weights only"
+                    )
+
+            def _estimate_single(cfg, wbytes, dt, mdl, pixel_frames):
+                """Estimate peak for one model's inference."""
                 breakdown = estimate_inference_peak(
-                    config=config,
-                    model_weight_bytes=weight_bytes,
-                    model_dtype=dtype,
+                    config=cfg,
+                    model_weight_bytes=wbytes,
+                    model_dtype=dt,
                     total_pixel_frames=pixel_frames,
                     height=height,
                     width=width,
@@ -228,9 +252,24 @@ class NV_ParallelChunkPlanner:
                     use_vace=use_vace,
                     use_cfg=use_cfg,
                     safety_margin_pct=20.0,
-                    model=model,
+                    model=mdl,
                 )
-                return breakdown.total
+                return breakdown
+
+            # Build estimator function that accounts for both models
+            def estimate_fn(pixel_frames):
+                peak_1 = _estimate_single(config, weight_bytes, dtype, model, pixel_frames).total
+
+                if model_2 is not None:
+                    if config_2 is not None:
+                        # Both WAN models: take max of (active + idle weights)
+                        peak_2 = _estimate_single(config_2, weight_bytes_2, dtype_2, model_2, pixel_frames).total
+                        return max(peak_1 + weight_bytes_2, peak_2 + weight_bytes)
+                    else:
+                        # model_2 is non-WAN: just add its weight footprint
+                        return peak_1 + weight_bytes_2
+
+                return peak_1
 
             max_frames = estimate_max_inference_frames(
                 estimate_fn=estimate_fn,
@@ -240,31 +279,35 @@ class NV_ParallelChunkPlanner:
             )
 
             # Get the peak for the chosen frame count for reporting
-            peak_breakdown = estimate_inference_peak(
-                config=config,
-                model_weight_bytes=weight_bytes,
-                model_dtype=dtype,
-                total_pixel_frames=max_frames,
-                height=height,
-                width=width,
-                backend=backend,
-                use_vace=use_vace,
-                use_cfg=use_cfg,
-                safety_margin_pct=20.0,
-                model=model,
-            )
+            peak_breakdown = _estimate_single(config, weight_bytes, dtype, model, max_frames)
+            effective_peak = peak_breakdown.total
+            if model_2 is not None:
+                effective_peak += weight_bytes_2
+                if config_2 is not None:
+                    peak_2 = _estimate_single(config_2, weight_bytes_2, dtype_2, model_2, max_frames).total
+                    effective_peak = max(peak_breakdown.total + weight_bytes_2,
+                                         peak_2 + weight_bytes)
 
             vram_info = {
-                "estimated_peak_gb": round(peak_breakdown.total_gb, 2),
+                "estimated_peak_gb": round(effective_peak / (1024 ** 3), 2),
                 "available_vram_gb": round(available_vram_bytes / (1024 ** 3), 2),
-                "headroom_gb": round((available_vram_bytes - peak_breakdown.total) / (1024 ** 3), 2),
+                "headroom_gb": round((available_vram_bytes - effective_peak) / (1024 ** 3), 2),
                 "attention_backend": backend.name,
             }
 
-            logger.info(
+            if model_2 is not None:
+                vram_info["multi_model"] = True
+                vram_info["model_1_weights_gb"] = round(weight_bytes / (1024 ** 3), 2)
+                vram_info["model_2_weights_gb"] = round(weight_bytes_2 / (1024 ** 3), 2)
+
+            log_msg = (
                 f"[ChunkPlanner] VRAM auto-compute: {max_frames} frames @ {width}x{height}, "
-                f"peak={peak_breakdown.total_gb:.1f}GB / {available_vram_bytes / (1024**3):.1f}GB available"
+                f"peak={effective_peak / (1024**3):.1f}GB / {available_vram_bytes / (1024**3):.1f}GB available"
             )
+            if model_2 is not None:
+                log_msg += f" (dual-model: {weight_bytes / (1024**3):.1f}GB + {weight_bytes_2 / (1024**3):.1f}GB weights)"
+            logger.info(log_msg)
+
             return max_frames, vram_info
 
         except Exception as e:
@@ -279,7 +322,8 @@ class NV_ParallelChunkPlanner:
         return max(16, aligned)
 
     def plan_chunks(self, video, max_frames_per_worker, overlap_frames, output_json_path,
-                    model=None, available_vram_gb=0.0, use_vace=False, use_cfg=True,
+                    model=None, model_2=None, available_vram_gb=0.0,
+                    use_vace=False, use_cfg=True,
                     seed=0, steps=20, cfg=5.0, sampler_name="euler", scheduler="sgm_uniform",
                     denoise=0.75, context_window_size=81, context_overlap=16,
                     wan_frame_alignment=True):
@@ -311,7 +355,8 @@ class NV_ParallelChunkPlanner:
         if max_frames_per_worker == 0:
             if model is not None:
                 max_frames_per_worker, vram_info = self._auto_compute_max_frames(
-                    model, height, width, available_vram_bytes, use_vace, use_cfg
+                    model, height, width, available_vram_bytes, use_vace, use_cfg,
+                    model_2=model_2,
                 )
                 max_frames_source = "vram_auto"
                 print(f"[NV_ParallelChunkPlanner] VRAM auto-computed: {max_frames_per_worker} max frames per worker")
@@ -489,11 +534,17 @@ class NV_ParallelChunkPlanner:
         if max_frames_source == "vram_auto":
             summary_lines.append(f"Max frames per worker: {max_frames_per_worker} (VRAM auto-computed)")
             if vram_info:
-                summary_lines.append(
+                vram_line = (
                     f"  VRAM: {vram_info['estimated_peak_gb']:.1f}GB peak / "
                     f"{vram_info['available_vram_gb']:.1f}GB available "
                     f"({vram_info['headroom_gb']:.1f}GB headroom, {vram_info['attention_backend']})"
                 )
+                summary_lines.append(vram_line)
+                if vram_info.get("multi_model"):
+                    summary_lines.append(
+                        f"  Dual-model: {vram_info['model_1_weights_gb']:.1f}GB + "
+                        f"{vram_info['model_2_weights_gb']:.1f}GB weights (both budgeted in VRAM)"
+                    )
         elif wan_frame_alignment and original_max_frames != max_frames_per_worker:
             summary_lines.append(f"Max frames per worker: {original_max_frames} → {max_frames_per_worker} (WAN-aligned)")
         else:
