@@ -423,14 +423,19 @@ class NV_ChunkLoaderVACE:
 
     RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "IMAGE", "IMAGE",
                     "INT", "INT", "INT", "INT", "INT", "FLOAT", "FLOAT", "STRING", "STRING", "INT", "INT", "STRING",
-                    "LATENT",)
+                    "LATENT",
+                    "FLOAT", "INT", "INT",)
     RETURN_NAMES = ("chunk_video", "chunk_ctrl_1", "chunk_ctrl_2", "chunk_ctrl_3", "chunk_ctrl_4",
                     "chunk_index", "start_frame", "frame_count", "seed", "steps", "cfg", "denoise", "sampler_name", "scheduler",
                     "context_window_size", "context_overlap", "chunk_info",
-                    "chunk_latent",)
+                    "chunk_latent",
+                    "cascade_shift", "cascade_expanded_steps", "cascade_start_at_step",)
     FUNCTION = "load_chunk"
     CATEGORY = "NV_Utils"
-    DESCRIPTION = "Loads video chunk AND control videos for VACE parallel processing. Controls are sliced in sync. Optional latent input for latent-space upscale path."
+    DESCRIPTION = ("Loads video chunk AND control videos for VACE parallel processing. Controls are sliced in sync. "
+                   "Optional latent input for latent-space upscale path. "
+                   "If plan contains cascaded_config (from NV_PreNoiseLatent), outputs cascade_shift, "
+                   "cascade_expanded_steps, and cascade_start_at_step for direct NV_MultiModelSampler wiring.")
 
     def load_chunk(self, video, plan_json_path, chunk_index,
                    control_1=None, control_2=None, control_3=None, control_4=None,
@@ -533,6 +538,12 @@ class NV_ChunkLoaderVACE:
         context_window_size = params.get("context_window_size", 81)
         context_overlap = params.get("context_overlap", 16)
 
+        # Get cascaded pipeline config (injected by NV_PreNoiseLatent)
+        cascade = plan.get("cascaded_config", {})
+        cascade_shift = cascade.get("shift_override", 0.0)
+        cascade_expanded_steps = cascade.get("expanded_steps", 0)
+        cascade_start_at_step = cascade.get("start_at_step", 0)
+
         # Build info string
         num_controls = sum(1 for c in chunk_controls if c is not None)
         info_lines = [
@@ -548,6 +559,14 @@ class NV_ChunkLoaderVACE:
             f"Context Window: {context_window_size}",
             f"Context Overlap: {context_overlap}",
         ]
+        if cascade:
+            info_lines.extend([
+                f"--- Cascaded Config (from NV_PreNoiseLatent) ---",
+                f"Cascade Shift: {cascade_shift}",
+                f"Cascade Expanded Steps: {cascade_expanded_steps}",
+                f"Cascade Start At Step: {cascade_start_at_step}",
+                f"Signal Preserved: {cascade.get('signal_preserved_pct', '?')}%",
+            ])
 
         chunk_info = "\n".join(info_lines)
 
@@ -590,7 +609,8 @@ class NV_ChunkLoaderVACE:
         return (chunk_video, chunk_controls[0], chunk_controls[1], chunk_controls[2], chunk_controls[3],
                 chunk_index, start_frame, frame_count, seed, steps, cfg, denoise, sampler_name, scheduler,
                 context_window_size, context_overlap, chunk_info,
-                chunk_latent)
+                chunk_latent,
+                cascade_shift, cascade_expanded_steps, cascade_start_at_step)
 
 
 # Node registration

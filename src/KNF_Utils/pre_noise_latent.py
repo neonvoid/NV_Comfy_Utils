@@ -73,6 +73,14 @@ class NV_PreNoiseLatent:
                 }),
             },
             "optional": {
+                "plan_json_path": ("STRING", {
+                    "default": "",
+                    "tooltip": (
+                        "Path to chunk plan JSON from NV_ParallelChunkPlanner. "
+                        "If provided, injects cascaded_config (shift, steps, start_at_step) "
+                        "into the plan for downstream nodes to read automatically."
+                    )
+                }),
                 "shift_override": ("FLOAT", {
                     "default": 0.0, "min": 0.0, "max": 20.0, "step": 0.5,
                     "tooltip": (
@@ -97,19 +105,21 @@ class NV_PreNoiseLatent:
             }
         }
 
-    RETURN_TYPES = ("LATENT", "INT", "INT", "FLOAT", "FLOAT", "FLOAT", "STRING")
+    RETURN_TYPES = ("LATENT", "INT", "INT", "FLOAT", "FLOAT", "FLOAT", "STRING", "STRING")
     RETURN_NAMES = ("latent", "expanded_steps", "start_at_step",
-                    "shift_used", "start_sigma", "signal_preserved_pct", "info")
+                    "shift_used", "start_sigma", "signal_preserved_pct", "info",
+                    "plan_json_path")
     FUNCTION = "execute"
     CATEGORY = "NV_Utils/Chunked Pipeline"
     DESCRIPTION = (
         "Add calibrated noise to a clean upscaled latent for cascaded refinement. "
         "Ensures consistent noise across chunk boundaries. "
-        "Wire expanded_steps, start_at_step, and shift_used to NV_MultiModelSampler."
+        "If plan_json_path is provided, injects cascaded_config into the plan "
+        "so NV_ChunkLoaderVACE can output shift/steps/start_at_step automatically."
     )
 
     def execute(self, latent, model, denoise, steps, seed,
-                shift_override=0.0, enable_freenoise=True,
+                plan_json_path="", shift_override=0.0, enable_freenoise=True,
                 context_length=81, context_overlap=16):
         samples = latent["samples"]  # [B, C, T, H, W]
 
@@ -164,18 +174,23 @@ class NV_PreNoiseLatent:
         # --- 6. Compute diagnostics ---
         signal_preserved = (1.0 - start_sigma) * 100.0
 
-        info = json.dumps({
-            "shift": shift,
-            "model_shift": model_shift,
-            "shift_overridden": shift_override > 0.0,
-            "denoise": denoise,
-            "steps_requested": steps,
+        cascaded_config = {
+            "shift_override": shift,
             "expanded_steps": expanded_steps,
             "start_at_step": start_at_step,
+            "add_noise": "disable",
             "start_sigma": round(start_sigma, 6),
             "signal_preserved_pct": round(signal_preserved, 2),
-            "seed": seed,
+            "prenoise_denoise": denoise,
+            "prenoise_steps": steps,
+            "prenoise_seed": seed,
             "freenoise_applied": freenoise_applied,
+        }
+
+        info = json.dumps({
+            **cascaded_config,
+            "model_shift": model_shift,
+            "shift_overridden": shift_override > 0.0,
             "latent_shape": list(samples.shape),
             "usage": (
                 "Wire expanded_steps → NV_MultiModelSampler 'steps' (and 'end_at_step'), "
@@ -183,6 +198,22 @@ class NV_PreNoiseLatent:
                 "shift_used → 'shift_override', set add_noise=disable"
             ),
         }, indent=2)
+
+        # --- 7. Inject cascaded_config into plan JSON if provided ---
+        plan_out_path = plan_json_path
+        if plan_json_path and plan_json_path.strip():
+            try:
+                with open(plan_json_path, 'r') as f:
+                    plan = json.load(f)
+                plan["cascaded_config"] = cascaded_config
+                with open(plan_json_path, 'w') as f:
+                    json.dump(plan, f, indent=2)
+                print(f"[NV_PreNoiseLatent] Injected cascaded_config into {plan_json_path}")
+            except FileNotFoundError:
+                print(f"[NV_PreNoiseLatent] Warning: plan not found at {plan_json_path}, "
+                      f"skipping injection. Wire outputs manually.")
+            except (json.JSONDecodeError, OSError) as e:
+                print(f"[NV_PreNoiseLatent] Warning: could not update plan: {e}")
 
         shift_src = f"{shift} (override)" if shift_override > 0.0 else f"{shift} (model)"
         print(f"[NV_PreNoiseLatent] shift={shift_src}, denoise={denoise}, "
@@ -192,7 +223,7 @@ class NV_PreNoiseLatent:
               f"freenoise={'yes' if freenoise_applied else 'no'}")
 
         return (out, expanded_steps, start_at_step,
-                shift, start_sigma, signal_preserved, info)
+                shift, start_sigma, signal_preserved, info, plan_out_path)
 
 
 NODE_CLASS_MAPPINGS = {
