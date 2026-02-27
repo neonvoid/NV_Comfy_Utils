@@ -201,6 +201,19 @@ class NV_MultiModelSampler:
                 positive, negative, latent_image, denoise=denoise,
                 start_step=start_step, last_step=last_step
             )
+        elif disable_noise:
+            # Flow matching (CONST) fix: common_ksampler sets noise=zeros when
+            # disable_noise=True, but noise_scaling(sigma, zeros, x) = (1-sigma)*x
+            # which scales down the pre-noised latent. Instead, use identity noise:
+            # noise_scaling(sigma, x, x) = sigma*x + (1-sigma)*x = x (passthrough).
+            # Noise must be process_latent_in'd since inner_sample only processes
+            # latent_image, not noise.
+            identity_noise = self._make_identity_noise(model, latent_image)
+            result = self._ksampler_with_noise(
+                model, identity_noise, seed, steps, cfg, sampler_name, scheduler,
+                positive, negative, latent_image, denoise=denoise,
+                start_step=start_step, last_step=last_step
+            )
         else:
             result = common_ksampler(
                 model, seed, steps, cfg, sampler_name, scheduler,
@@ -261,6 +274,18 @@ class NV_MultiModelSampler:
             if noise_tensor is not None and not seg_disable_noise:
                 result = self._ksampler_with_noise(
                     model, noise_tensor, seed, steps, cfg, sampler_name, scheduler,
+                    positive, negative, current_latent,
+                    denoise=denoise,
+                    start_step=seg_start,
+                    last_step=seg_end,
+                    force_full_denoise=(i == len(models) - 1)
+                )
+            elif seg_disable_noise:
+                # Flow matching (CONST) fix: see _sample_single for full explanation.
+                # Use identity noise so noise_scaling passes through the pre-noised latent.
+                identity_noise = self._make_identity_noise(model, current_latent)
+                result = self._ksampler_with_noise(
+                    model, identity_noise, seed, steps, cfg, sampler_name, scheduler,
                     positive, negative, current_latent,
                     denoise=denoise,
                     start_step=seg_start,
@@ -329,6 +354,26 @@ class NV_MultiModelSampler:
         return (out,)
 
     @staticmethod
+    def _make_identity_noise(model, latent):
+        """
+        Create noise tensor that makes noise_scaling a no-op for flow matching.
+
+        For CONST models, noise_scaling(sigma, noise, x) = sigma*noise + (1-sigma)*x.
+        With zeros noise this becomes (1-sigma)*x — scaling DOWN the pre-noised latent.
+
+        Fix: set noise = process_latent_in(x), so that after inner_sample applies
+        process_latent_in to latent_image, both args to noise_scaling are identical:
+        noise_scaling(sigma, y, y) = sigma*y + (1-sigma)*y = y  (identity).
+
+        For EPS models this is harmless: noise*sigma + latent_image → x*sigma + x = x*(1+sigma),
+        but EPS models don't use this path (disable_noise=True with zeros works fine for EPS).
+        """
+        samples = latent["samples"]
+        process_latent_in = model.get_model_object("process_latent_in")
+        identity_noise = process_latent_in(samples.clone()).cpu()
+        return identity_noise
+
+    @staticmethod
     def _strip_cascaded_config(result_tuple):
         """Remove nv_cascaded_config from sampler output — latent is now denoised."""
         if result_tuple and isinstance(result_tuple[0], dict):
@@ -366,7 +411,14 @@ class NV_MultiModelSampler:
                 parts = [int(x.strip()) for x in model_steps_str.split(",") if x.strip()]
                 while len(parts) < num_models:
                     parts.append(0)
-                return parts[:num_models]
+                parts = parts[:num_models]
+                manual_sum = sum(parts)
+                if manual_sum != total_steps:
+                    print(f"[NV_MultiModelSampler] WARNING: manual model_steps '{model_steps_str}' "
+                          f"sums to {manual_sum} but effective steps is {total_steps}. "
+                          f"Ignoring manual distribution — using auto-divide instead.")
+                else:
+                    return parts
             except ValueError:
                 pass
 

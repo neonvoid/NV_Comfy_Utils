@@ -555,9 +555,12 @@ class NV_ChunkLoaderVACE:
         # the full expanded schedule and start_at_step handles the truncation.
         if cascade and cascade_expanded_steps > 0:
             original_denoise = denoise
+            original_steps = steps
             denoise = 1.0
-            print(f"[NV_ChunkLoaderVACE] Cascaded mode: denoise overridden {original_denoise} → 1.0 "
-                  f"(encoded in expanded_steps={cascade_expanded_steps}/start_at_step={cascade_start_at_step})")
+            steps = cascade_expanded_steps
+            print(f"[NV_ChunkLoaderVACE] Cascaded mode: denoise overridden {original_denoise} → 1.0, "
+                  f"steps overridden {original_steps} → {cascade_expanded_steps} "
+                  f"(start_at_step={cascade_start_at_step}, effective={cascade_expanded_steps - cascade_start_at_step})")
 
         # --- Cross-validate plan config vs latent config ---
         if latent is not None and cascade and cascade_expanded_steps > 0:
@@ -620,6 +623,7 @@ class NV_ChunkLoaderVACE:
                 f"Cascade Shift: {cascade_shift}",
                 f"Cascade Expanded Steps: {cascade_expanded_steps}",
                 f"Cascade Start At Step: {cascade_start_at_step}",
+                f"Cascade Effective Steps: {cascade_expanded_steps - cascade_start_at_step}",
                 f"Signal Preserved: {cascade.get('signal_preserved_pct', '?')}%",
                 f"Add Noise: disable (latent is pre-noised)",
             ])
