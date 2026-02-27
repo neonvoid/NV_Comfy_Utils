@@ -280,14 +280,30 @@ class NV_MultiModelSampler:
                     last_step=seg_end,
                     force_full_denoise=(i == len(models) - 1)
                 )
-            elif seg_disable_noise:
-                # Flow matching (CONST) fix: see _sample_single for full explanation.
-                # Use identity noise so noise_scaling passes through the pre-noised latent.
+            elif i == 0 and disable_noise:
+                # Flow matching (CONST) fix for FIRST model only:
+                # Pre-noised latent from PreNoiseLatent has no inverse_noise_scaling applied.
+                # noise_scaling(sigma, zeros, x) = (1-sigma)*x would scale it DOWN.
+                # Identity noise: noise_scaling(sigma, x, x) = x (passthrough).
                 identity_noise = self._make_identity_noise(model, current_latent)
                 result = self._ksampler_with_noise(
                     model, identity_noise, seed, steps, cfg, sampler_name, scheduler,
                     positive, negative, current_latent,
                     denoise=denoise,
+                    start_step=seg_start,
+                    last_step=seg_end,
+                    force_full_denoise=(i == len(models) - 1)
+                )
+            elif seg_disable_noise:
+                # Subsequent models (i > 0): use standard zeros noise path.
+                # The previous model's output has inverse_noise_scaling applied (x / (1-sigma)).
+                # noise_scaling(sigma, zeros, x_scaled) = (1-sigma) * x/(1-sigma) = x
+                # The (1-sigma) scaling CORRECTLY cancels inverse_noise_scaling.
+                result = common_ksampler(
+                    model, seed, steps, cfg, sampler_name, scheduler,
+                    positive, negative, current_latent,
+                    denoise=denoise,
+                    disable_noise=True,
                     start_step=seg_start,
                     last_step=seg_end,
                     force_full_denoise=(i == len(models) - 1)
