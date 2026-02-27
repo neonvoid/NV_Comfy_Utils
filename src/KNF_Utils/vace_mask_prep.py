@@ -53,19 +53,18 @@ class NV_VaceMaskPrep:
                 "mask": ("MASK",),
                 "mode": (["auto", "manual"], {
                     "default": "auto",
-                    "tooltip": "auto: analyze mask geometry and derive optimal erosion/feather. "
+                    "tooltip": "auto: use widget values as targets, capped by mask geometry safety limits. "
                                "manual: use erosion_blocks and feather_blocks values directly."
                 }),
                 "erosion_blocks": ("FLOAT", {
                     "default": 0.5, "min": 0.0, "max": 4.0, "step": 0.25,
-                    "tooltip": "(Manual mode) Erode mask inward by this many VAE blocks. "
-                               "0.5 blocks = 4px for WAN. Fixes control-video/mask edge misalignment."
+                    "tooltip": "Erode mask inward by this many VAE blocks. "
+                               "0.5 blocks = 4px for WAN. In auto mode, capped by 1/3 inscribed radius."
                 }),
                 "feather_blocks": ("FLOAT", {
                     "default": 1.5, "min": 0.0, "max": 8.0, "step": 0.25,
-                    "tooltip": "(Manual mode) Feather mask edge over this many VAE blocks. "
-                               "1.5 blocks = 12px for WAN. Smooths the transition so no single "
-                               "8x8 VAE block sees a hard discontinuity."
+                    "tooltip": "Feather mask edge over this many VAE blocks. "
+                               "1.5 blocks = 12px for WAN. In auto mode, capped by 1/2 inscribed radius."
                 }),
                 "threshold": ("BOOLEAN", {
                     "default": False,
@@ -134,14 +133,14 @@ class NV_VaceMaskPrep:
 
         # --- Step 3: Compute pixel values ---
         if mode == "auto":
-            # Erosion: target half a VAE block, cap at 1/3 inscribed radius
-            erosion_target = vae_stride * 0.5
+            # Use widget values as TARGETS, capped by mask geometry safety limits.
+            # This way changing erosion_blocks/feather_blocks in the UI has an effect
+            # even in auto mode — auto just caps them to safe values.
+            erosion_target = erosion_blocks * vae_stride
             erosion_max_safe = max(1.0, min_radius / 3.0)
             erosion_px = int(round(min(erosion_target, erosion_max_safe)))
 
-            # Feather: target 1.5 VAE blocks, cap at half inscribed radius
-            #          but always allow at least 1 VAE block
-            feather_target = vae_stride * 1.5
+            feather_target = feather_blocks * vae_stride
             feather_max_safe = max(float(vae_stride), min_radius / 2.0)
             feather_px = int(round(min(feather_target, feather_max_safe)))
 

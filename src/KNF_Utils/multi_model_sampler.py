@@ -22,6 +22,8 @@ import comfy.utils
 import latent_preview
 from nodes import common_ksampler
 
+from .latent_constants import NV_CASCADED_CONFIG_KEY, LATENT_SAFE_KEYS
+
 
 class NV_MultiModelSampler:
     """
@@ -137,6 +139,25 @@ class NV_MultiModelSampler:
         start_step = start_at_step if start_at_step > 0 else None
         last_step = end_at_step if end_at_step > 0 else None
 
+        # --- Cascaded mode validation ---
+        if disable_noise and start_step is not None:
+            # Validate denoise is 1.0 (double-truncation guard)
+            if denoise < 0.999:
+                raise ValueError(
+                    f"[NV_MultiModelSampler] CASCADED MODE ERROR: denoise={denoise} but must be 1.0.\n"
+                    f"In cascaded mode (add_noise=disable, start_at_step={start_step}), the denoise\n"
+                    f"is already encoded in expanded_steps/start_at_step. Setting denoise < 1.0\n"
+                    f"would double-truncate the sigma schedule, resulting in near-zero effective\n"
+                    f"denoising steps and garbage output.\n\n"
+                    f"FIX: Set denoise=1.0 on this sampler, or wire denoise from ChunkLoaderVACE\n"
+                    f"(which auto-overrides to 1.0 in cascaded mode)."
+                )
+            # Warn about unusual end_at_step
+            if last_step is not None and last_step != steps:
+                print(f"[NV_MultiModelSampler] WARNING: end_at_step={last_step} != steps={steps}. "
+                      f"In cascaded mode, end_at_step should normally equal expanded_steps. "
+                      f"This may be intentional, but verify the wiring.")
+
         if disable_noise or start_step is not None:
             print(f"[NV_MultiModelSampler] Cascaded mode: add_noise={add_noise}, "
                   f"start_at_step={start_step}, end_at_step={last_step}, "
@@ -175,17 +196,21 @@ class NV_MultiModelSampler:
                        start_step=None, last_step=None):
         """Standard KSampler behavior - with optional committed noise and cascaded pipeline support."""
         if committed_noise is not None and not disable_noise:
-            return self._ksampler_with_noise(
+            result = self._ksampler_with_noise(
                 model, committed_noise["noise"], seed, steps, cfg, sampler_name, scheduler,
                 positive, negative, latent_image, denoise=denoise,
                 start_step=start_step, last_step=last_step
             )
-        return common_ksampler(
-            model, seed, steps, cfg, sampler_name, scheduler,
-            positive, negative, latent_image, denoise=denoise,
-            disable_noise=disable_noise,
-            start_step=start_step, last_step=last_step
-        )
+        else:
+            result = common_ksampler(
+                model, seed, steps, cfg, sampler_name, scheduler,
+                positive, negative, latent_image, denoise=denoise,
+                disable_noise=disable_noise,
+                start_step=start_step, last_step=last_step
+            )
+        # Strip cascaded config from output — latent has been denoised
+        self._strip_cascaded_config(result)
+        return result
 
     def _sample_sequential(self, models, positive, negative, latent_image,
                            seed, steps, cfg, sampler_name, scheduler,
@@ -256,7 +281,10 @@ class NV_MultiModelSampler:
             current_latent = result[0]
             current_step = seg_end
 
-        return (current_latent,)
+        # Strip cascaded config from final output — latent has been denoised
+        out = (current_latent,)
+        self._strip_cascaded_config(out)
+        return out
 
     def _ksampler_with_noise(self, model, noise, seed, steps, cfg, sampler_name, scheduler,
                               positive, negative, latent, denoise=1.0, start_step=None,
@@ -293,12 +321,20 @@ class NV_MultiModelSampler:
             disable_pbar=disable_pbar, seed=seed
         )
 
-        # Build clean output dict (defensive: drop stale temporal-dependent keys)
+        # Build clean output dict — strip nv_cascaded_config (latent is denoised now)
         out = {"samples": samples}
-        for key in ("downscale_ratio_spacial", "latent_format_version_0"):
-            if key in latent:
+        for key in LATENT_SAFE_KEYS:
+            if key in latent and key != "samples" and key != NV_CASCADED_CONFIG_KEY:
                 out[key] = latent[key]
         return (out,)
+
+    @staticmethod
+    def _strip_cascaded_config(result_tuple):
+        """Remove nv_cascaded_config from sampler output — latent is now denoised."""
+        if result_tuple and isinstance(result_tuple[0], dict):
+            latent = result_tuple[0]
+            if NV_CASCADED_CONFIG_KEY in latent:
+                del latent[NV_CASCADED_CONFIG_KEY]
 
     @staticmethod
     def _apply_shift_override(model, shift):

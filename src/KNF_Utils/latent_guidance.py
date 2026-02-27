@@ -20,6 +20,8 @@ import torch
 import torch.nn.functional as F
 from typing import Optional, Tuple
 
+from .latent_constants import NV_CASCADED_CONFIG_KEY
+
 
 class NV_SaveLatentReference:
     """
@@ -79,6 +81,13 @@ class NV_SaveLatentReference:
             }
         }
 
+        # Preserve cascaded config so it survives save/load round-trip
+        if NV_CASCADED_CONFIG_KEY in latent:
+            data[NV_CASCADED_CONFIG_KEY] = latent[NV_CASCADED_CONFIG_KEY]
+            print(f"[NV_SaveLatentReference] Embedded cascaded config "
+                  f"(shift={latent[NV_CASCADED_CONFIG_KEY].get('shift_override', '?')}, "
+                  f"sigma={latent[NV_CASCADED_CONFIG_KEY].get('start_sigma', '?')})")
+
         torch.save(data, output_path)
 
         size_mb = os.path.getsize(output_path) / (1024 * 1024)
@@ -123,6 +132,15 @@ class NV_LoadLatentReference:
 
         # Standard LATENT output for VAE decoding
         latent = {"samples": data["latents"].float()}
+
+        # Restore cascaded config from saved data
+        if NV_CASCADED_CONFIG_KEY in data:
+            latent[NV_CASCADED_CONFIG_KEY] = data[NV_CASCADED_CONFIG_KEY]
+            cfg = data[NV_CASCADED_CONFIG_KEY]
+            print(f"  Cascaded config: shift={cfg.get('shift_override', '?')}, "
+                  f"sigma={cfg.get('start_sigma', '?')}, "
+                  f"expanded_steps={cfg.get('expanded_steps', '?')}, "
+                  f"start_at_step={cfg.get('start_at_step', '?')}")
 
         return (data, latent,)
 

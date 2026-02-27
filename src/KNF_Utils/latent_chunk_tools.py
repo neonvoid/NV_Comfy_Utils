@@ -35,6 +35,7 @@ from .chunk_utils import (
     compute_latent_overlap,
     video_to_latent_frames,
 )
+from .latent_constants import NV_CASCADED_CONFIG_KEY
 
 
 class NV_SaveChunkLatent:
@@ -96,6 +97,9 @@ class NV_SaveChunkLatent:
         }
         if chunk_video_frames > 0:
             data["chunk_video_frames"] = chunk_video_frames
+        # Preserve cascaded config for round-trip validation
+        if NV_CASCADED_CONFIG_KEY in latent:
+            data[NV_CASCADED_CONFIG_KEY] = latent[NV_CASCADED_CONFIG_KEY]
         torch.save(data, filepath)
 
         file_size_mb = os.path.getsize(filepath) / (1024 * 1024)

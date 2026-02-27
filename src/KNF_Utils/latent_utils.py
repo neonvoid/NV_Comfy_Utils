@@ -7,6 +7,9 @@ where reference images need to be prepended to match conditioning dimensions.
 
 import torch
 import comfy.latent_formats
+import comfy.sample
+
+from .latent_constants import NV_CASCADED_CONFIG_KEY, LATENT_SAFE_KEYS
 
 
 class NV_PrependReferenceLatent:
@@ -37,15 +40,26 @@ class NV_PrependReferenceLatent:
                                "or multi-frame (from NV_VacePrePassReference ref_latent output)."
                 }),
             },
+            "optional": {
+                "model": ("MODEL", {
+                    "tooltip": "Required in cascaded mode (pre-noised latent). "
+                               "Used to auto-noise the reference to match the video's noise level. "
+                               "Wire from the same model used in Stage 3 sampling."
+                }),
+            },
         }
 
     RETURN_TYPES = ("LATENT", "INT")
     RETURN_NAMES = ("latent", "trim_amount")
     FUNCTION = "prepend"
     CATEGORY = "NV_Utils/latent"
-    DESCRIPTION = "Prepend reference frame(s) to video latent for VACE workflows. Use TrimVideoLatent with trim_amount after generation."
+    DESCRIPTION = (
+        "Prepend reference frame(s) to video latent for VACE workflows. "
+        "In cascaded mode (pre-noised latent), auto-noises the reference to match. "
+        "Wire MODEL in cascaded pipelines. Use TrimVideoLatent with trim_amount after generation."
+    )
 
-    def prepend(self, video_latent, reference_latent):
+    def prepend(self, video_latent, reference_latent, model=None):
         video_samples = video_latent["samples"]  # [B, C, T_video, H, W]
         ref_samples = reference_latent["samples"]  # [B, C, T_ref, H, W]
 
@@ -57,10 +71,51 @@ class NV_PrependReferenceLatent:
                 f"Ensure both are encoded at the same resolution."
             )
 
+        # --- Auto-noise reference in cascaded mode ---
+        cascaded_config = video_latent.get(NV_CASCADED_CONFIG_KEY, None)
+        if cascaded_config is not None:
+            if model is None:
+                raise ValueError(
+                    "[NV_PrependReferenceLatent] Cascaded mode detected (video latent has "
+                    "nv_cascaded_config from NV_PreNoiseLatent), but no MODEL is connected.\n"
+                    "The reference latent is CLEAN (sigma=0) while the video latent is "
+                    f"PRE-NOISED (sigma={cascaded_config.get('start_sigma', '?')}).\n"
+                    "Without matching noise levels, the model sees a massive signal cliff "
+                    "between reference and video frames, producing garbage.\n\n"
+                    "FIX: Wire the Stage 3 MODEL → NV_PrependReferenceLatent 'model' input."
+                )
+
+            start_sigma = cascaded_config["start_sigma"]
+            prenoise_seed = cascaded_config.get("prenoise_seed", 0)
+            # Offset seed so reference noise is independent from video noise
+            ref_seed = prenoise_seed + 7
+
+            # Generate noise for reference
+            noise = comfy.sample.prepare_noise(ref_samples, ref_seed)
+
+            # Apply noise using model's formula (same as PreNoiseLatent)
+            model_sampling = model.get_model_object("model_sampling")
+            process_latent_in = model.get_model_object("process_latent_in")
+            process_latent_out = model.get_model_object("process_latent_out")
+
+            ref_in = process_latent_in(ref_samples)
+            sigma_tensor = torch.tensor(
+                [start_sigma], dtype=ref_in.dtype, device=ref_in.device
+            )
+            noised_ref = model_sampling.noise_scaling(
+                sigma_tensor, noise.to(ref_in.device), ref_in
+            )
+            noised_ref = process_latent_out(noised_ref)
+            noised_ref = torch.nan_to_num(noised_ref, nan=0.0, posinf=0.0, neginf=0.0)
+
+            ref_samples = noised_ref
+            print(f"[NV_PrependReferenceLatent] Cascaded mode: auto-noised reference "
+                  f"to sigma={start_sigma:.4f} (seed={ref_seed})")
+
         # Concatenate along temporal dimension
         combined = torch.cat([ref_samples, video_samples], dim=2)
 
-        trim_amount = ref_samples.shape[2]
+        trim_amount = reference_latent["samples"].shape[2]
 
         print(f"[NV_PrependReferenceLatent] Prepended {trim_amount} reference frame(s)")
         print(f"  Video latent: {list(video_samples.shape)} -> Combined: {list(combined.shape)}")
@@ -72,14 +127,15 @@ class NV_PrependReferenceLatent:
         # after prepending, causing noise bleed artifacts at frame boundaries.
         out_latent = {"samples": combined}
 
-        # Preserve keys that are NOT temporal-dependent
-        safe_keys = {"downscale_ratio_spacial", "latent_format_version_0"}
+        for key in LATENT_SAFE_KEYS:
+            if key in video_latent and key != "samples":
+                out_latent[key] = video_latent[key]
+
+        # Log any dropped keys from the original
         for key in video_latent:
             if key == "samples":
                 continue
-            if key in safe_keys:
-                out_latent[key] = video_latent[key]
-            else:
+            if key not in LATENT_SAFE_KEYS:
                 print(f"  [NV_PrependReferenceLatent] Dropped stale key '{key}' "
                       f"(temporal dimension changed)")
 
@@ -126,13 +182,14 @@ class NV_LatentTemporalConcat:
         # Build clean output — drop temporal-dependent metadata (noise_mask,
         # batch_index) since the temporal dimension has changed.
         out_latent = {"samples": combined}
-        safe_keys = {"downscale_ratio_spacial", "latent_format_version_0"}
+        for key in LATENT_SAFE_KEYS:
+            if key in latent_a and key != "samples":
+                out_latent[key] = latent_a[key]
+
         for key in latent_a:
             if key == "samples":
                 continue
-            if key in safe_keys:
-                out_latent[key] = latent_a[key]
-            else:
+            if key not in LATENT_SAFE_KEYS:
                 print(f"  [NV_LatentTemporalConcat] Dropped stale key '{key}' "
                       f"(temporal dimension changed)")
 
@@ -353,13 +410,14 @@ class NV_LatentTemporalSlice:
         # Build clean output — drop temporal-dependent metadata (noise_mask,
         # batch_index) since the temporal dimension has changed.
         out_latent = {"samples": sliced}
-        safe_keys = {"downscale_ratio_spacial", "latent_format_version_0"}
+        for key in LATENT_SAFE_KEYS:
+            if key in latent and key != "samples":
+                out_latent[key] = latent[key]
+
         for key in latent:
             if key == "samples":
                 continue
-            if key in safe_keys:
-                out_latent[key] = latent[key]
-            else:
+            if key not in LATENT_SAFE_KEYS:
                 print(f"  [NV_LatentTemporalSlice] Dropped stale key '{key}' "
                       f"(temporal dimension changed)")
 

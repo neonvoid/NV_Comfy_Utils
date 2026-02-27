@@ -25,6 +25,7 @@ import comfy.sample
 
 from .chunk_utils import video_to_latent_frames
 from .committed_noise import apply_freenoise_temporal_correlation
+from .latent_constants import NV_CASCADED_CONFIG_KEY, LATENT_SAFE_KEYS
 from .sigma_schedule_visualizer import compute_schedule
 
 
@@ -166,12 +167,12 @@ class NV_PreNoiseLatent:
 
         # --- 5. Build clean output dict (drop stale temporal keys) ---
         out = {"samples": noised}
-        for key in ("downscale_ratio_spacial", "latent_format_version_0"):
-            if key in latent:
+        for key in LATENT_SAFE_KEYS:
+            if key in latent and key != NV_CASCADED_CONFIG_KEY:
                 out[key] = latent[key]
         # Deliberately drop noise_mask, batch_index — stale after noise injection
 
-        # --- 6. Compute diagnostics ---
+        # --- 6. Compute diagnostics + embed config in latent ---
         signal_preserved = (1.0 - start_sigma) * 100.0
 
         cascaded_config = {
@@ -186,6 +187,9 @@ class NV_PreNoiseLatent:
             "prenoise_seed": seed,
             "freenoise_applied": freenoise_applied,
         }
+
+        # Embed config IN the latent dict — travels with data through save/load/slice
+        out[NV_CASCADED_CONFIG_KEY] = cascaded_config
 
         info = json.dumps({
             **cascaded_config,

@@ -20,7 +20,10 @@ Usage:
 """
 
 import json
+import math
 import torch
+
+from .latent_constants import NV_CASCADED_CONFIG_KEY, LATENT_SAFE_KEYS
 
 
 class NV_ChunkLoader:
@@ -556,6 +559,46 @@ class NV_ChunkLoaderVACE:
             print(f"[NV_ChunkLoaderVACE] Cascaded mode: denoise overridden {original_denoise} → 1.0 "
                   f"(encoded in expanded_steps={cascade_expanded_steps}/start_at_step={cascade_start_at_step})")
 
+        # --- Cross-validate plan config vs latent config ---
+        if latent is not None and cascade and cascade_expanded_steps > 0:
+            latent_config = latent.get(NV_CASCADED_CONFIG_KEY, None)
+            if latent_config is not None:
+                # Both plan and latent have config — check they agree
+                mismatches = []
+                for key in ("shift_override", "start_sigma", "expanded_steps", "start_at_step"):
+                    plan_val = cascade.get(key)
+                    latent_val = latent_config.get(key)
+                    if plan_val is not None and latent_val is not None:
+                        # Float comparison with tolerance for sigma
+                        if isinstance(plan_val, float):
+                            if not math.isclose(plan_val, latent_val, rel_tol=1e-4):
+                                mismatches.append(f"  {key}: plan={plan_val}, latent={latent_val}")
+                        elif plan_val != latent_val:
+                            mismatches.append(f"  {key}: plan={plan_val}, latent={latent_val}")
+                if mismatches:
+                    raise ValueError(
+                        f"[NV_ChunkLoaderVACE] CASCADED CONFIG MISMATCH!\n"
+                        f"The plan JSON and the latent have different cascaded parameters.\n"
+                        f"This means the pre-noised latent was generated with different settings\n"
+                        f"than what the plan expects. The sampler would start at the wrong sigma,\n"
+                        f"producing garbage output.\n\n"
+                        f"Mismatched parameters:\n" + "\n".join(mismatches) + "\n\n"
+                        f"Fix: Re-run NV_PreNoiseLatent with matching parameters, or regenerate\n"
+                        f"the plan JSON to match the latent's config."
+                    )
+                print(f"[NV_ChunkLoaderVACE] Cascaded config validated: plan matches latent "
+                      f"(shift={cascade_shift}, sigma={cascade.get('start_sigma', '?')})")
+            else:
+                # Plan has cascaded config but latent doesn't — likely a legacy .pt file
+                print(f"[NV_ChunkLoaderVACE] WARNING: Plan has cascaded_config but the loaded "
+                      f"latent has no embedded config (nv_cascaded_config key missing).\n"
+                      f"  This could mean:\n"
+                      f"  1. The .pt file was saved before config embedding was added\n"
+                      f"  2. The wrong .pt file is being loaded (clean instead of pre-noised)\n"
+                      f"  Expected: shift={cascade_shift}, sigma={cascade.get('start_sigma', '?')}\n"
+                      f"  Cannot validate — proceeding with plan config. If output is noisy,\n"
+                      f"  re-run NV_PreNoiseLatent to generate a latent with embedded config.")
+
         # Build info string
         num_controls = sum(1 for c in chunk_controls if c is not None)
         info_lines = [
@@ -612,10 +655,12 @@ class NV_ChunkLoaderVACE:
                 print(f"  Latent: pre-sliced ({total_latent_frames} frames)")
             else:
                 chunk_samples = samples[:, :, latent_start:latent_end, :, :].clone()
-                chunk_latent = latent.copy()
-                chunk_latent["samples"] = chunk_samples
-                # Remove noise_mask if present — shape won't match sliced latent
-                chunk_latent.pop("noise_mask", None)
+                # Build clean output dict — only copy safe keys
+                # (latent.copy() would carry stale noise_mask/batch_index)
+                chunk_latent = {"samples": chunk_samples}
+                for k in LATENT_SAFE_KEYS:
+                    if k in latent:
+                        chunk_latent[k] = latent[k]
                 print(f"  Latent: sliced frames {latent_start}-{latent_end-1} "
                       f"({chunk_samples.shape[2]} latent frames from {total_latent_frames} total)")
 
