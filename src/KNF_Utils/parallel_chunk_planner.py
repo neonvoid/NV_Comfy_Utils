@@ -202,10 +202,11 @@ class NV_ParallelChunkPlanner:
                                  use_vace, use_cfg, model_2=None):
         """Auto-compute max frames that fit in VRAM using the VRAM estimator.
 
-        When model_2 is provided (e.g. WAN 2.2 dual-model pipeline), both models'
-        weights are budgeted. The multi-model sampler runs one model at a time, but
-        ComfyUI keeps idle model weights resident in VRAM to avoid reload latency.
-        Peak = max(active_1_peak + idle_2_weights, active_2_peak + idle_1_weights).
+        When model_2 is provided (e.g. WAN 2.2 dual-model pipeline):
+        - If both models' weights fit in VRAM: budget idle weights alongside active peak
+          Peak = max(active_1_peak + idle_2_weights, active_2_peak + idle_1_weights)
+        - If not: ComfyUI model management swaps models, so estimate for one at a time
+          Peak = max(active_1_peak, active_2_peak)
         """
         try:
             from .wan_vram_estimator import (
@@ -256,15 +257,31 @@ class NV_ParallelChunkPlanner:
                 )
                 return breakdown
 
+            # Can both models co-reside in VRAM? ComfyUI model management
+            # swaps models when VRAM is tight, so we only need to budget for
+            # one model at a time if both can't fit simultaneously.
+            both_fit = (model_2 is None) or (weight_bytes + weight_bytes_2 <= available_vram_bytes)
+
+            if not both_fit:
+                logger.info(
+                    f"[ChunkPlanner] Dual-model weights ({weight_bytes / (1024**3):.1f}GB + "
+                    f"{weight_bytes_2 / (1024**3):.1f}GB) exceed VRAM "
+                    f"({available_vram_bytes / (1024**3):.1f}GB) — estimating with model swapping"
+                )
+
             # Build estimator function that accounts for both models
             def estimate_fn(pixel_frames):
                 peak_1 = _estimate_single(config, weight_bytes, dtype, model, pixel_frames).total
 
                 if model_2 is not None:
                     if config_2 is not None:
-                        # Both WAN models: take max of (active + idle weights)
                         peak_2 = _estimate_single(config_2, weight_bytes_2, dtype_2, model_2, pixel_frames).total
-                        return max(peak_1 + weight_bytes_2, peak_2 + weight_bytes)
+                        if both_fit:
+                            # Both co-resident: active peak + idle weights
+                            return max(peak_1 + weight_bytes_2, peak_2 + weight_bytes)
+                        else:
+                            # ComfyUI swaps models: only one loaded at a time
+                            return max(peak_1, peak_2)
                     else:
                         # model_2 is non-WAN: just add its weight footprint
                         return peak_1 + weight_bytes_2
@@ -282,11 +299,15 @@ class NV_ParallelChunkPlanner:
             peak_breakdown = _estimate_single(config, weight_bytes, dtype, model, max_frames)
             effective_peak = peak_breakdown.total
             if model_2 is not None:
-                effective_peak += weight_bytes_2
                 if config_2 is not None:
                     peak_2 = _estimate_single(config_2, weight_bytes_2, dtype_2, model_2, max_frames).total
-                    effective_peak = max(peak_breakdown.total + weight_bytes_2,
-                                         peak_2 + weight_bytes)
+                    if both_fit:
+                        effective_peak = max(peak_breakdown.total + weight_bytes_2,
+                                             peak_2 + weight_bytes)
+                    else:
+                        effective_peak = max(peak_breakdown.total, peak_2)
+                else:
+                    effective_peak += weight_bytes_2
 
             vram_info = {
                 "estimated_peak_gb": round(effective_peak / (1024 ** 3), 2),
@@ -305,7 +326,11 @@ class NV_ParallelChunkPlanner:
                 f"peak={effective_peak / (1024**3):.1f}GB / {available_vram_bytes / (1024**3):.1f}GB available"
             )
             if model_2 is not None:
-                log_msg += f" (dual-model: {weight_bytes / (1024**3):.1f}GB + {weight_bytes_2 / (1024**3):.1f}GB weights)"
+                swap_mode = "swapping" if not both_fit else "co-resident"
+                log_msg += (
+                    f" (dual-model: {weight_bytes / (1024**3):.1f}GB + "
+                    f"{weight_bytes_2 / (1024**3):.1f}GB weights, {swap_mode})"
+                )
             logger.info(log_msg)
 
             return max_frames, vram_info
