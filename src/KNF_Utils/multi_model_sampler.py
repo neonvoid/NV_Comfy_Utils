@@ -321,7 +321,15 @@ class NV_MultiModelSampler:
 
             print(f"[NV_MultiModelSampler] Model {i+1}: steps {seg_start}-{seg_end}, cfg={cfg}, disable_noise={seg_disable_noise}")
 
+            if verbose:
+                self._verbose_sequential_segment(
+                    model, current_latent, seed, steps, scheduler, denoise,
+                    seg_disable_noise, committed_noise, seg_start, seg_end,
+                    i, len(models))
+
             if noise_tensor is not None and not seg_disable_noise:
+                if verbose:
+                    _log_tensor_stats(f"committed_noise (model {i+1})", noise_tensor)
                 result = self._ksampler_with_noise(
                     model, noise_tensor, seed, steps, cfg, sampler_name, scheduler,
                     positive, negative, current_latent,
@@ -336,6 +344,9 @@ class NV_MultiModelSampler:
                 # noise_scaling(sigma, zeros, x) = (1-sigma)*x would scale it DOWN.
                 # Identity noise: noise_scaling(sigma, x, x) = x (passthrough).
                 identity_noise = self._make_identity_noise(model, current_latent)
+                if verbose:
+                    _log_tensor_stats(f"identity_noise (model {i+1})", identity_noise)
+                    _log_tensor_stats(f"pre_noised_latent (model {i+1} input)", current_latent["samples"])
                 result = self._ksampler_with_noise(
                     model, identity_noise, seed, steps, cfg, sampler_name, scheduler,
                     positive, negative, current_latent,
@@ -349,6 +360,8 @@ class NV_MultiModelSampler:
                 # The previous model's output has inverse_noise_scaling applied (x / (1-sigma)).
                 # noise_scaling(sigma, zeros, x_scaled) = (1-sigma) * x/(1-sigma) = x
                 # The (1-sigma) scaling CORRECTLY cancels inverse_noise_scaling.
+                if verbose:
+                    _log_tensor_stats(f"handoff_latent (model {i+1} input, post-inverse_noise_scaling)", current_latent["samples"])
                 result = common_ksampler(
                     model, seed, steps, cfg, sampler_name, scheduler,
                     positive, negative, current_latent,
@@ -359,6 +372,9 @@ class NV_MultiModelSampler:
                     force_full_denoise=(i == len(models) - 1)
                 )
             else:
+                if verbose:
+                    self._verbose_standard_path(model, current_latent, seed, steps,
+                                                scheduler, denoise)
                 result = common_ksampler(
                     model, seed, steps, cfg, sampler_name, scheduler,
                     positive, negative, current_latent,
@@ -368,6 +384,9 @@ class NV_MultiModelSampler:
                     last_step=seg_end,
                     force_full_denoise=(i == len(models) - 1)
                 )
+
+            if verbose:
+                _log_tensor_stats(f"output_latent (model {i+1})", result[0]["samples"])
 
             current_latent = result[0]
             current_step = seg_end
@@ -447,6 +466,43 @@ class NV_MultiModelSampler:
         _log_tensor_stats("expected_x_init (σ*noise + (1-σ)*latent_in)", expected_x_init)
         print(f"[NV_DEBUG] Formula: {start_sigma:.6f} * noise + {1.0 - start_sigma:.6f} * process_latent_in(latent)")
         print(f"{'='*70}\n")
+
+    def _verbose_sequential_segment(self, model, latent_image, seed, steps,
+                                        scheduler, denoise, disable_noise,
+                                        committed_noise, seg_start, seg_end,
+                                        seg_idx, num_models):
+        """Log per-segment state in sequential mode."""
+        samples = latent_image["samples"]
+        model_sampling = model.get_model_object("model_sampling")
+        ms_cls = type(model_sampling).__name__
+        shift = getattr(model_sampling, "shift", "N/A")
+
+        if seg_idx == 0 and committed_noise is not None and not disable_noise:
+            path = "committed_noise"
+        elif seg_idx == 0 and disable_noise:
+            path = "prenoise+disable (identity noise)"
+        elif seg_idx > 0:
+            path = "continuation (zeros noise, inverse_noise_scaling cancellation)"
+        else:
+            path = "standard (add_noise=enable)"
+
+        print(f"\n{'='*70}")
+        print(f"[NV_DEBUG] === Sequential Segment {seg_idx+1}/{num_models} ===")
+        print(f"[NV_DEBUG] Path: {path}")
+        print(f"[NV_DEBUG] model_sampling: {ms_cls}, shift={shift}")
+        print(f"[NV_DEBUG] total_steps={steps}, denoise={denoise}, scheduler={scheduler}")
+        print(f"[NV_DEBUG] segment: steps {seg_start}-{seg_end} ({seg_end - seg_start} steps)")
+        print(f"[NV_DEBUG] seed={seed}")
+        _log_tensor_stats(f"input_latent (model {seg_idx+1})", samples)
+
+        # Compute and log the sigma schedule for this segment
+        full_sigmas = comfy.samplers.calculate_sigmas(model_sampling, scheduler, steps)
+        seg_sigmas = full_sigmas[seg_start:seg_end + 1]
+        sigmas_str = ", ".join(f"{s:.4f}" for s in seg_sigmas.tolist())
+        print(f"[NV_DEBUG] Segment sigmas ({len(seg_sigmas)}): [{sigmas_str}]")
+        if len(seg_sigmas) > 0:
+            print(f"[NV_DEBUG] Start sigma: {float(seg_sigmas[0]):.6f}")
+        print(f"{'='*70}")
 
     def _ksampler_with_noise(self, model, noise, seed, steps, cfg, sampler_name, scheduler,
                               positive, negative, latent, denoise=1.0, start_step=None,
