@@ -424,18 +424,19 @@ class NV_ChunkLoaderVACE:
     RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "IMAGE", "IMAGE",
                     "INT", "INT", "INT", "INT", "INT", "FLOAT", "FLOAT", "STRING", "STRING", "INT", "INT", "STRING",
                     "LATENT",
-                    "FLOAT", "INT", "INT",)
+                    "FLOAT", "INT", "INT", "STRING",)
     RETURN_NAMES = ("chunk_video", "chunk_ctrl_1", "chunk_ctrl_2", "chunk_ctrl_3", "chunk_ctrl_4",
                     "chunk_index", "start_frame", "frame_count", "seed", "steps", "cfg", "denoise", "sampler_name", "scheduler",
                     "context_window_size", "context_overlap", "chunk_info",
                     "chunk_latent",
-                    "cascade_shift", "cascade_expanded_steps", "cascade_start_at_step",)
+                    "cascade_shift", "cascade_expanded_steps", "cascade_start_at_step", "cascade_add_noise",)
     FUNCTION = "load_chunk"
     CATEGORY = "NV_Utils"
     DESCRIPTION = ("Loads video chunk AND control videos for VACE parallel processing. Controls are sliced in sync. "
                    "Optional latent input for latent-space upscale path. "
-                   "If plan contains cascaded_config (from NV_PreNoiseLatent), outputs cascade_shift, "
-                   "cascade_expanded_steps, and cascade_start_at_step for direct NV_MultiModelSampler wiring.")
+                   "If plan contains cascaded_config (from NV_PreNoiseLatent), outputs cascade parameters "
+                   "for direct NV_MultiModelSampler wiring. In cascaded mode, denoise is automatically "
+                   "set to 1.0 (encoded in expanded_steps/start_at_step) and cascade_add_noise='disable'.")
 
     def load_chunk(self, video, plan_json_path, chunk_index,
                    control_1=None, control_2=None, control_3=None, control_4=None,
@@ -543,6 +544,17 @@ class NV_ChunkLoaderVACE:
         cascade_shift = cascade.get("shift_override", 0.0)
         cascade_expanded_steps = cascade.get("expanded_steps", 0)
         cascade_start_at_step = cascade.get("start_at_step", 0)
+        cascade_add_noise = "disable" if (cascade and cascade_expanded_steps > 0) else "enable"
+
+        # In cascaded mode, denoise is already encoded in expanded_steps/start_at_step.
+        # Passing the shared_params denoise (<1.0) would double-truncate the sigma schedule,
+        # resulting in zero effective denoising steps. Override to 1.0 so the sampler uses
+        # the full expanded schedule and start_at_step handles the truncation.
+        if cascade and cascade_expanded_steps > 0:
+            original_denoise = denoise
+            denoise = 1.0
+            print(f"[NV_ChunkLoaderVACE] Cascaded mode: denoise overridden {original_denoise} → 1.0 "
+                  f"(encoded in expanded_steps={cascade_expanded_steps}/start_at_step={cascade_start_at_step})")
 
         # Build info string
         num_controls = sum(1 for c in chunk_controls if c is not None)
@@ -566,6 +578,7 @@ class NV_ChunkLoaderVACE:
                 f"Cascade Expanded Steps: {cascade_expanded_steps}",
                 f"Cascade Start At Step: {cascade_start_at_step}",
                 f"Signal Preserved: {cascade.get('signal_preserved_pct', '?')}%",
+                f"Add Noise: disable (latent is pre-noised)",
             ])
 
         chunk_info = "\n".join(info_lines)
@@ -610,7 +623,7 @@ class NV_ChunkLoaderVACE:
                 chunk_index, start_frame, frame_count, seed, steps, cfg, denoise, sampler_name, scheduler,
                 context_window_size, context_overlap, chunk_info,
                 chunk_latent,
-                cascade_shift, cascade_expanded_steps, cascade_start_at_step)
+                cascade_shift, cascade_expanded_steps, cascade_start_at_step, cascade_add_noise)
 
 
 # Node registration
