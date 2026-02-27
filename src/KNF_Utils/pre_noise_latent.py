@@ -143,15 +143,27 @@ class NV_PreNoiseLatent:
         expanded_steps = int(steps / denoise)
         start_at_step = expanded_steps - steps
 
-        # Build model_sampling with the correct shift for sigma computation
-        if shift_override > 0.0:
-            class _ShiftedSampling(comfy.model_sampling.ModelSamplingFlux,
-                                   comfy.model_sampling.CONST):
-                pass
-            sigma_model_sampling = _ShiftedSampling(model.model.model_config)
-            sigma_model_sampling.set_parameters(shift=shift)
+        # Build model_sampling with the correct shift for sigma computation.
+        # CRITICAL: Must use the model's ACTUAL model_sampling class, not a hardcoded
+        # one. Different classes use different sigma functions:
+        #   - ModelSamplingDiscreteFlow (WAN): time_snr_shift (Möbius transform)
+        #   - ModelSamplingFlux (Flux):        flux_time_shift (exponential)
+        # Using the wrong class produces completely wrong sigmas.
+        # Example: shift=4, t=0.303 → DiscreteFlow gives σ=0.635, Flux gives σ=0.96!
+        if shift_override > 0.0 and abs(shift_override - model_shift) > 1e-4:
+            ms_cls = type(model_sampling)
+            sigma_model_sampling = ms_cls(model.model.model_config)
+            kwargs = {"shift": shift}
+            if hasattr(model_sampling, "multiplier"):
+                kwargs["multiplier"] = model_sampling.multiplier
+            sigma_model_sampling.set_parameters(**kwargs)
+            print(f"[NV_PreNoiseLatent] Created {ms_cls.__name__} with shift={shift} "
+                  f"(model has {model_shift})")
         else:
             sigma_model_sampling = model_sampling
+            if shift_override > 0.0:
+                print(f"[NV_PreNoiseLatent] shift_override={shift_override} matches model "
+                      f"shift={model_shift}, using model's own sampling")
 
         # Compute the FULL expanded schedule (same as KSampler with denoise=1.0)
         full_sigmas = comfy.samplers.calculate_sigmas(sigma_model_sampling, scheduler, expanded_steps)
