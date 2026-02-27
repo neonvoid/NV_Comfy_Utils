@@ -416,22 +416,31 @@ class NV_MultiModelSampler:
         """
         Clone model and patch its model_sampling with a new shift value.
 
-        Uses the same pattern as ComfyUI's ModelSamplingFlux node:
-        creates a new ModelSamplingAdvanced(ModelSamplingFlux, CONST) and
-        calls set_parameters(shift=...).
+        CRITICAL: Must use the model's ACTUAL model_sampling class, not hardcoded
+        ModelSamplingFlux. Different classes use different sigma functions:
+          - ModelSamplingDiscreteFlow (WAN): time_snr_shift (Möbius transform)
+          - ModelSamplingFlux (Flux):        flux_time_shift (exponential)
+        Using the wrong class produces completely wrong sigma schedules.
         """
+        current_ms = model.get_model_object("model_sampling")
+        old_shift = getattr(current_ms, "shift", None)
+
+        # Skip if shift already matches — avoids unnecessary class replacement
+        if old_shift is not None and abs(old_shift - shift) < 1e-4:
+            print(f"[NV_MultiModelSampler] Shift override: {old_shift} → {shift} (already matches, skipping)")
+            return model
+
         m = model.clone()
-        sampling_base = comfy.model_sampling.ModelSamplingFlux
-        sampling_type = comfy.model_sampling.CONST
-
-        class ModelSamplingAdvanced(sampling_base, sampling_type):
-            pass
-
-        model_sampling = ModelSamplingAdvanced(model.model.model_config)
-        model_sampling.set_parameters(shift=shift)
-        m.add_object_patch("model_sampling", model_sampling)
-        old_shift = getattr(model.get_model_object("model_sampling"), "shift", "?")
-        print(f"[NV_MultiModelSampler] Shift override: {old_shift} → {shift}")
+        # Use the model's own model_sampling class to preserve correct sigma function
+        ms_cls = type(current_ms)
+        new_ms = ms_cls(model.model.model_config)
+        kwargs = {"shift": shift}
+        if hasattr(current_ms, "multiplier"):
+            kwargs["multiplier"] = current_ms.multiplier
+        new_ms.set_parameters(**kwargs)
+        m.add_object_patch("model_sampling", new_ms)
+        print(f"[NV_MultiModelSampler] Shift override: {old_shift} → {shift} "
+              f"(using {ms_cls.__name__})")
         return m
 
     def _parse_step_distribution(self, model_steps_str, total_steps, num_models):
