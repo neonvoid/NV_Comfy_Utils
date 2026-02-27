@@ -568,7 +568,7 @@ class NV_ChunkLoaderVACE:
             if latent_config is not None:
                 # Both plan and latent have config — check they agree
                 mismatches = []
-                for key in ("shift_override", "start_sigma", "expanded_steps", "start_at_step"):
+                for key in ("shift_override", "start_sigma", "expanded_steps", "start_at_step", "scheduler"):
                     plan_val = cascade.get(key)
                     latent_val = latent_config.get(key)
                     if plan_val is not None and latent_val is not None:

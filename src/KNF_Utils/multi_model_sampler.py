@@ -152,6 +152,20 @@ class NV_MultiModelSampler:
                     f"FIX: Set denoise=1.0 on this sampler, or wire denoise from ChunkLoaderVACE\n"
                     f"(which auto-overrides to 1.0 in cascaded mode)."
                 )
+            # Validate scheduler matches PreNoiseLatent's scheduler
+            cascaded_config = latent_image.get(NV_CASCADED_CONFIG_KEY, None)
+            if cascaded_config is not None:
+                prenoise_scheduler = cascaded_config.get("scheduler")
+                if prenoise_scheduler and prenoise_scheduler != scheduler:
+                    raise ValueError(
+                        f"[NV_MultiModelSampler] SCHEDULER MISMATCH!\n"
+                        f"PreNoiseLatent used scheduler='{prenoise_scheduler}' but this sampler uses "
+                        f"scheduler='{scheduler}'.\n"
+                        f"Different schedulers produce different sigma values at the same step index, "
+                        f"causing the sampler to misidentify the noise level.\n\n"
+                        f"FIX: Set both nodes to the same scheduler, or wire scheduler from "
+                        f"ChunkLoaderVACE."
+                    )
             # Warn about unusual end_at_step
             if last_step is not None and last_step != steps:
                 print(f"[NV_MultiModelSampler] WARNING: end_at_step={last_step} != steps={steps}. "

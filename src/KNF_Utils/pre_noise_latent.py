@@ -6,9 +6,9 @@ so overlapping regions between chunks receive identical noise patterns.
 This is the bridge between Stage 1 (low-res full pass) and Stage 3
 (chunked high-res refinement) in the cascaded pipeline.
 
-The noise level is computed from denoise/steps/shift using the same
-schedule math as KSampler, and the node outputs the exact expanded_steps
-and start_at_step values needed for KSamplerAdvanced(add_noise=disable).
+The sigma schedule is computed using ComfyUI's actual calculate_sigmas()
+function with the user-selected scheduler, ensuring the noise level
+EXACTLY matches what KSampler will use at the same step index.
 
 Flow matching formula: noised = sigma * noise + (1 - sigma) * latent
 
@@ -16,17 +16,18 @@ References:
   - FlashVideo (2502.05179): Stage 2 starts from upscaled+noised low-res latent
   - LUVE (2602.11564): 3-stage cascaded latent pipeline
   - comfy/model_sampling.py: noise_scaling() for flow matching CONST class
-  - comfy/samplers.py: set_steps() denoise truncation logic
+  - comfy/samplers.py: calculate_sigmas(), KSampler.set_steps()
 """
 
 import json
 import torch
 import comfy.sample
+import comfy.samplers
+import comfy.model_sampling
 
 from .chunk_utils import video_to_latent_frames
 from .committed_noise import apply_freenoise_temporal_correlation
 from .latent_constants import NV_CASCADED_CONFIG_KEY, LATENT_SAFE_KEYS
-from .sigma_schedule_visualizer import compute_schedule
 
 
 class NV_PreNoiseLatent:
@@ -71,6 +72,14 @@ class NV_PreNoiseLatent:
                     "default": 0, "min": 0, "max": 0xffffffffffffffff,
                     "control_after_generate": True,
                     "tooltip": "Noise seed for reproducibility"
+                }),
+                "scheduler": (comfy.samplers.KSampler.SCHEDULERS, {
+                    "default": "normal",
+                    "tooltip": (
+                        "MUST match the scheduler used by the Stage 3 KSampler. "
+                        "Different schedulers produce different sigma values at the same step, "
+                        "causing noise level mismatch if they don't agree."
+                    )
                 }),
             },
             "optional": {
@@ -119,12 +128,14 @@ class NV_PreNoiseLatent:
         "so NV_ChunkLoaderVACE can output shift/steps/start_at_step automatically."
     )
 
-    def execute(self, latent, model, denoise, steps, seed,
+    def execute(self, latent, model, denoise, steps, seed, scheduler="normal",
                 plan_json_path="", shift_override=0.0, enable_freenoise=True,
                 context_length=81, context_overlap=16):
         samples = latent["samples"]  # [B, C, T, H, W]
 
-        # --- 1. Compute sigma schedule (same math as KSampler) ---
+        # --- 1. Compute sigma schedule using ComfyUI's actual calculate_sigmas ---
+        # This MUST match the KSampler's schedule exactly. Using the same function
+        # guarantees consistency regardless of scheduler type (normal, simple, beta, etc.).
         model_sampling = model.get_model_object("model_sampling")
         model_shift = getattr(model_sampling, "shift", 1.0)
         shift = shift_override if shift_override > 0.0 else model_shift
@@ -132,8 +143,20 @@ class NV_PreNoiseLatent:
         expanded_steps = int(steps / denoise)
         start_at_step = expanded_steps - steps
 
-        _, used_sigmas, _ = compute_schedule(shift, steps, denoise)
-        start_sigma = used_sigmas[0]
+        # Build model_sampling with the correct shift for sigma computation
+        if shift_override > 0.0:
+            class _ShiftedSampling(comfy.model_sampling.ModelSamplingFlux,
+                                   comfy.model_sampling.CONST):
+                pass
+            sigma_model_sampling = _ShiftedSampling(model.model.model_config)
+            sigma_model_sampling.set_parameters(shift=shift)
+        else:
+            sigma_model_sampling = model_sampling
+
+        # Compute the FULL expanded schedule (same as KSampler with denoise=1.0)
+        full_sigmas = comfy.samplers.calculate_sigmas(sigma_model_sampling, scheduler, expanded_steps)
+        # The sigma at start_at_step is what the KSampler will see
+        start_sigma = float(full_sigmas[start_at_step])
 
         # --- 2. Generate noise for the FULL latent ---
         batch_inds = latent.get("batch_index", None)
@@ -185,6 +208,7 @@ class NV_PreNoiseLatent:
             "prenoise_denoise": denoise,
             "prenoise_steps": steps,
             "prenoise_seed": seed,
+            "scheduler": scheduler,
             "freenoise_applied": freenoise_applied,
         }
 
@@ -220,8 +244,8 @@ class NV_PreNoiseLatent:
                 print(f"[NV_PreNoiseLatent] Warning: could not update plan: {e}")
 
         shift_src = f"{shift} (override)" if shift_override > 0.0 else f"{shift} (model)"
-        print(f"[NV_PreNoiseLatent] shift={shift_src}, denoise={denoise}, "
-              f"steps={steps}→expanded={expanded_steps}, "
+        print(f"[NV_PreNoiseLatent] shift={shift_src}, scheduler={scheduler}, "
+              f"denoise={denoise}, steps={steps}→expanded={expanded_steps}, "
               f"start_step={start_at_step}, sigma={start_sigma:.4f}, "
               f"signal_preserved={signal_preserved:.1f}%, "
               f"freenoise={'yes' if freenoise_applied else 'no'}")
