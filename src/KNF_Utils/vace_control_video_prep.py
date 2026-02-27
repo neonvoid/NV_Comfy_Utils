@@ -257,9 +257,18 @@ class NV_VaceControlVideoPrep:
                     "default": 8, "min": 4, "max": 32, "step": 4,
                     "tooltip": "VAE spatial stride in pixels (8 for WAN)."
                 }),
+                "stitch_source": (["tight", "bbox"], {
+                    "default": "tight",
+                    "tooltip": "Source mask for pixel-space stitching. "
+                               "'tight': use original input mask (precise subject boundary, but may "
+                               "cut into VACE content at a boundary VACE wasn't aware of). "
+                               "'bbox': use the VACE bbox mask eroded inward — hides bbox-edge seam "
+                               "artifacts since the blend happens in VACE's clean interior zone. "
+                               "Trade-off: pastes everything VACE generated inside the bbox."
+                }),
                 "stitch_erosion": ("INT", {
                     "default": 0, "min": -32, "max": 32, "step": 1,
-                    "tooltip": "Erode (negative) or dilate (positive) the tight stitch mask for "
+                    "tooltip": "Erode (negative) or dilate (positive) the stitch mask for "
                                "pixel-space compositing. Independent of the VACE mask erosion. "
                                "Controls the pixel blend boundary, not the VACE conditioning zone."
                 }),
@@ -272,22 +281,23 @@ class NV_VaceControlVideoPrep:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "MASK", "MASK", "STRING")
-    RETURN_NAMES = ("control_video", "control_masks", "stitch_mask", "info")
+    RETURN_TYPES = ("IMAGE", "MASK", "MASK", "MASK", "STRING")
+    RETURN_NAMES = ("control_video", "control_masks", "stitch_mask", "tight_mask", "info")
     FUNCTION = "execute"
     CATEGORY = "NV_Utils/VACE"
     DESCRIPTION = (
-        "Single-node VACE control video + mask preparation with dual-mask output. "
-        "Processes the mask once for VACE conditioning (bbox for quality) and separately "
-        "for pixel-space compositing (tight for precision). control_masks is the VACE mask "
-        "(bbox, eroded, feathered). stitch_mask is the tight mask (feathered for pixel blend) — "
-        "use with NV_VaceVideoStitch to composite only the subject, discarding hallucinated surroundings."
+        "Single-node VACE control video + mask preparation with triple-mask output. "
+        "control_masks = VACE conditioning mask (bbox, eroded, feathered). "
+        "stitch_mask = compositing mask (source selectable: 'tight' for precise subject boundary, "
+        "'bbox' for eroded-inward bbox that hides VACE edge seams). "
+        "tight_mask = always the original tight mask with stitch erosion/feather applied (backup). "
+        "Use stitch_mask with NV_VaceVideoStitch for pixel compositing."
     )
 
     def execute(self, image, mask, mask_shape, mode, erosion_blocks, feather_blocks, fill_mode,
                 bbox_padding=0.15, bbox_smooth_frames=5,
                 fill_value=0.5, threshold=False, vae_stride=8,
-                stitch_erosion=0, stitch_feather=8):
+                stitch_source="tight", stitch_erosion=0, stitch_feather=8):
         if mask.dim() == 2:
             mask = mask.unsqueeze(0)
 
@@ -304,14 +314,14 @@ class NV_VaceControlVideoPrep:
             info_lines.append("  Mask is all zeros — passing through unchanged")
             info = "\n".join(info_lines)
             print(info)
-            return (image, mask, mask, info)
+            return (image, mask, mask, mask, info)
 
         if mask_min > 0.99:
             fill = torch.full_like(image, fill_value) if fill_mode == "soft" else image
             info_lines.append("  Mask is all ones — full fill applied")
             info = "\n".join(info_lines)
             print(info)
-            return (fill, mask, mask, info)
+            return (fill, mask, mask, mask, info)
 
         result_mask = mask.clone()
 
@@ -331,7 +341,7 @@ class NV_VaceControlVideoPrep:
             if result_mask.max().item() < 0.01:
                 info = "\n".join(info_lines)
                 print(info)
-                return (image, result_mask, mask, info)
+                return (image, result_mask, mask, mask, info)
 
         # --- Step 3: Analyze mask geometry ---
         radii, min_frame = compute_inscribed_radius(result_mask)
@@ -422,27 +432,63 @@ class NV_VaceControlVideoPrep:
                 "transition zone. Switch to fill_mode='none' for linear attenuation."
             )
 
-        # --- Step 9: Build stitch mask (from ORIGINAL tight mask, independent processing) ---
-        # The stitch mask is for pixel-space compositing — derived from the original input
-        # mask, NOT from the bbox/VACE-processed mask. This is the core of the dual-mask
-        # concept: VACE sees bbox, pixel compositing uses tight.
-        stitch_mask = mask.clone()
-
+        # --- Step 9: Build tight mask (always from original input mask) ---
+        tight_mask = mask.clone()
         if threshold:
-            stitch_mask = (stitch_mask > 0.5).float()
+            tight_mask = (tight_mask > 0.5).float()
 
+        # Apply stitch erosion/feather to tight mask
+        tight_processed = tight_mask.clone()
         if stitch_erosion != 0:
-            stitch_mask = mask_erode_dilate(stitch_mask, stitch_erosion)
-
+            tight_processed = mask_erode_dilate(tight_processed, stitch_erosion)
         if stitch_feather > 0:
-            stitch_mask = mask_blur(stitch_mask, stitch_feather)
+            tight_processed = mask_blur(tight_processed, stitch_feather)
+        tight_processed = tight_processed.clamp(0.0, 1.0)
 
-        stitch_mask = stitch_mask.clamp(0.0, 1.0)
+        # --- Step 10: Build stitch mask (source depends on stitch_source param) ---
+        if stitch_source == "bbox" and mask_shape == "bbox":
+            # Derive stitch mask from the bbox (result_mask before erosion/feather for VACE).
+            # Re-run bbox computation on the pre-erosion mask to get clean binary boxes,
+            # then apply stitch_erosion/feather independently.
+            # result_mask at this point has VACE erosion+feather applied, so we rebuild
+            # from the bbox step output. We can use the binary bbox by thresholding result_mask
+            # before VACE feathering was applied — but we already modified result_mask.
+            # Instead, recompute bboxes from the original mask.
+            bbox_binary = masks_to_bboxes(
+                (mask > 0.5).float() if threshold else mask,
+                bbox_padding, bbox_smooth_frames, vae_stride, []  # discard info
+            )
+            stitch_mask = bbox_binary.clone()
 
-        info_lines.append(
-            f"  Stitch mask: erosion={stitch_erosion}px, feather={stitch_feather}px "
-            f"(from original tight mask, independent of VACE mask)"
-        )
+            # Erode inward to cut inside the bbox seam
+            default_bbox_erosion = vae_stride  # 1 VAE block = 8px default inset
+            effective_erosion = stitch_erosion if stitch_erosion != 0 else -default_bbox_erosion
+            if effective_erosion != 0:
+                stitch_mask = mask_erode_dilate(stitch_mask, effective_erosion)
+
+            if stitch_feather > 0:
+                stitch_mask = mask_blur(stitch_mask, stitch_feather)
+
+            stitch_mask = stitch_mask.clamp(0.0, 1.0)
+
+            info_lines.append(
+                f"  Stitch mask: source=bbox, erosion={effective_erosion}px "
+                f"({'default 1 VAE block inset' if stitch_erosion == 0 else 'manual'}),"
+                f" feather={stitch_feather}px"
+            )
+        else:
+            # Use tight mask (original behavior)
+            stitch_mask = tight_processed
+            if stitch_source == "bbox" and mask_shape != "bbox":
+                info_lines.append(
+                    "  Stitch source: 'bbox' requested but mask_shape is not 'bbox' "
+                    "— falling back to tight mask."
+                )
+            info_lines.append(
+                f"  Stitch mask: source=tight, erosion={stitch_erosion}px, "
+                f"feather={stitch_feather}px"
+            )
+
         if stitch_feather == 0:
             info_lines.append(
                 "  WARNING: stitch_feather=0 produces hard edges — visible seams likely."
@@ -451,7 +497,7 @@ class NV_VaceControlVideoPrep:
         info = "\n".join(info_lines)
         print(info)
 
-        return (control_video, result_mask, stitch_mask, info)
+        return (control_video, result_mask, stitch_mask, tight_processed, info)
 
 
 NODE_CLASS_MAPPINGS = {

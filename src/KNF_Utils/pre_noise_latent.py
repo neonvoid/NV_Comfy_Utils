@@ -30,6 +30,16 @@ from .committed_noise import apply_freenoise_temporal_correlation
 from .latent_constants import NV_CASCADED_CONFIG_KEY, LATENT_SAFE_KEYS
 
 
+def _log_tensor_stats(name, tensor):
+    """Log tensor statistics for noise debugging. All math in float32."""
+    t = tensor.float()
+    flat = t.flatten()
+    fingerprint = float(flat[:64].sum()) if flat.numel() >= 64 else float(flat.sum())
+    print(f"[NV_DEBUG] {name}: shape={list(tensor.shape)} dtype={tensor.dtype} "
+          f"mean={t.mean():.6f} std={t.std():.6f} min={t.min():.6f} max={t.max():.6f} "
+          f"norm={t.norm():.4f} fingerprint={fingerprint:.6f}")
+
+
 class NV_PreNoiseLatent:
     """
     Add calibrated noise to a clean latent for cascaded refinement.
@@ -112,6 +122,8 @@ class NV_PreNoiseLatent:
                     "default": 16, "min": 1, "max": 128,
                     "tooltip": "Context overlap in VIDEO frames (for FreeNoise)"
                 }),
+                "verbose": ("BOOLEAN", {"default": False,
+                    "tooltip": "Log detailed noise/latent statistics at each stage for debugging."}),
             }
         }
 
@@ -130,7 +142,7 @@ class NV_PreNoiseLatent:
 
     def execute(self, latent, model, denoise, steps, seed, scheduler="normal",
                 plan_json_path="", shift_override=0.0, enable_freenoise=True,
-                context_length=81, context_overlap=16):
+                context_length=81, context_overlap=16, verbose=False):
         samples = latent["samples"]  # [B, C, T, H, W]
 
         # --- 1. Compute sigma schedule using ComfyUI's actual calculate_sigmas ---
@@ -170,9 +182,25 @@ class NV_PreNoiseLatent:
         # The sigma at start_at_step is what the KSampler will see
         start_sigma = float(full_sigmas[start_at_step])
 
+        if verbose:
+            ms_cls = type(model_sampling).__name__
+            active_sigmas = full_sigmas[start_at_step:]
+            sigmas_str = ", ".join(f"{s:.4f}" for s in active_sigmas.tolist())
+            print(f"\n{'='*70}")
+            print(f"[NV_DEBUG] === NV_PreNoiseLatent Verbose ===")
+            print(f"[NV_DEBUG] model_sampling: {ms_cls}, shift={shift}")
+            print(f"[NV_DEBUG] denoise={denoise}, steps={steps}, expanded={expanded_steps}, "
+                  f"start_at_step={start_at_step}")
+            print(f"[NV_DEBUG] start_sigma={start_sigma:.6f}, signal_preserved={(1.0-start_sigma)*100:.1f}%")
+            print(f"[NV_DEBUG] Active sigmas ({len(active_sigmas)}): [{sigmas_str}]")
+            _log_tensor_stats("clean_latent (input)", samples)
+
         # --- 2. Generate noise for the FULL latent ---
         batch_inds = latent.get("batch_index", None)
         noise = comfy.sample.prepare_noise(samples, seed, batch_inds)
+
+        if verbose:
+            _log_tensor_stats("raw_noise (prepare_noise)", noise)
 
         # --- 3. Optional FreeNoise temporal correlation ---
         total_latent_frames = samples.shape[2] if samples.ndim >= 5 else 1
@@ -188,6 +216,8 @@ class NV_PreNoiseLatent:
                 temporal_dim=2
             )
             freenoise_applied = True
+            if verbose:
+                _log_tensor_stats("noise_after_freenoise", noise)
 
         # --- 4. Apply noise using model's formula ---
         # Flow matching CONST: noised = sigma * noise + (1 - sigma) * latent
@@ -195,10 +225,22 @@ class NV_PreNoiseLatent:
         process_latent_out = model.get_model_object("process_latent_out")
 
         samples_in = process_latent_in(samples)
+        if verbose:
+            _log_tensor_stats("process_latent_in(samples)", samples_in)
+
         sigma_tensor = torch.tensor([start_sigma], dtype=samples_in.dtype, device=samples_in.device)
         noised = model_sampling.noise_scaling(sigma_tensor, noise.to(samples_in.device), samples_in)
+
+        if verbose:
+            _log_tensor_stats("noised (after noise_scaling)", noised)
+            print(f"[NV_DEBUG] Formula: {start_sigma:.6f} * noise + {1.0 - start_sigma:.6f} * process_latent_in(latent)")
+
         noised = process_latent_out(noised)
         noised = torch.nan_to_num(noised, nan=0.0, posinf=0.0, neginf=0.0)
+
+        if verbose:
+            _log_tensor_stats("output_latent (process_latent_out)", noised)
+            print(f"{'='*70}\n")
 
         # --- 5. Build clean output dict (drop stale temporal keys) ---
         out = {"samples": noised}

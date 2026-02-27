@@ -15,6 +15,7 @@ Cascaded Pipeline Features:
 - committed_noise: Pre-generated noise for consistent chunked processing
 """
 
+import torch
 import comfy.sample
 import comfy.samplers
 import comfy.model_sampling
@@ -23,6 +24,16 @@ import latent_preview
 from nodes import common_ksampler
 
 from .latent_constants import NV_CASCADED_CONFIG_KEY, LATENT_SAFE_KEYS
+
+
+def _log_tensor_stats(name, tensor):
+    """Log tensor statistics for noise debugging. All math in float32."""
+    t = tensor.float()
+    flat = t.flatten()
+    fingerprint = float(flat[:64].sum()) if flat.numel() >= 64 else float(flat.sum())
+    print(f"[NV_DEBUG] {name}: shape={list(tensor.shape)} dtype={tensor.dtype} "
+          f"mean={t.mean():.6f} std={t.std():.6f} min={t.min():.6f} max={t.max():.6f} "
+          f"norm={t.norm():.4f} fingerprint={fingerprint:.6f}")
 
 
 class NV_MultiModelSampler:
@@ -82,6 +93,9 @@ class NV_MultiModelSampler:
                 "committed_noise": ("COMMITTED_NOISE", {
                     "tooltip": "Pre-generated noise with FreeNoise correlation (from NV_CommittedNoise). If provided, seed is ignored."
                 }),
+                # Debug
+                "verbose": ("BOOLEAN", {"default": False,
+                    "tooltip": "Log detailed noise/latent statistics at each stage for debugging path equivalence."}),
             }
         }
 
@@ -96,7 +110,7 @@ class NV_MultiModelSampler:
                sampler_name_override=None, scheduler_override=None,
                mode="single", model_steps="", shift_override=0.0,
                add_noise="enable", start_at_step=0, end_at_step=0,
-               committed_noise=None):
+               committed_noise=None, verbose=False):
 
         # ============= Override sampler/scheduler from STRING inputs =============
         if sampler_name_override is not None and sampler_name_override.strip():
@@ -184,7 +198,8 @@ class NV_MultiModelSampler:
                 seed, steps, cfg, sampler_name, scheduler, denoise,
                 committed_noise=committed_noise,
                 disable_noise=disable_noise,
-                start_step=start_step, last_step=last_step
+                start_step=start_step, last_step=last_step,
+                verbose=verbose
             )
         elif mode == "sequential":
             return self._sample_sequential(
@@ -192,7 +207,8 @@ class NV_MultiModelSampler:
                 seed, steps, cfg, sampler_name, scheduler, denoise,
                 model_steps, committed_noise=committed_noise,
                 disable_noise=disable_noise,
-                start_step=start_step, last_step=last_step
+                start_step=start_step, last_step=last_step,
+                verbose=verbose
             )
         else:
             # Fallback to single
@@ -201,15 +217,24 @@ class NV_MultiModelSampler:
                 seed, steps, cfg, sampler_name, scheduler, denoise,
                 committed_noise=committed_noise,
                 disable_noise=disable_noise,
-                start_step=start_step, last_step=last_step
+                start_step=start_step, last_step=last_step,
+                verbose=verbose
             )
 
     def _sample_single(self, model, positive, negative, latent_image,
                        seed, steps, cfg, sampler_name, scheduler, denoise,
                        committed_noise=None, disable_noise=False,
-                       start_step=None, last_step=None):
+                       start_step=None, last_step=None, verbose=False):
         """Standard KSampler behavior - with optional committed noise and cascaded pipeline support."""
+
+        if verbose:
+            self._verbose_pre_sample(model, latent_image, seed, steps, scheduler,
+                                     denoise, disable_noise, committed_noise,
+                                     start_step, last_step)
+
         if committed_noise is not None and not disable_noise:
+            if verbose:
+                _log_tensor_stats("committed_noise", committed_noise["noise"])
             result = self._ksampler_with_noise(
                 model, committed_noise["noise"], seed, steps, cfg, sampler_name, scheduler,
                 positive, negative, latent_image, denoise=denoise,
@@ -223,18 +248,28 @@ class NV_MultiModelSampler:
             # Noise must be process_latent_in'd since inner_sample only processes
             # latent_image, not noise.
             identity_noise = self._make_identity_noise(model, latent_image)
+            if verbose:
+                _log_tensor_stats("identity_noise", identity_noise)
+                _log_tensor_stats("pre_noised_latent (input)", latent_image["samples"])
             result = self._ksampler_with_noise(
                 model, identity_noise, seed, steps, cfg, sampler_name, scheduler,
                 positive, negative, latent_image, denoise=denoise,
                 start_step=start_step, last_step=last_step
             )
         else:
+            if verbose:
+                self._verbose_standard_path(model, latent_image, seed, steps,
+                                            scheduler, denoise)
             result = common_ksampler(
                 model, seed, steps, cfg, sampler_name, scheduler,
                 positive, negative, latent_image, denoise=denoise,
                 disable_noise=disable_noise,
                 start_step=start_step, last_step=last_step
             )
+
+        if verbose:
+            _log_tensor_stats("output_latent", result[0]["samples"])
+
         # Strip cascaded config from output — latent has been denoised
         self._strip_cascaded_config(result)
         return result
@@ -242,7 +277,8 @@ class NV_MultiModelSampler:
     def _sample_sequential(self, models, positive, negative, latent_image,
                            seed, steps, cfg, sampler_name, scheduler,
                            denoise, model_steps_str, committed_noise=None,
-                           disable_noise=False, start_step=None, last_step=None):
+                           disable_noise=False, start_step=None, last_step=None,
+                           verbose=False):
         """
         Chain models by step count.
 
@@ -340,6 +376,77 @@ class NV_MultiModelSampler:
         out = (current_latent,)
         self._strip_cascaded_config(out)
         return out
+
+    def _verbose_pre_sample(self, model, latent_image, seed, steps, scheduler,
+                            denoise, disable_noise, committed_noise,
+                            start_step, last_step):
+        """Log common state before any sampling path."""
+        samples = latent_image["samples"]
+        model_sampling = model.get_model_object("model_sampling")
+        ms_cls = type(model_sampling).__name__
+        shift = getattr(model_sampling, "shift", "N/A")
+
+        path = "committed_noise" if (committed_noise is not None and not disable_noise) \
+               else "prenoise+disable" if disable_noise \
+               else "standard (add_noise=enable)"
+
+        print(f"\n{'='*70}")
+        print(f"[NV_DEBUG] === NV_MultiModelSampler Verbose ===")
+        print(f"[NV_DEBUG] Path: {path}")
+        print(f"[NV_DEBUG] model_sampling: {ms_cls}, shift={shift}")
+        print(f"[NV_DEBUG] steps={steps}, denoise={denoise}, scheduler={scheduler}")
+        print(f"[NV_DEBUG] start_step={start_step}, last_step={last_step}, seed={seed}")
+        _log_tensor_stats("input_latent", samples)
+
+        # Compute and log the sigma schedule this run will use
+        if denoise is not None and denoise < 0.9999 and not disable_noise:
+            expanded = int(steps / denoise)
+            full_sigmas = comfy.samplers.calculate_sigmas(model_sampling, scheduler, expanded)
+            active_sigmas = full_sigmas[-(steps + 1):]
+        elif disable_noise and start_step is not None:
+            total = last_step if last_step else steps
+            full_sigmas = comfy.samplers.calculate_sigmas(model_sampling, scheduler, total)
+            active_sigmas = full_sigmas[start_step:]
+        else:
+            full_sigmas = comfy.samplers.calculate_sigmas(model_sampling, scheduler, steps)
+            active_sigmas = full_sigmas
+
+        sigmas_str = ", ".join(f"{s:.4f}" for s in active_sigmas.tolist())
+        print(f"[NV_DEBUG] Active sigmas ({len(active_sigmas)}): [{sigmas_str}]")
+        print(f"[NV_DEBUG] Start sigma: {float(active_sigmas[0]):.6f}")
+
+    def _verbose_standard_path(self, model, latent_image, seed, steps,
+                               scheduler, denoise):
+        """Log what the standard add_noise=enable path will produce.
+
+        Reproduces the exact noise generation and noise_scaling that
+        common_ksampler + KSAMPLER.sample() will perform, so we can
+        compare with the PreNoiseLatent path.
+        """
+        samples = latent_image["samples"]
+        model_sampling = model.get_model_object("model_sampling")
+        process_latent_in = model.get_model_object("process_latent_in")
+
+        # Generate the same noise common_ksampler will generate
+        batch_inds = latent_image.get("batch_index", None)
+        noise = comfy.sample.prepare_noise(samples, seed, batch_inds)
+        _log_tensor_stats("standard_noise (prepare_noise)", noise)
+
+        # Compute start sigma (same logic as KSampler.set_steps)
+        expanded = int(steps / denoise)
+        full_sigmas = comfy.samplers.calculate_sigmas(model_sampling, scheduler, expanded)
+        active_sigmas = full_sigmas[-(steps + 1):]
+        start_sigma = float(active_sigmas[0])
+
+        # Compute expected x_init: what KSAMPLER.sample line 744 will produce
+        # noise_scaling(sigma, noise, process_latent_in(latent))
+        latent_in = process_latent_in(samples)
+        sigma_t = torch.tensor([start_sigma], dtype=latent_in.dtype, device=latent_in.device)
+        expected_x_init = model_sampling.noise_scaling(
+            sigma_t, noise.to(latent_in.device), latent_in)
+        _log_tensor_stats("expected_x_init (σ*noise + (1-σ)*latent_in)", expected_x_init)
+        print(f"[NV_DEBUG] Formula: {start_sigma:.6f} * noise + {1.0 - start_sigma:.6f} * process_latent_in(latent)")
+        print(f"{'='*70}\n")
 
     def _ksampler_with_noise(self, model, noise, seed, steps, cfg, sampler_name, scheduler,
                               positive, negative, latent, denoise=1.0, start_step=None,
