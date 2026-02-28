@@ -496,8 +496,16 @@ class NV_MultiModelSampler:
         _log_tensor_stats(f"input_latent (model {seg_idx+1})", samples)
 
         # Compute and log the sigma schedule for this segment
-        full_sigmas = comfy.samplers.calculate_sigmas(model_sampling, scheduler, steps)
-        seg_sigmas = full_sigmas[seg_start:seg_end + 1]
+        # Account for denoise truncation: KSampler expands to int(steps/denoise)
+        # then takes the last (steps+1) sigmas — same as _verbose_pre_sample logic
+        if denoise is not None and denoise < 0.9999 and not disable_noise:
+            expanded = int(steps / denoise)
+            full_sigmas = comfy.samplers.calculate_sigmas(model_sampling, scheduler, expanded)
+            active_sigmas = full_sigmas[-(steps + 1):]
+        else:
+            full_sigmas = comfy.samplers.calculate_sigmas(model_sampling, scheduler, steps)
+            active_sigmas = full_sigmas
+        seg_sigmas = active_sigmas[seg_start:seg_end + 1]
         sigmas_str = ", ".join(f"{s:.4f}" for s in seg_sigmas.tolist())
         print(f"[NV_DEBUG] Segment sigmas ({len(seg_sigmas)}): [{sigmas_str}]")
         if len(seg_sigmas) > 0:
