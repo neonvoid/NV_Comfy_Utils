@@ -23,6 +23,55 @@ import torchvision.transforms.v2 as T
 
 
 # =============================================================================
+# WAN Resolution Presets
+# =============================================================================
+
+WAN_PRESETS = {
+    "WAN_480p": {"pixels": 399_360, "divisor": 16, "min_side": 256, "max_side": 1024},
+    "WAN_720p": {"pixels": 921_600, "divisor": 16, "min_side": 384, "max_side": 1536},
+}
+
+
+def compute_auto_resolution(bbox_aspect, preset_name, padding_multiple):
+    """
+    Compute optimal target resolution from bbox aspect ratio and WAN preset.
+
+    Given a pixel budget and aspect ratio, solves:
+        width * height = target_pixels
+        width / height = aspect
+    => width = sqrt(pixels * aspect), height = sqrt(pixels / aspect)
+
+    Then snaps to the stricter of the preset's divisor or the padding_multiple.
+    """
+    config = WAN_PRESETS[preset_name]
+    pixels = config["pixels"]
+    divisor = max(config["divisor"], padding_multiple) if padding_multiple > 0 else config["divisor"]
+    min_side = config["min_side"]
+    max_side = config["max_side"]
+
+    # Clamp extreme aspect ratios (beyond 3:1 or 1:3 is rarely useful for diffusion)
+    bbox_aspect = max(1/3, min(3.0, bbox_aspect))
+
+    # Compute raw dimensions
+    raw_w = math.sqrt(pixels * bbox_aspect)
+    raw_h = math.sqrt(pixels / bbox_aspect)
+
+    # Snap to divisor
+    w = round(raw_w / divisor) * divisor
+    h = round(raw_h / divisor) * divisor
+
+    # Clamp to min/max
+    w = max(min_side, min(max_side, w))
+    h = max(min_side, min(max_side, h))
+
+    # Re-snap after clamp (clamp might have broken divisibility)
+    w = round(w / divisor) * divisor
+    h = round(h / divisor) * divisor
+
+    return int(w), int(h)
+
+
+# =============================================================================
 # Utility Functions
 # =============================================================================
 
@@ -358,13 +407,21 @@ class NV_InpaintCrop:
                 "image": ("IMAGE",),
                 "mask": ("MASK",),
 
+                "target_mode": (["manual", "auto"], {
+                    "default": "manual",
+                    "tooltip": "manual: use target_width/height below. auto: compute optimal resolution from bbox aspect ratio and preset."
+                }),
                 "target_width": ("INT", {
                     "default": 512, "min": 64, "max": nodes.MAX_RESOLUTION, "step": 8,
-                    "tooltip": "Output width for cropped region. Should match your model's expected input size (512 for SD1.5, 1024 for SDXL)."
+                    "tooltip": "Output width for cropped region (manual mode). Ignored when target_mode=auto."
                 }),
                 "target_height": ("INT", {
                     "default": 512, "min": 64, "max": nodes.MAX_RESOLUTION, "step": 8,
-                    "tooltip": "Output height for cropped region. Should match your model's expected input size (512 for SD1.5, 1024 for SDXL)."
+                    "tooltip": "Output height for cropped region (manual mode). Ignored when target_mode=auto."
+                }),
+                "auto_preset": (list(WAN_PRESETS.keys()), {
+                    "default": "WAN_480p",
+                    "tooltip": "Resolution preset for auto mode. WAN_480p: ~400k pixels (832x480 scale). WAN_720p: ~920k pixels (1280x720 scale)."
                 }),
                 "padding_multiple": (["0", "8", "16", "32", "64"], {
                     "default": "32",
@@ -436,15 +493,15 @@ class NV_InpaintCrop:
             }
         }
 
-    RETURN_TYPES = ("STITCHER", "IMAGE", "MASK", "MASK")
-    RETURN_NAMES = ("stitcher", "cropped_image", "cropped_mask", "cropped_mask_processed")
+    RETURN_TYPES = ("STITCHER", "IMAGE", "MASK", "MASK", "STRING")
+    RETURN_NAMES = ("stitcher", "cropped_image", "cropped_mask", "cropped_mask_processed", "info")
     FUNCTION = "crop"
     CATEGORY = "NV_Utils/Inpaint"
-    DESCRIPTION = "Crops image for inpainting. Outputs both original mask (for stitching) and processed mask (for diffusion)."
+    DESCRIPTION = "Crops image for inpainting. Outputs both original mask (for stitching) and processed mask (for diffusion). Auto mode computes optimal resolution from bbox."
 
-    def crop(self, image, mask, target_width, target_height, padding_multiple,
-             mask_erode_dilate, mask_fill_holes, mask_remove_noise, mask_smooth,
-             mask_blend_pixels, resize_algorithm,
+    def crop(self, image, mask, target_mode, target_width, target_height, auto_preset,
+             padding_multiple, mask_erode_dilate, mask_fill_holes, mask_remove_noise,
+             mask_smooth, mask_blend_pixels, resize_algorithm,
              bounding_box_mask=None, stabilize_crop=False, stabilization_mode="smooth", smooth_window=5):
 
         padding_multiple = int(padding_multiple)
@@ -467,6 +524,26 @@ class NV_InpaintCrop:
         # Validate dimensions
         assert image.shape[1] == mask.shape[1] and image.shape[2] == mask.shape[2], \
             f"Image and mask dimensions must match: image {image.shape}, mask {mask.shape}"
+
+        info_lines = []
+
+        # Auto resolution: compute optimal target from bbox aspect ratio
+        if target_mode == "auto":
+            bbox_union = self._compute_bbox_union(
+                bounding_box_mask if bounding_box_mask is not None else mask,
+                batch_size
+            )
+            if bbox_union is not None:
+                _, _, union_w, union_h = bbox_union
+                bbox_aspect = union_w / union_h
+                target_width, target_height = compute_auto_resolution(
+                    bbox_aspect, auto_preset, padding_multiple
+                )
+                info_lines.append(f"Auto resolution: {target_width}x{target_height}")
+                info_lines.append(f"  bbox union: {union_w}x{union_h} (aspect {bbox_aspect:.3f})")
+                info_lines.append(f"  preset: {auto_preset} ({WAN_PRESETS[auto_preset]['pixels']:,} px budget)")
+            else:
+                info_lines.append(f"Auto resolution: no bbox found, falling back to {target_width}x{target_height}")
 
         print(f"[NV_InpaintCrop] Processing {batch_size} frame(s), target {target_width}x{target_height}")
 
@@ -587,20 +664,52 @@ class NV_InpaintCrop:
         # Handle all-skipped case
         if len(result_images) == 0:
             print(f"[NV_InpaintCrop] All frames skipped - returning original")
+            info_lines.append("All frames skipped - no mask content found")
             empty_mask = torch.zeros((batch_size, image.shape[1], image.shape[2]),
                                      device=comfy.model_management.intermediate_device())
             return (stitcher,
                     image.to(comfy.model_management.intermediate_device()),
                     empty_mask,
-                    empty_mask)
+                    empty_mask,
+                    "\n".join(info_lines))
 
         result_images = torch.stack(result_images, dim=0)
         result_masks_original = torch.stack(result_masks_original, dim=0)
         result_masks_processed = torch.stack(result_masks_processed, dim=0)
 
-        print(f"[NV_InpaintCrop] Output: {result_images.shape[0]} frames, {result_images.shape[2]}x{result_images.shape[1]}")
+        out_h, out_w = result_images.shape[1], result_images.shape[2]
+        info_lines.append(f"Output: {result_images.shape[0]} frames @ {out_w}x{out_h}")
+        print(f"[NV_InpaintCrop] Output: {result_images.shape[0]} frames, {out_w}x{out_h}")
 
-        return (stitcher, result_images, result_masks_original, result_masks_processed)
+        return (stitcher, result_images, result_masks_original, result_masks_processed,
+                "\n".join(info_lines))
+
+    def _compute_bbox_union(self, mask_source, batch_size):
+        """
+        Compute the union bounding box across all frames.
+
+        Returns (x, y, w, h) of the envelope containing all per-frame bboxes,
+        or None if no frames have content.
+        """
+        union_x_min, union_y_min = float('inf'), float('inf')
+        union_x_max, union_y_max = 0, 0
+        found_any = False
+
+        for b in range(batch_size):
+            bbox = find_bbox(mask_source[b])
+            if bbox is not None:
+                bx, by, bw, bh = bbox
+                union_x_min = min(union_x_min, bx)
+                union_y_min = min(union_y_min, by)
+                union_x_max = max(union_x_max, bx + bw)
+                union_y_max = max(union_y_max, by + bh)
+                found_any = True
+
+        if not found_any:
+            return None
+
+        return (int(union_x_min), int(union_y_min),
+                int(union_x_max - union_x_min), int(union_y_max - union_y_min))
 
     def _stabilize_bboxes(self, bboxes, mode, window_size):
         """Apply temporal stabilization to bounding box sequence."""
