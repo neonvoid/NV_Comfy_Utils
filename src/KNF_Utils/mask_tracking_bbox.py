@@ -8,7 +8,6 @@ Unlike masks_to_bboxes() in vace_control_video_prep.py, this node:
   - Does NOT snap to VAE stride boundaries (eliminates 8px quantization jitter)
   - Offers multiple smoothing algorithms including One-Euro filter (velocity-adaptive)
   - Supports "lock" modes that fix bbox dimensions while tracking position
-  - Anomaly detection rejects occlusion/tracking-loss frames before smoothing
   - Outputs both the bbox mask and a pass-through of the input tight mask
 
 Smoothing modes:
@@ -24,11 +23,10 @@ Smoothing modes:
                  Position (center) still smoothed with One-Euro.
   none        - Raw per-frame bboxes with padding only. No temporal smoothing.
 
-Anomaly detection:
-  Runs between bbox extraction and smoothing. Detects frames where the bbox
-  jumps suddenly (occlusion, tracking loss, someone walking in front). Flagged
-  frames are rejected and filled from neighbors, so the smoother never sees
-  the bad data. Controlled by anomaly_threshold (0.0 = off, lower = stricter).
+Note: Anomaly detection (occlusion/tracking-loss rejection) lives in
+NV_InpaintCrop v2, not here. This node focuses purely on smoothing.
+InpaintCrop is where the crop canvas is determined, so anomaly detection
+there ensures a smooth, non-jarring canvas for inpaint workflows.
 """
 
 import math
@@ -149,151 +147,6 @@ def extract_bboxes(mask: torch.Tensor, info_lines: list) -> tuple:
 
     return x1s, y1s, x2s, y2s, present
 
-
-# =============================================================================
-# Anomaly Detection
-# =============================================================================
-
-def detect_anomalies(x1s, y1s, x2s, y2s, present, threshold, info_lines):
-    """Detect and reject anomalous bbox frames (occlusion, tracking loss).
-
-    Computes per-frame area and center-displacement deltas relative to stable
-    statistics. Frames exceeding the threshold are marked not-present so the
-    existing forward/backward fill replaces them with interpolated neighbors.
-
-    Metrics (for each frame t relative to t-1):
-      area_delta  = |area[t] - median_area| / median_area
-      center_jump = euclidean(center[t], center[t-1]) / sqrt(median_area)
-
-    A frame is flagged if max(area_delta, center_jump) > threshold.
-
-    Args:
-        x1s, y1s, x2s, y2s: Per-frame bbox corners (already forward/back filled).
-        present: Per-frame presence flags (True = had real mask content).
-        threshold: Sensitivity (lower = stricter). 0.0 disables detection.
-        info_lines: Diagnostic output accumulator.
-
-    Returns:
-        Updated (x1s, y1s, x2s, y2s, present) with anomalous frames cleared
-        and re-filled from neighbors.
-    """
-    if threshold <= 0.0:
-        return x1s, y1s, x2s, y2s, present
-
-    B = len(x1s)
-    present_indices = [i for i in range(B) if present[i]]
-
-    if len(present_indices) < 3:
-        # Not enough data to establish stable statistics
-        return x1s, y1s, x2s, y2s, present
-
-    # Compute per-frame areas and centers (only for present frames)
-    areas = []
-    cxs = []
-    cys = []
-    for i in present_indices:
-        w = x2s[i] - x1s[i]
-        h = y2s[i] - y1s[i]
-        areas.append(max(w * h, 1.0))
-        cxs.append((x1s[i] + x2s[i]) / 2.0)
-        cys.append((y1s[i] + y2s[i]) / 2.0)
-
-    # Stable reference: median area
-    sorted_areas = sorted(areas)
-    median_area = sorted_areas[len(sorted_areas) // 2]
-
-    if median_area < 1.0:
-        return x1s, y1s, x2s, y2s, present
-
-    # Score each present frame
-    flagged = []
-    scores = {}  # frame_idx -> (area_delta, center_jump)
-
-    for idx in range(len(present_indices)):
-        frame = present_indices[idx]
-        area = areas[idx]
-
-        # Area anomaly: how far from median?
-        area_delta = abs(area - median_area) / median_area
-
-        # Center displacement: compare to previous present frame
-        if idx > 0:
-            dx = cxs[idx] - cxs[idx - 1]
-            dy = cys[idx] - cys[idx - 1]
-            center_jump = math.sqrt(dx * dx + dy * dy) / math.sqrt(median_area)
-        else:
-            center_jump = 0.0
-
-        score = max(area_delta, center_jump)
-        scores[frame] = (area_delta, center_jump, score)
-
-        if score > threshold:
-            flagged.append(frame)
-
-    if not flagged:
-        info_lines.append(f"  Anomaly detection: clean (threshold={threshold:.2f})")
-        return x1s, y1s, x2s, y2s, present
-
-    # Report flagged frames
-    info_lines.append(
-        f"  Anomaly detection: {len(flagged)} frame(s) rejected "
-        f"(threshold={threshold:.2f})"
-    )
-
-    # Build contiguous runs for compact reporting
-    runs = []
-    run_start = flagged[0]
-    run_end = flagged[0]
-    for f in flagged[1:]:
-        if f == run_end + 1:
-            run_end = f
-        else:
-            runs.append((run_start, run_end))
-            run_start = f
-            run_end = f
-    runs.append((run_start, run_end))
-
-    for start, end in runs:
-        if start == end:
-            ad, cj, sc = scores[start]
-            info_lines.append(
-                f"    frame {start}: area_delta={ad:.2f}, "
-                f"center_jump={cj:.2f}, score={sc:.2f}"
-            )
-        else:
-            info_lines.append(f"    frames {start}-{end} ({end - start + 1} frames)")
-
-    # Reject: mark flagged frames as not-present and zero their coords
-    present = list(present)  # ensure mutable
-    for f in flagged:
-        present[f] = False
-        x1s[f] = 0.0
-        y1s[f] = 0.0
-        x2s[f] = 0.0
-        y2s[f] = 0.0
-
-    # Re-fill from neighbors (same logic as extract_bboxes)
-    coords = [x1s, y1s, x2s, y2s]
-    for c in coords:
-        last_valid = None
-        for i in range(B):
-            if present[i]:
-                last_valid = c[i]
-            elif last_valid is not None:
-                c[i] = last_valid
-        last_valid = None
-        for i in range(B - 1, -1, -1):
-            if present[i]:
-                last_valid = c[i]
-            elif last_valid is not None:
-                c[i] = last_valid
-
-    remaining = sum(present)
-    info_lines.append(
-        f"    {remaining}/{B} frames remain after rejection + fill"
-    )
-
-    return x1s, y1s, x2s, y2s, present
 
 
 # =============================================================================
@@ -499,14 +352,6 @@ class NV_MaskTrackingBBox:
                                "Used by one_euro, lock_largest, and lock_first modes. "
                                "0.0 = no speed adaptation, 0.5-1.0 = moderate, 2.0+ = aggressive."
                 }),
-                "anomaly_threshold": ("FLOAT", {
-                    "default": 1.5, "min": 0.0, "max": 10.0, "step": 0.1,
-                    "tooltip": "Reject frames where bbox jumps exceed this threshold "
-                               "(occlusion, tracking loss, someone walking in front). "
-                               "Rejected frames are interpolated from neighbors before smoothing. "
-                               "0.0 = disabled. 1.0 = strict (catches subtle jumps). "
-                               "1.5 = moderate (recommended). 3.0 = lenient (only extreme events)."
-                }),
                 "threshold": ("BOOLEAN", {
                     "default": False,
                     "tooltip": "Binarize input mask at 0.5 before bbox extraction. "
@@ -533,11 +378,12 @@ class NV_MaskTrackingBBox:
         "Extract per-frame bounding boxes from segmentation masks with temporal smoothing. "
         "Designed to sit between SAM3 and InpaintCrop: converts irregular per-frame masks "
         "into stable rectangular bbox masks. One-Euro filter provides velocity-adaptive "
-        "smoothing (heavy when still, light when moving). Lock modes fix crop dimensions."
+        "smoothing (heavy when still, light when moving). Lock modes fix crop dimensions. "
+        "Anomaly detection (occlusion rejection) is handled by InpaintCrop v2 downstream."
     )
 
     def execute(self, mask, padding, smooth_mode, smooth_window,
-                min_cutoff=0.05, beta=0.7, anomaly_threshold=1.5,
+                min_cutoff=0.05, beta=0.7,
                 threshold=False, output_erode=0, output_feather=0):
         if mask.dim() == 2:
             mask = mask.unsqueeze(0)
@@ -560,19 +406,6 @@ class NV_MaskTrackingBBox:
         # All-empty check
         if not any(present):
             info_lines.append("  No mask content in any frame — returning zero masks")
-            info = "\n".join(info_lines)
-            print(info)
-            tight_out = (mask > 0.5).float() if threshold else mask.clone()
-            return (torch.zeros_like(mask), tight_out, info)
-
-        # --- Anomaly detection (reject occlusion/tracking-loss frames) ---
-        x1s, y1s, x2s, y2s, present = detect_anomalies(
-            x1s, y1s, x2s, y2s, present, anomaly_threshold, info_lines
-        )
-
-        # Re-check after rejection (anomaly detection may have cleared all frames)
-        if not any(present):
-            info_lines.append("  All frames rejected by anomaly detection — returning zero masks")
             info = "\n".join(info_lines)
             print(info)
             tight_out = (mask > 0.5).float() if threshold else mask.clone()

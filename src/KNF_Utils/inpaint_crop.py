@@ -250,6 +250,132 @@ def mask_blur(mask, amount):
     return blurred
 
 
+def detect_bbox_anomalies(bboxes, threshold, info_lines):
+    """Detect and reject anomalous bounding boxes (occlusion, tracking loss).
+
+    Computes per-frame area and center-displacement relative to stable statistics.
+    Anomalous frames are set to None and forward/backward filled from neighbors,
+    so downstream smoothing never sees the bad data.
+
+    Metrics:
+        area_delta  = |area[t] - median_area| / median_area
+        center_jump = euclidean(center[t], center[t-1]) / sqrt(median_area)
+    A frame is flagged if max(area_delta, center_jump) > threshold.
+
+    Args:
+        bboxes: List of (x, y, w, h) tuples or None per frame.
+        threshold: Sensitivity (lower = stricter). 0.0 disables detection.
+        info_lines: Diagnostic output accumulator.
+
+    Returns:
+        New list of (x, y, w, h) tuples with anomalous frames filled from neighbors.
+    """
+    if threshold <= 0.0:
+        return bboxes
+
+    valid = [(i, b) for i, b in enumerate(bboxes) if b is not None]
+
+    if len(valid) < 3:
+        return bboxes
+
+    # Compute per-frame area and center
+    areas = []
+    centers = []
+    for _, (x, y, w, h) in valid:
+        areas.append(max(float(w * h), 1.0))
+        centers.append((x + w / 2.0, y + h / 2.0))
+
+    # Stable reference: median area
+    sorted_areas = sorted(areas)
+    median_area = sorted_areas[len(sorted_areas) // 2]
+
+    if median_area < 1.0:
+        return bboxes
+
+    # Score each frame
+    flagged = []
+    scores = {}  # frame_idx -> (area_delta, center_jump, score)
+
+    for idx in range(len(valid)):
+        frame_idx = valid[idx][0]
+        area = areas[idx]
+
+        area_delta = abs(area - median_area) / median_area
+
+        if idx > 0:
+            dx = centers[idx][0] - centers[idx - 1][0]
+            dy = centers[idx][1] - centers[idx - 1][1]
+            center_jump = math.sqrt(dx * dx + dy * dy) / math.sqrt(median_area)
+        else:
+            center_jump = 0.0
+
+        score = max(area_delta, center_jump)
+        scores[frame_idx] = (area_delta, center_jump, score)
+
+        if score > threshold:
+            flagged.append(frame_idx)
+
+    if not flagged:
+        info_lines.append(f"Anomaly detection: clean (threshold={threshold:.2f})")
+        return bboxes
+
+    # Report
+    info_lines.append(
+        f"Anomaly detection: {len(flagged)} frame(s) rejected "
+        f"(threshold={threshold:.2f})"
+    )
+
+    # Compact run reporting
+    runs = []
+    run_start = flagged[0]
+    run_end = flagged[0]
+    for f in flagged[1:]:
+        if f == run_end + 1:
+            run_end = f
+        else:
+            runs.append((run_start, run_end))
+            run_start = f
+            run_end = f
+    runs.append((run_start, run_end))
+
+    for start, end in runs:
+        if start == end:
+            ad, cj, sc = scores[start]
+            info_lines.append(
+                f"  frame {start}: area_delta={ad:.2f}, "
+                f"center_jump={cj:.2f}, score={sc:.2f}"
+            )
+        else:
+            info_lines.append(f"  frames {start}-{end} ({end - start + 1} frames)")
+
+    # Reject: set flagged frames to None
+    result = list(bboxes)
+    for f in flagged:
+        result[f] = None
+
+    # Forward/backward fill None entries from nearest valid neighbor
+    B = len(result)
+    last_valid = None
+    for i in range(B):
+        if result[i] is not None:
+            last_valid = result[i]
+        elif last_valid is not None:
+            result[i] = last_valid
+    last_valid = None
+    for i in range(B - 1, -1, -1):
+        if result[i] is not None:
+            last_valid = result[i]
+        elif last_valid is not None:
+            result[i] = last_valid
+
+    remaining = sum(1 for b in result if b is not None)
+    info_lines.append(
+        f"  {remaining}/{B} frames remain after rejection + fill"
+    )
+
+    return result
+
+
 def find_bbox(mask):
     """Find bounding box of non-zero mask region. Returns (x, y, w, h) or None if empty."""
     if mask.dim() == 3:
@@ -490,6 +616,14 @@ class NV_InpaintCrop:
                     "tooltip": "Window size for temporal smoothing. Larger = more stable but less responsive. "
                                "3-5: subtle stabilization, 7-11: moderate smoothing, 13-21: heavy stabilization."
                 }),
+                "anomaly_threshold": ("FLOAT", {
+                    "default": 1.5, "min": 0.0, "max": 10.0, "step": 0.1,
+                    "tooltip": "Reject frames where bbox jumps exceed this threshold "
+                               "(occlusion, tracking loss, someone walking in front). "
+                               "Rejected frames are filled from neighbors before stabilization. "
+                               "Ensures a smooth, non-jarring crop canvas for inpaint workflows. "
+                               "0.0 = disabled. 1.0 = strict. 1.5 = moderate (recommended). 3.0 = lenient."
+                }),
             }
         }
 
@@ -502,7 +636,8 @@ class NV_InpaintCrop:
     def crop(self, image, mask, target_mode, target_width, target_height, auto_preset,
              padding_multiple, mask_erode_dilate, mask_fill_holes, mask_remove_noise,
              mask_smooth, mask_blend_pixels, resize_algorithm,
-             bounding_box_mask=None, stabilize_crop=False, stabilization_mode="smooth", smooth_window=5):
+             bounding_box_mask=None, stabilize_crop=False, stabilization_mode="smooth",
+             smooth_window=5, anomaly_threshold=1.5):
 
         padding_multiple = int(padding_multiple)
         device = comfy.model_management.get_torch_device()
@@ -570,15 +705,22 @@ class NV_InpaintCrop:
         result_masks_original = []
         result_masks_processed = []
 
-        # First pass: collect bounding boxes for stabilization
-        if stabilize_crop and batch_size > 1:
+        # First pass: collect bounding boxes for anomaly detection / stabilization
+        needs_bbox_pass = batch_size > 1 and (stabilize_crop or anomaly_threshold > 0.0)
+        if needs_bbox_pass:
             raw_bboxes = []
             for b in range(batch_size):
                 bbox_source = bounding_box_mask[b] if bounding_box_mask is not None else mask[b]
                 bbox = find_bbox(bbox_source)
                 raw_bboxes.append(bbox)
 
-            raw_bboxes = self._stabilize_bboxes(raw_bboxes, stabilization_mode, smooth_window)
+            # Anomaly detection: reject occlusion/tracking-loss frames before smoothing
+            if anomaly_threshold > 0.0:
+                raw_bboxes = detect_bbox_anomalies(raw_bboxes, anomaly_threshold, info_lines)
+
+            # Temporal stabilization
+            if stabilize_crop:
+                raw_bboxes = self._stabilize_bboxes(raw_bboxes, stabilization_mode, smooth_window)
         else:
             raw_bboxes = None
 
