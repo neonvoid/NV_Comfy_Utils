@@ -94,6 +94,24 @@ function animate(player) {
 }
 
 /**
+ * Compute the total node content height for a given width.
+ * Sums preceding widget heights + the DOM widget height.
+ * NOTE: Do NOT use node.computeSize() — it passes a minimum width
+ * (from title/slot labels) to widget.computeSize(), not node.size[0].
+ */
+function computeTargetHeight(widgets, domWidget, width) {
+    const [, widgetHeight] = domWidget.computeSize(width);
+    let overhead = 0;
+    for (const w of widgets) {
+        if (w === domWidget) break;
+        if (w.type === "converted-widget" || w.hidden) continue;
+        const wh = w.computeSize ? w.computeSize(width)[1] : 20;
+        overhead += wh + 4; // 4px gap between widgets (LiteGraph standard)
+    }
+    return overhead + widgetHeight + 4; // trailing gap
+}
+
+/**
  * Resize the node to fit the canvas aspect ratio + controls.
  */
 function resizeNodeToFit(node, player) {
@@ -102,10 +120,11 @@ function resizeNodeToFit(node, player) {
         const aspectRatio = player.imageHeight / player.imageWidth;
         // Dynamic computeSize — recalculates height from current width each call
         player.domWidget.computeSize = (width) => [width, width * aspectRatio + controlsHeight];
+
+        // Compute height directly using actual node width
+        const nodeWidth = node.size[0];
+        node.setSize([nodeWidth, computeTargetHeight(node.widgets, player.domWidget, nodeWidth)]);
     }
-    // Force node to adopt the correct height for its current width
-    const sz = node.computeSize();
-    node.setSize([node.size[0], sz[1]]);
     node.setDirtyCanvas(true, true);
 }
 
@@ -353,10 +372,10 @@ app.registerExtension({
             node.onResize = function (size) {
                 origOnResize?.apply(this, arguments);
                 const p = this._animPlayer;
-                if (p && p.imageWidth > 0 && p.imageHeight > 0) {
-                    const sz = this.computeSize();
-                    if (Math.abs(size[1] - sz[1]) > 1) {
-                        size[1] = sz[1];
+                if (p && p.imageWidth > 0 && p.imageHeight > 0 && p.domWidget) {
+                    const target = computeTargetHeight(this.widgets, p.domWidget, size[0]);
+                    if (Math.abs(size[1] - target) > 2) {
+                        size[1] = target;
                     }
                 }
             };

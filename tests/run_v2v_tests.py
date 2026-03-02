@@ -38,6 +38,7 @@ def run_test(name, fn):
 
 builder = NV_V2VPromptBuilder()
 default_req = {
+    "task_mode": "full_restyle",
     "trigger_word": "ohwx",
     "style_description": "cinematic film grain with warm tones",
     "subject_count": 1,
@@ -373,6 +374,136 @@ def test_chunked_section_single():
 
 
 run_test("chunked_section_single", test_chunked_section_single)
+
+# === R2V Bootstrap mode ===
+r2v_req = {
+    "task_mode": "r2v_bootstrap",
+    "trigger_word": "@Video1",
+    "style_description": "",
+    "subject_count": 1,
+    "motion_intensity": "medium",
+    "denoise_strength": 0.5,
+    "word_count_min": 60,
+    "word_count_max": 100,
+}
+
+
+def test_r2v_basic():
+    result = builder.build_prompt(**r2v_req)
+    assert len(result) == 3
+    assert all(isinstance(r, str) and len(r) > 0 for r in result)
+
+
+run_test("r2v_basic", test_r2v_basic)
+
+
+def test_r2v_trigger_clause():
+    si, _, _ = builder.build_prompt(**r2v_req)
+    assert "R2V reference tags" in si
+    assert "@Video1" in si
+
+
+run_test("r2v_trigger_clause", test_r2v_trigger_clause)
+
+
+def test_r2v_no_trigger_default():
+    r = {**r2v_req, "trigger_word": ""}
+    si, _, _ = builder.build_prompt(**r)
+    assert "@Video1" in si
+
+
+run_test("r2v_no_trigger_default", test_r2v_no_trigger_default)
+
+
+def test_r2v_identity_exclusion():
+    si, _, _ = builder.build_prompt(**r2v_req)
+    assert "do not describe" in si.lower()
+    assert "identity" in si.lower()
+
+
+run_test("r2v_identity_exclusion", test_r2v_identity_exclusion)
+
+
+def test_r2v_negative_line():
+    si, _, _ = builder.build_prompt(**r2v_req)
+    assert "NEGATIVE:" in si
+
+
+run_test("r2v_negative_line", test_r2v_negative_line)
+
+
+def test_r2v_prompt_expansion():
+    si, _, _ = builder.build_prompt(**r2v_req)
+    assert "auto-expanded" in si.lower() or "prompt expansion" in si.lower()
+
+
+run_test("r2v_prompt_expansion", test_r2v_prompt_expansion)
+
+
+def test_r2v_word_budget_columns():
+    si, _, _ = builder.build_prompt(**r2v_req)
+    assert "Action/Pose" in si
+    assert "Lighting/Color" in si
+    assert "Materials" not in si
+
+
+run_test("r2v_word_budget_columns", test_r2v_word_budget_columns)
+
+
+def test_r2v_prompt_labels():
+    _, pt, _ = builder.build_prompt(**r2v_req, scene_subjects="man in jacket")
+    assert "R2V Subject References" in pt
+    assert "Original Subject(s)" in pt
+    assert "Scene Match Strictness" in pt
+
+
+run_test("r2v_prompt_labels", test_r2v_prompt_labels)
+
+
+def test_r2v_char_table():
+    si, _, _ = builder.build_prompt(
+        **r2v_req,
+        character_tokens="@Video1: man in dark jacket\n@Video2: woman in red dress",
+    )
+    assert "Subject Reference Mapping" in si
+    assert "@Video1" in si
+    assert "@Video2" in si
+
+
+run_test("r2v_char_table", test_r2v_char_table)
+
+
+def test_r2v_no_char_table():
+    si, _, _ = builder.build_prompt(**r2v_req)
+    assert "Subject Reference Mapping" not in si
+
+
+run_test("r2v_no_char_table", test_r2v_no_char_table)
+
+
+def test_r2v_wan_char_limit():
+    si, _, _ = builder.build_prompt(**r2v_req)
+    assert "800" in si
+
+
+run_test("r2v_wan_char_limit", test_r2v_wan_char_limit)
+
+
+def test_r2v_debug_mode():
+    _, _, di = builder.build_prompt(**r2v_req)
+    assert "Task Mode: r2v_bootstrap" in di
+
+
+run_test("r2v_debug_mode", test_r2v_debug_mode)
+
+
+def test_r2v_system_role():
+    si, _, _ = builder.build_prompt(**r2v_req)
+    assert "reference-to-video" in si.lower() or "r2v" in si.lower()
+
+
+run_test("r2v_system_role", test_r2v_system_role)
+
 
 # === Summary ===
 print()

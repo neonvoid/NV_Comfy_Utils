@@ -254,6 +254,145 @@ appear as the first identifier when introducing the character."""
 
 
 # ---------------------------------------------------------------------------
+# R2V Bootstrap mode template constants
+# ---------------------------------------------------------------------------
+
+_R2V_SYSTEM_ROLE = """\
+You are a video analysis assistant preparing scene descriptions for a \
+reference-to-video (R2V) generation pipeline. Analyze the input video to \
+produce a scene and action description that will guide the WAN 2.6 R2V model \
+to generate a replacement character performing the same actions in a matching \
+environment. The R2V model already knows what the character looks like from \
+reference video — your job is to describe everything ELSE: the scene, the \
+action, the camera, and the lighting."""
+
+_R2V_ANALYSIS_PRIORITIES = """\
+## Analysis Priorities
+
+- **Action and pose**: Describe precisely what the target subject is doing — \
+body position, gestures, gait, facing direction, movement trajectory. The R2V \
+model must generate the replacement character performing these same actions. \
+This is the highest priority.{denoise_structural_note}
+- **Scene environment**: Describe the setting in enough detail that R2V \
+generates a visually compatible background — indoor/outdoor, architecture, \
+surfaces, depth, spatial layout. Match the level of detail to what the \
+downstream VACE pipeline needs for seamless compositing.{denoise_surface_note}
+- **Lighting and color**: Describe lighting direction, color temperature, \
+contrast, and any dominant color palette. The R2V output must match the \
+target scene's lighting for VACE to blend without seams.
+- **Camera behavior**: Shot type (close-up, medium, wide), camera motion \
+(static, pan, track, handheld), and any depth-of-field characteristics. \
+R2V output framing should approximate the target.{temporal_note}
+{motion_priority_clause}"""
+
+_R2V_OUTPUT_CONSTRAINTS = """\
+## Output Constraints
+
+- Do NOT describe the original subject's identity, face, or appearance — \
+the R2V model gets identity from reference video, not from your caption. \
+Refer to the subject only by their actions and spatial position.
+- Use the provided R2V reference tags (e.g. @Video1) as the subject \
+identifier throughout. If multiple subjects are being replaced, use the \
+appropriate tag for each.
+- Describe the scene as the character would experience it — lighting hitting \
+them, ground beneath them, objects around them. This grounds the R2V \
+generation in the correct spatial context.
+- Include explicit camera framing — the R2V output must match shot type and \
+angle for VACE compatibility.
+- Use cinematic vocabulary: prefer precise terms like "tracking shot", \
+"dolly zoom", "shallow depth of field", "tungsten key light" over vague \
+descriptors like "smooth camera" or "warm lighting".
+- This prompt may be auto-expanded by the R2V API — be precise and specific \
+rather than exhaustive. Concise prompts with strong vocabulary outperform \
+verbose ones when prompt expansion is enabled.
+- Do not reference production infrastructure, compositing, VFX, or the \
+pipeline itself.
+- Use plain, technical language — no poetic flourishes, metaphors, or \
+dramatic framing.
+- Do not infer narrative, emotion, or intent beyond observable action.
+- Do not add details that are not clearly visible.
+- Be precise and factual.
+- End with quality-negative guidance on a separate line prefixed with \
+NEGATIVE: to populate the R2V negative prompt field."""
+
+_R2V_WORD_BUDGET = """\
+## Word Budget Allocation
+
+Distribute the target word count based on these priorities:
+
+| Condition | Action/Pose | Environment | Lighting/Color | Camera |
+|-----------|-------------|-------------|---------------|--------|
+| 1 subject, low motion | 25% | 30% | 25% | 20% |
+| 1 subject, low/medium motion | 30% | 25% | 25% | 20% |
+| 1 subject, high motion | 40% | 20% | 20% | 20% |
+| 2+ subjects, low motion | 30% | 25% | 25% | 20% |
+| 2+ subjects, low/medium motion | 35% | 20% | 25% | 20% |
+| 2+ subjects, high motion | 40% | 20% | 20% | 20% |
+| No subjects (environment only) | 10% | 40% | 30% | 20% |
+
+**Active row for this video**: {budget_row_label}
+
+These are guidelines, not rigid constraints. Prioritize whatever aspect of \
+the scene is most critical for generating a visually compatible R2V output. \
+Note: WAN 2.6 R2V prompt limit is 800 characters — stay concise."""
+
+_R2V_OUTPUT_FORMAT = """\
+## Output Format
+
+{word_count_min}-{word_count_max} words of flowing prose. \
+{trigger_word_clause}
+
+Cover in this order:
+1. Subject action and spatial position (using R2V reference tags)
+2. Scene environment and spatial context
+3. Lighting direction, color temperature, and mood
+4. Camera framing and movement
+5. NEGATIVE: quality-negative terms (on its own line, always include)
+
+Example structure:
+"@Video1 sits at a wooden desk in a warmly lit home office, gesturing with \
+their right hand while speaking. Bookshelves line the wall behind them. Warm \
+tungsten key light from the upper left, soft fill from a window on the right. \
+Medium close-up, static camera, shallow depth of field with background \
+softly blurred. Natural movement, cinematic quality.
+NEGATIVE: low quality, blurry, distorted faces, unnatural movement, text, \
+watermarks, shaky camera" """
+
+_R2V_PROMPT_TEMPLATE = """\
+Analyze this video and generate an R2V (reference-to-video) scene prompt \
+using these parameters:
+
+**R2V Subject References**: {trigger_word_display}
+**Target Pipeline**: R2V bootstrap → VACE inpainting (scene must match for compositing)
+**Scene Context**:
+- Original Subject(s): {subjects_display}
+- Setting: {setting_display}
+- Props: {props_display}
+**Video Duration**: {duration_display}
+**Camera**: {camera_display}
+**Subject Count**: {subject_count}
+**Motion Intensity**: {motion_intensity}
+**Scene Match Strictness**: {denoise_strength}
+**Target Word Count**: {word_count_min}-{word_count_max} words
+{chunked_section}
+
+Remember: Do NOT describe the subject's identity or appearance — only their \
+actions, pose, and the scene around them. Identity comes from reference video."""
+
+_R2V_CHARACTER_RECOGNITION = """\
+## Subject Reference Mapping
+
+Map the subjects you observe to these R2V reference tags:
+
+| Reference Tag | Replaces |
+|---------------|----------|
+{character_table_rows}
+
+Use the reference tag (e.g., @Video1) consistently throughout. Never describe \
+the replacement character's appearance — only their actions and position."""
+
+
+# ---------------------------------------------------------------------------
 # Mode template registry
 # ---------------------------------------------------------------------------
 
@@ -275,6 +414,15 @@ _MODE_TEMPLATES = {
         "output_format": _CS_OUTPUT_FORMAT,
         "prompt_template": _CS_PROMPT_TEMPLATE,
         "character_recognition": _CS_CHARACTER_RECOGNITION,
+    },
+    "r2v_bootstrap": {
+        "system_role": _R2V_SYSTEM_ROLE,
+        "analysis_priorities": _R2V_ANALYSIS_PRIORITIES,
+        "output_constraints": _R2V_OUTPUT_CONSTRAINTS,
+        "word_budget": _R2V_WORD_BUDGET,
+        "output_format": _R2V_OUTPUT_FORMAT,
+        "prompt_template": _R2V_PROMPT_TEMPLATE,
+        "character_recognition": _R2V_CHARACTER_RECOGNITION,
     },
 }
 
@@ -410,11 +558,11 @@ class NV_V2VPromptBuilder:
             "required": {
                 "task_mode": (list(_MODE_TEMPLATES.keys()), {
                     "default": "full_restyle",
-                    "tooltip": "Prompt generation mode. 'full_restyle' = full scene V2V style transfer. 'character_swap' = targeted character replacement via inpainting."
+                    "tooltip": "Prompt generation mode. 'full_restyle' = full scene V2V style transfer. 'character_swap' = targeted character replacement via inpainting. 'r2v_bootstrap' = scene prompts for WAN 2.6 R2V API."
                 }),
                 "trigger_word": ("STRING", {
                     "default": "",
-                    "tooltip": "LoRA trigger word that begins every output caption (e.g., 'ohwx', 'N1TEF1TESTLY3'). Leave empty if no trigger word needed."
+                    "tooltip": "LoRA trigger word (full_restyle/character_swap) or R2V reference tags like '@Video1' (r2v_bootstrap). Leave empty for defaults."
                 }),
                 "style_description": ("STRING", {
                     "multiline": True,
@@ -514,7 +662,8 @@ class NV_V2VPromptBuilder:
     DESCRIPTION = (
         "Assemble a structured V2V captioning prompt from individual parameters. "
         "Supports multiple task modes: 'full_restyle' for scene-wide style transfer, "
-        "'character_swap' for targeted character replacement via inpainting. "
+        "'character_swap' for targeted character replacement via inpainting, "
+        "'r2v_bootstrap' for WAN 2.6 R2V API scene prompts. "
         "Outputs system_instruction and prompt_text that connect directly to "
         "Multi-API Video Captioner."
     )
@@ -557,6 +706,7 @@ class NV_V2VPromptBuilder:
         else:
             system_instruction = self._assemble_system_instruction(
                 templates=templates,
+                task_mode=task_mode,
                 trigger_word=trigger_word,
                 subject_count=subject_count,
                 motion_intensity=motion_intensity,
@@ -614,7 +764,7 @@ class NV_V2VPromptBuilder:
 
         return (system_instruction, prompt_text, debug_info)
 
-    def _assemble_system_instruction(self, templates, trigger_word,
+    def _assemble_system_instruction(self, templates, task_mode, trigger_word,
                                      subject_count, motion_intensity,
                                      denoise_strength, word_count_min,
                                      word_count_max, character_tokens,
@@ -644,11 +794,20 @@ class NV_V2VPromptBuilder:
                 character_table_rows=char_table_rows
             )
 
-        # Section 6: Output Format
-        if trigger_word:
-            trigger_clause = f"Always begin with the trigger word: **{trigger_word}**"
+        # Section 6: Output Format — trigger clause is mode-aware
+        if task_mode == "r2v_bootstrap":
+            if trigger_word:
+                trigger_clause = (
+                    f"Use these R2V reference tags for subjects: **{trigger_word}**. "
+                    f"Integrate them naturally at the start of the description."
+                )
+            else:
+                trigger_clause = "Use @Video1 for the primary subject."
         else:
-            trigger_clause = "Begin directly with the scene description. No trigger word is needed."
+            if trigger_word:
+                trigger_clause = f"Always begin with the trigger word: **{trigger_word}**"
+            else:
+                trigger_clause = "Begin directly with the scene description. No trigger word is needed."
 
         output_format = templates["output_format"].format(
             word_count_min=word_count_min,

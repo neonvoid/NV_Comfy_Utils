@@ -494,3 +494,146 @@ def test_character_swap_chunked_works(builder, cs_required):
         chunk_index=0,
     )
     assert "establishing baseline" in prompt_text.lower() or "first chunk" in prompt_text.lower()
+
+
+# ---------------------------------------------------------------------------
+# Task mode: r2v_bootstrap
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def r2v_required():
+    """Default required args for r2v_bootstrap mode."""
+    return {
+        "task_mode": "r2v_bootstrap",
+        "trigger_word": "@Video1",
+        "style_description": "",
+        "subject_count": 1,
+        "motion_intensity": "medium",
+        "denoise_strength": 0.5,
+        "word_count_min": 60,
+        "word_count_max": 100,
+    }
+
+
+def test_r2v_mode_basic_output(builder, r2v_required):
+    """r2v_bootstrap returns 3 non-empty strings."""
+    result = builder.build_prompt(**r2v_required)
+    assert len(result) == 3
+    system_instruction, prompt_text, debug_info = result
+    assert isinstance(system_instruction, str) and len(system_instruction) > 0
+    assert isinstance(prompt_text, str) and len(prompt_text) > 0
+    assert isinstance(debug_info, str) and len(debug_info) > 0
+
+
+def test_r2v_trigger_word_clause(builder, r2v_required):
+    """R2V trigger word uses 'R2V reference tags' language, not 'trigger word'."""
+    system_instruction, _, _ = builder.build_prompt(**r2v_required)
+    assert "R2V reference tags" in system_instruction
+    assert "@Video1" in system_instruction
+
+
+def test_r2v_no_trigger_word_default(builder, r2v_required):
+    """Empty trigger word in R2V mode defaults to @Video1."""
+    r2v_required["trigger_word"] = ""
+    system_instruction, _, _ = builder.build_prompt(**r2v_required)
+    assert "@Video1" in system_instruction
+
+
+def test_r2v_character_table(builder, r2v_required):
+    """R2V uses 'Subject Reference Mapping' section header."""
+    system_instruction, _, _ = builder.build_prompt(
+        **r2v_required,
+        character_tokens="@Video1: The man in the dark jacket\n@Video2: The woman in the red dress",
+    )
+    assert "Subject Reference Mapping" in system_instruction
+    assert "@Video1" in system_instruction
+    assert "@Video2" in system_instruction
+    assert "dark jacket" in system_instruction
+
+
+def test_r2v_word_budget_columns(builder, r2v_required):
+    """R2V word budget uses Action/Pose + Environment + Lighting + Camera columns."""
+    system_instruction, _, _ = builder.build_prompt(**r2v_required)
+    assert "Action/Pose" in system_instruction
+    assert "Lighting/Color" in system_instruction
+    assert "Camera" in system_instruction
+    # Should NOT have V2V-specific columns
+    assert "Materials" not in system_instruction
+
+
+def test_r2v_identity_exclusion(builder, r2v_required):
+    """R2V system instruction forbids describing subject identity."""
+    system_instruction, _, _ = builder.build_prompt(**r2v_required)
+    assert "do not describe" in system_instruction.lower()
+    assert "identity" in system_instruction.lower()
+
+
+def test_r2v_negative_line_instruction(builder, r2v_required):
+    """R2V output format mentions NEGATIVE: line."""
+    system_instruction, _, _ = builder.build_prompt(**r2v_required)
+    assert "NEGATIVE:" in system_instruction
+
+
+def test_r2v_prompt_expansion_note(builder, r2v_required):
+    """R2V output constraints mention auto-expansion by the API."""
+    system_instruction, _, _ = builder.build_prompt(**r2v_required)
+    assert "auto-expanded" in system_instruction.lower() or "prompt expansion" in system_instruction.lower()
+
+
+def test_r2v_system_role_mentions_r2v(builder, r2v_required):
+    """R2V system role mentions reference-to-video."""
+    system_instruction, _, _ = builder.build_prompt(**r2v_required)
+    assert "reference-to-video" in system_instruction.lower() or "r2v" in system_instruction.lower()
+
+
+def test_r2v_prompt_template_labels(builder, r2v_required):
+    """R2V prompt template uses R2V-specific field labels."""
+    _, prompt_text, _ = builder.build_prompt(
+        **r2v_required,
+        scene_subjects="man walking a dog",
+    )
+    assert "R2V Subject References" in prompt_text
+    assert "Original Subject(s)" in prompt_text
+    assert "Scene Match Strictness" in prompt_text
+    assert "man walking a dog" in prompt_text
+
+
+def test_r2v_prompt_has_identity_reminder(builder, r2v_required):
+    """R2V prompt text reminds captioner not to describe identity."""
+    _, prompt_text, _ = builder.build_prompt(**r2v_required)
+    assert "identity comes from reference video" in prompt_text.lower()
+
+
+def test_r2v_debug_info_shows_mode(builder, r2v_required):
+    """Debug info shows task mode for r2v_bootstrap."""
+    _, _, debug_info = builder.build_prompt(**r2v_required)
+    assert "Task Mode: r2v_bootstrap" in debug_info
+
+
+def test_r2v_chunked_mode(builder, r2v_required):
+    """Chunked processing works with r2v_bootstrap mode."""
+    _, prompt_text, _ = builder.build_prompt(
+        **r2v_required,
+        processing_mode="chunked",
+        chunk_index=0,
+    )
+    assert "establishing baseline" in prompt_text.lower() or "first chunk" in prompt_text.lower()
+
+
+def test_r2v_no_style_in_prompt(builder, r2v_required):
+    """R2V prompt template does not include a Style field."""
+    _, prompt_text, _ = builder.build_prompt(**r2v_required)
+    # R2V template should not have "**Style**:" — style is irrelevant for R2V
+    assert "**Style**:" not in prompt_text
+
+
+def test_r2v_wan_char_limit_note(builder, r2v_required):
+    """R2V word budget mentions 800 character WAN limit."""
+    system_instruction, _, _ = builder.build_prompt(**r2v_required)
+    assert "800" in system_instruction
+
+
+def test_r2v_no_character_table_no_section(builder, r2v_required):
+    """No character tokens = no Subject Reference Mapping section."""
+    system_instruction, _, _ = builder.build_prompt(**r2v_required)
+    assert "Subject Reference Mapping" not in system_instruction
