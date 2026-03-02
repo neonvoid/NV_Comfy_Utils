@@ -94,21 +94,31 @@ function animate(player) {
 }
 
 /**
- * Compute the total node content height for a given width.
- * Sums preceding widget heights + the DOM widget height.
- * NOTE: Do NOT use node.computeSize() — it passes a minimum width
- * (from title/slot labels) to widget.computeSize(), not node.size[0].
+ * Compute the total node body height for a given width.
+ * Includes: slot header area + preceding widget heights + DOM widget height.
+ *
+ * node.size[1] = body height (excludes title bar, includes slot area).
+ * Widgets start at Y = slotRows * NODE_SLOT_HEIGHT + 2, so we must
+ * account for that offset — otherwise the node ends up too short and
+ * LiteGraph's _arrangeWidgets auto-expand fights our setSize.
  */
-function computeTargetHeight(widgets, domWidget, width) {
+function computeTargetHeight(node, domWidget, width) {
     const [, widgetHeight] = domWidget.computeSize(width);
-    let overhead = 0;
-    for (const w of widgets) {
+
+    // Slot header offset: input/output slots sit above the widget area
+    const slotRows = Math.max(node.inputs?.length ?? 0, node.outputs?.length ?? 0);
+    const slotH = LiteGraph?.NODE_SLOT_HEIGHT ?? 20;
+    let height = slotRows * slotH + 2;
+
+    // Preceding widget heights (before the DOM widget)
+    for (const w of node.widgets) {
         if (w === domWidget) break;
         if (w.type === "converted-widget" || w.hidden) continue;
-        const wh = w.computeSize ? w.computeSize(width)[1] : 20;
-        overhead += wh + 4; // 4px gap between widgets (LiteGraph standard)
+        const wh = w.computeSize ? w.computeSize(width)[1] : (LiteGraph?.NODE_WIDGET_HEIGHT ?? 20);
+        height += wh + 4; // 4px gap between widgets (LiteGraph standard)
     }
-    return overhead + widgetHeight + 4; // trailing gap
+
+    return height + widgetHeight + 4; // DOM widget + trailing gap
 }
 
 /**
@@ -118,12 +128,17 @@ function resizeNodeToFit(node, player) {
     const controlsHeight = 56;
     if (player.imageWidth > 0 && player.imageHeight > 0) {
         const aspectRatio = player.imageHeight / player.imageWidth;
-        // Dynamic computeSize — recalculates height from current width each call
-        player.domWidget.computeSize = (width) => [width, width * aspectRatio + controlsHeight];
+        // Dynamic computeSize — recalculates height from current width each call.
+        // MUST handle no-arg call: LiteGraph's _arrangeWidgets calls computeSize()
+        // without arguments to measure fixed widget heights.
+        player.domWidget.computeSize = (width) => {
+            const w = width ?? node.size[0];
+            return [w, w * aspectRatio + controlsHeight];
+        };
 
         // Compute height directly using actual node width
         const nodeWidth = node.size[0];
-        node.setSize([nodeWidth, computeTargetHeight(node.widgets, player.domWidget, nodeWidth)]);
+        node.setSize([nodeWidth, computeTargetHeight(node, player.domWidget, nodeWidth)]);
     }
     node.setDirtyCanvas(true, true);
 }
@@ -373,7 +388,7 @@ app.registerExtension({
                 origOnResize?.apply(this, arguments);
                 const p = this._animPlayer;
                 if (p && p.imageWidth > 0 && p.imageHeight > 0 && p.domWidget) {
-                    const target = computeTargetHeight(this.widgets, p.domWidget, size[0]);
+                    const target = computeTargetHeight(this, p.domWidget, size[0]);
                     if (Math.abs(size[1] - target) > 2) {
                         size[1] = target;
                     }

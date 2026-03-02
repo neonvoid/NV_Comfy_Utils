@@ -131,6 +131,7 @@ class NV_LatentInpaintStitch:
             )
 
         # --- Prepare blend mask ---
+        # Priority: explicit blend_mask input > pre-computed from stitcher > hard paste
         blend_mask_latent = None
         if blend_mask is not None:
             bm = blend_mask.to(device)
@@ -140,6 +141,14 @@ class NV_LatentInpaintStitch:
             # Feather in pixel space before downscale
             if blend_feather > 0:
                 bm = mask_blur(bm, blend_feather)
+
+            # Downscale to latent resolution
+            blend_mask_latent = rescale_mask(bm, cw, ch, 'bilinear')
+        elif 'blend_mask' in stitcher:
+            # Use pre-computed blend mask from NV_LatentInpaintCrop
+            bm = stitcher['blend_mask'].to(device)
+            if bm.dim() == 2:
+                bm = bm.unsqueeze(0)
 
             # Downscale to latent resolution
             blend_mask_latent = rescale_mask(bm, cw, ch, 'bilinear')
@@ -154,7 +163,12 @@ class NV_LatentInpaintStitch:
         for key, value in stitcher['safe_keys'].items():
             out_latent[key] = value
 
-        mode = 'soft blend' if blend_mask is not None else 'hard paste'
+        if blend_mask is not None:
+            mode = 'soft blend (explicit mask)'
+        elif 'blend_mask' in stitcher:
+            mode = 'soft blend (from stitcher)'
+        else:
+            mode = 'hard paste'
         print(
             f"[NV_LatentInpaintStitch] Stitched: crop ({cx},{cy}) "
             f"{cw}x{ch} latent cells ({mode})"

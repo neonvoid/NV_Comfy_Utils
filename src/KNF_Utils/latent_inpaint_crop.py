@@ -21,6 +21,13 @@ import torch.nn.functional as F
 import comfy.model_management
 
 from .latent_constants import LATENT_SAFE_KEYS
+from .inpaint_crop import (
+    mask_erode_dilate as _mask_erode_dilate,
+    mask_fill_holes as _mask_fill_holes,
+    mask_remove_noise as _mask_remove_noise,
+    mask_smooth as _mask_smooth,
+    mask_blur as _mask_blur,
+)
 
 VAE_STRIDE = 8  # WAN 2.1 spatial compression factor
 
@@ -111,6 +118,36 @@ class NV_LatentInpaintCrop:
                     "tooltip": "Extra padding around bbox union in pixels (snapped to VAE 8px grid). "
                                "Provides surrounding context for the denoiser."
                 }),
+
+                # Mask processing (applied to processed mask only)
+                "mask_erode_dilate": ("INT", {
+                    "default": 0, "min": -128, "max": 128, "step": 1,
+                    "tooltip": "Shrink (negative) or expand (positive) the subject mask using grey morphology. "
+                               "Applied to the processed mask output only; original mask stays untouched for stitching."
+                }),
+                "mask_fill_holes": ("INT", {
+                    "default": 0, "min": 0, "max": 128, "step": 1,
+                    "tooltip": "Fill gaps/holes in mask using morphological closing (dilate then erode). "
+                               "Useful for masks with unwanted holes from segmentation."
+                }),
+                "mask_remove_noise": ("INT", {
+                    "default": 0, "min": 0, "max": 32, "step": 1,
+                    "tooltip": "Remove isolated pixels/specks using morphological opening (erode then dilate). "
+                               "Keeps main mask regions intact while eliminating stray pixels."
+                }),
+                "mask_smooth": ("INT", {
+                    "default": 0, "min": 0, "max": 127, "step": 1,
+                    "tooltip": "Smooth jagged mask edges by binarizing (threshold 0.5) then Gaussian blurring. "
+                               "Creates cleaner edges than direct blur. Value must be odd (auto-adjusted if even)."
+                }),
+
+                # Blend settings (for stitching)
+                "mask_blend_pixels": ("INT", {
+                    "default": 16, "min": 0, "max": 64, "step": 1,
+                    "tooltip": "Feather the original mask edges for seamless stitching (dilate + blur). "
+                               "Stored in stitcher for automatic use by NV_LatentInpaintStitch. "
+                               "0 = hard paste (no blend mask pre-computed)."
+                }),
             },
             "optional": {
                 "bbox_mask": ("MASK", {
@@ -134,8 +171,8 @@ class NV_LatentInpaintCrop:
             }
         }
 
-    RETURN_TYPES = ("LATENT", "LATENT_STITCHER", "MASK", "STRING")
-    RETURN_NAMES = ("latent", "stitcher", "cropped_mask", "info")
+    RETURN_TYPES = ("LATENT", "LATENT_STITCHER", "MASK", "MASK", "STRING")
+    RETURN_NAMES = ("latent", "stitcher", "cropped_mask", "cropped_mask_processed", "info")
     FUNCTION = "execute"
     CATEGORY = "NV_Utils/Inpaint"
     DESCRIPTION = (
@@ -146,6 +183,9 @@ class NV_LatentInpaintCrop:
     )
 
     def execute(self, latent, padding=0,
+                mask_erode_dilate=0, mask_fill_holes=0,
+                mask_remove_noise=0, mask_smooth=0,
+                mask_blend_pixels=16,
                 bbox_mask=None, subject_mask=None,
                 x=0, y=0, width=512, height=512):
 
@@ -247,6 +287,40 @@ class NV_LatentInpaintCrop:
             num_mask_frames = T if samples.ndim == 5 else 1
             cropped_mask = torch.ones(num_mask_frames, ch_px, cw_px)
 
+        # --- Process mask for diffusion (apply all operations) ---
+        # Skip processing when subject_mask is None (all-ones mask — nothing to clean up,
+        # and negative erode_dilate would unexpectedly shrink the all-ones mask).
+        cropped_mask_processed = cropped_mask.clone()
+        if subject_mask is not None:
+            mask_ops = []
+
+            if mask_fill_holes > 0:
+                cropped_mask_processed = _mask_fill_holes(cropped_mask_processed, mask_fill_holes)
+                mask_ops.append(f"fill_holes={mask_fill_holes}")
+            if mask_remove_noise > 0:
+                cropped_mask_processed = _mask_remove_noise(cropped_mask_processed, mask_remove_noise)
+                mask_ops.append(f"remove_noise={mask_remove_noise}")
+            if mask_erode_dilate != 0:
+                cropped_mask_processed = _mask_erode_dilate(cropped_mask_processed, mask_erode_dilate)
+                mask_ops.append(f"erode_dilate={mask_erode_dilate}")
+            if mask_smooth > 0:
+                cropped_mask_processed = _mask_smooth(cropped_mask_processed, mask_smooth)
+                mask_ops.append(f"smooth={mask_smooth}")
+
+            if mask_ops:
+                info_lines.append(f"Mask processing: {', '.join(mask_ops)}")
+
+        # --- Pre-compute blend mask for stitching ---
+        # Union-reduce to single frame: the crop is a static union region so the blend
+        # mask should be a single spatial mask. This avoids frame-count mismatch when
+        # the subject_mask has more frames than the latent's batch dimension.
+        blend_mask_for_stitch = None
+        if mask_blend_pixels > 0 and subject_mask is not None:
+            blend_mask_for_stitch = cropped_mask.max(dim=0, keepdim=True).values
+            blend_mask_for_stitch = _mask_erode_dilate(blend_mask_for_stitch, mask_blend_pixels)
+            blend_mask_for_stitch = _mask_blur(blend_mask_for_stitch, mask_blend_pixels)
+            info_lines.append(f"Blend mask: union + dilate+blur {mask_blend_pixels}px")
+
         # --- Build LATENT_STITCHER ---
         intermediate = comfy.model_management.intermediate_device()
         stitcher = {
@@ -261,11 +335,13 @@ class NV_LatentInpaintCrop:
             'crop_h_pixel': ch_px,
             'safe_keys': safe_keys_snapshot,
         }
+        if blend_mask_for_stitch is not None:
+            stitcher['blend_mask'] = blend_mask_for_stitch.to(intermediate)
 
         info = "\n".join(info_lines)
         print(f"[NV_LatentInpaintCrop] {info}")
 
-        return (out_latent, stitcher, cropped_mask, info)
+        return (out_latent, stitcher, cropped_mask, cropped_mask_processed, info)
 
 
 # =============================================================================
