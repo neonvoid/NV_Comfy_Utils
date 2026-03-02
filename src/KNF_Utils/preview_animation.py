@@ -110,11 +110,14 @@ class NV_PreviewAnimation:
                 "type": self.type,
             })
 
+        width, height = pil_images[0].size
         return {
             "ui": {
                 "frames": results,
                 "fps": [fps],
                 "frame_count": [num_frames],
+                "width": [width],
+                "height": [height],
             }
         }
 

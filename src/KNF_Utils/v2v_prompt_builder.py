@@ -6,8 +6,9 @@ parameters. Designed to feed directly into GeminiVideoCaptioner (or any LLM
 captioner that accepts system_instruction + prompt_text).
 
 Supports:
-- Task mode selection: 'full_restyle' (scene-wide style transfer) or
-  'character_swap' (targeted character replacement via inpainting)
+- Task mode selection: 'full_restyle' (scene-wide style transfer),
+  'character_swap' (targeted character replacement via inpainting), or
+  'r2v_bootstrap' (scene prompts for WAN 2.6 R2V API)
 - Automatic word budget selection based on subject count and motion intensity
 - Denoise-strength-aware analysis priority weighting
 - Chunked processing mode with temporal continuity from previous chunk captions

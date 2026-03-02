@@ -97,13 +97,15 @@ function animate(player) {
  * Resize the node to fit the canvas aspect ratio + controls.
  */
 function resizeNodeToFit(node, player) {
-    const nodeWidth = node.size[0];
     const controlsHeight = 56;
     if (player.imageWidth > 0 && player.imageHeight > 0) {
         const aspectRatio = player.imageHeight / player.imageWidth;
-        const canvasHeight = nodeWidth * aspectRatio;
-        player.domWidget.computeSize = (width) => [width, canvasHeight + controlsHeight];
+        // Dynamic computeSize — recalculates height from current width each call
+        player.domWidget.computeSize = (width) => [width, width * aspectRatio + controlsHeight];
     }
+    // Force node to adopt the correct height for its current width
+    const sz = node.computeSize();
+    node.setSize([node.size[0], sz[1]]);
     node.setDirtyCanvas(true, true);
 }
 
@@ -282,6 +284,13 @@ app.registerExtension({
             `;
             frameLabel.textContent = "0 / 0";
 
+            const resLabel = document.createElement("span");
+            resLabel.style.cssText = `
+                font-size: 11px; font-family: monospace; color: #7a7;
+                text-align: center; white-space: nowrap;
+            `;
+            resLabel.textContent = "";
+
             const fpsLabel = document.createElement("span");
             fpsLabel.style.cssText = `
                 font-size: 11px; font-family: monospace; color: #8af;
@@ -295,10 +304,11 @@ app.registerExtension({
             controls.appendChild(nextBtn);
             controls.appendChild(frameLabel);
 
-            // Spacer to push FPS label to the right
+            // Spacer to push metadata labels to the right
             const spacer = document.createElement("div");
             spacer.style.flex = "1";
             controls.appendChild(spacer);
+            controls.appendChild(resLabel);
             controls.appendChild(fpsLabel);
 
             container.appendChild(controls);
@@ -334,8 +344,21 @@ app.registerExtension({
                 loaded: 0,
                 imageWidth: 0,
                 imageHeight: 0,
-                playBtn, prevBtn, nextBtn, frameLabel, fpsLabel, scrubber,
+                playBtn, prevBtn, nextBtn, frameLabel, resLabel, fpsLabel, scrubber,
                 domWidget: widget,
+            };
+
+            // ── Enforce aspect-ratio height on user resize ──
+            const origOnResize = node.onResize;
+            node.onResize = function (size) {
+                origOnResize?.apply(this, arguments);
+                const p = this._animPlayer;
+                if (p && p.imageWidth > 0 && p.imageHeight > 0) {
+                    const sz = this.computeSize();
+                    if (Math.abs(size[1] - sz[1]) > 1) {
+                        size[1] = sz[1];
+                    }
+                }
             };
 
             // ── Event handlers ──
@@ -446,11 +469,18 @@ app.registerExtension({
             // Read metadata
             const fps = message.fps?.[0] ?? 8.0;
             const frameCount = message.frame_count?.[0] ?? message.frames.length;
+            const msgWidth = message.width?.[0] ?? 0;
+            const msgHeight = message.height?.[0] ?? 0;
 
             player.fps = fps;
             player.totalFrames = frameCount;
             player.currentFrame = 0;
             player.loaded = 0;
+
+            // Update resolution label
+            if (msgWidth > 0 && msgHeight > 0) {
+                player.resLabel.textContent = `${msgWidth}\u00D7${msgHeight}`;
+            }
 
             // Update scrubber range
             player.scrubber.max = Math.max(0, frameCount - 1);
@@ -472,6 +502,8 @@ app.registerExtension({
                         player.imageHeight = img.naturalHeight;
                         player.canvas.width = img.naturalWidth;
                         player.canvas.height = img.naturalHeight;
+                        // CSS aspect-ratio keeps canvas proportional when container resizes
+                        player.canvas.style.aspectRatio = `${img.naturalWidth} / ${img.naturalHeight}`;
                         drawFrame(player, 0);
                         resizeNodeToFit(this, player);
                     }
@@ -495,7 +527,17 @@ app.registerExtension({
             const player = this._animPlayer;
             if (!player || !player.totalFrames) return;
 
+            // Info section
+            const duration = (player.totalFrames / player.fps).toFixed(1);
+            const resStr = (player.imageWidth && player.imageHeight)
+                ? `${player.imageWidth}\u00D7${player.imageHeight}`
+                : "unknown";
             options.unshift(
+                {
+                    content: `\u2139\uFE0F ${player.totalFrames} frames \u2022 ${resStr} \u2022 ${duration}s @ ${player.fps.toFixed(1)}fps`,
+                    disabled: true,
+                },
+                null, // separator
                 {
                     content: `Save as WebM Video (${player.totalFrames} frames)`,
                     callback: async () => {
