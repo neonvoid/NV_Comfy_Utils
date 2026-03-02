@@ -273,6 +273,10 @@ class NV_LatentInpaintCrop:
             bx, by, bw, bh = float(x), float(y), float(width), float(height)
             info_lines.append(f"Manual crop: ({bx},{by}) {bw}x{bh}px")
 
+        # Save raw bbox aspect before padding/growth for auto resolution computation.
+        # This matches pixel InpaintCrop which uses raw bbox union aspect.
+        raw_bbox_aspect = bw / bh
+
         # --- Apply padding ---
         if padding > 0:
             bx = max(0.0, bx - padding)
@@ -284,8 +288,7 @@ class NV_LatentInpaintCrop:
         # --- Aspect ratio growth ---
         if crop_aspect != "off":
             if crop_aspect == "auto":
-                ar = bw / bh
-                tw, th = compute_auto_resolution(ar, auto_preset, 0)
+                tw, th = compute_auto_resolution(raw_bbox_aspect, auto_preset, 0)
             else:  # manual
                 tw, th = target_width, target_height
 
@@ -349,8 +352,7 @@ class NV_LatentInpaintCrop:
 
         if target_mode != "off":
             if target_mode == "auto":
-                crop_ar = cw_px / ch_px
-                tw_px, th_px = compute_auto_resolution(crop_ar, auto_preset, 0)
+                tw_px, th_px = compute_auto_resolution(raw_bbox_aspect, auto_preset, 0)
             else:  # manual
                 tw_px, th_px = target_width, target_height
 
