@@ -13,6 +13,7 @@ Blend modes:
 
 import torch
 import comfy.model_management
+import comfy.utils
 
 from .inpaint_crop import rescale_mask, mask_blur
 
@@ -113,13 +114,20 @@ class NV_LatentInpaintStitch:
         ch = stitcher['crop_h_latent']
 
         # --- Validate spatial match ---
-        expected = (ch, cw)
+        target_w = stitcher.get('target_w_latent')
+        target_h = stitcher.get('target_h_latent')
+
+        if target_w is not None and target_h is not None:
+            expected = (target_h, target_w)
+        else:
+            expected = (ch, cw)
+
         actual = (inpainted_samples.shape[-2], inpainted_samples.shape[-1])
         if actual != expected:
             raise ValueError(
                 f"[NV_LatentInpaintStitch] Spatial size mismatch: "
-                f"inpainted {actual} != stitcher crop {expected}. "
-                f"Did you resize the crop before stitching?"
+                f"inpainted {actual} != expected {expected}. "
+                f"{'Target resize is active — did the KSampler change resolution?' if target_w else 'Did you resize the crop before stitching?'}"
             )
 
         # --- Validate temporal match ---
@@ -129,6 +137,19 @@ class NV_LatentInpaintStitch:
                 f"inpainted T={inpainted_samples.shape[2]}, "
                 f"original T={original_samples.shape[2]}."
             )
+
+        # --- Resize inpainted latent back to original crop dims ---
+        if target_w is not None and target_h is not None:
+            if inpainted_samples.shape[-2] != ch or inpainted_samples.shape[-1] != cw:
+                stitch_resize_method = stitcher.get('resize_method', 'bislerp')
+                inpainted_samples = comfy.utils.common_upscale(
+                    inpainted_samples, cw, ch, stitch_resize_method, "disabled"
+                )
+                print(
+                    f"[NV_LatentInpaintStitch] Resized inpainted: "
+                    f"({target_h},{target_w}) -> ({ch},{cw}) latent cells "
+                    f"({stitch_resize_method})"
+                )
 
         # --- Prepare blend mask ---
         # Priority: explicit blend_mask input > pre-computed from stitcher > hard paste
@@ -169,9 +190,12 @@ class NV_LatentInpaintStitch:
             mode = 'soft blend (from stitcher)'
         else:
             mode = 'hard paste'
+        resize_info = ""
+        if target_w is not None and target_h is not None:
+            resize_info = f", resized from {target_h}x{target_w}"
         print(
             f"[NV_LatentInpaintStitch] Stitched: crop ({cx},{cy}) "
-            f"{cw}x{ch} latent cells ({mode})"
+            f"{cw}x{ch} latent cells ({mode}{resize_info})"
         )
 
         return (out_latent,)

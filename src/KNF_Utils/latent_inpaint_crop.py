@@ -7,7 +7,8 @@ video latent [B,C,T,H,W] and packages stitching metadata for NV_LatentInpaintSti
 Key differences from pixel-space InpaintCrop:
 - Union bbox (single static crop for all frames) — per-frame variation via noise_mask
 - No canvas expansion — subject is always in-bounds (Stage 1 output)
-- No resize — crop stays at native latent resolution
+- Optional target resize — crop can be scaled to a target resolution for KSampler,
+  then NV_LatentInpaintStitch resizes back before pasting
 - Uses ellipsis indexing for 5D safety (built-in LatentCrop is broken for 5D)
 
 Pipeline:
@@ -19,6 +20,7 @@ Pipeline:
 import torch
 import torch.nn.functional as F
 import comfy.model_management
+import comfy.utils
 
 from .latent_constants import LATENT_SAFE_KEYS
 from .inpaint_crop import (
@@ -27,6 +29,7 @@ from .inpaint_crop import (
     mask_remove_noise as _mask_remove_noise,
     mask_smooth as _mask_smooth,
     mask_blur as _mask_blur,
+    rescale_mask as _rescale_mask,
     compute_auto_resolution,
     WAN_PRESETS,
 )
@@ -136,13 +139,31 @@ class NV_LatentInpaintCrop:
                 }),
                 "target_width": ("INT", {
                     "default": 512, "min": 64, "max": 8192, "step": 8,
-                    "tooltip": "Target width for manual aspect mode. "
-                               "Only the aspect ratio (w/h) is used — no resize."
+                    "tooltip": "Target width for manual aspect/resize mode. "
+                               "Used by crop_aspect for aspect ratio only, "
+                               "and by target_mode for actual resize dimensions."
                 }),
                 "target_height": ("INT", {
                     "default": 512, "min": 64, "max": 8192, "step": 8,
-                    "tooltip": "Target height for manual aspect mode. "
-                               "Only the aspect ratio (w/h) is used — no resize."
+                    "tooltip": "Target height for manual aspect/resize mode. "
+                               "Used by crop_aspect for aspect ratio only, "
+                               "and by target_mode for actual resize dimensions."
+                }),
+
+                # Target resolution resize
+                "target_mode": (["off", "auto", "manual"], {
+                    "default": "off",
+                    "tooltip": "off: native latent res (current behavior). "
+                               "auto: resize crop to WAN preset resolution (uses auto_preset). "
+                               "manual: resize crop to target_width x target_height. "
+                               "NV_LatentInpaintStitch resizes back automatically. "
+                               "Best combined with crop_aspect=auto (same preset) to match aspect before resize."
+                }),
+                "resize_method": (["bicubic", "bilinear", "nearest-exact", "area", "bislerp", "lanczos"], {
+                    "default": "bislerp",
+                    "tooltip": "Interpolation method for resizing latent. "
+                               "bislerp: best quality for latents (slerp-based). "
+                               "bicubic: good general quality. bilinear: fast."
                 }),
 
                 # Mask processing (applied to processed mask only)
@@ -211,6 +232,7 @@ class NV_LatentInpaintCrop:
     def execute(self, latent, padding=0,
                 crop_aspect="off", auto_preset="WAN_480p",
                 target_width=512, target_height=512,
+                target_mode="off", resize_method="bislerp",
                 mask_erode_dilate=0, mask_fill_holes=0,
                 mask_remove_noise=0, mask_smooth=0,
                 mask_blend_pixels=16,
@@ -319,7 +341,41 @@ class NV_LatentInpaintCrop:
 
         # --- Crop latent (5D-safe ellipsis) ---
         cropped_samples = samples[..., cy_l:cy_l + ch_l, cx_l:cx_l + cw_l].clone()
-        info_lines.append(f"Output shape: {list(cropped_samples.shape)}")
+        info_lines.append(f"Cropped shape: {list(cropped_samples.shape)}")
+
+        # --- Compute target resize dimensions ---
+        target_h_latent = None
+        target_w_latent = None
+
+        if target_mode != "off":
+            if target_mode == "auto":
+                crop_ar = cw_px / ch_px
+                tw_px, th_px = compute_auto_resolution(crop_ar, auto_preset, 0)
+            else:  # manual
+                tw_px, th_px = target_width, target_height
+
+            # Snap target to VAE grid
+            tw_px = max(VAE_STRIDE, ((tw_px + VAE_STRIDE - 1) // VAE_STRIDE) * VAE_STRIDE)
+            th_px = max(VAE_STRIDE, ((th_px + VAE_STRIDE - 1) // VAE_STRIDE) * VAE_STRIDE)
+
+            target_w_latent = tw_px // VAE_STRIDE
+            target_h_latent = th_px // VAE_STRIDE
+
+            info_lines.append(
+                f"Target resize ({target_mode}): "
+                f"crop {cw_px}x{ch_px}px -> target {tw_px}x{th_px}px | "
+                f"latent {cw_l}x{ch_l} -> {target_w_latent}x{target_h_latent} "
+                f"({resize_method})"
+            )
+
+        # --- Resize cropped latent to target dimensions ---
+        if target_h_latent is not None and target_w_latent is not None:
+            if target_h_latent != ch_l or target_w_latent != cw_l:
+                cropped_samples = comfy.utils.common_upscale(
+                    cropped_samples, target_w_latent, target_h_latent,
+                    resize_method, "disabled"
+                )
+                info_lines.append(f"Resized latent: {list(cropped_samples.shape)}")
 
         # --- Build output latent dict (clean, safe-key pattern) ---
         out_latent = {"samples": cropped_samples}
@@ -329,11 +385,22 @@ class NV_LatentInpaintCrop:
                 out_latent[key] = latent[key]
                 safe_keys_snapshot[key] = latent[key]
 
-        # Crop noise_mask if present
+        # Crop noise_mask if present (and resize to target if active)
         if "noise_mask" in latent:
             nm = latent["noise_mask"]
-            out_latent["noise_mask"] = nm[..., cy_l:cy_l + ch_l, cx_l:cx_l + cw_l].clone()
-            info_lines.append("noise_mask: cropped to match")
+            cropped_nm = nm[..., cy_l:cy_l + ch_l, cx_l:cx_l + cw_l].clone()
+
+            if target_h_latent is not None and target_w_latent is not None:
+                if target_h_latent != ch_l or target_w_latent != cw_l:
+                    cropped_nm = comfy.utils.common_upscale(
+                        cropped_nm, target_w_latent, target_h_latent,
+                        "bilinear", "disabled"
+                    )
+
+            out_latent["noise_mask"] = cropped_nm
+            info_lines.append(
+                f"noise_mask: cropped{' + resized' if target_h_latent is not None else ''}"
+            )
 
         # --- Crop subject_mask (pixel space) ---
         if subject_mask is not None:
@@ -383,15 +450,29 @@ class NV_LatentInpaintCrop:
                 info_lines.append(f"Mask processing: {', '.join(mask_ops)}")
 
         # --- Pre-compute blend mask for stitching ---
-        # Union-reduce to single frame: the crop is a static union region so the blend
-        # mask should be a single spatial mask. This avoids frame-count mismatch when
-        # the subject_mask has more frames than the latent's batch dimension.
+        # MUST happen BEFORE mask resize: blend mask stays at original crop pixel
+        # resolution because the stitch pastes at original crop coordinates.
         blend_mask_for_stitch = None
         if mask_blend_pixels > 0 and subject_mask is not None:
             blend_mask_for_stitch = cropped_mask.max(dim=0, keepdim=True).values
             blend_mask_for_stitch = _mask_erode_dilate(blend_mask_for_stitch, mask_blend_pixels)
             blend_mask_for_stitch = _mask_blur(blend_mask_for_stitch, mask_blend_pixels)
             info_lines.append(f"Blend mask: union + dilate+blur {mask_blend_pixels}px")
+
+        # --- Resize output masks to target pixel dimensions ---
+        # After blend mask (which needs original crop res), resize masks to match
+        # the target resolution that KSampler / SetLatentNoiseMask will see.
+        if target_h_latent is not None and target_w_latent is not None:
+            target_mask_h = target_h_latent * VAE_STRIDE
+            target_mask_w = target_w_latent * VAE_STRIDE
+            if target_mask_h != ch_px or target_mask_w != cw_px:
+                cropped_mask = _rescale_mask(cropped_mask, target_mask_w, target_mask_h, 'bilinear')
+                cropped_mask_processed = _rescale_mask(
+                    cropped_mask_processed, target_mask_w, target_mask_h, 'bilinear'
+                )
+                info_lines.append(
+                    f"Masks resized: {cw_px}x{ch_px} -> {target_mask_w}x{target_mask_h}px"
+                )
 
         # --- Build LATENT_STITCHER ---
         intermediate = comfy.model_management.intermediate_device()
@@ -406,6 +487,9 @@ class NV_LatentInpaintCrop:
             'crop_w_pixel': cw_px,
             'crop_h_pixel': ch_px,
             'safe_keys': safe_keys_snapshot,
+            'target_w_latent': target_w_latent,
+            'target_h_latent': target_h_latent,
+            'resize_method': resize_method if target_h_latent is not None else None,
         }
         if blend_mask_for_stitch is not None:
             stitcher['blend_mask'] = blend_mask_for_stitch.to(intermediate)
