@@ -27,6 +27,8 @@ from .inpaint_crop import (
     mask_remove_noise as _mask_remove_noise,
     mask_smooth as _mask_smooth,
     mask_blur as _mask_blur,
+    compute_auto_resolution,
+    WAN_PRESETS,
 )
 
 VAE_STRIDE = 8  # WAN 2.1 spatial compression factor
@@ -119,6 +121,30 @@ class NV_LatentInpaintCrop:
                                "Provides surrounding context for the denoiser."
                 }),
 
+                # Aspect ratio control
+                "crop_aspect": (["off", "auto", "manual"], {
+                    "default": "off",
+                    "tooltip": "off: crop = raw bbox + padding (no aspect constraint). "
+                               "auto: grow crop to match WAN preset aspect ratio. "
+                               "manual: grow crop to match target_width/target_height aspect ratio. "
+                               "No resize — only the spatial extent changes."
+                }),
+                "auto_preset": (list(WAN_PRESETS.keys()), {
+                    "default": "WAN_480p",
+                    "tooltip": "Resolution preset for auto mode. "
+                               "WAN_480p: ~400k pixels. WAN_720p: ~920k pixels."
+                }),
+                "target_width": ("INT", {
+                    "default": 512, "min": 64, "max": 8192, "step": 8,
+                    "tooltip": "Target width for manual aspect mode. "
+                               "Only the aspect ratio (w/h) is used — no resize."
+                }),
+                "target_height": ("INT", {
+                    "default": 512, "min": 64, "max": 8192, "step": 8,
+                    "tooltip": "Target height for manual aspect mode. "
+                               "Only the aspect ratio (w/h) is used — no resize."
+                }),
+
                 # Mask processing (applied to processed mask only)
                 "mask_erode_dilate": ("INT", {
                     "default": 0, "min": -128, "max": 128, "step": 1,
@@ -183,6 +209,8 @@ class NV_LatentInpaintCrop:
     )
 
     def execute(self, latent, padding=0,
+                crop_aspect="off", auto_preset="WAN_480p",
+                target_width=512, target_height=512,
                 mask_erode_dilate=0, mask_fill_holes=0,
                 mask_remove_noise=0, mask_smooth=0,
                 mask_blend_pixels=16,
@@ -230,6 +258,50 @@ class NV_LatentInpaintCrop:
             bw = min(float(spatial_w_px) - bx, bw + 2 * padding)
             bh = min(float(spatial_h_px) - by, bh + 2 * padding)
             info_lines.append(f"Padding: +{padding}px each side")
+
+        # --- Aspect ratio growth ---
+        if crop_aspect != "off":
+            if crop_aspect == "auto":
+                ar = bw / bh
+                tw, th = compute_auto_resolution(ar, auto_preset, 0)
+            else:  # manual
+                tw, th = target_width, target_height
+
+            target_aspect = tw / th
+            bbox_aspect = bw / bh
+
+            # Grow bbox in one dimension to match target aspect
+            if bbox_aspect < target_aspect:
+                # Need wider
+                new_w = bh * target_aspect
+                bx = bx - (new_w - bw) / 2.0
+                bw = new_w
+            else:
+                # Need taller
+                new_h = bw / target_aspect
+                by = by - (new_h - bh) / 2.0
+                bh = new_h
+
+            # Shift to keep in bounds (no canvas expansion in latent space)
+            if bx < 0:
+                bx = 0.0
+            elif bx + bw > spatial_w_px:
+                bx = float(spatial_w_px) - bw
+            if by < 0:
+                by = 0.0
+            elif by + bh > spatial_h_px:
+                by = float(spatial_h_px) - bh
+
+            # Hard clamp if still out of bounds (grown bbox larger than frame)
+            bx = max(0.0, bx)
+            by = max(0.0, by)
+            bw = min(bw, float(spatial_w_px) - bx)
+            bh = min(bh, float(spatial_h_px) - by)
+
+            info_lines.append(
+                f"Aspect growth ({crop_aspect}): target {tw}x{th} "
+                f"(ar={target_aspect:.3f}) -> bbox {bw:.0f}x{bh:.0f}px"
+            )
 
         # --- Snap to VAE grid ---
         cx_px, cy_px, cw_px, ch_px = snap_to_vae_grid(
