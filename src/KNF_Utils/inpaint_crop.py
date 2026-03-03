@@ -581,11 +581,17 @@ class NV_InpaintCrop:
                 }),
 
                 # Blend settings (for stitching)
+                "stitch_source": (["tight", "processed", "bbox"], {
+                    "default": "tight",
+                    "tooltip": "Which mask to use as the base for stitch blending. "
+                               "tight: original unprocessed mask (minimal changes to image). "
+                               "processed: mask after erode/dilate/fill/smooth (matches diffusion mask). "
+                               "bbox: full crop region (blends in the entire re-generated area)."
+                }),
                 "mask_blend_pixels": ("INT", {
                     "default": 16, "min": 0, "max": 64, "step": 1,
-                    "tooltip": "Feather the ORIGINAL mask edges for seamless stitching (dilate + blur). "
-                               "Recommended: 8-16 for subtle blending, 24-32 for visible seam hiding, 48-64 for aggressive blending. "
-                               "Applied to original mask, not processed mask, for tight stitch boundaries."
+                    "tooltip": "Feather the stitch mask edges for seamless stitching (dilate + blur). "
+                               "Recommended: 8-16 for subtle blending, 24-32 for visible seam hiding, 48-64 for aggressive blending."
                 }),
 
                 "resize_algorithm": (["bicubic", "bilinear", "nearest", "area"], {
@@ -631,11 +637,11 @@ class NV_InpaintCrop:
     RETURN_NAMES = ("stitcher", "cropped_image", "cropped_mask", "cropped_mask_processed", "info")
     FUNCTION = "crop"
     CATEGORY = "NV_Utils/Inpaint"
-    DESCRIPTION = "Crops image for inpainting. Outputs both original mask (for stitching) and processed mask (for diffusion). Auto mode computes optimal resolution from bbox."
+    DESCRIPTION = "Crops image for inpainting. Outputs both original mask (for stitching) and processed mask (for diffusion). stitch_source selects which mask drives the blend: tight (original), processed, or bbox (full region). Auto mode computes optimal resolution from bbox."
 
     def crop(self, image, mask, target_mode, target_width, target_height, auto_preset,
              padding_multiple, mask_erode_dilate, mask_fill_holes, mask_remove_noise,
-             mask_smooth, mask_blend_pixels, resize_algorithm,
+             mask_smooth, stitch_source, mask_blend_pixels, resize_algorithm,
              bounding_box_mask=None, stabilize_crop=False, stabilization_mode="smooth",
              smooth_window=5, anomaly_threshold=1.5):
 
@@ -780,9 +786,17 @@ class NV_InpaintCrop:
                 target_width, target_height, padding_multiple, resize_algorithm
             )
 
-            # Create blend mask from ORIGINAL mask (for tight stitching)
-            blend_mask = cropped_mask_orig.clone()
-            if mask_blend_pixels > 0:
+            # Create blend mask from selected source
+            if stitch_source == "bbox":
+                # Full crop region — blend in everything
+                blend_mask = torch.ones_like(cropped_mask_orig)
+            elif stitch_source == "processed":
+                blend_mask = cropped_mask_proc.clone()
+            else:
+                # "tight" — original unprocessed mask (default)
+                blend_mask = cropped_mask_orig.clone()
+
+            if mask_blend_pixels > 0 and stitch_source != "bbox":
                 blend_mask = mask_erode_dilate_fn(blend_mask, mask_blend_pixels)
                 blend_mask = mask_blur(blend_mask, mask_blend_pixels)
 
