@@ -35,8 +35,8 @@ _LAST_REFINED: dict[str, str] = {}
 _LAST_PROMPT_HASH: str = ""
 # Cumulative session cost tracking
 _SESSION_COST: float = 0.0
-# Single-entry media cache: media_hash -> (base64_data, mime_type, info_str)
-_MEDIA_CACHE: dict[str, tuple[str, str, str]] = {}
+# Single-entry media cache: conversation_key -> list of (base64_data, mime_type, info_str)
+_MEDIA_CACHE: dict[str, list[tuple[str, str, str]]] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -147,10 +147,10 @@ def _encode_file_to_base64(file_path):
         return base64.b64encode(f.read()).decode("utf-8")
 
 
-def _prepare_media(image_tensor, video_tensor, fps):
-    """Convert tensor inputs to base64-encoded media.
+def _prepare_single_media(image_tensor, video_tensor, fps):
+    """Convert a single primary media tensor to base64.
 
-    Returns (base64_data, mime_type, info_str) or None if no media provided.
+    Returns (base64_data, mime_type, info_str) or None.
     image_tensor takes priority over video_tensor.
     """
     if image_tensor is None and video_tensor is None:
@@ -180,6 +180,63 @@ def _prepare_media(image_tensor, video_tensor, fps):
                 os.remove(file_path)
             except Exception:
                 pass
+
+
+def _prepare_ref_image(image_tensor, label="ref"):
+    """Convert a single reference image tensor to base64 JPEG.
+
+    Returns (base64_data, mime_type, info_str) or None.
+    Takes only the first frame if batched.
+    """
+    if image_tensor is None:
+        return None
+    file_path = None
+    try:
+        # Take first frame only
+        if len(image_tensor.shape) == 4:
+            single = image_tensor[0:1]
+        else:
+            single = image_tensor.unsqueeze(0) if len(image_tensor.shape) == 3 else image_tensor
+        file_path = _tensor_to_image(single)
+        h, w = single.shape[-3], single.shape[-2]
+        base64_data = _encode_file_to_base64(file_path)
+        size_mb = len(base64_data) / (1024 * 1024)
+        info = f"{label} {w}x{h} (jpeg), {size_mb:.1f}MB"
+        return (base64_data, "image/jpeg", info)
+    finally:
+        if file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except Exception:
+                pass
+
+
+def _prepare_media_list(image_tensor, video_tensor, fps, ref_images=None):
+    """Convert all media tensors to base64.
+
+    Returns list of (base64_data, mime_type, info_str) tuples.
+    Primary media (video or image) comes first, then reference images.
+    Returns empty list if no media provided.
+
+    Args:
+        ref_images: list of (tensor_or_None, label_str) pairs
+    """
+    media_list = []
+
+    # Primary media
+    primary = _prepare_single_media(image_tensor, video_tensor, fps)
+    if primary is not None:
+        media_list.append(primary)
+
+    # Reference images
+    if ref_images:
+        for tensor, label in ref_images:
+            if tensor is not None:
+                ref = _prepare_ref_image(tensor, label)
+                if ref is not None:
+                    media_list.append(ref)
+
+    return media_list
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +301,67 @@ unless the user explicitly asks."""
 
 
 # ---------------------------------------------------------------------------
+# Built-in Kling mode system prompts (distilled from V2VPromptBuilder)
+# ---------------------------------------------------------------------------
+
+_KLING_EDIT_SYSTEM = """\
+You are a prompt engineer for the Kling AI video editing API. The API takes \
+an input video and modifies it according to a text prompt. Write a clear, \
+concise edit instruction that tells Kling what to change.
+
+## Key Constraints
+- The Kling API has a 2500 character total limit. Your prompt body should \
+stay under ~1800 characters to leave room for reference legends (~300 chars) \
+and negative prompt (~400 chars) that are appended automatically downstream.
+- Write EDIT INSTRUCTIONS, not scene descriptions. Focus on the delta \
+between the input video and the desired output. Be direct: "change X to Y", \
+"add Z", "remove W".
+- When reference images are attached, mention @image1, @image2 etc. \
+naturally where relevant. Do not force every reference into the prompt — \
+only mention images that are relevant to the edit.
+- Do NOT add [References: ...] legends — handled downstream.
+- Do NOT add "Avoid: ..." negative prompt lines — handled downstream.
+- Do NOT use <<<image_N>>> API wire format — handled downstream.
+- Use plain, direct language. Kling responds best to clear, unambiguous \
+instructions rather than poetic or abstract descriptions.
+- Output ONLY the prompt text — no explanations, preamble, or \
+meta-commentary.
+- When iterating, build on the previous version — do not restart from \
+scratch unless explicitly asked."""
+
+_KLING_REFERENCE_SYSTEM = """\
+You are a prompt engineer for the Kling AI reference-to-video API. The API \
+uses an input video as a style and motion template to generate entirely new \
+content. Your job is to describe the desired OUTPUT scene.
+
+## Key Constraints
+- The Kling API has a 2500 character total limit. Your prompt body should \
+stay under ~1800 characters to leave room for reference legends (~300 chars) \
+and negative prompt (~400 chars) that are appended automatically downstream.
+- Describe the OUTPUT scene you want generated, NOT the input video. The \
+input video provides motion rhythm and visual style — your prompt defines \
+the new content.
+- When reference images are attached, mention @image1, @image2 etc. \
+naturally for character identity or style elements. The input video is \
+automatically tagged as @video by the downstream pipeline — do not add it.
+- Do NOT add [References: ...] legends — handled downstream.
+- Do NOT add "Avoid: ..." negative prompt lines — handled downstream.
+- Do NOT use <<<image_N>>> API wire format — handled downstream.
+- Use cinematic vocabulary: shot types, lighting terms, movement descriptors.
+- Kling reference mode generates 3-15 seconds of video. Describe a scene \
+achievable in that timeframe — no complex narratives or scene transitions.
+- Output ONLY the prompt text — no explanations, preamble, or \
+meta-commentary.
+- When iterating, build on the previous version — do not restart from \
+scratch unless explicitly asked."""
+
+_KLING_MODE_MAP = {
+    "kling_edit": _KLING_EDIT_SYSTEM,
+    "kling_reference": _KLING_REFERENCE_SYSTEM,
+}
+
+
+# ---------------------------------------------------------------------------
 # Model list (text + vision capable)
 # ---------------------------------------------------------------------------
 
@@ -274,7 +392,7 @@ _MODEL_LIST = [
 
 def _call_gemini_text(conversation_turns, meta_system_prompt, api_key, model,
                       max_tokens, temperature, thinking_level,
-                      media=None, media_resolution="default"):
+                      media_list=None, media_resolution="default"):
     """Call Gemini API with multi-turn conversation, optional media.
 
     Args:
@@ -285,7 +403,8 @@ def _call_gemini_text(conversation_turns, meta_system_prompt, api_key, model,
         max_tokens: Max output tokens
         temperature: Sampling temperature
         thinking_level: "auto", "low", "medium", or "high" (Gemini 3+ only)
-        media: Optional (base64_data, mime_type) tuple — injected into first user turn
+        media_list: Optional list of (base64_data, mime_type, info) tuples —
+            all injected into first user turn
         media_resolution: Gemini 3 only — controls tokens per video frame
 
     Returns:
@@ -297,6 +416,8 @@ def _call_gemini_text(conversation_turns, meta_system_prompt, api_key, model,
 
     is_gemini3 = any(model.startswith(p) for p in ("gemini-3", "gemini-3."))
 
+    has_media = bool(media_list)
+
     # Build multi-turn contents array
     # Gemini uses "user" and "model" roles
     contents = []
@@ -304,14 +425,15 @@ def _call_gemini_text(conversation_turns, meta_system_prompt, api_key, model,
         role = "model" if turn["role"] == "assistant" else "user"
         parts = [{"text": turn["content"]}]
 
-        # Inject media into the first user turn
-        if i == 0 and role == "user" and media is not None:
-            parts.append({
-                "inline_data": {
-                    "mime_type": media[1],
-                    "data": media[0],
-                }
-            })
+        # Inject all media items into the first user turn
+        if i == 0 and role == "user" and has_media:
+            for item in media_list:
+                parts.append({
+                    "inline_data": {
+                        "mime_type": item[1],
+                        "data": item[0],
+                    }
+                })
 
         contents.append({"role": role, "parts": parts})
 
@@ -333,7 +455,7 @@ def _call_gemini_text(conversation_turns, meta_system_prompt, api_key, model,
 
     # Media resolution (Gemini 3 only, requires v1alpha endpoint)
     use_v1alpha = False
-    if is_gemini3 and media_resolution != "default" and media is not None:
+    if is_gemini3 and media_resolution != "default" and has_media:
         gen_config["mediaResolution"] = f"media_resolution_{media_resolution}"
         use_v1alpha = True
 
@@ -343,7 +465,7 @@ def _call_gemini_text(conversation_turns, meta_system_prompt, api_key, model,
     api_version = "v1alpha" if use_v1alpha else "v1beta"
     api_url = f"https://generativelanguage.googleapis.com/{api_version}/models/{model}:generateContent?key={api_key}"
 
-    media_note = " +media" if media is not None else ""
+    media_note = f" +{len(media_list)} media" if has_media else ""
     print(f"[NV_PromptRefiner] Calling Gemini ({model}), {len(conversation_turns)} turns{media_note}...")
     request_start = time.time()
     response = requests.post(api_url, headers=headers, json=payload, timeout=300)
@@ -384,7 +506,7 @@ def _call_gemini_text(conversation_turns, meta_system_prompt, api_key, model,
 
 def _call_openrouter_text(conversation_turns, meta_system_prompt, api_key, model,
                           max_tokens, temperature, thinking_level,
-                          media=None, media_resolution="default"):
+                          media_list=None, media_resolution="default"):
     """Call OpenRouter API with multi-turn conversation, optional media.
 
     Args:
@@ -395,7 +517,8 @@ def _call_openrouter_text(conversation_turns, meta_system_prompt, api_key, model
         max_tokens: Max output tokens
         temperature: Sampling temperature
         thinking_level: Unused for OpenRouter (kept for interface parity)
-        media: Optional (base64_data, mime_type) tuple — injected into first user turn
+        media_list: Optional list of (base64_data, mime_type, info) tuples —
+            all injected into first user turn
         media_resolution: Unused for OpenRouter (kept for interface parity)
 
     Returns:
@@ -404,6 +527,8 @@ def _call_openrouter_text(conversation_turns, meta_system_prompt, api_key, model
     # Auto-prefix bare Gemini model names
     if "/" not in model and model.startswith("gemini-"):
         model = f"google/{model}"
+
+    has_media = bool(media_list)
 
     headers = {
         "Content-Type": "application/json",
@@ -418,21 +543,21 @@ def _call_openrouter_text(conversation_turns, meta_system_prompt, api_key, model
         messages.append({"role": "system", "content": meta_system_prompt.strip()})
 
     for i, turn in enumerate(conversation_turns):
-        if i == 0 and turn["role"] == "user" and media is not None:
+        if i == 0 and turn["role"] == "user" and has_media:
             # First user message with media: multipart content array
-            base64_data, mime_type = media[0], media[1]
-            is_video = mime_type.startswith("video/")
             content_parts = [{"type": "text", "text": turn["content"]}]
-            if is_video:
-                content_parts.append({
-                    "type": "video_url",
-                    "video_url": {"url": f"data:{mime_type};base64,{base64_data}"}
-                })
-            else:
-                content_parts.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:{mime_type};base64,{base64_data}"}
-                })
+            for item in media_list:
+                base64_data, mime_type = item[0], item[1]
+                if mime_type.startswith("video/"):
+                    content_parts.append({
+                        "type": "video_url",
+                        "video_url": {"url": f"data:{mime_type};base64,{base64_data}"}
+                    })
+                else:
+                    content_parts.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime_type};base64,{base64_data}"}
+                    })
             messages.append({"role": turn["role"], "content": content_parts})
         else:
             messages.append({"role": turn["role"], "content": turn["content"]})
@@ -444,7 +569,7 @@ def _call_openrouter_text(conversation_turns, meta_system_prompt, api_key, model
         "temperature": temperature,
     }
 
-    media_note = " +media" if media is not None else ""
+    media_note = f" +{len(media_list)} media" if has_media else ""
     print(f"[NV_PromptRefiner] Calling OpenRouter ({model}), {len(conversation_turns)} turns{media_note}...")
     request_start = time.time()
 
@@ -516,15 +641,24 @@ class NV_PromptRefiner:
     def INPUT_TYPES(cls):
         return {
             "required": {
+                "mode": (["custom", "kling_edit", "kling_reference"], {
+                    "default": "custom",
+                    "tooltip": (
+                        "'custom' = use system_instruction input as-is (for V2V Prompt Builder workflows).\n"
+                        "'kling_edit' = built-in Kling edit mode system prompt — describe what to change.\n"
+                        "'kling_reference' = built-in Kling reference mode system prompt — describe new scene to generate.\n"
+                        "Kling modes bypass V2V Prompt Builder — type your edit goal directly into initial_prompt."
+                    ),
+                }),
                 "system_instruction": ("STRING", {
                     "multiline": True,
                     "default": "",
-                    "tooltip": "From Prompt Builder — provides task context, word budgets, and structural constraints."
+                    "tooltip": "In 'custom' mode: system prompt from V2V Prompt Builder. In Kling modes: optional supplemental context appended to the built-in prompt."
                 }),
                 "initial_prompt": ("STRING", {
                     "multiline": True,
                     "default": "",
-                    "tooltip": "From Prompt Builder's prompt_text output. With media: captioning guidelines. Without media: text to refine."
+                    "tooltip": "In 'custom' mode: from Prompt Builder's prompt_text output. In Kling modes: your edit goal or scene description directly."
                 }),
                 "user_instruction": ("STRING", {
                     "multiline": True,
@@ -588,6 +722,35 @@ class NV_PromptRefiner:
                     "default": "default",
                     "tooltip": "Gemini 3 only. Controls tokens per video frame. Higher = better detail but more tokens."
                 }),
+                # --- Reference images (mirrors NV_KlingPromptPreview slots) ---
+                "ref_image_1": ("IMAGE", {
+                    "tooltip": "Reference image for @image1. Sent to the LLM as visual context alongside the video."
+                }),
+                "ref_desc_1": ("STRING", {
+                    "default": "",
+                    "tooltip": "What @image1 represents (e.g. 'side profile of character'). Included in the LLM prompt."
+                }),
+                "ref_image_2": ("IMAGE", {
+                    "tooltip": "Reference image for @image2."
+                }),
+                "ref_desc_2": ("STRING", {
+                    "default": "",
+                    "tooltip": "What @image2 represents (e.g. 'lighting reference')."
+                }),
+                "ref_image_3": ("IMAGE", {
+                    "tooltip": "Reference image for @image3."
+                }),
+                "ref_desc_3": ("STRING", {
+                    "default": "",
+                    "tooltip": "What @image3 represents."
+                }),
+                "ref_image_4": ("IMAGE", {
+                    "tooltip": "Reference image for @image4."
+                }),
+                "ref_desc_4": ("STRING", {
+                    "default": "",
+                    "tooltip": "What @image4 represents."
+                }),
             },
         }
 
@@ -597,10 +760,13 @@ class NV_PromptRefiner:
     CATEGORY = "NV_Utils/Prompt"
     OUTPUT_NODE = True
     DESCRIPTION = (
-        "Iterative LLM captioner/refiner for V2V pipelines. Connect a video or "
-        "image and the LLM writes a caption guided by the Prompt Builder's "
-        "instructions. Edit user_instruction and re-queue to iterate. "
-        "Works text-only too (without media) for prompt refinement. "
+        "Iterative LLM captioner/refiner with built-in Kling modes. "
+        "'custom' mode: uses system_instruction from V2V Prompt Builder. "
+        "'kling_edit'/'kling_reference': built-in Kling system prompts — "
+        "type your edit goal directly, no Prompt Builder needed. "
+        "Connect reference images (ref_image_1–4) so the LLM sees the same "
+        "visual context that Kling will receive. "
+        "Edit user_instruction and re-queue to iterate. "
         "Supports Gemini (direct) and OpenRouter (Claude, GPT, LLaMA, etc.)."
     )
 
@@ -609,30 +775,46 @@ class NV_PromptRefiner:
         # Always re-execute — iteration is the intent
         return float("nan")
 
-    def refine(self, system_instruction, initial_prompt, user_instruction,
+    def refine(self, mode, system_instruction, initial_prompt, user_instruction,
                api_key, provider, model, temperature, max_tokens,
                thinking_level, clear_history, use_cached,
                video_tensor=None, image_tensor=None, fps=30.0,
-               media_resolution="default"):
+               media_resolution="default",
+               ref_image_1=None, ref_desc_1="",
+               ref_image_2=None, ref_desc_2="",
+               ref_image_3=None, ref_desc_3="",
+               ref_image_4=None, ref_desc_4=""):
         global _CONVERSATION_HISTORY, _LAST_REFINED, _LAST_PROMPT_HASH, _SESSION_COST
 
         system_instruction = system_instruction.strip()
         initial_prompt = initial_prompt.strip()
         user_instruction = user_instruction.strip()
 
+        is_kling_mode = mode in _KLING_MODE_MAP
+
         # --- Validate initial_prompt (needed for conversation key) ---
         if not initial_prompt:
             return ("(no initial prompt provided)", system_instruction,
                     "(no conversation)", "Error: initial_prompt is empty")
 
-        # --- Conversation key (computed early for use_cached + auto-reset) ---
+        # --- Collect reference images ---
+        ref_slots = [
+            (ref_image_1, ref_desc_1 or ""),
+            (ref_image_2, ref_desc_2 or ""),
+            (ref_image_3, ref_desc_3 or ""),
+            (ref_image_4, ref_desc_4 or ""),
+        ]
+        connected_refs = [(img, desc) for img, desc in ref_slots if img is not None]
+        num_refs = len(connected_refs)
+
+        # --- Conversation key (include all media hashes for change detection) ---
         prompt_hash = _hash_prompt(initial_prompt)
-        media_hash = ""
+        hash_parts = [prompt_hash, mode]
         if image_tensor is not None or video_tensor is not None:
-            media_hash = _hash_media(image_tensor if image_tensor is not None else video_tensor)
-            conversation_key = _hash_prompt(initial_prompt + media_hash)
-        else:
-            conversation_key = prompt_hash
+            hash_parts.append(_hash_media(image_tensor if image_tensor is not None else video_tensor))
+        for img, _desc in connected_refs:
+            hash_parts.append(_hash_media(img))
+        conversation_key = _hash_prompt(":".join(hash_parts))
 
         # Auto-reset: if context changed, clear old conversation
         if conversation_key != _LAST_PROMPT_HASH:
@@ -665,48 +847,87 @@ class NV_PromptRefiner:
             return ("(no API key)", system_instruction,
                     "(no conversation)", "Error: api_key is empty")
 
-        # --- Prepare media (if provided, with caching) ---
-        media_tuple = None
-        media_info = "none"
-        if image_tensor is not None or video_tensor is not None:
-            if media_hash in _MEDIA_CACHE:
-                cached_b64, cached_mime, cached_info = _MEDIA_CACHE[media_hash]
-                media_tuple = (cached_b64, cached_mime)
-                media_info = cached_info + " (cached)"
-                print(f"[NV_PromptRefiner] Media cache hit: {media_info}")
-            else:
-                try:
-                    result = _prepare_media(image_tensor, video_tensor, fps)
-                    if result is not None:
-                        media_tuple = (result[0], result[1])
-                        media_info = result[2]
-                        _MEDIA_CACHE.clear()
-                        _MEDIA_CACHE[media_hash] = (result[0], result[1], result[2])
-                        print(f"[NV_PromptRefiner] Media prepared and cached: {media_info}")
-                except Exception as e:
-                    print(f"[NV_PromptRefiner] Warning: media preparation failed: {e}")
-                    media_info = f"failed: {e}"
+        # --- Prepare all media (primary + refs, with caching) ---
+        media_list = []
+        media_info_parts = []
 
-        has_media = media_tuple is not None
-        mode = "captioner" if has_media else "refiner"
+        if conversation_key in _MEDIA_CACHE:
+            # Cache hit — rebuild media_list from cache
+            for cached_b64, cached_mime, cached_info in _MEDIA_CACHE[conversation_key]:
+                media_list.append((cached_b64, cached_mime, cached_info))
+                media_info_parts.append(cached_info)
+            print(f"[NV_PromptRefiner] Media cache hit: {len(media_list)} items")
+        else:
+            # Prepare fresh
+            try:
+                ref_pairs = [(img, f"@image{i+1}") for i, (img, _desc) in enumerate(ref_slots) if img is not None]
+                media_list = _prepare_media_list(image_tensor, video_tensor, fps, ref_pairs)
+                if media_list:
+                    media_info_parts = [item[2] for item in media_list]
+                    # Cache all items keyed by conversation_key
+                    _MEDIA_CACHE.clear()
+                    _MEDIA_CACHE[conversation_key] = [(b64, mime, info) for b64, mime, info in media_list]
+                    print(f"[NV_PromptRefiner] Media prepared and cached: {len(media_list)} items")
+                    for info in media_info_parts:
+                        print(f"  {info}")
+            except Exception as e:
+                print(f"[NV_PromptRefiner] Warning: media preparation failed: {e}")
+                media_info_parts = [f"failed: {e}"]
+
+        has_media = bool(media_list)
+        media_info = "; ".join(media_info_parts) if media_info_parts else "none"
+
+        # Determine operational mode label for debug
+        if is_kling_mode:
+            op_mode = mode
+        elif has_media:
+            op_mode = "captioner"
+        else:
+            op_mode = "refiner"
 
         # Get or create conversation for this context
         history = _CONVERSATION_HISTORY.get(conversation_key, [])
 
+        # --- Build reference description context ---
+        ref_context = ""
+        if num_refs > 0:
+            ref_lines = []
+            idx = 0
+            for img, desc in ref_slots:
+                if img is not None:
+                    idx += 1
+                    desc_text = desc.strip() if desc.strip() else "(no description provided)"
+                    ref_lines.append(f"- @image{idx}: {desc_text}")
+            ref_context = (
+                "\n\nReference images are attached to this message:\n"
+                + "\n".join(ref_lines)
+            )
+
         # --- Build the new user message ---
         if not history:
-            if has_media:
-                # Captioner mode: video attached, initial_prompt = guidelines
+            if is_kling_mode:
+                # Kling mode: initial_prompt = edit goal / scene description
+                mode_label = "edit" if mode == "kling_edit" else "reference-to-video"
+                user_message = (
+                    f"Analyze the attached video and write a Kling {mode_label} prompt.\n\n"
+                    f"Goal: {initial_prompt}"
+                    f"{ref_context}\n\n"
+                    f"Additional instruction: {user_instruction}"
+                )
+            elif has_media:
+                # Custom captioner mode: video attached, initial_prompt = guidelines
                 user_message = (
                     f"Captioning guidelines:\n\n"
-                    f"---\n{initial_prompt}\n---\n\n"
+                    f"---\n{initial_prompt}\n---"
+                    f"{ref_context}\n\n"
                     f"Additional instruction: {user_instruction}"
                 )
             else:
-                # Refiner mode: text-only, initial_prompt = text to refine
+                # Custom refiner mode: text-only
                 user_message = (
                     f"Here is the initial prompt to refine:\n\n"
-                    f"---\n{initial_prompt}\n---\n\n"
+                    f"---\n{initial_prompt}\n---"
+                    f"{ref_context}\n\n"
                     f"Refinement instruction: {user_instruction}"
                 )
         else:
@@ -717,28 +938,34 @@ class NV_PromptRefiner:
         history.append({"role": "user", "content": user_message})
 
         # --- Build meta-system prompt ---
-        sys_inst = system_instruction or "(no system instruction provided)"
-        if has_media:
-            meta_system = _META_SYSTEM_PROMPT_MEDIA.format(system_instruction=sys_inst)
+        if is_kling_mode:
+            meta_system = _KLING_MODE_MAP[mode]
+            # Append supplemental system_instruction if provided
+            if system_instruction:
+                meta_system += f"\n\n## Additional Context\n{system_instruction}"
         else:
-            meta_system = _META_SYSTEM_PROMPT_TEXT.format(system_instruction=sys_inst)
+            sys_inst = system_instruction or "(no system instruction provided)"
+            if has_media:
+                meta_system = _META_SYSTEM_PROMPT_MEDIA.format(system_instruction=sys_inst)
+            else:
+                meta_system = _META_SYSTEM_PROMPT_TEXT.format(system_instruction=sys_inst)
 
         # --- Call LLM ---
         turn_number = (len(history) + 1) // 2  # user/assistant pairs
-        # Pass a snapshot so the API function receives an immutable view
         turns_snapshot = list(history)
+        api_media = media_list if has_media else None
         try:
             if provider == "Gemini":
                 refined, token_info = _call_gemini_text(
                     turns_snapshot, meta_system, api_key, model,
                     max_tokens, temperature, thinking_level,
-                    media=media_tuple, media_resolution=media_resolution
+                    media_list=api_media, media_resolution=media_resolution
                 )
             elif provider == "OpenRouter":
                 refined, token_info = _call_openrouter_text(
                     turns_snapshot, meta_system, api_key, model,
                     max_tokens, temperature, thinking_level,
-                    media=media_tuple, media_resolution=media_resolution
+                    media_list=api_media, media_resolution=media_resolution
                 )
             else:
                 raise RuntimeError(f"Unknown provider: {provider}")
@@ -748,7 +975,6 @@ class NV_PromptRefiner:
             _CONVERSATION_HISTORY[conversation_key] = history
             error_msg = str(e)
             print(f"[NV_PromptRefiner] Error: {error_msg}")
-            # Return last refined if available, otherwise initial
             fallback = _LAST_REFINED.get(conversation_key, initial_prompt)
             return (fallback, system_instruction,
                     _format_conversation_log(history),
@@ -768,7 +994,7 @@ class NV_PromptRefiner:
 
         debug_info = (
             f"=== NV_PromptRefiner Debug ===\n"
-            f"Mode: {mode}\n"
+            f"Mode: {op_mode}\n"
             f"Turn: {turn_number}\n"
             f"Provider: {provider} | Model: {model}\n"
             f"Temperature: {temperature} | Max Tokens: {max_tokens}\n"
@@ -778,6 +1004,7 @@ class NV_PromptRefiner:
             f"History Turns: {len(history)} messages\n"
             f"Refined Length: {len(refined)} chars / ~{len(refined.split())} words\n"
             f"Media: {media_info}\n"
+            f"Ref Images: {num_refs}\n"
             f"Clear History: {'yes' if clear_history else 'no'}"
         )
 
