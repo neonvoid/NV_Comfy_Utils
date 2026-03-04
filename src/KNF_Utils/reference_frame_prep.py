@@ -43,6 +43,12 @@ class NV_ReferenceFramePrep:
                           "tooltip": "Target width for upscaling (should match Stage 2 target resolution)."}),
                 "height": ("INT", {"default": 480, "min": 16, "max": 8192, "step": 16,
                            "tooltip": "Target height for upscaling (should match Stage 2 target resolution)."}),
+                "frame_repeat": ("INT", {"default": 4, "min": 1, "max": 8, "step": 1,
+                                "tooltip": "Repeat each frame N times before VAE encode. "
+                                           "WAN 3D VAE has 4x temporal compression — without repeat, adjacent "
+                                           "frames blend into shared latent frames, blurring faces. "
+                                           "4x repeat = each ref maps to exactly 1 latent frame. "
+                                           "Match VacePrePassReference's frame_repeat setting."}),
             },
         }
 
@@ -56,7 +62,7 @@ class NV_ReferenceFramePrep:
         "Wire the LATENT output to a KSampler, decode, then feed into VacePrePassReference."
     )
 
-    def execute(self, images, vae, num_refs, width, height):
+    def execute(self, images, vae, num_refs, width, height, frame_repeat):
         total = images.shape[0]
         num_refs = min(num_refs, total)
 
@@ -77,9 +83,23 @@ class NV_ReferenceFramePrep:
               f"(indices: {indices}) from {total} total")
         print(f"[NV_ReferenceFramePrep] Upscaled to {width}x{height}")
 
+        # Frame repeat: duplicate each frame N times for 3D VAE temporal compression.
+        # Without this, adjacent frames blend into shared latent frames.
+        # 4x repeat = each reference maps to exactly 1 clean latent frame.
+        if frame_repeat > 1:
+            repeated = selected.unsqueeze(1).expand(-1, frame_repeat, -1, -1, -1)
+            repeated = repeated.reshape(-1, *selected.shape[1:])
+        else:
+            repeated = selected
+
+        total_pixel_frames = repeated.shape[0]
+        print(f"[NV_ReferenceFramePrep] Frame repeat {frame_repeat}x -> "
+              f"{total_pixel_frames} pixel frames -> {(total_pixel_frames - 1) // 4 + 1} latent frames")
+
         # VAE encode (streaming for OOM safety)
-        latent = streaming_vae_encode(vae, selected[:, :, :, :3])
-        # latent shape: [1, 16, T, H/8, W/8]
+        latent = streaming_vae_encode(vae, repeated[:, :, :, :3])
+        del repeated
+        # latent shape: [1, 16, T, H/8, W/8] where T = num_refs (with 4x repeat)
 
         # Place on intermediate device (matches ComfyUI convention)
         latent = latent.to(comfy.model_management.intermediate_device())
