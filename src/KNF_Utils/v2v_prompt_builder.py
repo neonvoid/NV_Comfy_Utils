@@ -7,8 +7,9 @@ captioner that accepts system_instruction + prompt_text).
 
 Supports:
 - Task mode selection: 'full_restyle' (scene-wide style transfer),
-  'character_swap' (targeted character replacement via inpainting), or
-  'r2v_bootstrap' (scene prompts for WAN 2.6 R2V API)
+  'character_swap' (targeted character replacement via inpainting),
+  'r2v_bootstrap' (scene prompts for WAN 2.6 R2V API),
+  'kling_edit' (Kling API edit mode), or 'kling_reference' (Kling API reference mode)
 - Automatic word budget selection based on subject count and motion intensity
 - Denoise-strength-aware analysis priority weighting
 - Chunked processing mode with temporal continuity from previous chunk captions
@@ -393,6 +394,244 @@ the replacement character's appearance — only their actions and position."""
 
 
 # ---------------------------------------------------------------------------
+# Kling Edit mode template constants
+# ---------------------------------------------------------------------------
+
+_KE_SYSTEM_ROLE = """\
+You are a prompt engineer for the Kling AI video editing API. The API takes \
+an input video and modifies it according to a text prompt. Your job is to \
+write a clear, concise edit instruction that tells Kling what to change.
+
+The downstream pipeline handles reference image tags (@image1, @image2, etc.), \
+alias legends, and negative prompt formatting automatically — you only need \
+to write the main prompt body. If reference images are described below, you \
+may mention them naturally in your prompt using @image1, @image2, etc., but \
+only when it adds clarity. Do not add a [References: ...] legend or \
+"Avoid: ..." line — those are appended by the pipeline."""
+
+_KE_ANALYSIS_PRIORITIES = """\
+## Analysis Priorities
+
+- **Transformation target**: What specifically should change in the video? \
+Focus on the delta between input and desired output — not on describing \
+what already exists. Be direct: "change X to Y", "add Z", "remove W".{denoise_structural_note}
+- **Identity preservation**: When reference images provide character or style \
+identity, describe the target appearance concisely. Kling handles identity \
+transfer from reference images — your prompt should guide the transformation, \
+not exhaustively describe the reference.{denoise_surface_note}
+- **Scene continuity**: Note which elements should remain unchanged. Kling \
+edits the entire frame — explicitly protect important elements by mentioning \
+them (e.g., "keep the background cityscape unchanged").{temporal_note}
+{motion_priority_clause}"""
+
+_KE_OUTPUT_CONSTRAINTS = """\
+## Output Constraints
+
+- Write edit instructions, not scene descriptions. "Transform the character \
+into a samurai wearing red armor" beats "A samurai in red armor stands in \
+a field" for edit mode.
+- Be specific about the transformation: what changes, what stays the same.
+- The Kling API has a 2500 character total limit. Your prompt body should \
+stay under ~1800 characters to leave room for reference legends (~300 chars) \
+and negative prompt (~400 chars) that are appended automatically.
+- When reference images are available, mention @image1, @image2 etc. naturally \
+in context. Example: "Transform the character to match @image1's appearance \
+while keeping the original pose and setting."
+- Do NOT add [References: ...] legends — handled downstream.
+- Do NOT add "Avoid: ..." lines — handled downstream.
+- Do NOT add <<<image_N>>> API wire format — handled downstream.
+- Use plain, direct language. Kling responds best to clear, unambiguous \
+instructions rather than poetic or abstract descriptions.
+- For subtle edits (low intensity): focus on specific details to change.
+- For dramatic edits (high intensity): describe the complete target state."""
+
+_KE_WORD_BUDGET = """\
+## Word Budget Allocation
+
+Distribute the target word count based on edit scope:
+
+| Condition | Transformation | Identity/Style | Preservation | Spatial |
+|-----------|---------------|----------------|--------------|---------|
+| 1 subject, low intensity | 40% | 25% | 25% | 10% |
+| 1 subject, medium intensity | 35% | 30% | 20% | 15% |
+| 1 subject, high intensity | 30% | 35% | 15% | 20% |
+| 2+ subjects, low intensity | 35% | 30% | 20% | 15% |
+| 2+ subjects, medium intensity | 30% | 35% | 15% | 20% |
+| 2+ subjects, high intensity | 25% | 35% | 15% | 25% |
+| Scene-only (no subjects) | 50% | 20% | 15% | 15% |
+
+**Active row for this video**: {budget_row_label}
+
+Kling edit prompts benefit from brevity — a focused 80-word prompt often \
+outperforms a detailed 200-word one. Stay concise."""
+
+_KE_OUTPUT_FORMAT = """\
+## Output Format
+
+{word_count_min}-{word_count_max} words of direct edit instructions. \
+{trigger_word_clause}
+
+Structure your prompt in this priority order:
+1. Primary transformation (what changes)
+2. Reference image usage (if applicable — @image1, @image2, etc.)
+3. Style/aesthetic target
+4. Preservation notes (what must stay unchanged)"""
+
+_KE_PROMPT_TEMPLATE = """\
+Write a Kling video edit prompt using these parameters:
+
+**Edit Goal**: {style_display}
+**Subjects in Scene**: {subjects_display}
+**Target Setting**: {setting_display}
+**Props/Details**: {props_display}
+**Edit Intensity**: {denoise_strength} (0.0 = subtle tweak, 1.0 = dramatic transformation)
+**Video Duration**: {duration_display}
+**Camera**: {camera_display}
+**Subject Count**: {subject_count}
+**Motion Level**: {motion_intensity}
+**Target Word Count**: {word_count_min}-{word_count_max} words
+{chunked_section}
+
+Write the prompt body only — reference legends and negative prompt are added \
+by the downstream pipeline. Stay under ~1800 characters."""
+
+_KE_CHARACTER_RECOGNITION = """\
+## Reference Image Mapping
+
+These reference images will be connected to the Kling node. Use the @image \
+tags naturally in your prompt when referencing them:
+
+| Tag | Role |
+|-----|------|
+{character_table_rows}
+
+Example usage: "Transform the character to match @image1's face and hairstyle \
+while wearing the outfit from @image2." Only reference images that are relevant \
+to the edit — don't force-include every reference."""
+
+
+# ---------------------------------------------------------------------------
+# Kling Reference mode template constants
+# ---------------------------------------------------------------------------
+
+_KR_SYSTEM_ROLE = """\
+You are a prompt engineer for the Kling AI reference-to-video API. The API \
+uses an input video as a style and motion template to generate entirely new \
+content. Your job is to describe the desired output scene — the input video \
+provides motion/style guidance, not content to preserve.
+
+The downstream pipeline handles reference image tags (@image1, @image2, etc.), \
+alias legends, @video tags, and negative prompt formatting automatically — \
+you only need to write the main prompt body. If reference images are described \
+below, you may mention them using @image1, @image2, etc. The input video is \
+automatically tagged as @video by the pipeline."""
+
+_KR_ANALYSIS_PRIORITIES = """\
+## Analysis Priorities
+
+- **Scene description**: Describe the scene you want generated, not the input \
+video. The input provides motion rhythm and visual style — your prompt defines \
+the new content.{denoise_structural_note}
+- **Character identity**: When reference images provide character identity, \
+mention them naturally with @image tags. Kling will extract the character's \
+appearance from the image.{denoise_surface_note}
+- **Visual style and mood**: Describe the target aesthetic — color palette, \
+lighting, atmosphere. The input video's style is a starting point; your prompt \
+can steer it.
+- **Camera and framing**: Describe the desired shot type and camera behavior. \
+Kling will use the input video's camera motion as a baseline but your prompt \
+can influence it.{temporal_note}
+{motion_priority_clause}"""
+
+_KR_OUTPUT_CONSTRAINTS = """\
+## Output Constraints
+
+- Describe the OUTPUT scene, not the input video. The input is a template — \
+you're telling Kling what new content to generate using that template's \
+motion and style.
+- The Kling API has a 2500 character total limit. Your prompt body should \
+stay under ~1800 characters to leave room for reference legends (~300 chars) \
+and negative prompt (~400 chars) that are appended automatically.
+- When reference images are available, mention @image1, @image2 etc. naturally \
+in context. The input video is @video (auto-injected by pipeline).
+- Do NOT add [References: ...] legends — handled downstream.
+- Do NOT add "Avoid: ..." lines — handled downstream.
+- Do NOT add @video tags — auto-injected by the pipeline.
+- Do NOT add <<<image_N>>> API wire format — handled downstream.
+- Use cinematic vocabulary: shot types, lighting terms, movement descriptors.
+- Kling reference mode generates 3-15 seconds of video. Describe a scene \
+achievable in that timeframe — no complex narratives or scene transitions.
+- Be specific about visual elements. "A warrior in red samurai armor walking \
+through cherry blossoms at sunset" beats "an epic battle scene"."""
+
+_KR_WORD_BUDGET = """\
+## Word Budget Allocation
+
+Distribute the target word count based on scene complexity:
+
+| Condition | Scene/Action | Character | Style/Mood | Camera |
+|-----------|-------------|-----------|------------|--------|
+| 1 subject, low motion | 25% | 30% | 25% | 20% |
+| 1 subject, medium motion | 30% | 25% | 25% | 20% |
+| 1 subject, high motion | 35% | 20% | 20% | 25% |
+| 2+ subjects, low motion | 30% | 30% | 20% | 20% |
+| 2+ subjects, medium motion | 30% | 25% | 20% | 25% |
+| 2+ subjects, high motion | 35% | 20% | 20% | 25% |
+| Scene-only (no subjects) | 40% | 0% | 35% | 25% |
+
+**Active row for this video**: {budget_row_label}
+
+Reference mode benefits from rich visual description — be specific about \
+the scene you want generated."""
+
+_KR_OUTPUT_FORMAT = """\
+## Output Format
+
+{word_count_min}-{word_count_max} words of flowing scene description. \
+{trigger_word_clause}
+
+Structure your prompt in this priority order:
+1. Scene and subject action (what's happening)
+2. Character identity via @image references (if applicable)
+3. Visual style, lighting, and atmosphere
+4. Camera framing and movement"""
+
+_KR_PROMPT_TEMPLATE = """\
+Write a Kling reference-to-video scene prompt using these parameters:
+
+**Scene Goal**: {style_display}
+**Subjects**: {subjects_display}
+**Setting**: {setting_display}
+**Props/Details**: {props_display}
+**Creative Freedom**: {denoise_strength} (0.0 = closely match input, 1.0 = free interpretation)
+**Video Duration**: {duration_display}
+**Camera**: {camera_display}
+**Subject Count**: {subject_count}
+**Motion Level**: {motion_intensity}
+**Target Word Count**: {word_count_min}-{word_count_max} words
+{chunked_section}
+
+Describe the desired OUTPUT scene — the input video is just a motion/style \
+template. Write the prompt body only — reference legends, @video tag, and \
+negative prompt are added by the downstream pipeline. Stay under ~1800 characters."""
+
+_KR_CHARACTER_RECOGNITION = """\
+## Reference Image Mapping
+
+These reference images will be connected to the Kling node. Use the @image \
+tags naturally when describing characters or style elements:
+
+| Tag | Role |
+|-----|------|
+{character_table_rows}
+
+The input video is automatically referenced as @video by the pipeline. \
+Example: "A warrior with @image1's face walks through a bamboo forest at \
+golden hour, matching the cinematic style of the input." Only reference \
+images that are relevant to the scene."""
+
+
+# ---------------------------------------------------------------------------
 # Mode template registry
 # ---------------------------------------------------------------------------
 
@@ -423,6 +662,24 @@ _MODE_TEMPLATES = {
         "output_format": _R2V_OUTPUT_FORMAT,
         "prompt_template": _R2V_PROMPT_TEMPLATE,
         "character_recognition": _R2V_CHARACTER_RECOGNITION,
+    },
+    "kling_edit": {
+        "system_role": _KE_SYSTEM_ROLE,
+        "analysis_priorities": _KE_ANALYSIS_PRIORITIES,
+        "output_constraints": _KE_OUTPUT_CONSTRAINTS,
+        "word_budget": _KE_WORD_BUDGET,
+        "output_format": _KE_OUTPUT_FORMAT,
+        "prompt_template": _KE_PROMPT_TEMPLATE,
+        "character_recognition": _KE_CHARACTER_RECOGNITION,
+    },
+    "kling_reference": {
+        "system_role": _KR_SYSTEM_ROLE,
+        "analysis_priorities": _KR_ANALYSIS_PRIORITIES,
+        "output_constraints": _KR_OUTPUT_CONSTRAINTS,
+        "word_budget": _KR_WORD_BUDGET,
+        "output_format": _KR_OUTPUT_FORMAT,
+        "prompt_template": _KR_PROMPT_TEMPLATE,
+        "character_recognition": _KR_CHARACTER_RECOGNITION,
     },
 }
 
@@ -558,7 +815,14 @@ class NV_V2VPromptBuilder:
             "required": {
                 "task_mode": (list(_MODE_TEMPLATES.keys()), {
                     "default": "full_restyle",
-                    "tooltip": "Prompt generation mode. 'full_restyle' = full scene V2V style transfer. 'character_swap' = targeted character replacement via inpainting. 'r2v_bootstrap' = scene prompts for WAN 2.6 R2V API."
+                    "tooltip": (
+                        "Prompt generation mode.\n"
+                        "'full_restyle' = full scene V2V style transfer.\n"
+                        "'character_swap' = targeted character replacement via inpainting.\n"
+                        "'r2v_bootstrap' = scene prompts for WAN 2.6 R2V API.\n"
+                        "'kling_edit' = Kling API edit mode — describe what to change.\n"
+                        "'kling_reference' = Kling API reference mode — describe new scene to generate."
+                    ),
                 }),
                 "trigger_word": ("STRING", {
                     "default": "",
@@ -660,12 +924,11 @@ class NV_V2VPromptBuilder:
     FUNCTION = "build_prompt"
     CATEGORY = "NV_Utils/Prompt"
     DESCRIPTION = (
-        "Assemble a structured V2V captioning prompt from individual parameters. "
-        "Supports multiple task modes: 'full_restyle' for scene-wide style transfer, "
-        "'character_swap' for targeted character replacement via inpainting, "
-        "'r2v_bootstrap' for WAN 2.6 R2V API scene prompts. "
-        "Outputs system_instruction and prompt_text that connect directly to "
-        "Multi-API Video Captioner."
+        "Assemble a structured captioning/prompting prompt from individual parameters. "
+        "Supports task modes: 'full_restyle' (V2V style transfer), "
+        "'character_swap' (inpainting), 'r2v_bootstrap' (WAN R2V API), "
+        "'kling_edit' (Kling edit API), 'kling_reference' (Kling reference API). "
+        "Outputs system_instruction and prompt_text for the LLM prompt refiner."
     )
 
     def build_prompt(self, task_mode, trigger_word, style_description,
@@ -803,6 +1066,12 @@ class NV_V2VPromptBuilder:
                 )
             else:
                 trigger_clause = "Use @Video1 for the primary subject."
+        elif task_mode in ("kling_edit", "kling_reference"):
+            trigger_clause = (
+                "Begin directly with the edit/scene instruction. "
+                "Reference images (@image1, @image2, etc.) can be mentioned "
+                "naturally where relevant — do not force them in."
+            )
         else:
             if trigger_word:
                 trigger_clause = f"Always begin with the trigger word: **{trigger_word}**"
