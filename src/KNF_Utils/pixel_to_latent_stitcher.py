@@ -96,25 +96,13 @@ class NV_PixelToLatentStitcher:
             f"Union bbox (px): ({union_x},{union_y}) {union_w}x{union_h}"
         )
 
-        # --- Snap to VAE grid ---
-        cx_px, cy_px, cw_px, ch_px = snap_to_vae_grid(
-            union_x, union_y, union_w, union_h,
-            spatial_h_px, spatial_w_px
-        )
-        cx_l = cx_px // VAE_STRIDE
-        cy_l = cy_px // VAE_STRIDE
-        cw_l = cw_px // VAE_STRIDE
-        ch_l = ch_px // VAE_STRIDE
-
-        info_lines.append(
-            f"Snapped crop (px): ({cx_px},{cy_px}) {cw_px}x{ch_px} | "
-            f"latent: ({cx_l},{cy_l}) {cw_l}x{ch_l}"
-        )
-
         # --- Derive target dims from blend mask shape ---
-        # The blend mask is at InpaintCrop2's output resolution (target size)
+        # Must happen BEFORE snap so we can grow the union bbox to match target aspect.
+        # The blend mask is at InpaintCrop2's output resolution (target size).
         target_w_latent = None
         target_h_latent = None
+        target_w_px = None
+        target_h_px = None
         resize_method = None
 
         if stitcher.get('cropped_mask_for_blend') and len(stitcher['cropped_mask_for_blend']) > 0:
@@ -134,6 +122,64 @@ class NV_PixelToLatentStitcher:
                 f"Target (from blend mask): {target_w_px}x{target_h_px}px | "
                 f"latent: {target_w_latent}x{target_h_latent} ({resize_method})"
             )
+
+        # --- Grow union bbox to match target aspect ratio ---
+        # The pixel InpaintCrop2 may have grown its bbox (crop_aspect) before cropping,
+        # but ctc-cto coordinates reflect the raw bbox. Without matching that growth here,
+        # the latent crop gets resized to the target at the wrong aspect ratio, squishing
+        # the content during KSampler denoising.
+        if target_w_px is not None and target_h_px is not None:
+            target_aspect = target_w_px / target_h_px
+            bbox_aspect = union_w / union_h
+
+            if abs(bbox_aspect - target_aspect) > 0.01:  # only grow if meaningfully different
+                if bbox_aspect < target_aspect:
+                    # Need wider — grow width
+                    new_w = union_h * target_aspect
+                    union_x -= (new_w - union_w) / 2.0
+                    union_w = new_w
+                else:
+                    # Need taller — grow height
+                    new_h = union_w / target_aspect
+                    union_y -= (new_h - union_h) / 2.0
+                    union_h = new_h
+
+                # Shift to keep in bounds (no canvas expansion in latent space)
+                if union_x < 0:
+                    union_x = 0.0
+                elif union_x + union_w > spatial_w_px:
+                    union_x = float(spatial_w_px) - union_w
+                if union_y < 0:
+                    union_y = 0.0
+                elif union_y + union_h > spatial_h_px:
+                    union_y = float(spatial_h_px) - union_h
+
+                # Hard clamp if grown bbox exceeds frame
+                union_x = max(0.0, union_x)
+                union_y = max(0.0, union_y)
+                union_w = min(union_w, float(spatial_w_px) - union_x)
+                union_h = min(union_h, float(spatial_h_px) - union_y)
+
+                info_lines.append(
+                    f"Aspect growth: target ar={target_aspect:.3f}, "
+                    f"bbox ar={bbox_aspect:.3f} -> grown ({union_x:.0f},{union_y:.0f}) "
+                    f"{union_w:.0f}x{union_h:.0f}px"
+                )
+
+        # --- Snap to VAE grid ---
+        cx_px, cy_px, cw_px, ch_px = snap_to_vae_grid(
+            union_x, union_y, union_w, union_h,
+            spatial_h_px, spatial_w_px
+        )
+        cx_l = cx_px // VAE_STRIDE
+        cy_l = cy_px // VAE_STRIDE
+        cw_l = cw_px // VAE_STRIDE
+        ch_l = ch_px // VAE_STRIDE
+
+        info_lines.append(
+            f"Snapped crop (px): ({cx_px},{cy_px}) {cw_px}x{ch_px} | "
+            f"latent: ({cx_l},{cy_l}) {cw_l}x{ch_l}"
+        )
 
         # --- Build blend mask (union of per-frame masks) ---
         blend_mask = None
