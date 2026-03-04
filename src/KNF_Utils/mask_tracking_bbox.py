@@ -33,6 +33,7 @@ import math
 import torch
 
 from .inpaint_crop import gaussian_smooth_1d, median_filter_1d, mask_erode_dilate, mask_blur
+from .kalman_rts_smoother import kalman_rts_smooth
 
 
 # =============================================================================
@@ -154,17 +155,24 @@ def extract_bboxes(mask: torch.Tensor, info_lines: list) -> tuple:
 # =============================================================================
 
 def smooth_coordinates(x1s, y1s, x2s, y2s, smooth_mode, smooth_window,
-                       min_cutoff, beta, info_lines):
+                       min_cutoff, beta, info_lines,
+                       present=None, q_pos=4.0, q_dim=1.0,
+                       r_pos=9.0, r_dim=25.0):
     """Apply temporal smoothing to bbox coordinate sequences.
 
     Args:
         x1s, y1s, x2s, y2s: Per-frame corner coordinates.
-        smooth_mode: One of "one_euro", "gaussian", "median",
+        smooth_mode: One of "kalman_rts", "one_euro", "gaussian", "median",
                      "lock_largest", "lock_first", "none".
         smooth_window: Window size for gaussian/median modes.
         min_cutoff: One-Euro min_cutoff (used by one_euro and lock modes).
         beta: One-Euro beta (used by one_euro and lock modes).
         info_lines: Diagnostic output accumulator.
+        present: Per-frame bool list (True=detected, False=filled). For kalman_rts.
+        q_pos: Kalman process noise for position acceleration.
+        q_dim: Kalman process noise for dimension acceleration.
+        r_pos: Kalman measurement noise for center position.
+        r_dim: Kalman measurement noise for width/height.
 
     Returns:
         Smoothed (x1s, y1s, x2s, y2s).
@@ -174,6 +182,26 @@ def smooth_coordinates(x1s, y1s, x2s, y2s, smooth_mode, smooth_window,
     if smooth_mode == "none" or B <= 1:
         info_lines.append("  Smoothing: none")
         return x1s, y1s, x2s, y2s
+
+    if smooth_mode == "kalman_rts":
+        if B < 10:
+            # Fall back to one_euro for very short sequences
+            info_lines.append(
+                f"  Smoothing: kalman_rts → fallback to one_euro ({B} frames < 10)"
+            )
+            smooth_mode = "one_euro"
+        else:
+            if present is None:
+                present = [True] * B
+            x1s, y1s, x2s, y2s = kalman_rts_smooth(
+                x1s, y1s, x2s, y2s, present,
+                q_pos=q_pos, q_dim=q_dim, r_pos=r_pos, r_dim=r_dim
+            )
+            info_lines.append(
+                f"  Smoothing: kalman_rts (q_pos={q_pos}, q_dim={q_dim}, "
+                f"r_pos={r_pos}, r_dim={r_dim})"
+            )
+            return x1s, y1s, x2s, y2s
 
     if smooth_mode == "one_euro":
         x1s = one_euro_smooth_1d(x1s, min_cutoff, beta)
@@ -320,11 +348,13 @@ class NV_MaskTrackingBBox:
                                "Ensures the crop includes context around the subject."
                 }),
                 "smooth_mode": ([
-                    "one_euro", "gaussian", "median",
+                    "kalman_rts", "one_euro", "gaussian", "median",
                     "lock_largest", "lock_first", "none"
                 ], {
-                    "default": "one_euro",
-                    "tooltip": "one_euro: velocity-adaptive smoothing (best default). "
+                    "default": "kalman_rts",
+                    "tooltip": "kalman_rts: 8D Kalman + RTS backward smoother — globally optimal, "
+                               "handles missing frames, no causal lag (RECOMMENDED). "
+                               "one_euro: velocity-adaptive, forward-only (slight lag). "
                                "gaussian: temporal Gaussian blur on coordinates. "
                                "median: median filter + Gaussian (removes outlier frames). "
                                "lock_largest: fix bbox size to largest frame, smooth position. "
@@ -367,6 +397,31 @@ class NV_MaskTrackingBBox:
                     "tooltip": "Feather (Gaussian blur) the output bbox mask edges. "
                                "0 = hard rectangular edges. 8-16 = soft transition."
                 }),
+                "kalman_q_pos": ("FLOAT", {
+                    "default": 4.0, "min": 0.1, "max": 100.0, "step": 0.5,
+                    "tooltip": "Kalman process noise for position acceleration. "
+                               "Higher = trust measurements more (less smooth). "
+                               "Lower = smoother trajectory (may lag real motion). "
+                               "Default 4.0 tuned for SAM3 at 8fps."
+                }),
+                "kalman_q_dim": ("FLOAT", {
+                    "default": 1.0, "min": 0.1, "max": 50.0, "step": 0.5,
+                    "tooltip": "Kalman process noise for dimension (w/h) acceleration. "
+                               "Lower than q_pos because bbox size changes slowly. "
+                               "Default 1.0."
+                }),
+                "kalman_r_pos": ("FLOAT", {
+                    "default": 9.0, "min": 0.1, "max": 200.0, "step": 1.0,
+                    "tooltip": "Kalman measurement noise for center position. "
+                               "Higher = smoother (treats measurements as noisier). "
+                               "Default 9.0 = 3px standard deviation from SAM3 mask edges."
+                }),
+                "kalman_r_dim": ("FLOAT", {
+                    "default": 25.0, "min": 0.1, "max": 400.0, "step": 1.0,
+                    "tooltip": "Kalman measurement noise for width/height. "
+                               "Higher = more stable bbox dimensions. "
+                               "Default 25.0 = 5px standard deviation."
+                }),
             },
         }
 
@@ -384,7 +439,9 @@ class NV_MaskTrackingBBox:
 
     def execute(self, mask, padding, smooth_mode, smooth_window,
                 min_cutoff=0.05, beta=0.7,
-                threshold=False, output_erode=0, output_feather=0):
+                threshold=False, output_erode=0, output_feather=0,
+                kalman_q_pos=4.0, kalman_q_dim=1.0,
+                kalman_r_pos=9.0, kalman_r_dim=25.0):
         if mask.dim() == 2:
             mask = mask.unsqueeze(0)
 
@@ -416,7 +473,10 @@ class NV_MaskTrackingBBox:
             x1s, y1s, x2s, y2s,
             smooth_mode, smooth_window,
             min_cutoff, beta,
-            info_lines
+            info_lines,
+            present=present,
+            q_pos=kalman_q_pos, q_dim=kalman_q_dim,
+            r_pos=kalman_r_pos, r_dim=kalman_r_dim
         )
 
         # --- Build output bbox masks ---
