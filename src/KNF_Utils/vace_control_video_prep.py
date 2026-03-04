@@ -40,7 +40,12 @@ import torch
 import numpy as np
 from scipy.ndimage import distance_transform_edt
 
-from .inpaint_crop import mask_erode_dilate, mask_blur, gaussian_smooth_1d, median_filter_1d
+from .inpaint_crop import (
+    mask_erode_dilate, mask_blur, gaussian_smooth_1d, median_filter_1d,
+    mask_fill_holes as _mask_fill_holes,
+    mask_remove_noise as _mask_remove_noise,
+    mask_smooth as _mask_smooth,
+)
 
 
 def compute_inscribed_radius(mask: torch.Tensor) -> tuple[list[float], int]:
@@ -253,6 +258,30 @@ class NV_VaceControlVideoPrep:
                     "tooltip": "Binarize mask at 0.5 before processing. Enable if mask has "
                                "intermediate values from resizing that should be hard edges."
                 }),
+                "mask_grow": ("INT", {
+                    "default": 0, "min": -128, "max": 128, "step": 1,
+                    "tooltip": "Grow (positive) or shrink (negative) the input mask before "
+                               "VACE processing. Applied after threshold, before bbox conversion. "
+                               "Uses grey morphology to preserve gradients."
+                }),
+                "mask_fill_holes": ("INT", {
+                    "default": 0, "min": 0, "max": 128, "step": 1,
+                    "tooltip": "Fill gaps/holes in the mask using morphological closing "
+                               "(dilate then erode). Bridges small gaps in segmentation masks. "
+                               "Value is the kernel size in pixels."
+                }),
+                "mask_remove_noise": ("INT", {
+                    "default": 0, "min": 0, "max": 32, "step": 1,
+                    "tooltip": "Remove isolated pixels/noise using morphological opening "
+                               "(erode then dilate). Eliminates small specks while preserving "
+                               "larger regions. Value is the kernel size in pixels."
+                }),
+                "mask_smooth": ("INT", {
+                    "default": 0, "min": 0, "max": 127, "step": 2,
+                    "tooltip": "Smooth jagged mask edges by binarizing at 0.5 then blurring. "
+                               "Creates cleaner edges without shifting the boundary. "
+                               "Value is the blur kernel size in pixels (odd)."
+                }),
                 "vae_stride": ("INT", {
                     "default": 8, "min": 4, "max": 32, "step": 4,
                     "tooltip": "VAE spatial stride in pixels (8 for WAN)."
@@ -296,7 +325,9 @@ class NV_VaceControlVideoPrep:
 
     def execute(self, image, mask, mask_shape, mode, erosion_blocks, feather_blocks, fill_mode,
                 bbox_padding=0.15, bbox_smooth_frames=5,
-                fill_value=0.5, threshold=False, vae_stride=8,
+                fill_value=0.5, threshold=False,
+                mask_grow=0, mask_fill_holes=0, mask_remove_noise=0, mask_smooth=0,
+                vae_stride=8,
                 stitch_source="tight", stitch_erosion=0, stitch_feather=8):
         if mask.dim() == 2:
             mask = mask.unsqueeze(0)
@@ -329,6 +360,24 @@ class NV_VaceControlVideoPrep:
         if threshold:
             result_mask = (result_mask > 0.5).float()
             info_lines.append("  Threshold: applied at 0.5")
+
+        # --- Step 1b: Mask pre-processing (grow/shrink, fill holes, denoise, smooth) ---
+        preproc_applied = []
+        if mask_grow != 0:
+            result_mask = mask_erode_dilate(result_mask, mask_grow)
+            preproc_applied.append(f"grow={mask_grow}px")
+        if mask_fill_holes > 0:
+            result_mask = _mask_fill_holes(result_mask, mask_fill_holes)
+            preproc_applied.append(f"fill_holes={mask_fill_holes}px")
+        if mask_remove_noise > 0:
+            result_mask = _mask_remove_noise(result_mask, mask_remove_noise)
+            preproc_applied.append(f"remove_noise={mask_remove_noise}px")
+        if mask_smooth > 0:
+            result_mask = _mask_smooth(result_mask, mask_smooth)
+            preproc_applied.append(f"smooth={mask_smooth}px")
+        if preproc_applied:
+            result_mask = result_mask.clamp(0.0, 1.0)
+            info_lines.append(f"  Mask pre-processing: {', '.join(preproc_applied)}")
 
         # --- Step 2: BBox conversion (before erosion/feather) ---
         if mask_shape == "bbox":
