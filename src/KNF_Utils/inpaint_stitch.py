@@ -59,7 +59,7 @@ def _inverse_content_warp(image, mask, warp_mode, warp_entry):
                               padding_mode='zeros', align_corners=False).permute(0, 2, 3, 1)
 
     elif warp_mode == "optical_flow":
-        flow = -warp_entry["flow"].to(device)  # Negate flow for inverse
+        flow = warp_entry["flow"].to(device)  # Forward flow: maps src→ref, used as-is for inverse grid
         if flow.dim() == 3:
             flow = flow.unsqueeze(0)
 

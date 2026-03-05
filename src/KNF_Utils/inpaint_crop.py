@@ -123,8 +123,8 @@ def _stabilize_content_centroid(images, masks_orig, masks_proc):
     warped_imgs, warped_mo, warped_mp = [], [], []
 
     for b in range(B):
-        dx = ref_cx - cx_smooth[b]
-        dy = ref_cy - cy_smooth[b]
+        dx = cx_smooth[b] - ref_cx
+        dy = cy_smooth[b] - ref_cy
         warp_data.append({"dx": dx, "dy": dy})
 
         grid = _build_translation_grid(dx, dy, H, W, device)
@@ -254,18 +254,20 @@ def _stabilize_content_flow(images, masks_orig, masks_proc):
         flow = accumulated[b]
         warp_data.append({"flow": flow.cpu()})  # Store on CPU for stitcher
 
-        # Warp image
+        # Warp image (negate flow: forward flow points src→ref, but grid_sample
+        # needs backward mapping ref→src, so we sample from src at (x - flow_x))
+        neg_flow = -flow
         img_nchw_b = images[b:b+1].permute(0, 3, 1, 2)
-        wi = _warp_with_flow(img_nchw_b, flow, padding_mode='border')
+        wi = _warp_with_flow(img_nchw_b, neg_flow, padding_mode='border')
         warped_imgs.append(wi.permute(0, 2, 3, 1).squeeze(0))
 
         # Warp masks
         mo_4d = masks_orig[b:b+1].unsqueeze(1)
-        wmo = _warp_with_flow(mo_4d, flow, padding_mode='zeros')
+        wmo = _warp_with_flow(mo_4d, neg_flow, padding_mode='zeros')
         warped_mo.append(wmo.squeeze(0).squeeze(0))
 
         mp_4d = masks_proc[b:b+1].unsqueeze(1)
-        wmp = _warp_with_flow(mp_4d, flow, padding_mode='zeros')
+        wmp = _warp_with_flow(mp_4d, neg_flow, padding_mode='zeros')
         warped_mp.append(wmp.squeeze(0).squeeze(0))
 
     max_flow = max(f.abs().max().item() for f in accumulated)
