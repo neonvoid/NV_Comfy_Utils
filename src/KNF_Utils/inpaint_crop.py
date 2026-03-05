@@ -141,19 +141,13 @@ def _stabilize_content_centroid(images, masks_orig, masks_proc, stitcher=None,
     use_expansion = (margin > 0 and stitcher is not None
                      and len(stitcher.get('canvas_image', [])) == B)
 
-    if use_expansion:
-        expanded_w = tw + 2 * margin
-        expanded_h = th + 2 * margin
-    else:
-        expanded_w, expanded_h = W, H
-
     warp_data = []
     warped_imgs, warped_mo, warped_mp = [], [], []
+    n_clamped = 0
 
     for b in range(B):
         dx = cx_smooth[b] - ref_cx
         dy = cy_smooth[b] - ref_cy
-        warp_data.append({"dx": dx, "dy": dy})
 
         if use_expansion:
             # Expand: re-crop a larger region from the stored canvas
@@ -166,82 +160,105 @@ def _stabilize_content_centroid(images, masks_orig, masks_proc, stitcher=None,
             ctc_h = stitcher['cropped_to_canvas_h'][b]
             canvas_h, canvas_w = canvas.shape[1], canvas.shape[2]
 
-            # Margin in canvas-space pixels
-            mcx = int(math.ceil(margin * ctc_w / tw)) + 1
-            mcy = int(math.ceil(margin * ctc_h / th)) + 1
+            # Scale factors: canvas-space → target-space
+            sx = tw / ctc_w
+            sy = th / ctc_h
 
-            # Desired expanded region in canvas space (may exceed canvas bounds)
-            want_ex = ctc_x - mcx
-            want_ey = ctc_y - mcy
-            want_ex2 = ctc_x + ctc_w + mcx
-            want_ey2 = ctc_y + ctc_h + mcy
+            # Available canvas margin per side (in target-space pixels)
+            avail_l = ctc_x * sx
+            avail_r = (canvas_w - ctc_x - ctc_w) * sx
+            avail_t = ctc_y * sy
+            avail_b = (canvas_h - ctc_y - ctc_h) * sy
 
-            # Clamp to available canvas
-            avail_ex = max(0, want_ex)
-            avail_ey = max(0, want_ey)
-            avail_ex2 = min(canvas_w, want_ex2)
-            avail_ey2 = min(canvas_h, want_ey2)
+            # Clamp displacement to available canvas margins so we never
+            # need content beyond what the canvas provides.
+            # dx > 0 → grid samples rightward → needs right-side content
+            dx_orig, dy_orig = dx, dy
+            dx = max(-avail_l, min(avail_r, dx))
+            dy = max(-avail_t, min(avail_b, dy))
+            if dx != dx_orig or dy != dy_orig:
+                n_clamped += 1
 
-            # Compute padding needed where canvas falls short
-            pad_l = avail_ex - want_ex   # pixels missing on left
-            pad_t = avail_ey - want_ey   # pixels missing on top
-            pad_r = want_ex2 - avail_ex2  # pixels missing on right
-            pad_b = want_ey2 - avail_ey2  # pixels missing on bottom
+            # Per-side margins: just enough for the clamped displacement + 1px safety
+            need_l = (int(math.ceil(abs(dx))) + 1) if dx < 0 else 1
+            need_r = (int(math.ceil(abs(dx))) + 1) if dx > 0 else 1
+            need_t = (int(math.ceil(abs(dy))) + 1) if dy < 0 else 1
+            need_b = (int(math.ceil(abs(dy))) + 1) if dy > 0 else 1
 
-            # Crop available region from canvas
-            exp_img = canvas[:, avail_ey:avail_ey2, avail_ex:avail_ex2, :]
+            # Canvas-space margins per side (proportional to target margins)
+            mc_l = int(math.ceil(need_l / sx)) + 1
+            mc_r = int(math.ceil(need_r / sx)) + 1
+            mc_t = int(math.ceil(need_t / sy)) + 1
+            mc_b = int(math.ceil(need_b / sy)) + 1
 
-            # Pad with zeros where canvas didn't have content (preserves spatial layout)
-            if pad_l > 0 or pad_r > 0 or pad_t > 0 or pad_b > 0:
-                # TF.pad uses (left, right, top, bottom) for last two dims
-                # exp_img is [1, H, W, C] — pad W then H dims
-                exp_img = exp_img.permute(0, 3, 1, 2)  # [1, C, H, W]
-                exp_img = TF.pad(exp_img, (pad_l, pad_r, pad_t, pad_b),
-                                 mode='constant', value=0)
-                exp_img = exp_img.permute(0, 2, 3, 1)  # [1, H, W, C]
+            # Expanded crop region in canvas space (safety-clamped)
+            ex = max(0, ctc_x - mc_l)
+            ey = max(0, ctc_y - mc_t)
+            ex2 = min(canvas_w, ctc_x + ctc_w + mc_r)
+            ey2 = min(canvas_h, ctc_y + ctc_h + mc_b)
 
-            exp_img = rescale_image(exp_img, expanded_w, expanded_h, resize_algorithm)
+            # Actual canvas margins obtained
+            actual_l_c = ctc_x - ex
+            actual_t_c = ctc_y - ey
 
-            # Masks: pad from target to expanded size (zeros at margins)
+            # Target-space dimensions of expanded image (proportional resize)
+            total_c_w = ex2 - ex
+            total_c_h = ey2 - ey
+            expanded_w_b = int(round(total_c_w * sx))
+            expanded_h_b = int(round(total_c_h * sy))
+
+            # Trim offsets: where the crop content starts in the expanded image
+            trim_left = int(round(actual_l_c * sx))
+            trim_top = int(round(actual_t_c * sy))
+
+            # Crop from canvas and resize (proportional — no spatial distortion)
+            exp_img = canvas[:, ey:ey2, ex:ex2, :]
+            exp_img = rescale_image(exp_img, expanded_w_b, expanded_h_b, resize_algorithm)
+
+            # Masks: pad at target resolution with per-side margins
+            pad_right = max(0, expanded_w_b - trim_left - tw)
+            pad_bottom = max(0, expanded_h_b - trim_top - th)
             mo_padded = TF.pad(masks_orig[b].unsqueeze(0).unsqueeze(0),
-                               (margin, margin, margin, margin),
+                               (trim_left, pad_right, trim_top, pad_bottom),
                                mode='constant', value=0).squeeze(0).squeeze(0)
             mp_padded = TF.pad(masks_proc[b].unsqueeze(0).unsqueeze(0),
-                               (margin, margin, margin, margin),
+                               (trim_left, pad_right, trim_top, pad_bottom),
                                mode='constant', value=0).squeeze(0).squeeze(0)
 
             img_nchw = exp_img.permute(0, 3, 1, 2)  # [1, C, eH, eW]
             mo_4d = mo_padded.unsqueeze(0).unsqueeze(0)  # [1, 1, eH, eW]
             mp_4d = mp_padded.unsqueeze(0).unsqueeze(0)
+
+            grid = _build_translation_grid(dx, dy, expanded_h_b, expanded_w_b, device)
+
+            wi = TF.grid_sample(img_nchw, grid, mode='bilinear',
+                                padding_mode='zeros', align_corners=False)
+            wmo = TF.grid_sample(mo_4d, grid, mode='bilinear',
+                                 padding_mode='zeros', align_corners=False)
+            wmp = TF.grid_sample(mp_4d, grid, mode='bilinear',
+                                 padding_mode='zeros', align_corners=False)
+
+            # Trim back to target resolution at computed offsets
+            wi = wi[:, :, trim_top:trim_top+th, trim_left:trim_left+tw]
+            wmo = wmo[:, :, trim_top:trim_top+th, trim_left:trim_left+tw]
+            wmp = wmp[:, :, trim_top:trim_top+th, trim_left:trim_left+tw]
         else:
-            # Fallback: warp in-place with zeros padding
-            img_nchw = images[b:b+1].permute(0, 3, 1, 2)
-            mo_4d = masks_orig[b:b+1].unsqueeze(1)
-            mp_4d = masks_proc[b:b+1].unsqueeze(1)
+            # No expansion available — pass through without stabilization
+            wi = images[b:b+1].permute(0, 3, 1, 2)
+            wmo = masks_orig[b:b+1].unsqueeze(1)
+            wmp = masks_proc[b:b+1].unsqueeze(1)
+            dx, dy = 0.0, 0.0
 
-        grid = _build_translation_grid(dx, dy, expanded_h, expanded_w, device)
-
-        wi = TF.grid_sample(img_nchw, grid, mode='bilinear',
-                            padding_mode='zeros', align_corners=False)
-        wmo = TF.grid_sample(mo_4d, grid, mode='bilinear',
-                             padding_mode='zeros', align_corners=False)
-        wmp = TF.grid_sample(mp_4d, grid, mode='bilinear',
-                             padding_mode='zeros', align_corners=False)
-
-        if use_expansion:
-            # Trim: center-crop back to target resolution
-            wi = wi[:, :, margin:margin+th, margin:margin+tw]
-            wmo = wmo[:, :, margin:margin+th, margin:margin+tw]
-            wmp = wmp[:, :, margin:margin+th, margin:margin+tw]
-
+        warp_data.append({"dx": dx, "dy": dy})
         warped_imgs.append(wi.permute(0, 2, 3, 1).squeeze(0))
         warped_mo.append(wmo.squeeze(0).squeeze(0))
         warped_mp.append(wmp.squeeze(0).squeeze(0))
 
     max_disp = max(max(abs(d["dx"]) for d in warp_data), max(abs(d["dy"]) for d in warp_data))
-    mode_str = "expand-crop-trim" if use_expansion else "fallback-zeros"
+    mode_str = "expand-crop-trim" if use_expansion else "no-stitcher"
+    clamp_str = f", {n_clamped} edge-clamped" if n_clamped > 0 else ""
     print(f"[ContentStabilize/centroid] {B} frames, ref=({ref_cx:.1f},{ref_cy:.1f}), "
-          f"max_disp={max_disp:.1f}px, margin={margin}px ({mode_str})")
+          f"max_disp={max_disp:.1f}px, margin={margin}px ({mode_str}{clamp_str})")
 
     return (torch.stack(warped_imgs), torch.stack(warped_mo), torch.stack(warped_mp), warp_data)
 
