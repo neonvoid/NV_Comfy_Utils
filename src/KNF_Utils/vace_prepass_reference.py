@@ -10,7 +10,7 @@ video.
 Key differences from native WanVaceToVideo:
 - Multiple reference frames (not just 1)
 - Frame repeat (4x default) for 3D VAE temporal compression preservation
-- Uniform sampling of N reference frames from input
+- Uniform or adaptive (IFS) sampling of N reference frames from input
 - Internal upscaling of reference frames to target resolution
 
 Based on research validation:
@@ -18,6 +18,7 @@ Based on research validation:
 - FlashVideo (arXiv 2502.05179): cascaded is HIGHER quality than single-stage
 - HiStream (arXiv 2512.21338): cascaded validated on Wan 2.1
 - VINs (arXiv 2503.17539): parallel chunks converge with shared global signal
+- LongDiff (CVPR 2025): Informative Frame Selection +1.8% subject consistency vs uniform
 
 Output format is identical to WanVaceToVideo:
 - vace_frames: [1, 32, T_ref+T_ctrl, H/8, W/8]
@@ -26,11 +27,63 @@ Output format is identical to WanVaceToVideo:
 """
 
 import torch
+import numpy as np
 import comfy.utils
 import comfy.model_management
 import comfy.latent_formats
 import node_helpers
 from .streaming_vace_to_video import streaming_vae_encode
+
+
+def _score_frames_ifs(frames):
+    """LongDiff-style Informative Frame Selection (IFS).
+
+    Score(k) = normalized_entropy(k) + normalized_SAD(k)
+
+    - Entropy: Shannon entropy of grayscale histogram — high = visually complex
+    - SAD: Sum of Absolute Differences with previous frame — high = content change
+
+    Args:
+        frames: [T, H, W, C] tensor in [0, 1]
+    Returns:
+        [T] numpy array of scores (higher = more informative)
+    """
+    # Work on CPU numpy for histogram speed
+    gray = (0.299 * frames[..., 0] + 0.587 * frames[..., 1] + 0.114 * frames[..., 2]).cpu().numpy()
+    T = gray.shape[0]
+
+    # Entropy per frame: Shannon entropy of 256-bin histogram
+    entropies = np.zeros(T)
+    for i in range(T):
+        hist, _ = np.histogram(gray[i], bins=256, range=(0.0, 1.0))
+        hist = hist.astype(np.float64)
+        total = hist.sum()
+        if total > 0:
+            p = hist / total
+            p = p[p > 0]
+            entropies[i] = -np.sum(p * np.log2(p))
+
+    # SAD per frame: sum of absolute differences with previous frame
+    # Frame 0 gets max SAD so it's always a strong candidate (first-frame dominance)
+    sads = np.zeros(T)
+    for i in range(1, T):
+        sads[i] = np.abs(gray[i] - gray[i - 1]).mean()
+    sads[0] = sads.max() if T > 1 else 1.0
+
+    # Normalize each to [0, 1] before combining
+    e_min, e_max = entropies.min(), entropies.max()
+    if e_max > e_min:
+        entropies = (entropies - e_min) / (e_max - e_min)
+    else:
+        entropies[:] = 1.0
+
+    s_min, s_max = sads.min(), sads.max()
+    if s_max > s_min:
+        sads = (sads - s_min) / (s_max - s_min)
+    else:
+        sads[:] = 1.0
+
+    return entropies + sads
 
 
 class NV_VacePrePassReference:
@@ -75,6 +128,13 @@ class NV_VacePrePassReference:
                 "frame_repeat": ("INT", {"default": 4, "min": 1, "max": 8, "step": 1,
                                 "tooltip": "Repeat each reference N times for 3D VAE temporal compression "
                                            "(4 recommended for Wan 2.1, prevents 6.5%% identity drop per SkyReels-A2)"}),
+                "ref_sampling": (["uniform", "adaptive (IFS)"], {
+                    "default": "uniform",
+                    "tooltip": "How to select reference frames. 'uniform' = evenly spaced. "
+                               "'adaptive (IFS)' = LongDiff-style Informative Frame Selection: "
+                               "scores each frame by image entropy + temporal change, picks the "
+                               "best per temporal bin. Better for content with uneven motion."
+                }),
             },
             "optional": {
                 "control_video": ("IMAGE", {
@@ -100,7 +160,7 @@ class NV_VacePrePassReference:
 
     def execute(self, positive, negative, vae, width, height, length, batch_size, strength,
                 ref_strength, reference_frames, num_refs_per_chunk, frame_repeat,
-                control_video=None, control_masks=None):
+                ref_sampling="uniform", control_video=None, control_masks=None):
 
         latent_length = ((length - 1) // 4) + 1
 
@@ -108,11 +168,23 @@ class NV_VacePrePassReference:
         total_refs = reference_frames.shape[0]
         num_refs = min(num_refs_per_chunk, total_refs)
 
-        # Uniformly sample frame indices for temporal coverage
         if num_refs >= total_refs:
             ref_indices = list(range(total_refs))
-        else:
+        elif ref_sampling == "uniform":
             ref_indices = torch.linspace(0, total_refs - 1, num_refs).long().tolist()
+        else:
+            # Adaptive (IFS): score all frames, pick best per temporal bin
+            scores = _score_frames_ifs(reference_frames)
+            bin_edges = np.linspace(0, total_refs, num_refs + 1).astype(int)
+            ref_indices = []
+            for i in range(num_refs):
+                start, end = bin_edges[i], bin_edges[i + 1]
+                if start >= end:
+                    start = max(0, end - 1)
+                best_in_bin = start + int(scores[start:end].argmax())
+                ref_indices.append(best_in_bin)
+            print(f"[NV_VacePrePassReference] IFS scores for selected frames: "
+                  f"{', '.join(f'[{idx}]={scores[idx]:.3f}' for idx in ref_indices)}")
 
         sampled_refs = reference_frames[ref_indices]  # [num_refs, H_in, W_in, C]
 
@@ -129,7 +201,7 @@ class NV_VacePrePassReference:
         ref_latent_length = ((total_ref_pixels - 1) // 4) + 1
 
         print(f"[NV_VacePrePassReference] Sampled {num_refs} reference frames "
-              f"(indices: {ref_indices}) from {total_refs} available")
+              f"(indices: {ref_indices}, mode: {ref_sampling}) from {total_refs} available")
         print(f"[NV_VacePrePassReference] Frame repeat {frame_repeat}x -> "
               f"{total_ref_pixels} pixel frames -> {ref_latent_length} latent frames")
 

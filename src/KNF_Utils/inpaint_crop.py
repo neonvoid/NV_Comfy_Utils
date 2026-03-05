@@ -98,13 +98,22 @@ def _build_translation_grid(dx, dy, H, W, device):
     return TF.affine_grid(theta, (1, 1, H, W), align_corners=False)
 
 
-def _stabilize_content_centroid(images, masks_orig, masks_proc):
+def _stabilize_content_centroid(images, masks_orig, masks_proc, stitcher=None,
+                                target_w=None, target_h=None, resize_algorithm='lanczos'):
     """Centroid-lock stabilization: translate each frame to lock mask centroid.
 
+    Uses expand-crop-trim to avoid edge spillage: expands each frame from
+    its stored canvas by the max displacement margin, warps at the expanded
+    resolution, then center-crops back to target size.  All output pixels
+    come from real image content — no padding artifacts.
+
     Args:
-        images: [B, H, W, C] cropped frames
+        images: [B, H, W, C] cropped frames at target resolution
         masks_orig: [B, H, W] original masks
         masks_proc: [B, H, W] processed masks
+        stitcher: STITCHER dict with canvas_image and crop coordinates
+        target_w, target_h: target output dimensions
+        resize_algorithm: algorithm for rescaling expanded crops
 
     Returns:
         (warped_images, warped_masks_orig, warped_masks_proc, warp_data)
@@ -119,6 +128,25 @@ def _stabilize_content_centroid(images, masks_orig, masks_proc):
     ref_cx = float(sorted(cx_smooth)[B // 2])
     ref_cy = float(sorted(cy_smooth)[B // 2])
 
+    # Compute max displacement to determine expansion margin
+    max_dx = max(abs(cx - ref_cx) for cx in cx_smooth)
+    max_dy = max(abs(cy - ref_cy) for cy in cy_smooth)
+    margin = int(math.ceil(max(max_dx, max_dy))) + 1
+
+    # Determine target dimensions
+    tw = target_w if target_w is not None else W
+    th = target_h if target_h is not None else H
+
+    # Can we do expand-crop-trim? Need stitcher with canvas data.
+    use_expansion = (margin > 0 and stitcher is not None
+                     and len(stitcher.get('canvas_image', [])) == B)
+
+    if use_expansion:
+        expanded_w = tw + 2 * margin
+        expanded_h = th + 2 * margin
+    else:
+        expanded_w, expanded_h = W, H
+
     warp_data = []
     warped_imgs, warped_mo, warped_mp = [], [], []
 
@@ -127,24 +155,93 @@ def _stabilize_content_centroid(images, masks_orig, masks_proc):
         dy = cy_smooth[b] - ref_cy
         warp_data.append({"dx": dx, "dy": dy})
 
-        grid = _build_translation_grid(dx, dy, H, W, device)
+        if use_expansion:
+            # Expand: re-crop a larger region from the stored canvas
+            canvas = stitcher['canvas_image'][b].to(device)
+            if canvas.dim() == 3:
+                canvas = canvas.unsqueeze(0)  # [1, H_c, W_c, C]
+            ctc_x = stitcher['cropped_to_canvas_x'][b]
+            ctc_y = stitcher['cropped_to_canvas_y'][b]
+            ctc_w = stitcher['cropped_to_canvas_w'][b]
+            ctc_h = stitcher['cropped_to_canvas_h'][b]
+            canvas_h, canvas_w = canvas.shape[1], canvas.shape[2]
 
-        # Warp image [1,C,H,W]
-        img_nchw = images[b:b+1].permute(0, 3, 1, 2)
-        wi = TF.grid_sample(img_nchw, grid, mode='bilinear', padding_mode='border', align_corners=False)
+            # Margin in canvas-space pixels
+            mcx = int(math.ceil(margin * ctc_w / tw)) + 1
+            mcy = int(math.ceil(margin * ctc_h / th)) + 1
+
+            # Desired expanded region in canvas space (may exceed canvas bounds)
+            want_ex = ctc_x - mcx
+            want_ey = ctc_y - mcy
+            want_ex2 = ctc_x + ctc_w + mcx
+            want_ey2 = ctc_y + ctc_h + mcy
+
+            # Clamp to available canvas
+            avail_ex = max(0, want_ex)
+            avail_ey = max(0, want_ey)
+            avail_ex2 = min(canvas_w, want_ex2)
+            avail_ey2 = min(canvas_h, want_ey2)
+
+            # Compute padding needed where canvas falls short
+            pad_l = avail_ex - want_ex   # pixels missing on left
+            pad_t = avail_ey - want_ey   # pixels missing on top
+            pad_r = want_ex2 - avail_ex2  # pixels missing on right
+            pad_b = want_ey2 - avail_ey2  # pixels missing on bottom
+
+            # Crop available region from canvas
+            exp_img = canvas[:, avail_ey:avail_ey2, avail_ex:avail_ex2, :]
+
+            # Pad with zeros where canvas didn't have content (preserves spatial layout)
+            if pad_l > 0 or pad_r > 0 or pad_t > 0 or pad_b > 0:
+                # TF.pad uses (left, right, top, bottom) for last two dims
+                # exp_img is [1, H, W, C] — pad W then H dims
+                exp_img = exp_img.permute(0, 3, 1, 2)  # [1, C, H, W]
+                exp_img = TF.pad(exp_img, (pad_l, pad_r, pad_t, pad_b),
+                                 mode='constant', value=0)
+                exp_img = exp_img.permute(0, 2, 3, 1)  # [1, H, W, C]
+
+            exp_img = rescale_image(exp_img, expanded_w, expanded_h, resize_algorithm)
+
+            # Masks: pad from target to expanded size (zeros at margins)
+            mo_padded = TF.pad(masks_orig[b].unsqueeze(0).unsqueeze(0),
+                               (margin, margin, margin, margin),
+                               mode='constant', value=0).squeeze(0).squeeze(0)
+            mp_padded = TF.pad(masks_proc[b].unsqueeze(0).unsqueeze(0),
+                               (margin, margin, margin, margin),
+                               mode='constant', value=0).squeeze(0).squeeze(0)
+
+            img_nchw = exp_img.permute(0, 3, 1, 2)  # [1, C, eH, eW]
+            mo_4d = mo_padded.unsqueeze(0).unsqueeze(0)  # [1, 1, eH, eW]
+            mp_4d = mp_padded.unsqueeze(0).unsqueeze(0)
+        else:
+            # Fallback: warp in-place with zeros padding
+            img_nchw = images[b:b+1].permute(0, 3, 1, 2)
+            mo_4d = masks_orig[b:b+1].unsqueeze(1)
+            mp_4d = masks_proc[b:b+1].unsqueeze(1)
+
+        grid = _build_translation_grid(dx, dy, expanded_h, expanded_w, device)
+
+        wi = TF.grid_sample(img_nchw, grid, mode='bilinear',
+                            padding_mode='zeros', align_corners=False)
+        wmo = TF.grid_sample(mo_4d, grid, mode='bilinear',
+                             padding_mode='zeros', align_corners=False)
+        wmp = TF.grid_sample(mp_4d, grid, mode='bilinear',
+                             padding_mode='zeros', align_corners=False)
+
+        if use_expansion:
+            # Trim: center-crop back to target resolution
+            wi = wi[:, :, margin:margin+th, margin:margin+tw]
+            wmo = wmo[:, :, margin:margin+th, margin:margin+tw]
+            wmp = wmp[:, :, margin:margin+th, margin:margin+tw]
+
         warped_imgs.append(wi.permute(0, 2, 3, 1).squeeze(0))
-
-        # Warp masks [1,1,H,W]
-        mo_4d = masks_orig[b:b+1].unsqueeze(1)
-        wmo = TF.grid_sample(mo_4d, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
         warped_mo.append(wmo.squeeze(0).squeeze(0))
-
-        mp_4d = masks_proc[b:b+1].unsqueeze(1)
-        wmp = TF.grid_sample(mp_4d, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
         warped_mp.append(wmp.squeeze(0).squeeze(0))
 
     max_disp = max(max(abs(d["dx"]) for d in warp_data), max(abs(d["dy"]) for d in warp_data))
-    print(f"[ContentStabilize/centroid] {B} frames, ref=({ref_cx:.1f},{ref_cy:.1f}), max_disp={max_disp:.1f}px")
+    mode_str = "expand-crop-trim" if use_expansion else "fallback-zeros"
+    print(f"[ContentStabilize/centroid] {B} frames, ref=({ref_cx:.1f},{ref_cy:.1f}), "
+          f"max_disp={max_disp:.1f}px, margin={margin}px ({mode_str})")
 
     return (torch.stack(warped_imgs), torch.stack(warped_mo), torch.stack(warped_mp), warp_data)
 
@@ -258,7 +355,7 @@ def _stabilize_content_flow(images, masks_orig, masks_proc):
         # needs backward mapping ref→src, so we sample from src at (x - flow_x))
         neg_flow = -flow
         img_nchw_b = images[b:b+1].permute(0, 3, 1, 2)
-        wi = _warp_with_flow(img_nchw_b, neg_flow, padding_mode='border')
+        wi = _warp_with_flow(img_nchw_b, neg_flow, padding_mode='reflection')
         warped_imgs.append(wi.permute(0, 2, 3, 1).squeeze(0))
 
         # Warp masks
@@ -1101,7 +1198,9 @@ class NV_InpaintCrop:
         if content_stabilize != "off" and result_images.shape[0] > 1:
             if content_stabilize == "centroid":
                 result_images, result_masks_original, result_masks_processed, warp_data = \
-                    _stabilize_content_centroid(result_images, result_masks_original, result_masks_processed)
+                    _stabilize_content_centroid(result_images, result_masks_original, result_masks_processed,
+                                               stitcher=stitcher, target_w=target_width, target_h=target_height,
+                                               resize_algorithm=resize_algorithm)
             else:
                 result_images, result_masks_original, result_masks_processed, warp_data = \
                     _stabilize_content_flow(result_images, result_masks_original, result_masks_processed)
