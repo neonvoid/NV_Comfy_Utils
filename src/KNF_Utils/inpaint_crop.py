@@ -686,19 +686,22 @@ def crop_for_inpaint(image, original_mask, processed_mask, bbox_x, bbox_y, bbox_
     target_aspect = target_w / target_h
     bbox_aspect = bbox_w / bbox_h
 
-    # Grow bbox to match target aspect ratio
+    # Grow bbox to match target aspect ratio, centered on bbox center.
+    # Use float center to avoid ±1px oscillation from integer division.
+    bbox_cx = bbox_x + bbox_w / 2.0
+    bbox_cy = bbox_y + bbox_h / 2.0
+
     if bbox_aspect < target_aspect:
         # Need wider - grow width
-        new_w = int(bbox_h * target_aspect)
+        new_w = int(round(bbox_h * target_aspect))
         new_h = bbox_h
-        new_x = bbox_x - (new_w - bbox_w) // 2
-        new_y = bbox_y
     else:
         # Need taller - grow height
         new_w = bbox_w
-        new_h = int(bbox_w / target_aspect)
-        new_x = bbox_x
-        new_y = bbox_y - (new_h - bbox_h) // 2
+        new_h = int(round(bbox_w / target_aspect))
+
+    new_x = int(round(bbox_cx - new_w / 2.0))
+    new_y = int(round(bbox_cy - new_h / 2.0))
 
     # Try to keep within image bounds by shifting
     if new_x < 0 and new_x + new_w <= img_w:
@@ -1141,7 +1144,13 @@ class NV_InpaintCrop:
                 int(union_x_max - union_x_min), int(union_y_max - union_y_min))
 
     def _stabilize_bboxes(self, bboxes, mode, window_size):
-        """Apply temporal stabilization to bounding box sequence."""
+        """Apply temporal stabilization to bounding box sequence.
+
+        Smooths bbox CENTER and dimensions independently, then derives
+        corner positions from the smoothed center.  This prevents the
+        ±1px A-B-A-B oscillation caused by integer-division centering
+        when x/y/w/h are smoothed and rounded separately.
+        """
         valid_indices = [i for i, b in enumerate(bboxes) if b is not None]
 
         if len(valid_indices) <= 1:
@@ -1152,38 +1161,37 @@ class NV_InpaintCrop:
         ws = [bboxes[i][2] for i in valid_indices]
         hs = [bboxes[i][3] for i in valid_indices]
 
+        # Convert corner+size → center+size (float)
+        cxs = [x + w / 2.0 for x, w in zip(xs, ws)]
+        cys = [y + h / 2.0 for y, h in zip(ys, hs)]
+
         if mode == "smooth":
-            xs = [int(round(v)) for v in gaussian_smooth_1d(xs, window_size)]
-            ys = [int(round(v)) for v in gaussian_smooth_1d(ys, window_size)]
+            cxs = list(gaussian_smooth_1d(cxs, window_size))
+            cys = list(gaussian_smooth_1d(cys, window_size))
             ws = [int(round(v)) for v in gaussian_smooth_1d(ws, window_size)]
             hs = [int(round(v)) for v in gaussian_smooth_1d(hs, window_size)]
 
         elif mode == "lock_first":
             ref_w, ref_h = ws[0], hs[0]
-            for idx in range(len(valid_indices)):
-                center_x = xs[idx] + ws[idx] // 2
-                center_y = ys[idx] + hs[idx] // 2
-                ws[idx] = ref_w
-                hs[idx] = ref_h
-                xs[idx] = center_x - ref_w // 2
-                ys[idx] = center_y - ref_h // 2
+            # Centers already computed above; just lock dimensions
+            ws = [ref_w] * len(valid_indices)
+            hs = [ref_h] * len(valid_indices)
 
         elif mode == "lock_largest":
             max_w = max(ws)
             max_h = max(hs)
-            for idx in range(len(valid_indices)):
-                center_x = xs[idx] + ws[idx] // 2
-                center_y = ys[idx] + hs[idx] // 2
-                ws[idx] = max_w
-                hs[idx] = max_h
-                xs[idx] = center_x - max_w // 2
-                ys[idx] = center_y - max_h // 2
+            ws = [max_w] * len(valid_indices)
+            hs = [max_h] * len(valid_indices)
 
         elif mode == "median":
-            xs = [int(round(v)) for v in median_filter_1d(xs, window_size)]
-            ys = [int(round(v)) for v in median_filter_1d(ys, window_size)]
+            cxs = list(median_filter_1d(cxs, window_size))
+            cys = list(median_filter_1d(cys, window_size))
             ws = [int(round(v)) for v in median_filter_1d(ws, window_size)]
             hs = [int(round(v)) for v in median_filter_1d(hs, window_size)]
+
+        # Derive corner from smoothed center — round position LAST
+        xs = [int(round(cx - w / 2.0)) for cx, w in zip(cxs, ws)]
+        ys = [int(round(cy - h / 2.0)) for cy, h in zip(cys, hs)]
 
         result = list(bboxes)
         for idx, i in enumerate(valid_indices):
