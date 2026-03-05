@@ -20,6 +20,259 @@ import numpy as np
 import scipy.ndimage
 from scipy.ndimage import gaussian_filter1d, median_filter
 import torchvision.transforms.v2 as T
+import torch.nn.functional as TF
+
+from .mask_tracking_bbox import one_euro_smooth_1d
+
+
+# =============================================================================
+# Content Stabilization (within-crop pixel locking)
+# =============================================================================
+
+def _compute_mask_centroids(masks):
+    """Compute weighted centroid per frame from cropped masks [B, H, W]."""
+    B, H, W = masks.shape
+    cx_list, cy_list, valid = [], [], []
+    ys = torch.arange(H, device=masks.device, dtype=masks.dtype)
+    xs = torch.arange(W, device=masks.device, dtype=masks.dtype)
+
+    for b in range(B):
+        m = masks[b]
+        total = m.sum()
+        if total < 1.0:
+            valid.append(False)
+            cx_list.append(W / 2.0)
+            cy_list.append(H / 2.0)
+        else:
+            cy = float((m.sum(dim=1) * ys).sum() / total)
+            cx = float((m.sum(dim=0) * xs).sum() / total)
+            valid.append(True)
+            cx_list.append(cx)
+            cy_list.append(cy)
+
+    # Forward/backward fill invalid frames
+    last = None
+    for i in range(B):
+        if valid[i]:
+            last = (cx_list[i], cy_list[i])
+        elif last is not None:
+            cx_list[i], cy_list[i] = last
+    last = None
+    for i in range(B - 1, -1, -1):
+        if valid[i]:
+            last = (cx_list[i], cy_list[i])
+        elif last is not None:
+            cx_list[i], cy_list[i] = last
+
+    return cx_list, cy_list, valid
+
+
+def _smooth_centroid_trajectory(cx_list, cy_list, valid):
+    """Smooth centroid trajectory using Kalman+RTS (>=10 frames) or One-Euro."""
+    B = len(cx_list)
+    if B <= 2:
+        return cx_list, cy_list
+
+    if B >= 10:
+        from .kalman_rts_smoother import kalman_rts_smooth
+        # Fake-bbox trick: x1=cx, x2=cx+1 — only position matters
+        x2s = [cx + 1.0 for cx in cx_list]
+        y2s = [cy + 1.0 for cy in cy_list]
+        sx1, sy1, _, _ = kalman_rts_smooth(
+            cx_list, cy_list, x2s, y2s, valid,
+            q_pos=4.0, q_dim=0.01, r_pos=9.0, r_dim=0.01
+        )
+        return sx1, sy1
+
+    # Short sequences: One-Euro
+    return one_euro_smooth_1d(cx_list, 0.05, 0.7), one_euro_smooth_1d(cy_list, 0.05, 0.7)
+
+
+def _build_translation_grid(dx, dy, H, W, device):
+    """Build affine_grid for pure translation. dx/dy in pixels."""
+    norm_dx = 2.0 * dx / W
+    norm_dy = 2.0 * dy / H
+    theta = torch.tensor([
+        [1.0, 0.0, norm_dx],
+        [0.0, 1.0, norm_dy]
+    ], device=device, dtype=torch.float32).unsqueeze(0)
+    return TF.affine_grid(theta, (1, 1, H, W), align_corners=False)
+
+
+def _stabilize_content_centroid(images, masks_orig, masks_proc):
+    """Centroid-lock stabilization: translate each frame to lock mask centroid.
+
+    Args:
+        images: [B, H, W, C] cropped frames
+        masks_orig: [B, H, W] original masks
+        masks_proc: [B, H, W] processed masks
+
+    Returns:
+        (warped_images, warped_masks_orig, warped_masks_proc, warp_data)
+    """
+    B, H, W, C = images.shape
+    device = images.device
+
+    cx_raw, cy_raw, valid = _compute_mask_centroids(masks_orig)
+    cx_smooth, cy_smooth = _smooth_centroid_trajectory(cx_raw, cy_raw, valid)
+
+    # Reference = temporal median
+    ref_cx = float(sorted(cx_smooth)[B // 2])
+    ref_cy = float(sorted(cy_smooth)[B // 2])
+
+    warp_data = []
+    warped_imgs, warped_mo, warped_mp = [], [], []
+
+    for b in range(B):
+        dx = ref_cx - cx_smooth[b]
+        dy = ref_cy - cy_smooth[b]
+        warp_data.append({"dx": dx, "dy": dy})
+
+        grid = _build_translation_grid(dx, dy, H, W, device)
+
+        # Warp image [1,C,H,W]
+        img_nchw = images[b:b+1].permute(0, 3, 1, 2)
+        wi = TF.grid_sample(img_nchw, grid, mode='bilinear', padding_mode='border', align_corners=False)
+        warped_imgs.append(wi.permute(0, 2, 3, 1).squeeze(0))
+
+        # Warp masks [1,1,H,W]
+        mo_4d = masks_orig[b:b+1].unsqueeze(1)
+        wmo = TF.grid_sample(mo_4d, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
+        warped_mo.append(wmo.squeeze(0).squeeze(0))
+
+        mp_4d = masks_proc[b:b+1].unsqueeze(1)
+        wmp = TF.grid_sample(mp_4d, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
+        warped_mp.append(wmp.squeeze(0).squeeze(0))
+
+    max_disp = max(max(abs(d["dx"]) for d in warp_data), max(abs(d["dy"]) for d in warp_data))
+    print(f"[ContentStabilize/centroid] {B} frames, ref=({ref_cx:.1f},{ref_cy:.1f}), max_disp={max_disp:.1f}px")
+
+    return (torch.stack(warped_imgs), torch.stack(warped_mo), torch.stack(warped_mp), warp_data)
+
+
+# Module-level RAFT model cache
+_raft_model = None
+
+
+def _get_raft_model(device):
+    """Lazy-load and cache RAFT-small model."""
+    global _raft_model
+    if _raft_model is None:
+        from torchvision.models.optical_flow import raft_small, Raft_Small_Weights
+        _raft_model = raft_small(weights=Raft_Small_Weights.DEFAULT)
+        _raft_model.eval()
+        print("[ContentStabilize/flow] Loaded RAFT-small model")
+    return _raft_model.to(device)
+
+
+def _warp_with_flow(img_nchw, flow, padding_mode='border'):
+    """Warp image using optical flow field.
+
+    Args:
+        img_nchw: [1, C, H, W]
+        flow: [1, 2, H, W] or [2, H, W] — (dx, dy) pixel displacement
+    """
+    if flow.dim() == 3:
+        flow = flow.unsqueeze(0)
+    _, _, H, W = img_nchw.shape
+    device = img_nchw.device
+
+    y = torch.arange(H, device=device, dtype=torch.float32)
+    x = torch.arange(W, device=device, dtype=torch.float32)
+    yy, xx = torch.meshgrid(y, x, indexing='ij')
+
+    xx_warped = xx + flow[0, 0]
+    yy_warped = yy + flow[0, 1]
+
+    # Normalize to [-1, 1]
+    xx_norm = 2.0 * xx_warped / (W - 1) - 1.0
+    yy_norm = 2.0 * yy_warped / (H - 1) - 1.0
+    grid = torch.stack([xx_norm, yy_norm], dim=-1).unsqueeze(0)
+
+    return TF.grid_sample(img_nchw, grid, mode='bilinear', padding_mode=padding_mode, align_corners=True)
+
+
+def _stabilize_content_flow(images, masks_orig, masks_proc):
+    """Optical flow stabilization: RAFT-based alignment to reference frame.
+
+    Args:
+        images: [B, H, W, C] cropped frames
+        masks_orig: [B, H, W]
+        masks_proc: [B, H, W]
+
+    Returns:
+        (warped_images, warped_masks_orig, warped_masks_proc, warp_data)
+    """
+    B, H, W, C = images.shape
+    device = images.device
+    ref_idx = B // 2
+
+    # Convert to NCHW [0,255] for RAFT
+    imgs_nchw = images.permute(0, 3, 1, 2) * 255.0  # [B, C, H, W]
+
+    # Pad to multiple of 8 if needed
+    pad_h = (8 - H % 8) % 8
+    pad_w = (8 - W % 8) % 8
+    if pad_h > 0 or pad_w > 0:
+        imgs_nchw = TF.pad(imgs_nchw, (0, pad_w, 0, pad_h), mode='replicate')
+
+    model = _get_raft_model(device)
+
+    # Compute pairwise forward flows
+    pairwise_flows = []
+    with torch.no_grad():
+        for i in range(B - 1):
+            flow_list = model(imgs_nchw[i:i+1], imgs_nchw[i+1:i+1+1])
+            flow = flow_list[-1]  # [1, 2, H_pad, W_pad]
+            # Crop back to original size
+            if pad_h > 0 or pad_w > 0:
+                flow = flow[:, :, :H, :W]
+            pairwise_flows.append(flow.squeeze(0))  # [2, H, W]
+
+    # Accumulate flow to reference frame
+    accumulated = []
+    for i in range(B):
+        if i == ref_idx:
+            accumulated.append(torch.zeros(2, H, W, device=device))
+        elif i < ref_idx:
+            # Chain forward: frame i → i+1 → ... → ref
+            acc = torch.zeros(2, H, W, device=device)
+            for j in range(i, ref_idx):
+                acc = acc + pairwise_flows[j]
+            accumulated.append(acc)
+        else:
+            # Chain backward: frame i → i-1 → ... → ref (negate forward flows)
+            acc = torch.zeros(2, H, W, device=device)
+            for j in range(ref_idx, i):
+                acc = acc - pairwise_flows[j]
+            accumulated.append(acc)
+
+    # Warp all frames to reference
+    warp_data = []
+    warped_imgs, warped_mo, warped_mp = [], [], []
+
+    for b in range(B):
+        flow = accumulated[b]
+        warp_data.append({"flow": flow.cpu()})  # Store on CPU for stitcher
+
+        # Warp image
+        img_nchw_b = images[b:b+1].permute(0, 3, 1, 2)
+        wi = _warp_with_flow(img_nchw_b, flow, padding_mode='border')
+        warped_imgs.append(wi.permute(0, 2, 3, 1).squeeze(0))
+
+        # Warp masks
+        mo_4d = masks_orig[b:b+1].unsqueeze(1)
+        wmo = _warp_with_flow(mo_4d, flow, padding_mode='zeros')
+        warped_mo.append(wmo.squeeze(0).squeeze(0))
+
+        mp_4d = masks_proc[b:b+1].unsqueeze(1)
+        wmp = _warp_with_flow(mp_4d, flow, padding_mode='zeros')
+        warped_mp.append(wmp.squeeze(0).squeeze(0))
+
+    max_flow = max(f.abs().max().item() for f in accumulated)
+    print(f"[ContentStabilize/flow] {B} frames, ref={ref_idx}, max_flow={max_flow:.1f}px")
+
+    return (torch.stack(warped_imgs), torch.stack(warped_mo), torch.stack(warped_mp), warp_data)
 
 
 # =============================================================================
@@ -630,6 +883,13 @@ class NV_InpaintCrop:
                                "Ensures a smooth, non-jarring crop canvas for inpaint workflows. "
                                "0.0 = disabled. 1.0 = strict. 1.5 = moderate (recommended). 3.0 = lenient."
                 }),
+                "content_stabilize": (["off", "centroid", "optical_flow"], {
+                    "default": "off",
+                    "tooltip": "Stabilize content WITHIN the crop to pixel-lock the subject for denoise. "
+                               "off: no content warp. "
+                               "centroid: translate to lock mask centroid (fast, translation only). "
+                               "optical_flow: RAFT-based alignment (slower, handles rotation + deformation)."
+                }),
             }
         }
 
@@ -643,7 +903,7 @@ class NV_InpaintCrop:
              padding_multiple, mask_erode_dilate, mask_fill_holes, mask_remove_noise,
              mask_smooth, stitch_source, mask_blend_pixels, resize_algorithm,
              bounding_box_mask=None, stabilize_crop=False, stabilization_mode="smooth",
-             smooth_window=5, anomaly_threshold=1.5):
+             smooth_window=5, anomaly_threshold=1.5, content_stabilize="off"):
 
         padding_multiple = int(padding_multiple)
         device = comfy.model_management.get_torch_device()
@@ -832,6 +1092,18 @@ class NV_InpaintCrop:
         result_images = torch.stack(result_images, dim=0)
         result_masks_original = torch.stack(result_masks_original, dim=0)
         result_masks_processed = torch.stack(result_masks_processed, dim=0)
+
+        # Content stabilization: warp pixels within crop to lock subject
+        if content_stabilize != "off" and result_images.shape[0] > 1:
+            if content_stabilize == "centroid":
+                result_images, result_masks_original, result_masks_processed, warp_data = \
+                    _stabilize_content_centroid(result_images, result_masks_original, result_masks_processed)
+            else:
+                result_images, result_masks_original, result_masks_processed, warp_data = \
+                    _stabilize_content_flow(result_images, result_masks_original, result_masks_processed)
+            stitcher['content_warp_mode'] = content_stabilize
+            stitcher['content_warp_data'] = warp_data
+            info_lines.append(f"Content stabilization: {content_stabilize} ({len(warp_data)} frames)")
 
         out_h, out_w = result_images.shape[1], result_images.shape[2]
         info_lines.append(f"Output: {result_images.shape[0]} frames @ {out_w}x{out_h}")

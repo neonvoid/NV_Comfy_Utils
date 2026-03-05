@@ -1,14 +1,19 @@
 """
-NV Pixel-to-Latent Stitcher — Converts a pixel STITCHER (from NV_InpaintCrop2)
-into a LATENT_STITCHER for use with NV_LatentInpaintStitch.
+NV Pixel-to-Latent Stitcher — DEPRECATED / BROKEN
 
-Enables latent-space stitching using pixel-space crop coordinates as the single
-source of truth, eliminating coordinate mismatches between pixel and latent crop nodes.
+DO NOT USE. This node has a fundamental flaw: InpaintCrop2 crops per-frame at
+varying sizes/positions (stabilization), then resizes each to 512x512 at different
+magnifications. This node computes a static union bbox and tries to paste the
+KSampler output at that union size. But the content was generated at per-frame
+magnification, not union magnification → face pasted at wrong scale (~30% too large).
 
-Workflow:
-  InpaintCrop2 → stitcher → PixelToLatentStitcher → LATENT_STITCHER → LatentInpaintStitch
-                                    ↑                                         ↑
-                 full-scene latent ──┘                   KSampler output ──────┘
+5D latent paste is static (same crop for all frames). Per-frame pixel crops have
+varying spatial layouts. These are structurally incompatible.
+
+CORRECT APPROACH: Use NV_LatentInpaintCrop for latent crop+stitch (static union,
+consistent scale). Use InpaintCrop2 only for pixel-space VACE conditioning.
+
+Kept for reference only. Will print a deprecation warning if executed.
 """
 
 import torch
@@ -52,6 +57,20 @@ class NV_PixelToLatentStitcher:
     )
 
     def execute(self, stitcher, latent):
+        import warnings
+        warnings.warn(
+            "[NV_PixelToLatentStitcher] DEPRECATED — this node produces wrong scale/position. "
+            "Use NV_LatentInpaintCrop for latent crop+stitch instead. "
+            "InpaintCrop2 should only be used for pixel-space VACE conditioning.",
+            DeprecationWarning, stacklevel=2
+        )
+        print(
+            "\n⚠️  [NV_PixelToLatentStitcher] WARNING: This node is BROKEN and DEPRECATED.\n"
+            "    Per-frame pixel crops have varying magnification that cannot map to static\n"
+            "    latent union paste → face will be pasted at WRONG SCALE.\n"
+            "    Use NV_LatentInpaintCrop for latent crop+stitch instead.\n"
+        )
+
         intermediate = comfy.model_management.intermediate_device()
         samples = latent["samples"]
         info_lines = []

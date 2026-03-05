@@ -14,9 +14,74 @@ reinserts the original frames at their correct positions in the output batch.
 """
 
 import torch
+import torch.nn.functional as TF
 import comfy.model_management
 
 from .inpaint_crop import rescale_image, rescale_mask
+
+
+# =============================================================================
+# Inverse Content Warp
+# =============================================================================
+
+def _inverse_content_warp(image, mask, warp_mode, warp_entry):
+    """Apply inverse content warp to undo crop stabilization before blending.
+
+    Args:
+        image: [1, H, W, C] — resized inpainted crop.
+        mask: [1, H, W, 1] — blend mask (already clamped+expanded).
+        warp_mode: 'centroid' or 'optical_flow'.
+        warp_entry: dict with warp data for this frame.
+
+    Returns:
+        (image, mask) with inverse warp applied.
+    """
+    device = image.device
+    _, H, W, C = image.shape
+
+    if warp_mode == "centroid":
+        dx = -warp_entry["dx"]
+        dy = -warp_entry["dy"]
+        norm_dx = 2.0 * dx / W
+        norm_dy = 2.0 * dy / H
+        theta = torch.tensor([
+            [1.0, 0.0, norm_dx],
+            [0.0, 1.0, norm_dy]
+        ], device=device, dtype=torch.float32).unsqueeze(0)
+        grid = TF.affine_grid(theta, (1, 1, H, W), align_corners=False)
+
+        img_nchw = image.permute(0, 3, 1, 2)
+        image = TF.grid_sample(img_nchw, grid, mode='bilinear',
+                               padding_mode='border', align_corners=False).permute(0, 2, 3, 1)
+
+        mask_nchw = mask.permute(0, 3, 1, 2)
+        mask = TF.grid_sample(mask_nchw, grid, mode='bilinear',
+                              padding_mode='zeros', align_corners=False).permute(0, 2, 3, 1)
+
+    elif warp_mode == "optical_flow":
+        flow = -warp_entry["flow"].to(device)  # Negate flow for inverse
+        if flow.dim() == 3:
+            flow = flow.unsqueeze(0)
+
+        y = torch.arange(H, device=device, dtype=torch.float32)
+        x = torch.arange(W, device=device, dtype=torch.float32)
+        yy, xx = torch.meshgrid(y, x, indexing='ij')
+
+        xx_warped = xx + flow[0, 0]
+        yy_warped = yy + flow[0, 1]
+        xx_norm = 2.0 * xx_warped / (W - 1) - 1.0
+        yy_norm = 2.0 * yy_warped / (H - 1) - 1.0
+        grid = torch.stack([xx_norm, yy_norm], dim=-1).unsqueeze(0)
+
+        img_nchw = image.permute(0, 3, 1, 2)
+        image = TF.grid_sample(img_nchw, grid, mode='bilinear',
+                               padding_mode='border', align_corners=True).permute(0, 2, 3, 1)
+
+        mask_nchw = mask.permute(0, 3, 1, 2)
+        mask = TF.grid_sample(mask_nchw, grid, mode='bilinear',
+                              padding_mode='zeros', align_corners=True).permute(0, 2, 3, 1)
+
+    return image, mask
 
 
 # =============================================================================
@@ -26,7 +91,8 @@ from .inpaint_crop import rescale_image, rescale_mask
 def stitch_single_frame(canvas_image, inpainted_image, mask,
                         ctc_x, ctc_y, ctc_w, ctc_h,
                         cto_x, cto_y, cto_w, cto_h,
-                        resize_algorithm):
+                        resize_algorithm,
+                        warp_mode=None, warp_entry=None):
     """Blend one inpainted crop back into its canvas and extract the original region.
 
     Args:
@@ -36,6 +102,8 @@ def stitch_single_frame(canvas_image, inpainted_image, mask,
         ctc_x/y/w/h: Where the crop sits on the canvas.
         cto_x/y/w/h: Where the original image sits on the canvas.
         resize_algorithm: Interpolation method for resizing crop back to canvas scale.
+        warp_mode: Optional content warp mode ('centroid' or 'optical_flow').
+        warp_entry: Optional per-frame warp data dict.
 
     Returns:
         [1, cto_h, cto_w, C] output image (original image region with inpainted area blended in).
@@ -61,6 +129,12 @@ def stitch_single_frame(canvas_image, inpainted_image, mask,
 
     # Clamp mask and expand to match image channels
     resized_mask = resized_mask.clamp(0, 1).unsqueeze(-1)  # [1, H, W, 1]
+
+    # Inverse content warp: undo crop stabilization before blending
+    if warp_mode is not None and warp_entry is not None:
+        resized_image, resized_mask = _inverse_content_warp(
+            resized_image, resized_mask, warp_mode, warp_entry
+        )
 
     # Extract canvas region, blend, paste back
     canvas_crop = canvas_image[:, ctc_y:ctc_y + ctc_h, ctc_x:ctc_x + ctc_w, :]
@@ -116,6 +190,10 @@ class NV_InpaintStitch:
         original_frames = stitcher.get('original_frames', [])
         total_frames = stitcher.get('total_frames', inpainted_image.shape[0])
 
+        # Content warp data (backward-compatible — absent in old stitchers)
+        content_warp_mode = stitcher.get('content_warp_mode', None)
+        content_warp_data = stitcher.get('content_warp_data', None)
+
         results = []
 
         if len(skipped_indices) == 0:
@@ -126,6 +204,7 @@ class NV_InpaintStitch:
 
             for b in range(batch_size):
                 idx = 0 if single_stitcher else b
+                warp_entry = content_warp_data[idx] if (content_warp_data and not single_stitcher) else None
                 out = stitch_single_frame(
                     stitcher['canvas_image'][idx].to(device),
                     inpainted_image[b:b+1].to(device),
@@ -139,6 +218,8 @@ class NV_InpaintStitch:
                     stitcher['canvas_to_orig_w'][idx],
                     stitcher['canvas_to_orig_h'][idx],
                     resize_algorithm,
+                    warp_mode=content_warp_mode,
+                    warp_entry=warp_entry,
                 )
                 results.append(out.squeeze(0).to(intermediate))
         else:
@@ -151,6 +232,7 @@ class NV_InpaintStitch:
                     results.append(original_frames[original_idx].to(intermediate))
                     original_idx += 1
                 else:
+                    warp_entry = content_warp_data[inpainted_idx] if content_warp_data else None
                     out = stitch_single_frame(
                         stitcher['canvas_image'][inpainted_idx].to(device),
                         inpainted_image[inpainted_idx:inpainted_idx+1].to(device),
@@ -164,6 +246,8 @@ class NV_InpaintStitch:
                         stitcher['canvas_to_orig_w'][inpainted_idx],
                         stitcher['canvas_to_orig_h'][inpainted_idx],
                         resize_algorithm,
+                        warp_mode=content_warp_mode,
+                        warp_entry=warp_entry,
                     )
                     results.append(out.squeeze(0).to(intermediate))
                     inpainted_idx += 1
