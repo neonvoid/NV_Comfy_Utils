@@ -22,8 +22,6 @@ from scipy.ndimage import gaussian_filter1d, median_filter
 import torchvision.transforms.v2 as T
 import torch.nn.functional as TF
 
-from .mask_tracking_bbox import one_euro_smooth_1d
-
 
 # =============================================================================
 # Content Stabilization (within-crop pixel locking)
@@ -84,7 +82,8 @@ def _smooth_centroid_trajectory(cx_list, cy_list, valid):
         )
         return sx1, sy1
 
-    # Short sequences: One-Euro
+    # Short sequences: One-Euro (lazy import to avoid circular dependency)
+    from .mask_tracking_bbox import one_euro_smooth_1d
     return one_euro_smooth_1d(cx_list, 0.05, 0.7), one_euro_smooth_1d(cy_list, 0.05, 0.7)
 
 
