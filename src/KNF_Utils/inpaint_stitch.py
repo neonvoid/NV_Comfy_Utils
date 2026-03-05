@@ -120,12 +120,16 @@ def stitch_single_frame(canvas_image, inpainted_image, mask,
 
     # Inverse content warp BEFORE resize: dx/dy are in the crop's working resolution
     # (target res from InpaintCrop), so must be applied before downsizing to canvas scale.
+    # Only warp the IMAGE, not the blend mask — the mask was created at InpaintCrop time
+    # in original (non-stabilized) coordinates and was never forward-warped by CoTrackerBridge.
+    # After inverse-warping the image back to original coordinates, the mask already aligns.
     if warp_mode is not None and warp_entry is not None:
-        mask_4d = mask.clamp(0, 1).unsqueeze(-1)  # [1, H, W, 1]
-        inpainted_image, mask_4d = _inverse_content_warp(
-            inpainted_image, mask_4d, warp_mode, warp_entry
+        # Create a dummy mask (all-ones) for the warp function signature — we discard it
+        dummy_mask = torch.ones(1, inpainted_image.shape[1], inpainted_image.shape[2], 1,
+                                device=device, dtype=inpainted_image.dtype)
+        inpainted_image, _ = _inverse_content_warp(
+            inpainted_image, dummy_mask, warp_mode, warp_entry
         )
-        mask = mask_4d.squeeze(-1)  # back to [1, H, W]
 
     # Resize inpainted image and mask to canvas crop size
     _, h, w, _ = inpainted_image.shape
