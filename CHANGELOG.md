@@ -18,6 +18,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- NV_MaskProcessingConfig — shared config bus for mask processing parameters. Connect to InpaintCrop2, LatentInpaintCrop, MaskPipelineViz, or VaceControlVideoPrep to ensure identical mask settings across the pipeline. Fully backward compatible (optional input, nodes work as before when disconnected).
+- NV_MaskPipelineViz: new `mode` selector (grid/batch/video). Batch mode outputs 6 separate images as a clickable batch. Video mode outputs all frames for a single selected stage for temporal scrub.
+- NV_MaskPipelineViz: new `cropped_image` + `cropped_mask` optional inputs. Wire from InpaintCrop to preview mask stages on the actual crop the diffusion model sees.
 - NV_PointPicker — interactive point placement node for CoTracker stabilization. Click on features in the cropped image to specify tracking points. Outputs JSON coordinates consumed by NV_CoTrackerBridge. Supports `frame_index` input to pick which video frame to annotate, plus `frame_index`/`total_frames` outputs for downstream chaining.
 - NV_CoTrackerBridge now supports multi-point tracking via `tracking_points` input from NV_PointPicker. Averages trajectories across all tracked points weighted by visibility for more robust stabilization.
 - NV_MaskTrackingBBox: new `ema` smoothing mode — bidirectional exponential moving average with single `alpha` parameter. Zero lag from forward+backward pass averaging.

@@ -246,9 +246,15 @@ class NV_MaskPipelineViz:
                 "bbox_mask": ("MASK", {
                     "tooltip": "Optional bounding box mask from MaskTrackingBBox.",
                 }),
-                "stitcher": ("STITCHER", {
-                    "tooltip": "Optional stitcher from NV_InpaintCrop. When connected, previews the "
-                               "cropped image + mask at the resolution the diffusion model sees."
+                "cropped_image": ("IMAGE", {
+                    "tooltip": "Cropped image from NV_InpaintCrop (cropped_image output). "
+                               "When connected, shows mask stages on the crop the diffusion model sees. "
+                               "Wire: InpaintCrop.cropped_image -> here."
+                }),
+                "cropped_mask": ("MASK", {
+                    "tooltip": "Cropped mask from NV_InpaintCrop (cropped_mask output). "
+                               "Used as the original_mask when previewing the cropped view. "
+                               "Wire: InpaintCrop.cropped_mask -> here."
                 }),
             },
         }
@@ -260,7 +266,7 @@ class NV_MaskPipelineViz:
     DESCRIPTION = (
         "Debug visualization of mask processing stages. "
         "grid: 3x2 contact sheet. batch: 6 clickable images. video: temporal scrub for one stage. "
-        "Connect STITCHER from InpaintCrop to preview the cropped view."
+        "Connect cropped_image + cropped_mask from InpaintCrop to preview the crop the model sees."
     )
 
     def execute(self, image, original_mask, mode, frame_index, video_stage, overlay_alpha,
@@ -268,7 +274,8 @@ class NV_MaskPipelineViz:
                 mask_smooth, mask_blend_pixels,
                 erosion_blocks, feather_blocks, vae_stride,
                 stitch_erosion, stitch_feather,
-                mask_config=None, bbox_mask=None, stitcher=None):
+                mask_config=None, bbox_mask=None,
+                cropped_image=None, cropped_mask=None):
 
         # Apply shared config override if connected
         from .mask_processing_config import apply_mask_config, apply_vace_mask_config
@@ -309,10 +316,11 @@ class NV_MaskPipelineViz:
             stitch_feather=stitch_feather,
         )
 
-        # Resolve image/mask source: stitcher cropped data or raw inputs
-        use_stitcher = stitcher is not None
-        if use_stitcher:
-            src_image, src_mask, src_bbox = self._resolve_stitcher(stitcher, image, original_mask, bbox_mask)
+        # Resolve image/mask source: use cropped inputs if connected, otherwise full-frame
+        if cropped_image is not None and cropped_mask is not None:
+            src_image = cropped_image
+            src_mask = cropped_mask if cropped_mask.dim() == 3 else cropped_mask.unsqueeze(0)
+            src_bbox = None  # bbox doesn't apply to already-cropped images
         else:
             src_image = image
             src_mask = original_mask if original_mask.dim() == 3 else original_mask.unsqueeze(0)
@@ -322,24 +330,6 @@ class NV_MaskPipelineViz:
             return self._mode_video(src_image, src_mask, src_bbox, video_stage, overlay_alpha, mask_kwargs)
         else:
             return self._mode_single_frame(src_image, src_mask, src_bbox, frame_index, overlay_alpha, mask_kwargs, grid=(mode == "grid"))
-
-    def _resolve_stitcher(self, stitcher, image, original_mask, bbox_mask):
-        """Extract cropped image + masks from STITCHER dict.
-        Falls back to raw inputs if stitcher doesn't have the expected data."""
-        # The stitcher stores per-frame cropped data — use the cropped_image output
-        # from InpaintCrop instead. But the stitcher itself stores canvas_image (padded crops)
-        # and cropped_mask_for_blend. We need the actual cropped image from the node outputs.
-        #
-        # Since STITCHER is a metadata dict (not the cropped image itself), we use it to
-        # signal "show the cropped perspective" but still need the cropped image/mask from
-        # the node's IMAGE/MASK outputs. The user should wire:
-        #   InpaintCrop.cropped_image → MaskPipelineViz.image
-        #   InpaintCrop.cropped_mask  → MaskPipelineViz.original_mask
-        #   InpaintCrop.stitcher      → MaskPipelineViz.stitcher (just as a flag + metadata)
-        #
-        # So we just pass through the image/mask inputs but use stitcher presence as context.
-        src_mask = original_mask if original_mask.dim() == 3 else original_mask.unsqueeze(0)
-        return image, src_mask, bbox_mask
 
     def _get_frame_data(self, src_image, src_mask, src_bbox, fi):
         """Extract and validate frame + mask + optional bbox for frame index fi."""

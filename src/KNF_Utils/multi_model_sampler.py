@@ -14,9 +14,11 @@ Cascaded Pipeline Features:
 - start_at_step / end_at_step: Sub-range execution for partial denoising
 """
 
+import gc
 import torch
 import comfy.sample
 import comfy.samplers
+import comfy.model_management
 import comfy.utils
 import latent_preview
 from nodes import common_ksampler
@@ -332,6 +334,15 @@ class NV_MultiModelSampler:
 
             current_latent = result[0]
             current_step = seg_end
+
+            # Free VRAM between models so the next model's LoRA patches can load.
+            # Matches ComfyUI's own pattern in load_models_gpu (model_management.py:782).
+            if i < len(models) - 1:
+                gc.collect()
+                comfy.model_management.soft_empty_cache()
+                if verbose:
+                    free_mem = torch.cuda.mem_get_info(0)[0] / (1024**3)
+                    print(f"[NV_MultiModelSampler] VRAM cleanup between models: {free_mem:.1f} GiB free")
 
         # Strip cascaded config from final output — latent has been denoised
         out = (current_latent,)
