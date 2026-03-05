@@ -985,6 +985,11 @@ class NV_InpaintCrop:
                 }),
             },
             "optional": {
+                "mask_config": ("MASK_PROCESSING_CONFIG", {
+                    "tooltip": "Optional shared config from NV_MaskProcessingConfig. "
+                               "When connected, overrides this node's local mask processing widgets "
+                               "(erode_dilate, fill_holes, remove_noise, smooth, blend_pixels)."
+                }),
                 "bounding_box_mask": ("MASK", {
                     "tooltip": "Optional mask defining minimum crop area. Crop region will encompass this entire mask. "
                                "Use to ensure specific areas are included even if main mask is smaller. "
@@ -1041,9 +1046,24 @@ class NV_InpaintCrop:
     def crop(self, image, mask, target_mode, target_width, target_height, auto_preset,
              padding_multiple, mask_erode_dilate, mask_fill_holes, mask_remove_noise,
              mask_smooth, stitch_source, mask_blend_pixels, resize_algorithm,
-             bounding_box_mask=None, stabilize_crop=False, stabilization_mode="smooth",
-             smooth_window=5, anomaly_threshold=1.5, content_stabilize="off",
-             stabilize_strength=1.0):
+             mask_config=None, bounding_box_mask=None, stabilize_crop=False,
+             stabilization_mode="smooth", smooth_window=5, anomaly_threshold=1.5,
+             content_stabilize="off", stabilize_strength=1.0):
+
+        # Apply shared config override if connected
+        from .mask_processing_config import apply_mask_config
+        vals = apply_mask_config(mask_config,
+            mask_erode_dilate=mask_erode_dilate,
+            mask_fill_holes=mask_fill_holes,
+            mask_remove_noise=mask_remove_noise,
+            mask_smooth=mask_smooth,
+            mask_blend_pixels=mask_blend_pixels,
+        )
+        mask_erode_dilate = vals["mask_erode_dilate"]
+        mask_fill_holes = vals["mask_fill_holes"]
+        mask_remove_noise = vals["mask_remove_noise"]
+        mask_smooth = vals["mask_smooth"]
+        mask_blend_pixels = vals["mask_blend_pixels"]
 
         padding_multiple = int(padding_multiple)
         device = comfy.model_management.get_torch_device()

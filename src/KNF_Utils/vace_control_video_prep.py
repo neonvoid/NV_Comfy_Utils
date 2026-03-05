@@ -236,6 +236,12 @@ class NV_VaceControlVideoPrep:
                 }),
             },
             "optional": {
+                "mask_config": ("MASK_PROCESSING_CONFIG", {
+                    "tooltip": "Optional shared config from NV_MaskProcessingConfig. "
+                               "When connected, overrides VACE erosion/feather, stitch, and "
+                               "mask cleanup widgets (fill_holes, remove_noise, smooth). "
+                               "Note: mask_grow is NOT overridden (different semantics)."
+                }),
                 "bbox_padding": ("FLOAT", {
                     "default": 0.15, "min": 0.0, "max": 1.0, "step": 0.05,
                     "tooltip": "BBox padding as fraction of bbox dimensions (0.15 = 15%). "
@@ -324,11 +330,31 @@ class NV_VaceControlVideoPrep:
     )
 
     def execute(self, image, mask, mask_shape, mode, erosion_blocks, feather_blocks, fill_mode,
-                bbox_padding=0.15, bbox_smooth_frames=5,
+                mask_config=None, bbox_padding=0.15, bbox_smooth_frames=5,
                 fill_value=0.5, threshold=False,
                 mask_grow=0, mask_fill_holes=0, mask_remove_noise=0, mask_smooth=0,
                 vae_stride=8,
                 stitch_source="tight", stitch_erosion=0, stitch_feather=8):
+
+        # Apply shared config override if connected
+        from .mask_processing_config import apply_vace_mask_config
+        vals = apply_vace_mask_config(mask_config,
+            mask_fill_holes=mask_fill_holes,
+            mask_remove_noise=mask_remove_noise,
+            mask_smooth=mask_smooth,
+            erosion_blocks=erosion_blocks,
+            feather_blocks=feather_blocks,
+            stitch_erosion=stitch_erosion,
+            stitch_feather=stitch_feather,
+        )
+        mask_fill_holes = vals["mask_fill_holes"]
+        mask_remove_noise = vals["mask_remove_noise"]
+        mask_smooth = vals["mask_smooth"]
+        erosion_blocks = vals["erosion_blocks"]
+        feather_blocks = vals["feather_blocks"]
+        stitch_erosion = vals["stitch_erosion"]
+        stitch_feather = vals["stitch_feather"]
+
         if mask.dim() == 2:
             mask = mask.unsqueeze(0)
 

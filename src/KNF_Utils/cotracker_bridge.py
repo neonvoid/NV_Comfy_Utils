@@ -12,6 +12,7 @@ Workflow:
   InpaintCrop2 (stabilize=off) -> NV_CoTrackerBridge -> denoise -> InpaintStitch2
 """
 
+import json
 import math
 import torch
 import torch.nn.functional as TF
@@ -125,13 +126,20 @@ class NV_CoTrackerBridge:
             "optional": {
                 "cropped_mask": ("MASK",),
                 "cropped_mask_processed": ("MASK",),
+                "tracking_points": ("STRING", {
+                    "forceInput": True,
+                    "tooltip": "JSON array of {x, y} points from NV_PointPicker. When provided, tracks all points "
+                               "and averages their trajectories for more robust stabilization."
+                }),
                 "query_x": ("FLOAT", {
                     "default": -1.0, "min": -1.0, "max": 8192.0, "step": 0.5,
-                    "tooltip": "Manual query point X in crop pixels. -1 = auto from mask centroid on frame 0."
+                    "tooltip": "Manual query point X in crop pixels. -1 = auto from mask centroid on frame 0. "
+                               "Ignored when tracking_points is connected."
                 }),
                 "query_y": ("FLOAT", {
                     "default": -1.0, "min": -1.0, "max": 8192.0, "step": 0.5,
-                    "tooltip": "Manual query point Y in crop pixels. -1 = auto from mask centroid on frame 0."
+                    "tooltip": "Manual query point Y in crop pixels. -1 = auto from mask centroid on frame 0. "
+                               "Ignored when tracking_points is connected."
                 }),
             }
         }
@@ -150,7 +158,7 @@ class NV_CoTrackerBridge:
 
     def apply_tracking(self, stitcher, cropped_image, strength=1.0,
                        cropped_mask=None, cropped_mask_processed=None,
-                       query_x=-1.0, query_y=-1.0):
+                       tracking_points=None, query_x=-1.0, query_y=-1.0):
         device = comfy.model_management.get_torch_device()
         intermediate = comfy.model_management.intermediate_device()
         B, H, W, C = cropped_image.shape
@@ -162,21 +170,41 @@ class NV_CoTrackerBridge:
             return (stitcher, cropped_image, cropped_mask, cropped_mask_processed, info)
 
         # =====================================================================
-        # Step 1: Determine query point
+        # Step 1: Determine query points
         # =====================================================================
-        if query_x >= 0 and query_y >= 0:
-            qx, qy = float(query_x), float(query_y)
-            query_source = "manual"
-        elif cropped_mask is not None:
-            qx, qy = _compute_mask_centroid(cropped_mask[0])
-            query_source = "mask_centroid"
-        else:
-            qx, qy = W / 2.0, H / 2.0
-            query_source = "image_center (no mask)"
-            print(f"[NV_CoTrackerBridge] WARNING: No mask provided and no manual query point. Using image center.")
+        query_list = []  # list of (x, y)
 
-        # queries: (1, 1, 3) = [frame_idx, x, y]
-        queries = torch.tensor([[[0.0, qx, qy]]], dtype=torch.float32)
+        # Priority 1: tracking_points from NV_PointPicker
+        if tracking_points:
+            try:
+                parsed = json.loads(tracking_points)
+                for p in parsed:
+                    if isinstance(p, dict) and "x" in p and "y" in p:
+                        query_list.append((float(p["x"]), float(p["y"])))
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        # Priority 2: manual query_x/query_y
+        if not query_list and query_x >= 0 and query_y >= 0:
+            query_list.append((float(query_x), float(query_y)))
+
+        # Priority 3: mask centroid
+        if not query_list and cropped_mask is not None:
+            cx, cy = _compute_mask_centroid(cropped_mask[0])
+            query_list.append((cx, cy))
+
+        # Priority 4: image center
+        if not query_list:
+            query_list.append((W / 2.0, H / 2.0))
+            print("[NV_CoTrackerBridge] WARNING: No tracking points, mask, or manual query. Using image center.")
+
+        n_queries = len(query_list)
+        query_source = f"point_picker({n_queries})" if tracking_points else ("manual" if query_x >= 0 else "mask_centroid")
+        if not tracking_points and query_x < 0 and cropped_mask is None:
+            query_source = "image_center (no mask)"
+
+        # queries: (1, N, 3) = [[frame_idx, x, y], ...]
+        queries = torch.tensor([[[0.0, qx, qy] for qx, qy in query_list]], dtype=torch.float32)
 
         # =====================================================================
         # Step 2: Run CoTracker3 inference
@@ -201,33 +229,75 @@ class NV_CoTrackerBridge:
             return (stitcher, cropped_image, cropped_mask, cropped_mask_processed, info)
 
         # =====================================================================
-        # Step 3: Extract positions and handle visibility
+        # Step 3: Extract positions and handle visibility (multi-point averaging)
         # =====================================================================
-        tracks = pred_tracks[0, :, 0, :].cpu()  # [B, 2]
-        vis = pred_visibility[0, :, 0].cpu()     # [B] or [B, 1]
-        if vis.dim() > 1:
-            vis = vis.squeeze(-1)
+        # pred_tracks: [1, B, N, 2], pred_visibility: [1, B, N] or [1, B, N, 1]
+        all_tracks = pred_tracks[0].cpu()   # [B, N, 2]
+        all_vis = pred_visibility[0].cpu()  # [B, N] or [B, N, 1]
+        if all_vis.dim() > 2:
+            all_vis = all_vis.squeeze(-1)   # [B, N]
 
-        positions = [(tracks[b, 0].item(), tracks[b, 1].item()) for b in range(B)]
-        vis_list = [vis[b].item() for b in range(B)]
+        N = all_tracks.shape[1]
 
-        positions = _interpolate_invisible(positions, vis_list, threshold=0.5)
-        if positions is None:
-            info = "All frames invisible to CoTracker — passed through unchanged."
+        # For each query point, get interpolated trajectory, then average across points
+        per_point_positions = []  # list of N trajectory lists (each length B)
+        per_point_vis = []
+        for qi in range(N):
+            positions_qi = [(all_tracks[b, qi, 0].item(), all_tracks[b, qi, 1].item()) for b in range(B)]
+            vis_qi = [all_vis[b, qi].item() for b in range(B)]
+            interp = _interpolate_invisible(positions_qi, vis_qi, threshold=0.5)
+            if interp is not None:
+                per_point_positions.append(interp)
+                per_point_vis.append(vis_qi)
+
+        if not per_point_positions:
+            info = "All frames invisible to CoTracker across all query points — passed through unchanged."
             print(f"[NV_CoTrackerBridge] WARNING: {info}")
             return (stitcher, cropped_image, cropped_mask, cropped_mask_processed, info)
 
-        n_visible = sum(1 for v in vis_list if v >= 0.5)
+        # Average displacement across all valid tracked points per frame
+        # Each point's displacement = position[b] - position[ref_frame]
+        # We average the displacements (not raw positions) so different points in different
+        # locations contribute their motion equally.
+        n_tracked = len(per_point_positions)
+
+        # Compute per-point reference (median position)
+        per_point_ref = []
+        for qi in range(n_tracked):
+            xs = sorted(p[0] for p in per_point_positions[qi])
+            ys = sorted(p[1] for p in per_point_positions[qi])
+            per_point_ref.append((xs[B // 2], ys[B // 2]))
+
+        # Average displacement across points, weighted by visibility
+        positions = []  # averaged displacement as (dx, dy) relative to zero
+        for b in range(B):
+            total_w = 0.0
+            sum_dx = 0.0
+            sum_dy = 0.0
+            for qi in range(n_tracked):
+                w = per_point_vis[qi][b] if per_point_vis[qi][b] >= 0.5 else 0.3  # lower weight for interpolated
+                dx_qi = per_point_positions[qi][b][0] - per_point_ref[qi][0]
+                dy_qi = per_point_positions[qi][b][1] - per_point_ref[qi][1]
+                sum_dx += dx_qi * w
+                sum_dy += dy_qi * w
+                total_w += w
+            if total_w > 0:
+                positions.append((sum_dx / total_w, sum_dy / total_w))
+            else:
+                positions.append((0.0, 0.0))
+
+        # Count visible frames (any point visible counts)
+        n_visible = 0
+        for b in range(B):
+            if any(per_point_vis[qi][b] >= 0.5 for qi in range(n_tracked)):
+                n_visible += 1
 
         # =====================================================================
-        # Step 4: Compute displacements
+        # Step 4: Apply strength to displacements
         # =====================================================================
-        ref_x = sorted(p[0] for p in positions)[B // 2]
-        ref_y = sorted(p[1] for p in positions)[B // 2]
-
+        # positions[] are already averaged displacements relative to median reference
         displacements = [
-            ((positions[b][0] - ref_x) * strength,
-             (positions[b][1] - ref_y) * strength)
+            (positions[b][0] * strength, positions[b][1] * strength)
             for b in range(B)
         ]
 
@@ -359,15 +429,16 @@ class NV_CoTrackerBridge:
         clamp_str = f", {n_clamped} edge-clamped" if n_clamped > 0 else ""
         mode_str = "expand-crop-trim" if use_expansion else "passthrough"
 
+        query_coords = ", ".join(f"({qx:.0f},{qy:.0f})" for qx, qy in query_list)
         info_lines = [
-            f"CoTracker3: {B} frames stabilized, query={query_source} ({qx:.1f}, {qy:.1f})",
+            f"CoTracker3: {B} frames, {n_tracked}/{n_queries} points tracked, query={query_source}",
+            f"Points: {query_coords}",
             f"Strength: {strength:.2f}, max_disp: {max_disp:.1f}px ({mode_str}{clamp_str})",
-            f"Reference: ({ref_x:.1f}, {ref_y:.1f}) in crop space",
             f"Visibility: {n_visible}/{B} frames visible (threshold=0.5)",
         ]
         info = "\n".join(info_lines)
 
-        print(f"[NV_CoTrackerBridge] {B} frames, strength={strength:.2f}, "
+        print(f"[NV_CoTrackerBridge] {B} frames, {n_tracked} pts tracked, strength={strength:.2f}, "
               f"max_disp={max_disp:.1f}px, query={query_source} "
               f"({mode_str}{clamp_str}), {n_visible}/{B} visible")
 

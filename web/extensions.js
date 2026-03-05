@@ -14,4 +14,5 @@ import "./variables_panel.js";
 import "./download_video.js";
 import "./preview_animation.js";
 import "./clone_with_connections.js";
+import "./point_picker.js";
 console.log("[NV_Comfy_Utils] All extensions loaded successfully"); 

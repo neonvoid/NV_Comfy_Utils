@@ -197,6 +197,11 @@ class NV_LatentInpaintCrop:
                 }),
             },
             "optional": {
+                "mask_config": ("MASK_PROCESSING_CONFIG", {
+                    "tooltip": "Optional shared config from NV_MaskProcessingConfig. "
+                               "When connected, overrides this node's local mask processing widgets "
+                               "(erode_dilate, fill_holes, remove_noise, smooth, blend_pixels)."
+                }),
                 "bbox_mask": ("MASK", {
                     "tooltip": "Bounding box mask [B,H,W] from MaskTrackingBBox. "
                                "Union across ALL frames determines crop region. "
@@ -236,8 +241,23 @@ class NV_LatentInpaintCrop:
                 mask_erode_dilate=0, mask_fill_holes=0,
                 mask_remove_noise=0, mask_smooth=0,
                 mask_blend_pixels=16,
-                bbox_mask=None, subject_mask=None,
+                mask_config=None, bbox_mask=None, subject_mask=None,
                 x=0, y=0, width=512, height=512):
+
+        # Apply shared config override if connected
+        from .mask_processing_config import apply_mask_config
+        vals = apply_mask_config(mask_config,
+            mask_erode_dilate=mask_erode_dilate,
+            mask_fill_holes=mask_fill_holes,
+            mask_remove_noise=mask_remove_noise,
+            mask_smooth=mask_smooth,
+            mask_blend_pixels=mask_blend_pixels,
+        )
+        mask_erode_dilate = vals["mask_erode_dilate"]
+        mask_fill_holes = vals["mask_fill_holes"]
+        mask_remove_noise = vals["mask_remove_noise"]
+        mask_smooth = vals["mask_smooth"]
+        mask_blend_pixels = vals["mask_blend_pixels"]
 
         samples = latent["samples"]
         info_lines = []

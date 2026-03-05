@@ -150,6 +150,10 @@ class NV_MaskPipelineViz:
                 }),
             },
             "optional": {
+                "mask_config": ("MASK_PROCESSING_CONFIG", {
+                    "tooltip": "Optional shared config from NV_MaskProcessingConfig. "
+                               "When connected, overrides all mask processing widgets on this node."
+                }),
                 "bbox_mask": ("MASK", {
                     "tooltip": "Optional bounding box mask from MaskTrackingBBox.",
                 }),
@@ -171,7 +175,32 @@ class NV_MaskPipelineViz:
                 mask_smooth, mask_blend_pixels,
                 erosion_blocks, feather_blocks, vae_stride,
                 stitch_erosion, stitch_feather,
-                bbox_mask=None):
+                mask_config=None, bbox_mask=None):
+
+        # Apply shared config override if connected
+        from .mask_processing_config import apply_mask_config, apply_vace_mask_config
+        vals = apply_mask_config(mask_config,
+            mask_erode_dilate=mask_erode_dilate,
+            mask_fill_holes=mask_fill_holes,
+            mask_remove_noise=mask_remove_noise,
+            mask_smooth=mask_smooth,
+            mask_blend_pixels=mask_blend_pixels,
+        )
+        mask_erode_dilate = vals["mask_erode_dilate"]
+        mask_fill_holes = vals["mask_fill_holes"]
+        mask_remove_noise = vals["mask_remove_noise"]
+        mask_smooth = vals["mask_smooth"]
+        mask_blend_pixels = vals["mask_blend_pixels"]
+        vace_vals = apply_vace_mask_config(mask_config,
+            erosion_blocks=erosion_blocks,
+            feather_blocks=feather_blocks,
+            stitch_erosion=stitch_erosion,
+            stitch_feather=stitch_feather,
+        )
+        erosion_blocks = vace_vals["erosion_blocks"]
+        feather_blocks = vace_vals["feather_blocks"]
+        stitch_erosion = vace_vals["stitch_erosion"]
+        stitch_feather = vace_vals["stitch_feather"]
 
         B = image.shape[0]
         fi = min(frame_index, B - 1)
