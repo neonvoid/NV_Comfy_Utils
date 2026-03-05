@@ -118,6 +118,15 @@ def stitch_single_frame(canvas_image, inpainted_image, mask,
     if mask.dim() == 2:
         mask = mask.unsqueeze(0)
 
+    # Inverse content warp BEFORE resize: dx/dy are in the crop's working resolution
+    # (target res from InpaintCrop), so must be applied before downsizing to canvas scale.
+    if warp_mode is not None and warp_entry is not None:
+        mask_4d = mask.clamp(0, 1).unsqueeze(-1)  # [1, H, W, 1]
+        inpainted_image, mask_4d = _inverse_content_warp(
+            inpainted_image, mask_4d, warp_mode, warp_entry
+        )
+        mask = mask_4d.squeeze(-1)  # back to [1, H, W]
+
     # Resize inpainted image and mask to canvas crop size
     _, h, w, _ = inpainted_image.shape
     if ctc_w != w or ctc_h != h:
@@ -129,12 +138,6 @@ def stitch_single_frame(canvas_image, inpainted_image, mask,
 
     # Clamp mask and expand to match image channels
     resized_mask = resized_mask.clamp(0, 1).unsqueeze(-1)  # [1, H, W, 1]
-
-    # Inverse content warp: undo crop stabilization before blending
-    if warp_mode is not None and warp_entry is not None:
-        resized_image, resized_mask = _inverse_content_warp(
-            resized_image, resized_mask, warp_mode, warp_entry
-        )
 
     # Extract canvas region, blend, paste back
     canvas_crop = canvas_image[:, ctc_y:ctc_y + ctc_h, ctc_x:ctc_x + ctc_w, :]
