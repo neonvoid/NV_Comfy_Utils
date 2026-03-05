@@ -99,7 +99,8 @@ def _build_translation_grid(dx, dy, H, W, device):
 
 
 def _stabilize_content_centroid(images, masks_orig, masks_proc, stitcher=None,
-                                target_w=None, target_h=None, resize_algorithm='lanczos'):
+                                target_w=None, target_h=None, resize_algorithm='lanczos',
+                                strength=1.0):
     """Centroid-lock stabilization: translate each frame to lock mask centroid.
 
     Uses expand-crop-trim to avoid edge spillage: expands each frame from
@@ -114,6 +115,11 @@ def _stabilize_content_centroid(images, masks_orig, masks_proc, stitcher=None,
         stitcher: STITCHER dict with canvas_image and crop coordinates
         target_w, target_h: target output dimensions
         resize_algorithm: algorithm for rescaling expanded crops
+        strength: 0.0-2.0, controls how aggressively centroids are locked.
+            0.0 = no correction.
+            0.5 = smoothed centroids only (conservative).
+            1.0 = raw centroids (full lock, default).
+            >1.0 = overcorrect (compensate for centroid bias).
 
     Returns:
         (warped_images, warped_masks_orig, warped_masks_proc, warp_data)
@@ -124,13 +130,19 @@ def _stabilize_content_centroid(images, masks_orig, masks_proc, stitcher=None,
     cx_raw, cy_raw, valid = _compute_mask_centroids(masks_orig)
     cx_smooth, cy_smooth = _smooth_centroid_trajectory(cx_raw, cy_raw, valid)
 
-    # Reference = temporal median
+    # Reference = temporal median of smoothed centroids (stable anchor)
     ref_cx = float(sorted(cx_smooth)[B // 2])
     ref_cy = float(sorted(cy_smooth)[B // 2])
 
+    # Effective centroids: interpolate between smoothed and raw based on strength.
+    # strength=0 → smoothed (conservative), strength=1 → raw (full lock),
+    # strength>1 → extrapolate past raw (overcorrect).
+    cx_eff = [cx_smooth[b] + (cx_raw[b] - cx_smooth[b]) * strength for b in range(B)]
+    cy_eff = [cy_smooth[b] + (cy_raw[b] - cy_smooth[b]) * strength for b in range(B)]
+
     # Compute max displacement to determine expansion margin
-    max_dx = max(abs(cx - ref_cx) for cx in cx_smooth)
-    max_dy = max(abs(cy - ref_cy) for cy in cy_smooth)
+    max_dx = max(abs(cx - ref_cx) for cx in cx_eff)
+    max_dy = max(abs(cy - ref_cy) for cy in cy_eff)
     margin = int(math.ceil(max(max_dx, max_dy))) + 1
 
     # Determine target dimensions
@@ -146,8 +158,8 @@ def _stabilize_content_centroid(images, masks_orig, masks_proc, stitcher=None,
     n_clamped = 0
 
     for b in range(B):
-        dx = cx_smooth[b] - ref_cx
-        dy = cy_smooth[b] - ref_cy
+        dx = cx_eff[b] - ref_cx
+        dy = cy_eff[b] - ref_cy
 
         if use_expansion:
             # Expand: re-crop a larger region from the stored canvas
@@ -257,8 +269,9 @@ def _stabilize_content_centroid(images, masks_orig, masks_proc, stitcher=None,
     max_disp = max(max(abs(d["dx"]) for d in warp_data), max(abs(d["dy"]) for d in warp_data))
     mode_str = "expand-crop-trim" if use_expansion else "no-stitcher"
     clamp_str = f", {n_clamped} edge-clamped" if n_clamped > 0 else ""
-    print(f"[ContentStabilize/centroid] {B} frames, ref=({ref_cx:.1f},{ref_cy:.1f}), "
-          f"max_disp={max_disp:.1f}px, margin={margin}px ({mode_str}{clamp_str})")
+    print(f"[ContentStabilize/centroid] {B} frames, strength={strength:.2f}, "
+          f"ref=({ref_cx:.1f},{ref_cy:.1f}), max_disp={max_disp:.1f}px, "
+          f"margin={margin}px ({mode_str}{clamp_str})")
 
     return (torch.stack(warped_imgs), torch.stack(warped_mo), torch.stack(warped_mp), warp_data)
 
@@ -1008,6 +1021,14 @@ class NV_InpaintCrop:
                                "centroid: translate to lock mask centroid (fast, translation only). "
                                "optical_flow: RAFT-based alignment (slower, handles rotation + deformation)."
                 }),
+                "stabilize_strength": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
+                    "tooltip": "Content stabilization strength (centroid mode). "
+                               "0.0 = no correction. "
+                               "0.5 = conservative (smoothed centroids only, less jitter in corrections). "
+                               "1.0 = full lock (raw centroids, maximum stabilization). "
+                               "1.0-2.0 = overcorrect (can compensate for systematic centroid bias)."
+                }),
             }
         }
 
@@ -1021,7 +1042,8 @@ class NV_InpaintCrop:
              padding_multiple, mask_erode_dilate, mask_fill_holes, mask_remove_noise,
              mask_smooth, stitch_source, mask_blend_pixels, resize_algorithm,
              bounding_box_mask=None, stabilize_crop=False, stabilization_mode="smooth",
-             smooth_window=5, anomaly_threshold=1.5, content_stabilize="off"):
+             smooth_window=5, anomaly_threshold=1.5, content_stabilize="off",
+             stabilize_strength=1.0):
 
         padding_multiple = int(padding_multiple)
         device = comfy.model_management.get_torch_device()
@@ -1217,7 +1239,8 @@ class NV_InpaintCrop:
                 result_images, result_masks_original, result_masks_processed, warp_data = \
                     _stabilize_content_centroid(result_images, result_masks_original, result_masks_processed,
                                                stitcher=stitcher, target_w=target_width, target_h=target_height,
-                                               resize_algorithm=resize_algorithm)
+                                               resize_algorithm=resize_algorithm,
+                                               strength=stabilize_strength)
             else:
                 result_images, result_masks_original, result_masks_processed, warp_data = \
                     _stabilize_content_flow(result_images, result_masks_original, result_masks_processed)
