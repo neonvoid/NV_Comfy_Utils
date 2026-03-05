@@ -6,10 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- NodeBypasser action widgets (Bypass/Enable/List) changed from BOOLEAN toggles to button widgets for reliable click handling. Existing nodes must be re-added.
+- `extensions.js` now uses dynamic imports with per-module error isolation — one broken extension no longer kills all others.
+
+### Fixed
+
+- Fixed NodeBypasser buttons silently failing on ComfyUI frontend v1.39+ — `onWidgetChange` was never called because the frontend uses `onWidgetChanged` (with 'd') and a different signature (see `bug_tracker/node_bypasser/2026-03-05_button_click_and_load_failures.md`)
+- Fixed NodeBypasser intermittently disappearing after restart — class definition at module scope could race with `LGraphNode` global availability; now deferred to `registerCustomNodes()`
+
 ### Added
 
-- NV_PointPicker — interactive point placement node for CoTracker stabilization. Click on features in the cropped image to specify tracking points. Outputs JSON coordinates consumed by NV_CoTrackerBridge.
+- NV_PointPicker — interactive point placement node for CoTracker stabilization. Click on features in the cropped image to specify tracking points. Outputs JSON coordinates consumed by NV_CoTrackerBridge. Supports `frame_index` input to pick which video frame to annotate, plus `frame_index`/`total_frames` outputs for downstream chaining.
 - NV_CoTrackerBridge now supports multi-point tracking via `tracking_points` input from NV_PointPicker. Averages trajectories across all tracked points weighted by visibility for more robust stabilization.
+- NV_MaskTrackingBBox: new `ema` smoothing mode — bidirectional exponential moving average with single `alpha` parameter. Zero lag from forward+backward pass averaging.
+- NV_MaskTrackingBBox: new `smooth_strength` parameter (0-1) — lerps between raw and smoothed coordinates. Works with all smoothing modes for easy partial-smoothing control.
 - NV_AspectChunkPlanner — temporal segmentation by bounding-box aspect ratio changes. Analyzes per-frame bbox masks, detects aspect change points via log-ratio threshold, and segments the video into chunks where each has a stable aspect. Per-chunk union bbox and WAN-aligned target resolution exported as JSON plan file. Greedy segmentation with small-segment merge and optional WAN frame alignment.
 
 ## [0.1.0] - 2026-02-26

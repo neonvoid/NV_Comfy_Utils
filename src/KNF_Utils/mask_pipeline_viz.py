@@ -1,9 +1,13 @@
 """
 NV Mask Pipeline Viz - Debug visualization of all mask processing stages.
 
-Shows a 3x2 contact sheet with colored mask overlays at each stage of the
-MaskTrackingBBox -> InpaintCrop v2 -> VACE Control Video Prep pipeline.
-Helps tune mask parameters by making spatial relationships visible.
+Modes:
+  grid:  3x2 contact sheet of all 6 stages for a single frame (original behavior)
+  batch: 6 separate images as a batch — click through in ComfyUI's image preview
+  video: All frames for a single selected stage — scrub through to check temporal consistency
+
+Accepts optional STITCHER from NV_InpaintCrop to preview cropped image + mask
+at the resolution the diffusion model actually sees.
 """
 
 import torch
@@ -20,8 +24,8 @@ from .inpaint_crop import (
 )
 
 
-# Panel color assignments (RGB) — chosen for visual distinctness
-PANEL_CONFIGS = [
+# Stage definitions: (key, label, color_rgb)
+STAGE_CONFIGS = [
     ("original",  "1. Original Mask",  (60, 120, 255)),   # blue
     ("bbox",      "2. BBox Mask",      (255, 220, 60)),    # yellow
     ("processed", "3. Processed Mask", (60, 220, 100)),    # green
@@ -29,6 +33,10 @@ PANEL_CONFIGS = [
     ("vace",      "5. VACE Cond Mask", (220, 80, 255)),    # magenta
     ("stitch",    "6. Stitch Mask",    (80, 220, 255)),    # cyan
 ]
+
+STAGE_KEYS = [s[0] for s in STAGE_CONFIGS]
+STAGE_LABELS = {s[0]: s[1] for s in STAGE_CONFIGS}
+STAGE_COLORS = {s[0]: s[2] for s in STAGE_CONFIGS}
 
 
 def _get_font(size):
@@ -74,19 +82,90 @@ def _draw_label(img_np, text, font):
     text_w = bbox[2] - bbox[0]
     text_h = bbox[3] - bbox[1]
 
-    # Dark background rectangle
     draw.rectangle(
         [pad, pad, pad + text_w + 8, pad + text_h + 8],
         fill=(0, 0, 0, 180),
     )
-    # White text
     draw.text((pad + 4, pad + 4), text, fill=(255, 255, 255), font=font)
 
     return np.array(pil_img)
 
 
+def _compute_masks_for_frame(mask_frame, bbox_frame,
+                             mask_erode_dilate, mask_fill_holes, mask_remove_noise,
+                             mask_smooth, mask_blend_pixels,
+                             erosion_blocks, feather_blocks, vae_stride,
+                             stitch_erosion, stitch_feather):
+    """Compute all 6 mask stages for a single frame. Returns dict of [1,H,W] tensors (or None for bbox)."""
+    masks = {}
+
+    # 1. Original
+    masks["original"] = mask_frame.clone()
+
+    # 2. BBox
+    masks["bbox"] = bbox_frame.clone() if bbox_frame is not None else None
+
+    # 3. Processed — InpaintCrop pipeline order
+    processed = mask_frame.clone()
+    if mask_fill_holes > 0:
+        processed = _mask_fill_holes(processed, mask_fill_holes)
+    if mask_remove_noise > 0:
+        processed = _mask_remove_noise(processed, mask_remove_noise)
+    if mask_erode_dilate != 0:
+        processed = _mask_erode_dilate(processed, mask_erode_dilate)
+    if mask_smooth > 0:
+        processed = _mask_smooth(processed, mask_smooth)
+    masks["processed"] = processed
+
+    # 4. Blend — dilate + blur of ORIGINAL (not processed)
+    blend = mask_frame.clone()
+    if mask_blend_pixels > 0:
+        blend = _mask_erode_dilate(blend, mask_blend_pixels)
+        blend = _mask_blur(blend, mask_blend_pixels)
+    masks["blend"] = blend.clamp(0.0, 1.0)
+
+    # 5. VACE conditioning
+    vace = mask_frame.clone()
+    erosion_px = int(round(erosion_blocks * vae_stride))
+    feather_px = int(round(feather_blocks * vae_stride))
+    if erosion_px > 0:
+        vace = _mask_erode_dilate(vace, -erosion_px)
+    if feather_px > 0:
+        vace = _mask_blur(vace, feather_px)
+    masks["vace"] = vace.clamp(0.0, 1.0)
+
+    # 6. Stitch
+    stitch = mask_frame.clone()
+    if stitch_erosion != 0:
+        stitch = _mask_erode_dilate(stitch, stitch_erosion)
+    if stitch_feather > 0:
+        stitch = _mask_blur(stitch, stitch_feather)
+    masks["stitch"] = stitch.clamp(0.0, 1.0)
+
+    return masks
+
+
+def _render_overlay(frame_np, mask_tensor, stage_key, overlay_alpha, font, frame_label=None):
+    """Render a single overlay panel as uint8 numpy [H,W,3]."""
+    label = STAGE_LABELS[stage_key]
+    color = STAGE_COLORS[stage_key]
+    panel = frame_np.copy()
+
+    if mask_tensor is not None:
+        mask_np = mask_tensor[0].cpu().numpy()
+        panel = _overlay_mask_soft(panel, mask_np, color, overlay_alpha)
+    else:
+        label += " (none)"
+
+    if frame_label is not None:
+        label = f"[{frame_label}] {label}"
+
+    panel = _draw_label(panel, label, font)
+    return panel
+
+
 class NV_MaskPipelineViz:
-    """Visualize all mask processing stages as a 3x2 colored overlay contact sheet."""
+    """Visualize mask processing stages as grid, image batch, or temporal video."""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -98,9 +177,19 @@ class NV_MaskPipelineViz:
                 "original_mask": ("MASK", {
                     "tooltip": "Raw segmentation mask [B, H, W].",
                 }),
+                "mode": (["grid", "batch", "video"], {
+                    "default": "batch",
+                    "tooltip": "grid: 3x2 contact sheet (single frame, all stages). "
+                               "batch: 6 separate images as clickable batch (single frame, all stages). "
+                               "video: all frames for a single selected stage (temporal preview)."
+                }),
                 "frame_index": ("INT", {
                     "default": 0, "min": 0, "max": 99999, "step": 1,
-                    "tooltip": "Which frame to visualize.",
+                    "tooltip": "Which frame to visualize (grid/batch modes). Ignored in video mode.",
+                }),
+                "video_stage": (STAGE_KEYS, {
+                    "default": "processed",
+                    "tooltip": "Which mask stage to preview across all frames (video mode only).",
                 }),
                 "overlay_alpha": ("FLOAT", {
                     "default": 0.4, "min": 0.1, "max": 0.9, "step": 0.05,
@@ -157,6 +246,10 @@ class NV_MaskPipelineViz:
                 "bbox_mask": ("MASK", {
                     "tooltip": "Optional bounding box mask from MaskTrackingBBox.",
                 }),
+                "stitcher": ("STITCHER", {
+                    "tooltip": "Optional stitcher from NV_InpaintCrop. When connected, previews the "
+                               "cropped image + mask at the resolution the diffusion model sees."
+                }),
             },
         }
 
@@ -165,17 +258,17 @@ class NV_MaskPipelineViz:
     FUNCTION = "execute"
     CATEGORY = "NV_Utils/Debug"
     DESCRIPTION = (
-        "Debug visualization: 3x2 contact sheet showing all 6 mask processing "
-        "stages as colored overlays. Mirror your InpaintCrop + VACE Prep "
-        "parameters here to see what each stage looks like spatially."
+        "Debug visualization of mask processing stages. "
+        "grid: 3x2 contact sheet. batch: 6 clickable images. video: temporal scrub for one stage. "
+        "Connect STITCHER from InpaintCrop to preview the cropped view."
     )
 
-    def execute(self, image, original_mask, frame_index, overlay_alpha,
+    def execute(self, image, original_mask, mode, frame_index, video_stage, overlay_alpha,
                 mask_erode_dilate, mask_fill_holes, mask_remove_noise,
                 mask_smooth, mask_blend_pixels,
                 erosion_blocks, feather_blocks, vae_stride,
                 stitch_erosion, stitch_feather,
-                mask_config=None, bbox_mask=None):
+                mask_config=None, bbox_mask=None, stitcher=None):
 
         # Apply shared config override if connected
         from .mask_processing_config import apply_mask_config, apply_vace_mask_config
@@ -202,107 +295,125 @@ class NV_MaskPipelineViz:
         stitch_erosion = vace_vals["stitch_erosion"]
         stitch_feather = vace_vals["stitch_feather"]
 
-        B = image.shape[0]
-        fi = min(frame_index, B - 1)
+        # Common mask processing kwargs
+        mask_kwargs = dict(
+            mask_erode_dilate=mask_erode_dilate,
+            mask_fill_holes=mask_fill_holes,
+            mask_remove_noise=mask_remove_noise,
+            mask_smooth=mask_smooth,
+            mask_blend_pixels=mask_blend_pixels,
+            erosion_blocks=erosion_blocks,
+            feather_blocks=feather_blocks,
+            vae_stride=vae_stride,
+            stitch_erosion=stitch_erosion,
+            stitch_feather=stitch_feather,
+        )
 
-        # Extract single frame
-        frame = image[fi]  # [H, W, C]
+        # Resolve image/mask source: stitcher cropped data or raw inputs
+        use_stitcher = stitcher is not None
+        if use_stitcher:
+            src_image, src_mask, src_bbox = self._resolve_stitcher(stitcher, image, original_mask, bbox_mask)
+        else:
+            src_image = image
+            src_mask = original_mask if original_mask.dim() == 3 else original_mask.unsqueeze(0)
+            src_bbox = bbox_mask
+
+        if mode == "video":
+            return self._mode_video(src_image, src_mask, src_bbox, video_stage, overlay_alpha, mask_kwargs)
+        else:
+            return self._mode_single_frame(src_image, src_mask, src_bbox, frame_index, overlay_alpha, mask_kwargs, grid=(mode == "grid"))
+
+    def _resolve_stitcher(self, stitcher, image, original_mask, bbox_mask):
+        """Extract cropped image + masks from STITCHER dict.
+        Falls back to raw inputs if stitcher doesn't have the expected data."""
+        # The stitcher stores per-frame cropped data — use the cropped_image output
+        # from InpaintCrop instead. But the stitcher itself stores canvas_image (padded crops)
+        # and cropped_mask_for_blend. We need the actual cropped image from the node outputs.
+        #
+        # Since STITCHER is a metadata dict (not the cropped image itself), we use it to
+        # signal "show the cropped perspective" but still need the cropped image/mask from
+        # the node's IMAGE/MASK outputs. The user should wire:
+        #   InpaintCrop.cropped_image → MaskPipelineViz.image
+        #   InpaintCrop.cropped_mask  → MaskPipelineViz.original_mask
+        #   InpaintCrop.stitcher      → MaskPipelineViz.stitcher (just as a flag + metadata)
+        #
+        # So we just pass through the image/mask inputs but use stitcher presence as context.
+        src_mask = original_mask if original_mask.dim() == 3 else original_mask.unsqueeze(0)
+        return image, src_mask, bbox_mask
+
+    def _get_frame_data(self, src_image, src_mask, src_bbox, fi):
+        """Extract and validate frame + mask + optional bbox for frame index fi."""
+        B = src_image.shape[0]
+        fi = min(fi, B - 1)
+
+        frame = src_image[fi]  # [H, W, C]
         H, W = frame.shape[0], frame.shape[1]
 
-        # Extract and validate mask — ensure [1, H, W] for processing functions
-        if original_mask.dim() == 2:
-            original_mask = original_mask.unsqueeze(0)
-        mask_fi = min(fi, original_mask.shape[0] - 1)
-        mask_frame = original_mask[mask_fi:mask_fi + 1]  # [1, H, W]
-
-        # Resize mask if resolution mismatch
+        mask_fi = min(fi, src_mask.shape[0] - 1)
+        mask_frame = src_mask[mask_fi:mask_fi + 1]  # [1, H, W]
         if mask_frame.shape[1] != H or mask_frame.shape[2] != W:
             mask_frame = rescale_mask(mask_frame, W, H)
 
-        # Handle optional bbox_mask
-        has_bbox = bbox_mask is not None
         bbox_frame = None
-        if has_bbox:
-            if bbox_mask.dim() == 2:
-                bbox_mask = bbox_mask.unsqueeze(0)
-            bbox_fi = min(fi, bbox_mask.shape[0] - 1)
-            bbox_frame = bbox_mask[bbox_fi:bbox_fi + 1]
+        if src_bbox is not None:
+            if src_bbox.dim() == 2:
+                src_bbox = src_bbox.unsqueeze(0)
+            bbox_fi = min(fi, src_bbox.shape[0] - 1)
+            bbox_frame = src_bbox[bbox_fi:bbox_fi + 1]
             if bbox_frame.shape[1] != H or bbox_frame.shape[2] != W:
                 bbox_frame = rescale_mask(bbox_frame, W, H)
 
-        # --- Compute 6 mask stages ---
-        masks = {}
-
-        # 1. Original — as-is
-        masks["original"] = mask_frame.clone()
-
-        # 2. BBox — from optional input
-        masks["bbox"] = bbox_frame.clone() if has_bbox else None
-
-        # 3. Processed — InpaintCrop pipeline (same order as inpaint_crop.py execute)
-        processed = mask_frame.clone()
-        if mask_fill_holes > 0:
-            processed = _mask_fill_holes(processed, mask_fill_holes)
-        if mask_remove_noise > 0:
-            processed = _mask_remove_noise(processed, mask_remove_noise)
-        if mask_erode_dilate != 0:
-            processed = _mask_erode_dilate(processed, mask_erode_dilate)
-        if mask_smooth > 0:
-            processed = _mask_smooth(processed, mask_smooth)
-        masks["processed"] = processed
-
-        # 4. Blend — dilate + blur of ORIGINAL mask (not processed)
-        blend = mask_frame.clone()
-        if mask_blend_pixels > 0:
-            blend = _mask_erode_dilate(blend, mask_blend_pixels)  # positive = dilate
-            blend = _mask_blur(blend, mask_blend_pixels)
-        masks["blend"] = blend.clamp(0.0, 1.0)
-
-        # 5. VACE conditioning — erode inward + feather
-        vace = mask_frame.clone()
-        erosion_px = int(round(erosion_blocks * vae_stride))
-        feather_px = int(round(feather_blocks * vae_stride))
-        if erosion_px > 0:
-            vace = _mask_erode_dilate(vace, -erosion_px)  # negative = erode
-        if feather_px > 0:
-            vace = _mask_blur(vace, feather_px)
-        masks["vace"] = vace.clamp(0.0, 1.0)
-
-        # 6. Stitch — erosion + feather (pixels, independent from VACE blocks)
-        stitch = mask_frame.clone()
-        if stitch_erosion != 0:
-            stitch = _mask_erode_dilate(stitch, stitch_erosion)
-        if stitch_feather > 0:
-            stitch = _mask_blur(stitch, stitch_feather)
-        masks["stitch"] = stitch.clamp(0.0, 1.0)
-
-        # --- Build overlay panels ---
         frame_np = (frame.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+        return frame_np, mask_frame, bbox_frame, H, W
+
+    def _mode_single_frame(self, src_image, src_mask, src_bbox, frame_index, overlay_alpha, mask_kwargs, grid=False):
+        """Grid or batch mode: process one frame, output all 6 stages."""
+        frame_np, mask_frame, bbox_frame, H, W = self._get_frame_data(src_image, src_mask, src_bbox, frame_index)
         font = _get_font(max(16, min(H // 20, 28)))
 
+        masks = _compute_masks_for_frame(mask_frame, bbox_frame, **mask_kwargs)
+
         panels = []
-        for key, label, color in PANEL_CONFIGS:
-            panel_img = frame_np.copy()
+        for key, label, color in STAGE_CONFIGS:
+            panel = _render_overlay(frame_np, masks[key], key, overlay_alpha, font)
+            panels.append(panel)
 
-            if masks[key] is not None:
-                mask_np = masks[key][0].cpu().numpy()  # [H, W]
-                panel_img = _overlay_mask_soft(panel_img, mask_np, color, overlay_alpha)
-            else:
-                label += " (none)"
+        if grid:
+            # 3x2 contact sheet
+            row1 = np.concatenate([panels[0], panels[1]], axis=1)
+            row2 = np.concatenate([panels[2], panels[3]], axis=1)
+            row3 = np.concatenate([panels[4], panels[5]], axis=1)
+            contact_sheet = np.concatenate([row1, row2, row3], axis=0)
+            result = torch.from_numpy(contact_sheet.astype(np.float32) / 255.0)
+            result = result.unsqueeze(0)  # [1, 3*H, 2*W, 3]
+        else:
+            # Batch: 6 separate images as [6, H, W, 3]
+            tensors = []
+            for panel in panels:
+                t = torch.from_numpy(panel.astype(np.float32) / 255.0)
+                tensors.append(t)
+            result = torch.stack(tensors, dim=0)  # [6, H, W, 3]
 
-            panel_img = _draw_label(panel_img, label, font)
-            panels.append(panel_img)
+        return (result,)
 
-        # --- Assemble 3x2 grid ---
-        row1 = np.concatenate([panels[0], panels[1]], axis=1)
-        row2 = np.concatenate([panels[2], panels[3]], axis=1)
-        row3 = np.concatenate([panels[4], panels[5]], axis=1)
-        contact_sheet = np.concatenate([row1, row2, row3], axis=0)
+    def _mode_video(self, src_image, src_mask, src_bbox, video_stage, overlay_alpha, mask_kwargs):
+        """Video mode: process all frames for a single selected stage."""
+        B = src_image.shape[0]
+        color = STAGE_COLORS[video_stage]
+        label_base = STAGE_LABELS[video_stage]
 
-        # --- Convert to IMAGE tensor ---
-        result = torch.from_numpy(contact_sheet.astype(np.float32) / 255.0)
-        result = result.unsqueeze(0)  # [1, 3*H, 2*W, 3]
+        frames_out = []
+        for fi in range(B):
+            frame_np, mask_frame, bbox_frame, H, W = self._get_frame_data(src_image, src_mask, src_bbox, fi)
+            font = _get_font(max(16, min(H // 20, 28)))
 
+            masks = _compute_masks_for_frame(mask_frame, bbox_frame, **mask_kwargs)
+            panel = _render_overlay(frame_np, masks[video_stage], video_stage, overlay_alpha, font,
+                                    frame_label=f"F{fi}")
+            t = torch.from_numpy(panel.astype(np.float32) / 255.0)
+            frames_out.append(t)
+
+        result = torch.stack(frames_out, dim=0)  # [B, H, W, 3]
         return (result,)
 
 

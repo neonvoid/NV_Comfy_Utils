@@ -3,805 +3,607 @@ import { ComfyWidgets } from "../../scripts/widgets.js";
 
 const MODE_ALWAYS = 0;
 const MODE_BYPASS = 4;
+const NODE_SLOT_HEIGHT = 20;
+const NODE_WIDGET_HEIGHT = 20;
 
-// Create a simple node class that extends LGraphNode
-class NodeBypasser extends LGraphNode {
-    constructor(title = "Node Bypasser") {
-        super(title);
-        this.comfyClass = "NodeBypasser";
-        this.isVirtualNode = true;  // Mark as virtual to avoid execution errors
-        this.removed = false;
-        this.configuring = false;
-        this._tempWidth = 0;
-        this.__constructed__ = false;
-        this.widgets = this.widgets || [];
-        this.properties = this.properties || {};
-        
-        // Initialize size first to prevent the error
-        this.size = [250, 250];
-        
-        // Add selector ID widget (for mapping to INT input)
-        this.selectorIdWidget = ComfyWidgets["INT"](this, "selector_id", ["INT", { default: 0, min: 0, max: 999, step: 1 }], app).widget;
-        this.selectorIdWidget.name = "Selector ID";
-        console.log("[NodeBypasser] Created selectorIdWidget:", this.selectorIdWidget);
-        
-        // Add a button to list all nodes
-        this.listNodesButton = ComfyWidgets["BOOLEAN"](this, "list_nodes", ["BOOLEAN", { default: false }], app).widget;
-        this.listNodesButton.name = "List All Nodes";
-        console.log("[NodeBypasser] Created listNodesButton:", this.listNodesButton);
-        
-        // Add a text input for node names to bypass
-        this.nodeNamesInput = ComfyWidgets["STRING"](this, "node_names", ["STRING", {
-            default: "Enter node names separated by commas (e.g., LoadImage, singlePass*, !extension, @GroupName)",
-            multiline: true
-        }], app).widget;
-        this.nodeNamesInput.name = "Node Names to Bypass";
-        
-        // Add bypass button
-        this.bypassButton = ComfyWidgets["BOOLEAN"](this, "bypass_nodes", ["BOOLEAN", { default: false }], app).widget;
-        this.bypassButton.name = "Bypass Nodes";
-        
-        // Add selector input (connects to INT source)
-        this.addInput("selector", "INT");
-        
-        // Add boolean input for bypass trigger
-        this.addInput("bypass_input", "BOOLEAN");
-        
-        // Add enable button
-        this.enableButton = ComfyWidgets["BOOLEAN"](this, "enable_nodes", ["BOOLEAN", { default: false }], app).widget;
-        this.enableButton.name = "Enable Nodes";
-        
-        // Add boolean input for enable trigger
-        this.addInput("enable_input", "BOOLEAN");
-        
-        // Add override boolean input (acts as disable switch)
-        this.addInput("override_input", "BOOLEAN");
-        
-        // Add a result display widget
-        this.resultWidget = ComfyWidgets["STRING"](this, "result", ["STRING", { multiline: true }], app).widget;
-        this.resultWidget.name = "Status";
-        this.resultWidget.inputEl.readOnly = true;
-        
-        // Set up widget change detection
-        const originalOnWidgetChange = this.onWidgetChange;
-        this.onWidgetChange = function (widget, value) {
-            if (originalOnWidgetChange) {
-                originalOnWidgetChange.apply(this, [widget, value]);
-            }
-            
-            // Handle list nodes button
-            if (widget === this.listNodesButton && value === true) {
-                console.log("[NodeBypasser] List nodes button clicked!");
+// Deferred class definition — LGraphNode must exist before we can extend it
+let NodeBypasser = null;
+
+function defineNodeBypasser() {
+    if (NodeBypasser) return; // Already defined
+
+    class _NodeBypasser extends LGraphNode {
+        constructor(title = "Node Bypasser") {
+            super(title);
+            this.comfyClass = "NodeBypasser";
+            this.isVirtualNode = true;
+            this.removed = false;
+            this.configuring = false;
+            this._tempWidth = 0;
+            this.__constructed__ = false;
+            this.widgets = this.widgets || [];
+            this.properties = this.properties || {};
+
+            // Initialize size
+            this.size = [250, 100];
+
+            // Add selector ID widget
+            this.selectorIdWidget = ComfyWidgets["INT"](this, "selector_id", ["INT", { default: 0, min: 0, max: 999, step: 1 }], app).widget;
+            this.selectorIdWidget.name = "Selector ID";
+
+            // List All Nodes — button widget with direct callback
+            this.listNodesButton = this.addWidget("button", "List All Nodes", null, () => {
                 this.listAllNodes();
-                setTimeout(() => {
-                    this.listNodesButton.value = false;
-                }, 100);
-            }
-            
-            // Handle bypass button
-            if (widget === this.bypassButton && value === true) {
+            });
+            this.listNodesButton.serialize = false;
+
+            // Add a text input for node names to bypass
+            this.nodeNamesInput = ComfyWidgets["STRING"](this, "node_names", ["STRING", {
+                default: "Enter node names separated by commas (e.g., LoadImage, singlePass*, !extension, @GroupName)",
+                multiline: true
+            }], app).widget;
+            this.nodeNamesInput.name = "Node Names to Bypass";
+
+            // Bypass button — direct callback
+            this.bypassButton = this.addWidget("button", "Bypass Nodes", null, () => {
                 this.bypassNodesByName(true);
-                setTimeout(() => {
-                    this.bypassButton.value = false;
-                }, 100);
-            }
-            
-            // Handle enable button
-            if (widget === this.enableButton && value === true) {
+            });
+            this.bypassButton.serialize = false;
+
+            // Add selector input (connects to INT source)
+            this.addInput("selector", "INT");
+
+            // Add boolean input for bypass trigger
+            this.addInput("bypass_input", "BOOLEAN");
+
+            // Enable button — direct callback
+            this.enableButton = this.addWidget("button", "Enable Nodes", null, () => {
                 this.bypassNodesByName(false);
-                setTimeout(() => {
-                    this.enableButton.value = false;
-                }, 100);
-            }
-        };
-        
-        // Add backup onClick handlers for debugging
-        setTimeout(() => {
-            console.log("[NodeBypasser] Setting up backup onClick handlers...");
-            
-            if (this.listNodesButton && this.listNodesButton.onClick) {
-                console.log("[NodeBypasser] Adding onClick to list button");
-                const originalOnClick = this.listNodesButton.onClick;
-                this.listNodesButton.onClick = (options) => {
-                    console.log("[NodeBypasser] List button onClick triggered!");
-                    this.listAllNodes();
-                    if (originalOnClick) {
-                        originalOnClick.call(this.listNodesButton, options);
-                    }
+            });
+            this.enableButton.serialize = false;
+
+            // Add boolean input for enable trigger
+            this.addInput("enable_input", "BOOLEAN");
+
+            // Add override boolean input (acts as disable switch)
+            this.addInput("override_input", "BOOLEAN");
+
+            // Add a result display widget
+            this.resultWidget = ComfyWidgets["STRING"](this, "result", ["STRING", { multiline: true }], app).widget;
+            this.resultWidget.name = "Status";
+            this.resultWidget.inputEl.readOnly = true;
+
+            this.onConstructed();
+        }
+
+        // Save widget values when they change
+        serialize() {
+            const data = super.serialize();
+            if (data) {
+                data.widget_values = {
+                    node_names: this.nodeNamesInput.value,
+                    selector_id: this.selectorIdWidget.value
                 };
-            } else {
-                console.log("[NodeBypasser] List button or onClick not found:", this.listNodesButton);
             }
-            
-            if (this.bypassButton && this.bypassButton.onClick) {
-                console.log("[NodeBypasser] Adding onClick to bypass button");
-                const originalBypassOnClick = this.bypassButton.onClick;
-                this.bypassButton.onClick = (options) => {
-                    console.log("[NodeBypasser] Bypass button onClick triggered!");
-                    this.bypassNodesByName(true);
-                    if (originalBypassOnClick) {
-                        originalBypassOnClick.call(this.bypassButton, options);
-                    }
-                };
-            } else {
-                console.log("[NodeBypasser] Bypass button or onClick not found:", this.bypassButton);
-            }
-            
-            if (this.enableButton && this.enableButton.onClick) {
-                console.log("[NodeBypasser] Adding onClick to enable button");
-                const originalEnableOnClick = this.enableButton.onClick;
-                this.enableButton.onClick = (options) => {
-                    console.log("[NodeBypasser] Enable button onClick triggered!");
-                    this.bypassNodesByName(false);
-                    if (originalEnableOnClick) {
-                        originalEnableOnClick.call(this.enableButton, options);
-                    }
-                };
-            } else {
-                console.log("[NodeBypasser] Enable button or onClick not found:", this.enableButton);
-            }
-        }, 1000);
-        
-        this.onConstructed();
-    }
-    
-    // Save widget values when they change
-    serialize() {
-        const data = super.serialize();
-        if (data) {
-            data.widget_values = {
-                node_names: this.nodeNamesInput.value,
-                selector_id: this.selectorIdWidget.value
-            };
+            return data;
         }
-        return data;
-    }
-    
-    // Load widget values when node is loaded
-    configure(info) {
-        super.configure(info);
-        if (info.widget_values) {
-            if (info.widget_values.node_names !== undefined) {
-                this.nodeNamesInput.value = info.widget_values.node_names;
-            }
-            if (info.widget_values.selector_id !== undefined) {
-                this.selectorIdWidget.value = info.widget_values.selector_id;
-            }
-        }
-    }
-    
-    onConstructed() {
-        this.__constructed__ = true;
-        // Ensure size is set after construction
-        this.size = [250, 250];
-        console.log("[NodeBypasser] Node constructed, widgets:", this.widgets.length);
-        console.log("[NodeBypasser] Widget names:", this.widgets.map(w => w.name));
-        
-        // Set up timer to check inputs even when node is off-screen
-        // This ensures inputs are processed regardless of viewport visibility
-        this._inputCheckInterval = setInterval(() => {
-            if (this.graph && !this.removed) {
-                this.checkInputs();
-            }
-        }, 50); // Check every 50ms for responsive input detection
-    }
-    
-    onRemoved() {
-        // Clean up interval when node is removed
-        if (this._inputCheckInterval) {
-            clearInterval(this._inputCheckInterval);
-            this._inputCheckInterval = null;
-        }
-    }
-    
-    computeSize() {
-        // Make sure size is always defined
-        if (!this.size || this.size.length !== 2) {
-            this.size = [250, 250];
-        }
-        return this.size;
-    }
-    
-    // Get the effective bypass value (from input or widget)
-    getBypassValue() {
-        // Find the bypass_input slot by name
-        const bypassInputSlot = this.inputs.findIndex(i => i.name === "bypass_input");
-        
-        if (bypassInputSlot >= 0 && this.inputs[bypassInputSlot].link != null) {
-            const link = this.graph.links[this.inputs[bypassInputSlot].link];
-            if (link) {
-                const originNode = this.graph.getNodeById(link.origin_id);
-                if (!this._connectionLogged) {
-                    console.log(`[NodeBypasser] Connected to bypass_input: ${originNode ? originNode.type : 'null'}`);
-                    this._connectionLogged = true;
+
+        // Load widget values when node is loaded
+        configure(info) {
+            super.configure(info);
+            if (info.widget_values) {
+                if (info.widget_values.node_names !== undefined) {
+                    this.nodeNamesInput.value = info.widget_values.node_names;
                 }
-                if (originNode) {
-                    // Try getOutputData FIRST for momentary button compatibility
-                    if (originNode.getOutputData && originNode.outputs && originNode.outputs[link.origin_slot]) {
-                        const value = originNode.getOutputData(link.origin_slot);
-                        if (value !== undefined) {
-                            if (this._lastDebugBypassValue !== value) {
-                                console.log(`[NodeBypasser] Reading bypass from getOutputData: ${value} (node: ${originNode.type})`);
-                                this._lastDebugBypassValue = value;
+                if (info.widget_values.selector_id !== undefined) {
+                    this.selectorIdWidget.value = info.widget_values.selector_id;
+                }
+            }
+        }
+
+        onConstructed() {
+            this.__constructed__ = true;
+            this.size = this.computeSize();
+
+            // Set up timer to check inputs even when node is off-screen
+            this._inputCheckInterval = setInterval(() => {
+                if (this.graph && !this.removed) {
+                    this.checkInputs();
+                }
+            }, 50);
+        }
+
+        onRemoved() {
+            this.removed = true;
+            if (this._inputCheckInterval) {
+                clearInterval(this._inputCheckInterval);
+                this._inputCheckInterval = null;
+            }
+        }
+
+        computeSize(width) {
+            const w = width || this.size?.[0] || 250;
+            const numSlots = Math.max(
+                (this.inputs ? this.inputs.length : 0),
+                (this.outputs ? this.outputs.length : 0)
+            );
+            const slotHeight = numSlots * NODE_SLOT_HEIGHT;
+            const widgetHeight = (this.widgets ? this.widgets.length : 0) * NODE_WIDGET_HEIGHT;
+            // Extra padding for multiline STRING widgets (node_names + status)
+            const multilineExtra = 80;
+            const h = slotHeight + widgetHeight + multilineExtra + 10;
+            return [Math.max(w, 250), Math.max(h, 200)];
+        }
+
+        // Get the effective bypass value (from input or widget)
+        getBypassValue() {
+            const bypassInputSlot = this.inputs.findIndex(i => i.name === "bypass_input");
+
+            if (bypassInputSlot >= 0 && this.inputs[bypassInputSlot].link != null) {
+                const link = this.graph.links[this.inputs[bypassInputSlot].link];
+                if (link) {
+                    const originNode = this.graph.getNodeById(link.origin_id);
+                    if (originNode) {
+                        // Try getOutputData FIRST for momentary button compatibility
+                        if (originNode.getOutputData && originNode.outputs && originNode.outputs[link.origin_slot]) {
+                            const value = originNode.getOutputData(link.origin_slot);
+                            if (value !== undefined) {
+                                return value;
                             }
-                            return value;
                         }
-                    }
-                    // Try to get value from widget as fallback (works for primitive nodes)
-                    if (originNode.widgets && originNode.widgets.length > 0) {
-                        const widget = originNode.widgets.find(w => w.type === "toggle" || w.name === "boolean" || w.name === "value");
-                        if (widget && widget.value !== undefined) {
-                            // Debug logging for widget reading
-                            if (this._lastDebugBypassValue !== widget.value) {
-                                console.log(`[NodeBypasser] Reading bypass from widget "${widget.name}": ${widget.value} (node: ${originNode.type})`);
-                                this._lastDebugBypassValue = widget.value;
+                        // Try to get value from widget as fallback (works for primitive nodes)
+                        if (originNode.widgets && originNode.widgets.length > 0) {
+                            const widget = originNode.widgets.find(w => w.type === "toggle" || w.name === "boolean" || w.name === "value");
+                            if (widget && widget.value !== undefined) {
+                                return widget.value;
                             }
-                            return widget.value;
-                        }
-                        if (originNode.widgets[0].value !== undefined) {
-                            return originNode.widgets[0].value;
+                            if (originNode.widgets[0].value !== undefined) {
+                                return originNode.widgets[0].value;
+                            }
                         }
                     }
                 }
             }
+            return false;
         }
-        return this.bypassButton.value;
-    }
-    
-    // Get the effective enable value (from input or widget)
-    getEnableValue() {
-        // Find the enable_input slot by name
-        const enableInputSlot = this.inputs.findIndex(i => i.name === "enable_input");
-        
-        if (enableInputSlot >= 0 && this.inputs[enableInputSlot].link != null) {
-            const link = this.graph.links[this.inputs[enableInputSlot].link];
-            if (link) {
-                const originNode = this.graph.getNodeById(link.origin_id);
-                if (originNode) {
-                    // Try getOutputData FIRST for momentary button compatibility
-                    if (originNode.getOutputData && originNode.outputs && originNode.outputs[link.origin_slot]) {
-                        const value = originNode.getOutputData(link.origin_slot);
-                        if (value !== undefined) {
-                            return value;
+
+        // Get the effective enable value (from input or widget)
+        getEnableValue() {
+            const enableInputSlot = this.inputs.findIndex(i => i.name === "enable_input");
+
+            if (enableInputSlot >= 0 && this.inputs[enableInputSlot].link != null) {
+                const link = this.graph.links[this.inputs[enableInputSlot].link];
+                if (link) {
+                    const originNode = this.graph.getNodeById(link.origin_id);
+                    if (originNode) {
+                        if (originNode.getOutputData && originNode.outputs && originNode.outputs[link.origin_slot]) {
+                            const value = originNode.getOutputData(link.origin_slot);
+                            if (value !== undefined) {
+                                return value;
+                            }
+                        }
+                        if (originNode.widgets && originNode.widgets.length > 0) {
+                            const widget = originNode.widgets.find(w => w.type === "toggle" || w.name === "boolean" || w.name === "value");
+                            if (widget && widget.value !== undefined) {
+                                return widget.value;
+                            }
+                            if (originNode.widgets[0].value !== undefined) {
+                                return originNode.widgets[0].value;
+                            }
                         }
                     }
-                    // Try to get value from widget as fallback (works for primitive nodes)
-                    if (originNode.widgets && originNode.widgets.length > 0) {
-                        const widget = originNode.widgets.find(w => w.type === "toggle" || w.name === "boolean" || w.name === "value");
+                }
+            }
+            return false;
+        }
+
+        // Get the selector value (from input or null if not connected)
+        getSelectorValue() {
+            const selectorInputSlot = this.inputs.findIndex(i => i.name === "selector");
+
+            if (selectorInputSlot >= 0 && this.inputs[selectorInputSlot].link != null) {
+                const link = this.graph.links[this.inputs[selectorInputSlot].link];
+                if (link) {
+                    const originNode = this.graph.getNodeById(link.origin_id);
+                    if (originNode && originNode.widgets && originNode.widgets.length > 0) {
+                        const widget = originNode.widgets.find(w =>
+                            w.type === "number" || w.name === "value" || w.name === "int"
+                        );
                         if (widget && widget.value !== undefined) {
                             return widget.value;
                         }
-                        if (originNode.widgets[0].value !== undefined) {
-                            return originNode.widgets[0].value;
+                        return originNode.widgets[0].value;
+                    }
+                }
+            }
+            return null;
+        }
+
+        // Get the override value (from input)
+        getOverrideValue() {
+            const overrideInputSlot = this.inputs.findIndex(i => i.name === "override_input");
+
+            if (overrideInputSlot >= 0 && this.inputs[overrideInputSlot].link != null) {
+                const link = this.graph.links[this.inputs[overrideInputSlot].link];
+                if (link) {
+                    const originNode = this.graph.getNodeById(link.origin_id);
+                    if (originNode) {
+                        if (originNode.getOutputData && originNode.outputs && originNode.outputs[link.origin_slot]) {
+                            const value = originNode.getOutputData(link.origin_slot);
+                            if (value !== undefined) {
+                                return value;
+                            }
+                        }
+                        if (originNode.widgets && originNode.widgets.length > 0) {
+                            const widget = originNode.widgets.find(w => w.type === "toggle" || w.name === "boolean" || w.name === "value");
+                            if (widget && widget.value !== undefined) {
+                                return widget.value;
+                            }
+                            if (originNode.widgets[0].value !== undefined) {
+                                return originNode.widgets[0].value;
+                            }
                         }
                     }
                 }
             }
+            return false;
         }
-        return this.enableButton.value;
-    }
-    
-    // Get the selector value (from input or null if not connected)
-    getSelectorValue() {
-        // Find the selector input slot
-        const selectorInputSlot = this.inputs.findIndex(i => i.name === "selector");
-        
-        if (selectorInputSlot >= 0 && this.inputs[selectorInputSlot].link != null) {
-            const link = this.graph.links[this.inputs[selectorInputSlot].link];
-            if (link) {
-                const originNode = this.graph.getNodeById(link.origin_id);
-                if (originNode && originNode.widgets && originNode.widgets.length > 0) {
-                    // Try to find INT/number widget
-                    const widget = originNode.widgets.find(w => 
-                        w.type === "number" || w.name === "value" || w.name === "int"
-                    );
-                    if (widget && widget.value !== undefined) {
-                        return widget.value;
-                    }
-                    // Fallback to first widget
-                    return originNode.widgets[0].value;
-                }
+
+        // Check the input values and trigger actions (runs on interval)
+        checkInputs() {
+            if (!this.graph) return;
+
+            const bypassValue = this.getBypassValue();
+            const enableValue = this.getEnableValue();
+            const selectorValue = this.getSelectorValue();
+            const overrideValue = this.getOverrideValue();
+            const myId = this.selectorIdWidget.value;
+
+            const isSelectorActive = selectorValue !== null && selectorValue === myId;
+
+            // Detect selector change — reset state tracking
+            if (selectorValue !== this._lastSelectorValue) {
+                this._lastBypassState = undefined;
+                this._lastEnableState = undefined;
+                this._lastSelectorValue = selectorValue;
             }
-        }
-        // No selector connected - return null (allows bypasser to work independently)
-        return null;
-    }
-    
-    // Get the override value (from input)
-    getOverrideValue() {
-        // Find the override_input slot by name
-        const overrideInputSlot = this.inputs.findIndex(i => i.name === "override_input");
-        
-        if (overrideInputSlot >= 0 && this.inputs[overrideInputSlot].link != null) {
-            const link = this.graph.links[this.inputs[overrideInputSlot].link];
-            if (link) {
-                const originNode = this.graph.getNodeById(link.origin_id);
-                if (originNode) {
-                    // Try getOutputData FIRST for momentary button compatibility
-                    if (originNode.getOutputData && originNode.outputs && originNode.outputs[link.origin_slot]) {
-                        const value = originNode.getOutputData(link.origin_slot);
-                        if (value !== undefined) {
-                            return value;
-                        }
-                    }
-                    // Try to get value from widget as fallback (works for primitive nodes)
-                    if (originNode.widgets && originNode.widgets.length > 0) {
-                        const widget = originNode.widgets.find(w => w.type === "toggle" || w.name === "boolean" || w.name === "value");
-                        if (widget && widget.value !== undefined) {
-                            return widget.value;
-                        }
-                        if (originNode.widgets[0].value !== undefined) {
-                            return originNode.widgets[0].value;
-                        }
-                    }
-                }
+
+            // Visual indicator based on selector
+            if (isSelectorActive) {
+                this.bgcolor = "#224422";
+            } else if (selectorValue !== null) {
+                this.bgcolor = "#222222";
+            } else {
+                this.bgcolor = null;
             }
-        }
-        // Default to false if not connected
-        return false;
-    }
-    
-    // Note: We use setInterval in onConstructed() to check inputs every 100ms
-    // This is more efficient than checking every frame in onDrawBackground
-    // and also works when the node is off-screen
-    
-    // Check the input values and trigger actions
-    checkInputs() {
-        if (!this.graph) return;
-        
-        const bypassValue = this.getBypassValue();
-        const enableValue = this.getEnableValue();
-        const selectorValue = this.getSelectorValue();
-        const overrideValue = this.getOverrideValue();
-        const myId = this.selectorIdWidget.value;
-        
-        // Debug logging every few checks to help troubleshoot
-        if (!this._debugCounter) this._debugCounter = 0;
-        this._debugCounter++;
-        if (this._debugCounter % 100 === 0) {
-            console.log(`[NodeBypasser ${myId}] Status check - bypass=${bypassValue}, enable=${enableValue}, selector=${selectorValue}, override=${overrideValue}`);
-        }
-        
-        // Check if selector matches this bypasser's ID
-        const isSelectorActive = selectorValue !== null && selectorValue === myId;
-        
-        // Detect if selector has changed - reset state tracking when it does
-        if (selectorValue !== this._lastSelectorValue) {
-            // Reset state tracking so bypass/enable can trigger again
-            this._lastBypassState = undefined;
-            this._lastEnableState = undefined;
-            this._lastSelectorValue = selectorValue;
-        }
-        
-        // Update visual indicator based on selector
-        if (isSelectorActive) {
-            this.bgcolor = "#224422"; // Green tint when this bypasser is selected
-        } else if (selectorValue !== null) {
-            this.bgcolor = "#222222"; // Dark gray when selector is active but not matching
-        } else {
-            this.bgcolor = null; // Normal when no selector connected
-        }
-        
-        // DON'T update widget values when connected - this fights with manual changes
-        // The widgets are just for manual control when no inputs are connected
-        
-        // Check if override is blocking actions
-        if (overrideValue === true) {
-            // Override is active - block all bypass/enable actions
-            // Only log state changes to avoid spam
+
+            // Check override
+            if (overrideValue === true) {
+                if (bypassValue === true && this._lastBypassState !== true) {
+                    this._lastBypassState = true;
+                } else if (bypassValue !== true && this._lastBypassState === true) {
+                    this._lastBypassState = bypassValue;
+                }
+                if (enableValue === true && this._lastEnableState !== true) {
+                    this._lastEnableState = true;
+                } else if (enableValue !== true && this._lastEnableState === true) {
+                    this._lastEnableState = enableValue;
+                }
+                return;
+            }
+
+            // Check bypass input (only respond to TRUE pulses)
             if (bypassValue === true && this._lastBypassState !== true) {
-                console.log(`[NodeBypasser ${myId}] 🚫 Bypass blocked by override`);
+                if (selectorValue === null || isSelectorActive) {
+                    this.bypassNodesByName(true);
+                }
                 this._lastBypassState = true;
             } else if (bypassValue !== true && this._lastBypassState === true) {
                 this._lastBypassState = bypassValue;
             }
-            
+
+            // Check enable input (only respond to TRUE pulses)
             if (enableValue === true && this._lastEnableState !== true) {
-                console.log(`[NodeBypasser ${myId}] 🚫 Enable blocked by override`);
+                if (selectorValue === null || isSelectorActive) {
+                    this.bypassNodesByName(false);
+                }
                 this._lastEnableState = true;
             } else if (enableValue !== true && this._lastEnableState === true) {
                 this._lastEnableState = enableValue;
             }
-            return; // Exit early - don't process any bypass/enable
         }
-        
-        // Check if bypass input triggered (only respond to TRUE pulses)
-        if (bypassValue === true && this._lastBypassState !== true) {
-            // Only bypass if selector matches OR no selector connected
-            if (selectorValue === null || isSelectorActive) {
-                console.log(`[NodeBypasser ${myId}] ✅ Bypass triggered! Selector=${selectorValue}, Active=${isSelectorActive}`);
-                this.bypassNodesByName(true);
-            } else {
-                console.log(`[NodeBypasser ${myId}] ❌ Bypass blocked by selector (selector=${selectorValue}, myId=${myId})`);
-            }
-            this._lastBypassState = true;
-        } else if (bypassValue !== true && this._lastBypassState === true) {
-            // Reset state when value drops, but don't take action
-            console.log(`[NodeBypasser ${myId}] Bypass pulse ended (value=${bypassValue})`);
-            this._lastBypassState = bypassValue;
-        } else if (bypassValue === true) {
-            // Value is true but state is already true - duplicate
-            // console.log(`[NodeBypasser ${myId}] Bypass already triggered, ignoring`);
-        }
-        
-        // Check if enable input triggered (only respond to TRUE pulses)
-        if (enableValue === true && this._lastEnableState !== true) {
-            // Only enable if selector matches OR no selector connected
-            if (selectorValue === null || isSelectorActive) {
-                console.log(`[NodeBypasser ${myId}] ✅ Enable triggered!`);
-                this.bypassNodesByName(false);
-            }
-            this._lastEnableState = true;
-        } else if (enableValue !== true && this._lastEnableState === true) {
-            // Reset state when value drops, but don't take action
-            this._lastEnableState = enableValue;
-        }
-    }
-    
-    // onConnectionsChange removed - the setInterval handles input checking automatically
-    
-    listAllNodes() {
-        try {
-            console.log("[NodeBypasser] listAllNodes() called");
-            
-            const graph = app.graph;
-            console.log("[NodeBypasser] Graph:", graph);
-            if (!graph) {
-                this.resultWidget.value = "Error: No graph found";
-                return;
-            }
-            
-            const nodes = graph._nodes;
-            console.log("[NodeBypasser] Nodes:", nodes);
-            console.log("[NodeBypasser] Number of nodes:", nodes ? nodes.length : "undefined");
-            
-            if (!nodes) {
-                this.resultWidget.value = "Error: No nodes found in graph";
-                return;
-            }
-            
-            let nodeDetails = [];
-            
-            // List all nodes
-            for (const node of nodes) {
-                const nodeId = node.id;
-                const nodeType = node.type || 'Unknown';
-                const nodeTitle = node.title || 'No title';
-                const nodeMode = node.mode || 0;
-                
-                console.log(`[NodeBypasser] Processing node: ${nodeId} - ${nodeType} - ${nodeTitle}`);
-                
-                // Skip the bypasser node itself
-                if (node === this) {
-                    console.log("[NodeBypasser] Skipping self node");
-                    continue;
+
+        listAllNodes() {
+            try {
+                const graph = app.graph;
+                if (!graph) {
+                    this.resultWidget.value = "Error: No graph found";
+                    return;
                 }
-                
-                // Get mode description
-                let modeText = "Active";
-                if (nodeMode === MODE_BYPASS) {
-                    modeText = "Bypassed";
-                } else if (nodeMode === 2) {
-                    modeText = "Muted";
+
+                const nodes = graph._nodes;
+                if (!nodes) {
+                    this.resultWidget.value = "Error: No nodes found in graph";
+                    return;
                 }
-                
-                nodeDetails.push(`Node ${nodeId}: ${nodeType} - ${nodeTitle} (${modeText})`);
-                
-                // If this is a subgraph, list internal nodes too
-                if (node.subgraph && node.subgraph._nodes) {
-                    for (const internalNode of node.subgraph._nodes) {
-                        const internalMode = internalNode.mode || 0;
-                        let internalModeText = "Active";
-                        if (internalMode === MODE_BYPASS) {
-                            internalModeText = "Bypassed";
-                        } else if (internalMode === 2) {
-                            internalModeText = "Muted";
+
+                let nodeDetails = [];
+
+                for (const node of nodes) {
+                    if (node === this) continue;
+
+                    const nodeId = node.id;
+                    const nodeType = node.type || 'Unknown';
+                    const nodeTitle = node.title || 'No title';
+                    const nodeMode = node.mode || 0;
+
+                    let modeText = "Active";
+                    if (nodeMode === MODE_BYPASS) {
+                        modeText = "Bypassed";
+                    } else if (nodeMode === 2) {
+                        modeText = "Muted";
+                    }
+
+                    nodeDetails.push(`Node ${nodeId}: ${nodeType} - ${nodeTitle} (${modeText})`);
+
+                    if (node.subgraph && node.subgraph._nodes) {
+                        for (const internalNode of node.subgraph._nodes) {
+                            const internalMode = internalNode.mode || 0;
+                            let internalModeText = "Active";
+                            if (internalMode === MODE_BYPASS) {
+                                internalModeText = "Bypassed";
+                            } else if (internalMode === 2) {
+                                internalModeText = "Muted";
+                            }
+                            nodeDetails.push(`  └─ Internal ${internalNode.id}: ${internalNode.type} - ${internalNode.title} (${internalModeText})`);
                         }
-                        nodeDetails.push(`  └─ Internal ${internalNode.id}: ${internalNode.type} - ${internalNode.title} (${internalModeText})`);
                     }
                 }
-            }
-            
-            console.log("[NodeBypasser] Node details:", nodeDetails);
-            
-            if (nodeDetails.length === 0) {
-                this.resultWidget.value = "No other nodes found in graph";
-                return;
-            }
 
-            // Also list available groups
-            const groups = graph._groups || [];
-            let groupDetails = [];
-            if (groups.length > 0) {
-                for (const group of groups) {
-                    if (group.recomputeInsideNodes) {
-                        group.recomputeInsideNodes();
-                    }
-                    const nodeCount = (group._nodes || []).length;
-                    groupDetails.push(`@${group.title} (${nodeCount} nodes)`);
+                if (nodeDetails.length === 0) {
+                    this.resultWidget.value = "No other nodes found in graph";
+                    return;
                 }
-            }
 
-            let result = `Found ${nodeDetails.length} nodes in graph:\n\n${nodeDetails.join('\n')}`;
-            if (groupDetails.length > 0) {
-                result += `\n\n--- Groups (use @GroupName to bypass) ---\n${groupDetails.join('\n')}`;
+                const groups = graph._groups || [];
+                let groupDetails = [];
+                if (groups.length > 0) {
+                    for (const group of groups) {
+                        if (group.recomputeInsideNodes) {
+                            group.recomputeInsideNodes();
+                        }
+                        const nodeCount = (group._nodes || []).length;
+                        groupDetails.push(`@${group.title} (${nodeCount} nodes)`);
+                    }
+                }
+
+                let result = `Found ${nodeDetails.length} nodes in graph:\n\n${nodeDetails.join('\n')}`;
+                if (groupDetails.length > 0) {
+                    result += `\n\n--- Groups (use @GroupName to bypass) ---\n${groupDetails.join('\n')}`;
+                }
+                this.resultWidget.value = result;
+
+            } catch (error) {
+                console.error('[NodeBypasser] Error listing nodes:', error);
+                this.resultWidget.value = `Error: ${error.message}`;
             }
-            this.resultWidget.value = result;
-            console.log("[NodeBypasser] Result set:", result);
-            
-        } catch (error) {
-            console.error('[NodeBypasser] Error listing nodes:', error);
-            this.resultWidget.value = `Error: ${error.message}`;
         }
-    }
-    
-    // Bypass nodes by name
-    bypassNodesByName(bypass) {
-        try {
-            console.log("[NodeBypasser] bypassNodesByName called with bypass=", bypass);
-            
-            const nodeNamesText = this.nodeNamesInput.value;
-            console.log("[NodeBypasser] Node names text:", nodeNamesText);
-            
-            if (!nodeNamesText || nodeNamesText.trim() === "" || nodeNamesText.includes("Enter node names")) {
-                this.resultWidget.value = "Please enter node names to bypass";
-                return;
+
+        bypassNodesByName(bypass) {
+            try {
+                const nodeNamesText = this.nodeNamesInput.value;
+
+                if (!nodeNamesText || nodeNamesText.trim() === "" || nodeNamesText.includes("Enter node names")) {
+                    this.resultWidget.value = "Please enter node names to bypass";
+                    return;
+                }
+
+                const graph = app.graph;
+                if (!graph) {
+                    this.resultWidget.value = "Error: No graph found";
+                    return;
+                }
+
+                const nodes = graph._nodes;
+                let processedCount = 0;
+                const results = [];
+                const notFound = [];
+                const errors = [];
+
+                const nodeNames = nodeNamesText.split(',').map(name => name.trim()).filter(name => name.length > 0);
+                const mainResults = this.processNodeList(nodeNames, nodes, bypass, "");
+                processedCount += mainResults.processedCount;
+                results.push(...mainResults.results);
+                notFound.push(...mainResults.notFound);
+                errors.push(...mainResults.errors);
+
+                const action = bypass ? "Bypassed" : "Enabled";
+                let resultText = `${action} ${processedCount} nodes:\n${results.join('\n')}`;
+
+                if (notFound.length > 0) {
+                    resultText += `\n\nNot found: ${notFound.join(', ')}`;
+                }
+                if (errors.length > 0) {
+                    resultText += `\n\nErrors: ${errors.join(', ')}`;
+                }
+
+                this.resultWidget.value = resultText;
+
+            } catch (error) {
+                console.error('[NodeBypasser] Error bypassing nodes:', error);
+                this.resultWidget.value = `Error: ${error.message}`;
             }
-            
-            const graph = app.graph;
-            if (!graph) {
-                this.resultWidget.value = "Error: No graph found";
-                return;
-            }
-            
-            const nodes = graph._nodes;
-            let processedCount = 0;
+        }
+
+        processNodeList(nodeNames, nodes, bypass, label = "") {
+            const processedCount = { count: 0 };
             const results = [];
             const notFound = [];
             const errors = [];
-            
-            // Process main node names
-            const nodeNames = nodeNamesText.split(',').map(name => name.trim()).filter(name => name.length > 0);
-            const mainResults = this.processNodeList(nodeNames, nodes, bypass, "");
-            processedCount += mainResults.processedCount;
-            results.push(...mainResults.results);
-            notFound.push(...mainResults.notFound);
-            errors.push(...mainResults.errors);
-            
-            // Build result message
-            const action = bypass ? "Bypassed" : "Enabled";
-            let resultText = `${action} ${processedCount} nodes:\n${results.join('\n')}`;
-            
-            if (notFound.length > 0) {
-                resultText += `\n\nNot found: ${notFound.join(', ')}`;
-            }
-            if (errors.length > 0) {
-                resultText += `\n\nErrors: ${errors.join(', ')}`;
-            }
-            
-            this.resultWidget.value = resultText;
-            
-        } catch (error) {
-            console.error('[NodeBypasser] Error bypassing nodes:', error);
-            this.resultWidget.value = `Error: ${error.message}`;
-        }
-    }
-    
-    // Helper method to process a list of node names
-    processNodeList(nodeNames, nodes, bypass, label = "") {
-        const processedCount = { count: 0 };
-        const results = [];
-        const notFound = [];
-        const errors = [];
 
-        for (const nodeName of nodeNames) {
-            try {
-                let matchingNodes = [];
+            for (const nodeName of nodeNames) {
+                try {
+                    let matchingNodes = [];
 
-                // Check if it's a group pattern (starts with @)
-                if (nodeName.startsWith('@')) {
-                    const groupName = nodeName.substring(1); // Remove @ prefix
-                    console.log(`[NodeBypasser] Processing group pattern (${label}):`, groupName);
-                    matchingNodes = this.findNodesInGroup(groupName, nodes);
-                }
-                // Check if it's a regex pattern (contains * or ! or other regex chars)
-                else if (this.isRegexPattern(nodeName)) {
-                    console.log(`[NodeBypasser] Processing regex pattern (${label}):`, nodeName);
-                    matchingNodes = this.findNodesByRegex(nodeName, nodes);
-                } else {
-                    // Use simple string matching for non-regex patterns
-                    matchingNodes = nodes.filter(node => 
-                        node !== this && // Don't include the bypasser node itself
-                        (node.type.toLowerCase().includes(nodeName.toLowerCase()) ||
-                         (node.title && node.title.toLowerCase().includes(nodeName.toLowerCase())) ||
-                         (node.properties && node.properties.name && node.properties.name.toLowerCase().includes(nodeName.toLowerCase())) ||
-                         (node.properties && node.properties.variable_name && node.properties.variable_name.toLowerCase().includes(nodeName.toLowerCase())) ||
-                         (node.properties && node.properties.custom_name && node.properties.custom_name.toLowerCase().includes(nodeName.toLowerCase())) ||
-                         (node._stableCustomName && node._stableCustomName.toLowerCase().includes(nodeName.toLowerCase())))
-                    );
-                }
-                
-                if (matchingNodes.length === 0) {
-                    notFound.push(`${label}: ${nodeName}`);
-                    continue;
-                }
-                
-                for (const targetNode of matchingNodes) {
-                    const newMode = bypass ? MODE_BYPASS : MODE_ALWAYS;
-                    targetNode.mode = newMode;
-                    processedCount.count++;
-                    results.push(`${label ? '[' + label + '] ' : ''}Node ${targetNode.id}: ${targetNode.type}`);
-                    
-                    // If this is a collapsed subgraph, also bypass all internal nodes
-                    if (targetNode.subgraph && targetNode.subgraph._nodes) {
-                        console.log(`[NodeBypasser] Subgraph detected in node ${targetNode.id}, bypassing internal nodes`);
-                        for (const internalNode of targetNode.subgraph._nodes) {
-                            internalNode.mode = newMode;
-                            processedCount.count++;
-                            results.push(`  └─ Internal: ${internalNode.id} (${internalNode.type})`);
+                    if (nodeName.startsWith('@')) {
+                        const groupName = nodeName.substring(1);
+                        matchingNodes = this.findNodesInGroup(groupName);
+                    }
+                    else if (this.isRegexPattern(nodeName)) {
+                        matchingNodes = this.findNodesByRegex(nodeName, nodes);
+                    } else {
+                        matchingNodes = nodes.filter(node =>
+                            node !== this &&
+                            (node.type.toLowerCase().includes(nodeName.toLowerCase()) ||
+                             (node.title && node.title.toLowerCase().includes(nodeName.toLowerCase())) ||
+                             (node.properties && node.properties.name && node.properties.name.toLowerCase().includes(nodeName.toLowerCase())) ||
+                             (node.properties && node.properties.variable_name && node.properties.variable_name.toLowerCase().includes(nodeName.toLowerCase())) ||
+                             (node.properties && node.properties.custom_name && node.properties.custom_name.toLowerCase().includes(nodeName.toLowerCase())) ||
+                             (node._stableCustomName && node._stableCustomName.toLowerCase().includes(nodeName.toLowerCase())))
+                        );
+                    }
+
+                    if (matchingNodes.length === 0) {
+                        notFound.push(`${label}: ${nodeName}`);
+                        continue;
+                    }
+
+                    for (const targetNode of matchingNodes) {
+                        const newMode = bypass ? MODE_BYPASS : MODE_ALWAYS;
+                        targetNode.mode = newMode;
+                        processedCount.count++;
+                        results.push(`${label ? '[' + label + '] ' : ''}Node ${targetNode.id}: ${targetNode.type}`);
+
+                        if (targetNode.subgraph && targetNode.subgraph._nodes) {
+                            for (const internalNode of targetNode.subgraph._nodes) {
+                                internalNode.mode = newMode;
+                                processedCount.count++;
+                                results.push(`  └─ Internal: ${internalNode.id} (${internalNode.type})`);
+                            }
                         }
                     }
+                } catch (error) {
+                    console.error(`[NodeBypasser] Error processing pattern "${nodeName}":`, error);
+                    errors.push(`${label}: ${nodeName}: ${error.message}`);
                 }
-            } catch (error) {
-                console.error(`[NodeBypasser] Error processing pattern "${nodeName}":`, error);
-                errors.push(`${label}: ${nodeName}: ${error.message}`);
             }
+
+            return { processedCount: processedCount.count, results, notFound, errors };
         }
-        
-        return {
-            processedCount: processedCount.count,
-            results,
-            notFound,
-            errors
-        };
-    }
-    
-    // Check if a pattern contains regex-like characters
-    isRegexPattern(pattern) {
-        // Check for common regex indicators
-        return pattern.includes('*') || 
-               pattern.includes('!') || 
-               pattern.includes('^') || 
-               pattern.includes('$') || 
-               pattern.includes('[') || 
-               pattern.includes(']') || 
-               pattern.includes('(') || 
-               pattern.includes(')') ||
-               pattern.includes('+') ||
-               pattern.includes('?') ||
-               pattern.includes('|');
-    }
-    
-    // Find nodes using regex patterns
-    findNodesByRegex(pattern, nodes) {
-        try {
+
+        isRegexPattern(pattern) {
+            return pattern.includes('*') ||
+                   pattern.includes('!') ||
+                   pattern.includes('^') ||
+                   pattern.includes('$') ||
+                   pattern.includes('[') ||
+                   pattern.includes(']') ||
+                   pattern.includes('(') ||
+                   pattern.includes(')') ||
+                   pattern.includes('+') ||
+                   pattern.includes('?') ||
+                   pattern.includes('|');
+        }
+
+        findNodesByRegex(pattern, nodes) {
             let regexPattern = pattern;
             let isExclusion = false;
-            
-            // Handle exclusion patterns (starting with !)
+
             if (pattern.startsWith('!')) {
                 isExclusion = true;
                 regexPattern = pattern.substring(1);
             }
-            
-            // Convert wildcard patterns to regex
-            // * becomes .* (match any characters)
-            // ? becomes . (match single character)
+
             regexPattern = regexPattern
                 .replace(/\*/g, '.*')
                 .replace(/\?/g, '.');
-            
-            // Create case-insensitive regex
+
             const regex = new RegExp(regexPattern, 'i');
-            
-            console.log(`[NodeBypasser] Converted pattern "${pattern}" to regex: /${regexPattern}/i`);
-            
+
             const matchingNodes = nodes.filter(node => {
-                if (node === this) return false; // Don't include the bypasser node itself
-                
+                if (node === this) return false;
+
                 const typeMatch = regex.test(node.type);
                 const titleMatch = node.title ? regex.test(node.title) : false;
                 const customNameMatch = node.properties && node.properties.custom_name ? regex.test(node.properties.custom_name) : false;
                 const stableCustomNameMatch = node._stableCustomName ? regex.test(node._stableCustomName) : false;
                 const matches = typeMatch || titleMatch || customNameMatch || stableCustomNameMatch;
-                
-                // For exclusion patterns, return the opposite
+
                 return isExclusion ? !matches : matches;
             });
-            
-            console.log(`[NodeBypasser] Found ${matchingNodes.length} nodes matching pattern "${pattern}"`);
+
             return matchingNodes;
-
-        } catch (error) {
-            console.error(`[NodeBypasser] Regex error for pattern "${pattern}":`, error);
-            throw new Error(`Invalid regex pattern: ${error.message}`);
-        }
-    }
-
-    // Find nodes inside a group by group name
-    findNodesInGroup(groupName, nodes) {
-        const graph = app.graph;
-        const groups = graph._groups || [];
-
-        if (groups.length === 0) {
-            console.log(`[NodeBypasser] No groups found in graph`);
-            return [];
         }
 
-        // Support wildcard matching for group names (e.g., @My* matches "My Group", "MyNodes")
-        let matchingGroups = [];
-        const isWildcard = groupName.includes('*') || groupName.includes('?');
+        findNodesInGroup(groupName) {
+            const graph = app.graph;
+            const groups = graph._groups || [];
 
-        if (isWildcard) {
-            // Convert wildcard pattern to regex
-            let regexPattern = groupName
-                .replace(/\*/g, '.*')
-                .replace(/\?/g, '.');
-            const regex = new RegExp(`^${regexPattern}$`, 'i');
-
-            matchingGroups = groups.filter(g => g.title && regex.test(g.title));
-            console.log(`[NodeBypasser] Wildcard group pattern "${groupName}" matched ${matchingGroups.length} groups`);
-        } else {
-            // Exact or partial match (case-insensitive)
-            matchingGroups = groups.filter(g =>
-                g.title && g.title.toLowerCase().includes(groupName.toLowerCase())
-            );
-        }
-
-        if (matchingGroups.length === 0) {
-            console.log(`[NodeBypasser] No groups found matching "${groupName}". Available groups: ${groups.map(g => g.title).join(', ')}`);
-            return [];
-        }
-
-        // Collect all nodes from matching groups
-        const nodesInGroups = [];
-        const seenNodeIds = new Set();
-
-        for (const group of matchingGroups) {
-            // Recompute which nodes are inside this group
-            if (group.recomputeInsideNodes) {
-                group.recomputeInsideNodes();
+            if (groups.length === 0) {
+                return [];
             }
 
-            const groupNodes = group._nodes || [];
-            console.log(`[NodeBypasser] Group "${group.title}" contains ${groupNodes.length} nodes`);
+            let matchingGroups = [];
+            const isWildcard = groupName.includes('*') || groupName.includes('?');
 
-            for (const node of groupNodes) {
-                // Skip the bypasser node itself and avoid duplicates
-                if (node !== this && !seenNodeIds.has(node.id)) {
-                    nodesInGroups.push(node);
-                    seenNodeIds.add(node.id);
+            if (isWildcard) {
+                let regexPattern = groupName
+                    .replace(/\*/g, '.*')
+                    .replace(/\?/g, '.');
+                const regex = new RegExp(`^${regexPattern}$`, 'i');
+                matchingGroups = groups.filter(g => g.title && regex.test(g.title));
+            } else {
+                matchingGroups = groups.filter(g =>
+                    g.title && g.title.toLowerCase().includes(groupName.toLowerCase())
+                );
+            }
+
+            if (matchingGroups.length === 0) {
+                return [];
+            }
+
+            const nodesInGroups = [];
+            const seenNodeIds = new Set();
+
+            for (const group of matchingGroups) {
+                if (group.recomputeInsideNodes) {
+                    group.recomputeInsideNodes();
+                }
+
+                const groupNodes = group._nodes || [];
+
+                for (const node of groupNodes) {
+                    if (node !== this && !seenNodeIds.has(node.id)) {
+                        nodesInGroups.push(node);
+                        seenNodeIds.add(node.id);
+                    }
                 }
             }
-        }
 
-        console.log(`[NodeBypasser] Found ${nodesInGroups.length} unique nodes in ${matchingGroups.length} matching group(s)`);
-        return nodesInGroups;
+            return nodesInGroups;
+        }
     }
 
+    // Set up the node properties
+    _NodeBypasser.type = "NodeBypasser";
+    _NodeBypasser.title = "Node Bypasser";
+    _NodeBypasser.category = "KNF_Utils";
+    _NodeBypasser.description = "Bypass nodes by name";
+
+    NodeBypasser = _NodeBypasser;
 }
 
-// Set up the node properties
-NodeBypasser.type = "NodeBypasser";
-NodeBypasser.title = "Node Bypasser";
-NodeBypasser.category = "KNF_Utils";
-NodeBypasser.description = "Bypass nodes by name";
-
 // Register the extension
-console.log("[NodeBypasser] Extension loading...");
 app.registerExtension({
     name: "NV_Comfy_Utils.NodeBypasser",
     registerCustomNodes() {
-        console.log("[NodeBypasser] Registering custom nodes...");
+        // Define the class here — LGraphNode is guaranteed to exist at this point
+        defineNodeBypasser();
         LiteGraph.registerNodeType(NodeBypasser.type, NodeBypasser);
-        console.log("[NodeBypasser] Node type registered:", NodeBypasser.type);
     },
     loadedGraphNode(node) {
         if (node.type == "NodeBypasser") {
-            console.log("[NodeBypasser] Node loaded in graph:", node.id);
             node._tempWidth = node.size[0];
         }
     },
 });
-console.log("[NodeBypasser] Extension registered");
-console.log("[NodeBypasser] Extension registered");

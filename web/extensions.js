@@ -1,18 +1,31 @@
-// Import the extensions
+// Import extensions sequentially (order matters for dependencies)
+// Dynamic imports isolate failures so one broken module doesn't kill all others
 console.log("[NV_Comfy_Utils] Loading extensions...");
-import "./node_bypasser.js";
-import "./stable_naming.js";
-import "./variable_manager.js";
-import "./simple_variables.js";
-import "./variable_context_menu.js";
-import "./simple_link_switcher.js";
-import "./momentary_button.js";
-import "./frame_annotator.js";
-import "./bbox_creator.js";
-import "./floating_panel.js";
-import "./variables_panel.js";
-import "./download_video.js";
-import "./preview_animation.js";
-import "./clone_with_connections.js";
-import "./point_picker.js";
-console.log("[NV_Comfy_Utils] All extensions loaded successfully"); 
+
+const modules = [
+    "./node_bypasser.js",
+    "./stable_naming.js",
+    "./variable_manager.js",        // Must load before simple_variables, variable_context_menu, variables_panel
+    "./simple_variables.js",
+    "./variable_context_menu.js",
+    "./simple_link_switcher.js",
+    "./momentary_button.js",
+    "./frame_annotator.js",
+    "./bbox_creator.js",
+    "./floating_panel.js",          // Must load before variables_panel
+    "./variables_panel.js",
+    "./download_video.js",
+    "./preview_animation.js",
+    "./clone_with_connections.js",
+    "./point_picker.js",
+];
+
+for (const mod of modules) {
+    try {
+        await import(mod);
+    } catch (err) {
+        console.error(`[NV_Comfy_Utils] Failed to load ${mod}:`, err);
+    }
+}
+
+console.log("[NV_Comfy_Utils] All extensions loaded successfully");

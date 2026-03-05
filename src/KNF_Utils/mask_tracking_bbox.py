@@ -11,8 +11,11 @@ Unlike masks_to_bboxes() in vace_control_video_prep.py, this node:
   - Outputs both the bbox mask and a pass-through of the input tight mask
 
 Smoothing modes:
+  kalman_rts  - 8D Kalman + RTS backward smoother. Globally optimal, no causal lag.
   one_euro    - Velocity-adaptive: heavy smoothing when still, light when moving.
                 Best for subjects with variable speed. Forward-pass only (causal).
+  ema         - Bidirectional Exponential Moving Average. Simple single-parameter
+                control via alpha. Zero lag from forward+backward averaging.
   gaussian    - Temporal Gaussian blur on coordinates. Smooth but lags fast motion.
   median      - Median filter then Gaussian smooth (from vace_control_video_prep).
                 Best for removing outlier frames.
@@ -22,6 +25,8 @@ Smoothing modes:
   lock_first  - Lock bbox WIDTH and HEIGHT to the first frame's values.
                  Position (center) still smoothed with One-Euro.
   none        - Raw per-frame bboxes with padding only. No temporal smoothing.
+
+smooth_strength (0-1) lerps between raw and smoothed for any mode.
 
 Note: Anomaly detection (occlusion/tracking-loss rejection) lives in
 NV_InpaintCrop v2, not here. This node focuses purely on smoothing.
@@ -94,6 +99,48 @@ def one_euro_smooth_1d(values: list, min_cutoff: float = 0.05,
 
 
 # =============================================================================
+# Bidirectional Exponential Moving Average
+# =============================================================================
+
+def ema_smooth_1d(values: list, alpha: float = 0.3, bidirectional: bool = True) -> list:
+    """Apply Exponential Moving Average to a 1D sequence.
+
+    Bidirectional mode runs a forward pass and a backward pass, then averages
+    the two results. This eliminates the causal lag of a one-directional EMA
+    while keeping the simple, single-parameter interface.
+
+    Args:
+        values: Raw coordinate values, one per frame.
+        alpha: Smoothing factor in (0, 1]. Lower = more smoothing.
+               0.1 = heavy (90% memory), 0.5 = moderate, 0.9 = light.
+        bidirectional: If True, average forward and backward passes for zero lag.
+                       If False, forward-pass only (causal, suitable for real-time).
+
+    Returns:
+        Filtered values as list, same length as input.
+    """
+    if len(values) <= 1:
+        return list(values)
+
+    # Forward pass
+    fwd = [values[0]]
+    for i in range(1, len(values)):
+        fwd.append(alpha * values[i] + (1.0 - alpha) * fwd[i - 1])
+
+    if not bidirectional:
+        return fwd
+
+    # Backward pass
+    bwd = [0.0] * len(values)
+    bwd[-1] = values[-1]
+    for i in range(len(values) - 2, -1, -1):
+        bwd[i] = alpha * values[i] + (1.0 - alpha) * bwd[i + 1]
+
+    # Average forward and backward
+    return [(f + b) / 2.0 for f, b in zip(fwd, bwd)]
+
+
+# =============================================================================
 # Bbox Extraction
 # =============================================================================
 
@@ -157,12 +204,13 @@ def extract_bboxes(mask: torch.Tensor, info_lines: list) -> tuple:
 def smooth_coordinates(x1s, y1s, x2s, y2s, smooth_mode, smooth_window,
                        min_cutoff, beta, info_lines,
                        present=None, q_pos=4.0, q_dim=1.0,
-                       r_pos=9.0, r_dim=25.0):
+                       r_pos=9.0, r_dim=25.0,
+                       ema_alpha=0.3, smooth_strength=1.0):
     """Apply temporal smoothing to bbox coordinate sequences.
 
     Args:
         x1s, y1s, x2s, y2s: Per-frame corner coordinates.
-        smooth_mode: One of "kalman_rts", "one_euro", "gaussian", "median",
+        smooth_mode: One of "kalman_rts", "one_euro", "ema", "gaussian", "median",
                      "lock_largest", "lock_first", "none".
         smooth_window: Window size for gaussian/median modes.
         min_cutoff: One-Euro min_cutoff (used by one_euro and lock modes).
@@ -173,6 +221,8 @@ def smooth_coordinates(x1s, y1s, x2s, y2s, smooth_mode, smooth_window,
         q_dim: Kalman process noise for dimension acceleration.
         r_pos: Kalman measurement noise for center position.
         r_dim: Kalman measurement noise for width/height.
+        ema_alpha: EMA smoothing factor (0,1]. Lower = more smoothing.
+        smooth_strength: Lerp between raw (0.0) and smoothed (1.0). Works with all modes.
 
     Returns:
         Smoothed (x1s, y1s, x2s, y2s).
@@ -182,6 +232,10 @@ def smooth_coordinates(x1s, y1s, x2s, y2s, smooth_mode, smooth_window,
     if smooth_mode == "none" or B <= 1:
         info_lines.append("  Smoothing: none")
         return x1s, y1s, x2s, y2s
+
+    # Save raw values for smooth_strength lerp
+    raw_x1s, raw_y1s = list(x1s), list(y1s)
+    raw_x2s, raw_y2s = list(x2s), list(y2s)
 
     if smooth_mode == "kalman_rts":
         if B < 10:
@@ -201,6 +255,14 @@ def smooth_coordinates(x1s, y1s, x2s, y2s, smooth_mode, smooth_window,
                 f"  Smoothing: kalman_rts (q_pos={q_pos}, q_dim={q_dim}, "
                 f"r_pos={r_pos}, r_dim={r_dim})"
             )
+            # Apply smooth_strength lerp before returning
+            if smooth_strength < 1.0:
+                s = smooth_strength
+                x1s = [r + s * (sm - r) for r, sm in zip(raw_x1s, x1s)]
+                y1s = [r + s * (sm - r) for r, sm in zip(raw_y1s, y1s)]
+                x2s = [r + s * (sm - r) for r, sm in zip(raw_x2s, x2s)]
+                y2s = [r + s * (sm - r) for r, sm in zip(raw_y2s, y2s)]
+                info_lines.append(f"  Strength: {smooth_strength:.0%} (lerp raw→smoothed)")
             return x1s, y1s, x2s, y2s
 
     if smooth_mode == "one_euro":
@@ -211,6 +273,13 @@ def smooth_coordinates(x1s, y1s, x2s, y2s, smooth_mode, smooth_window,
         info_lines.append(
             f"  Smoothing: one_euro (min_cutoff={min_cutoff}, beta={beta})"
         )
+
+    elif smooth_mode == "ema":
+        x1s = ema_smooth_1d(x1s, ema_alpha, bidirectional=True)
+        y1s = ema_smooth_1d(y1s, ema_alpha, bidirectional=True)
+        x2s = ema_smooth_1d(x2s, ema_alpha, bidirectional=True)
+        y2s = ema_smooth_1d(y2s, ema_alpha, bidirectional=True)
+        info_lines.append(f"  Smoothing: ema (alpha={ema_alpha}, bidirectional)")
 
     elif smooth_mode == "gaussian":
         win = min(smooth_window, B)
@@ -262,6 +331,15 @@ def smooth_coordinates(x1s, y1s, x2s, y2s, smooth_mode, smooth_window,
         y1s = [cy - ref_h / 2.0 for cy in cys]
         x2s = [cx + ref_w / 2.0 for cx in cxs]
         y2s = [cy + ref_h / 2.0 for cy in cys]
+
+    # Apply smooth_strength lerp: blend between raw and smoothed
+    if smooth_strength < 1.0:
+        s = smooth_strength
+        x1s = [r + s * (sm - r) for r, sm in zip(raw_x1s, x1s)]
+        y1s = [r + s * (sm - r) for r, sm in zip(raw_y1s, y1s)]
+        x2s = [r + s * (sm - r) for r, sm in zip(raw_x2s, x2s)]
+        y2s = [r + s * (sm - r) for r, sm in zip(raw_y2s, y2s)]
+        info_lines.append(f"  Strength: {smooth_strength:.0%} (lerp raw→smoothed)")
 
     return x1s, y1s, x2s, y2s
 
@@ -348,13 +426,14 @@ class NV_MaskTrackingBBox:
                                "Ensures the crop includes context around the subject."
                 }),
                 "smooth_mode": ([
-                    "kalman_rts", "one_euro", "gaussian", "median",
+                    "kalman_rts", "one_euro", "ema", "gaussian", "median",
                     "lock_largest", "lock_first", "none"
                 ], {
                     "default": "kalman_rts",
                     "tooltip": "kalman_rts: 8D Kalman + RTS backward smoother — globally optimal, "
                                "handles missing frames, no causal lag (RECOMMENDED). "
                                "one_euro: velocity-adaptive, forward-only (slight lag). "
+                               "ema: bidirectional exponential moving average — simple, one param (alpha). "
                                "gaussian: temporal Gaussian blur on coordinates. "
                                "median: median filter + Gaussian (removes outlier frames). "
                                "lock_largest: fix bbox size to largest frame, smooth position. "
@@ -381,6 +460,18 @@ class NV_MaskTrackingBBox:
                                "Higher = faster adaptation when subject moves quickly. "
                                "Used by one_euro, lock_largest, and lock_first modes. "
                                "0.0 = no speed adaptation, 0.5-1.0 = moderate, 2.0+ = aggressive."
+                }),
+                "ema_alpha": ("FLOAT", {
+                    "default": 0.3, "min": 0.01, "max": 1.0, "step": 0.05,
+                    "tooltip": "EMA smoothing factor. Lower = more smoothing (more memory of past). "
+                               "0.1 = heavy smoothing, 0.3 = moderate (default), 0.5 = light, 0.9 = minimal. "
+                               "Only used by 'ema' smooth_mode."
+                }),
+                "smooth_strength": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Lerp between raw bbox (0.0) and fully smoothed (1.0). "
+                               "Works with ALL smoothing modes. Use to dial in partial smoothing "
+                               "without changing algorithm parameters. 0.5 = half the correction."
                 }),
                 "threshold": ("BOOLEAN", {
                     "default": False,
@@ -439,6 +530,7 @@ class NV_MaskTrackingBBox:
 
     def execute(self, mask, padding, smooth_mode, smooth_window,
                 min_cutoff=0.05, beta=0.7,
+                ema_alpha=0.3, smooth_strength=1.0,
                 threshold=False, output_erode=0, output_feather=0,
                 kalman_q_pos=4.0, kalman_q_dim=1.0,
                 kalman_r_pos=9.0, kalman_r_dim=25.0):
@@ -476,7 +568,8 @@ class NV_MaskTrackingBBox:
             info_lines,
             present=present,
             q_pos=kalman_q_pos, q_dim=kalman_q_dim,
-            r_pos=kalman_r_pos, r_dim=kalman_r_dim
+            r_pos=kalman_r_pos, r_dim=kalman_r_dim,
+            ema_alpha=ema_alpha, smooth_strength=smooth_strength
         )
 
         # --- Build output bbox masks ---

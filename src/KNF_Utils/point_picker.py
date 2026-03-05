@@ -33,6 +33,12 @@ class NV_PointPicker:
                 }),
             },
             "optional": {
+                "frame_index": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 99999,
+                    "tooltip": "Frame index to display from video batch (0 = first frame). Pick a frame where the feature you want to track is clearly visible."
+                }),
                 "mask": ("MASK", {
                     "tooltip": "Optional mask overlay to help visualize the tracked region while placing points."
                 }),
@@ -43,8 +49,8 @@ class NV_PointPicker:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "STRING", "STRING")
-    RETURN_NAMES = ("images", "tracking_points", "info")
+    RETURN_TYPES = ("IMAGE", "STRING", "STRING", "INT", "INT")
+    RETURN_NAMES = ("images", "tracking_points", "info", "frame_index", "total_frames")
     FUNCTION = "pick_points"
     CATEGORY = "NV_Utils/Inpaint"
     OUTPUT_NODE = True
@@ -54,8 +60,9 @@ class NV_PointPicker:
         "Connect tracking_points output to NV_CoTrackerBridge."
     )
 
-    def pick_points(self, images, mask=None, point_data="[]"):
+    def pick_points(self, images, frame_index=0, mask=None, point_data="[]"):
         B, H, W, C = images.shape
+        frame_index = min(frame_index, B - 1)
 
         # Parse point data from frontend
         try:
@@ -75,27 +82,27 @@ class NV_PointPicker:
 
         n = len(valid_points)
         if n == 0:
-            info = f"No points placed. Click on the image to add tracking points. Image: {W}x{H}, {B} frames."
+            info = f"No points placed. Click on the image to add tracking points. Image: {W}x{H}, {B} frames, showing frame {frame_index}."
         else:
             coords = ", ".join(f"({p['x']:.0f}, {p['y']:.0f})" for p in valid_points)
-            info = f"{n} tracking point{'s' if n != 1 else ''}: {coords}. Image: {W}x{H}, {B} frames."
+            info = f"{n} tracking point{'s' if n != 1 else ''}: {coords}. Image: {W}x{H}, {B} frames, showing frame {frame_index}."
 
         print(f"[NV_PointPicker] {info}")
 
-        # Send first frame as preview to frontend
-        preview = self._encode_preview(images[0], mask=mask)
+        # Send selected frame as preview to frontend
+        preview = self._encode_preview(images[frame_index], mask=mask, frame_index=frame_index if mask is not None else 0)
 
         return {
-            "ui": {"bg_image": [preview], "image_size": [{"width": W, "height": H}]},
-            "result": (images, tracking_points, info),
+            "ui": {"bg_image": [preview], "image_size": [{"width": W, "height": H}], "total_frames": [B]},
+            "result": (images, tracking_points, info, frame_index, B),
         }
 
-    def _encode_preview(self, image_tensor, mask=None):
+    def _encode_preview(self, image_tensor, mask=None, frame_index=0):
         """Encode image tensor to base64 JPEG for frontend display."""
         img_np = (image_tensor.cpu().numpy() * 255).astype(np.uint8)
 
         if mask is not None:
-            img_np = self._overlay_mask(img_np, mask, frame_index=0)
+            img_np = self._overlay_mask(img_np, mask, frame_index=frame_index)
 
         pil_img = Image.fromarray(img_np)
         buffer = BytesIO()
