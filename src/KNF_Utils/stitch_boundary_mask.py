@@ -1,19 +1,21 @@
 """
 NV Stitch Boundary Mask — Generate a gradient mask along stitch boundaries for seam harmonization.
 
-Works with both pipeline types:
-  - Latent path: LATENT_STITCHER from NV_LatentInpaintCrop (static union bbox)
-  - Pixel path:  STITCHER from NV_InpaintCrop2 (per-frame coords → union computed here)
+Works with three input modes (connect one):
+  1. latent_stitcher: LATENT_STITCHER from NV_LatentInpaintCrop (static union bbox, has frame dims)
+  2. bbox_mask + latent: MASK from MaskTrackingBBox + VAE-encoded stitched frame
+     (computes union bbox from mask — most accurate for pixel-path workflows like Kling)
+  3. pixel_stitcher + latent: STITCHER from NV_InpaintCrop2 (per-frame canvas_to_orig union)
 
 Feed the output mask to SetLatentNoiseMask, then run a low-denoise KSampler pass
 to let WAN 2.2's native mask handling harmonize the seam.
 
 Pixel path pipeline (e.g. Kling API output):
-    InpaintStitch2 (pixel composite) → VAE Encode → NV_StitchBoundaryMask
+    InpaintStitch2 (pixel composite) → VAE Encode → NV_StitchBoundaryMask (bbox_mask + latent)
     → SetLatentNoiseMask → KSampler (denoise 0.3-0.5) → VAE Decode
 
 Latent path pipeline:
-    NV_LatentInpaintStitch (hard paste) → NV_StitchBoundaryMask
+    NV_LatentInpaintStitch (hard paste) → NV_StitchBoundaryMask (latent_stitcher)
     → SetLatentNoiseMask → KSampler (denoise 0.3-0.5) → StreamingVAEDecode
 """
 
@@ -69,10 +71,34 @@ def _build_boundary_strip(frame_h, frame_w, cx, cy, cw, ch, inner_px, outer_px):
     return mask
 
 
+def _union_bbox_from_mask(mask):
+    """Compute union bbox across all frames of a [B,H,W] mask.
+
+    Returns (x, y, w, h) as ints, or None if mask is empty.
+    """
+    if mask.dim() == 2:
+        m = mask
+    else:
+        m = mask.max(dim=0).values
+
+    non_zero = torch.nonzero(m > 0.01)
+    if non_zero.numel() == 0:
+        return None
+
+    y_min = non_zero[:, 0].min().item()
+    y_max = non_zero[:, 0].max().item()
+    x_min = non_zero[:, 1].min().item()
+    x_max = non_zero[:, 1].max().item()
+
+    return int(x_min), int(y_min), int(x_max - x_min + 1), int(y_max - y_min + 1)
+
+
 def _extract_pixel_stitcher_union(stitcher):
-    """Compute union bbox from pixel STITCHER per-frame coordinates.
+    """Compute union bbox from pixel STITCHER per-frame canvas_to_orig coordinates.
 
     Returns (x, y, w, h) in pixel space covering all frames.
+    Note: This uses the canvas boundary, which includes padding/expansion.
+    For more accurate seam boundaries, use bbox_mask input instead.
     """
     xs = stitcher['canvas_to_orig_x']
     ys = stitcher['canvas_to_orig_y']
@@ -90,9 +116,10 @@ def _extract_pixel_stitcher_union(stitcher):
 class NV_StitchBoundaryMask:
     """Generate a gradient mask along stitch boundaries for boundary diffusion seam repair.
 
-    Accepts either LATENT_STITCHER (from latent crop path) or pixel STITCHER
-    (from InpaintCrop2, e.g. Kling API workflows). When using pixel STITCHER,
-    connect the VAE-encoded stitched frame as the latent input for frame dimensions.
+    Accepts three input modes (connect one):
+      1. latent_stitcher — static crop coordinates from latent path
+      2. bbox_mask + latent — most accurate for pixel-path workflows (Kling, etc.)
+      3. pixel_stitcher + latent — canvas boundary union (less accurate, includes padding)
     """
 
     @classmethod
@@ -123,14 +150,21 @@ class NV_StitchBoundaryMask:
                     "tooltip": "From NV Latent Inpaint Crop. Contains static crop coordinates "
                                "and original_samples for frame dimensions. Use for latent-path workflows."
                 }),
+                "bbox_mask": ("MASK", {
+                    "tooltip": "Bounding box mask [B,H,W] from MaskTrackingBBox. "
+                               "Union across all frames determines the boundary rectangle. "
+                               "Most accurate option for pixel-path workflows (Kling, etc.). "
+                               "Requires latent input for frame dimensions."
+                }),
                 "pixel_stitcher": ("STITCHER", {
-                    "tooltip": "From NV Inpaint Crop v2. Contains per-frame crop coordinates "
-                               "(union computed automatically). Use for pixel-path workflows (e.g. Kling API). "
+                    "tooltip": "From NV Inpaint Crop v2. Uses canvas_to_orig union — "
+                               "includes stabilization padding, so boundary may be larger "
+                               "than actual seam. Prefer bbox_mask for accuracy. "
                                "Requires latent input for frame dimensions."
                 }),
                 "latent": ("LATENT", {
-                    "tooltip": "VAE-encoded stitched frame. Required when using pixel_stitcher "
-                               "to determine frame dimensions. Not needed for latent_stitcher."
+                    "tooltip": "VAE-encoded stitched frame. Required when using bbox_mask or "
+                               "pixel_stitcher to determine frame dimensions."
                 }),
             },
         }
@@ -141,12 +175,12 @@ class NV_StitchBoundaryMask:
     CATEGORY = "NV_Utils/Inpaint"
     DESCRIPTION = (
         "Generate a gradient mask along stitch boundaries for boundary diffusion seam repair. "
-        "Accepts LATENT_STITCHER (latent path) or pixel STITCHER (Kling/API path). "
+        "Accepts LATENT_STITCHER, bbox_mask, or pixel STITCHER as boundary source. "
         "Use with SetLatentNoiseMask + low-denoise KSampler to harmonize inpaint seams."
     )
 
     def execute(self, strip_width=32, blur_radius=16, inner_ratio=0.5,
-                latent_stitcher=None, pixel_stitcher=None, latent=None):
+                latent_stitcher=None, bbox_mask=None, pixel_stitcher=None, latent=None):
 
         # --- Resolve crop coordinates and frame dimensions ---
         if latent_stitcher is not None:
@@ -156,13 +190,42 @@ class NV_StitchBoundaryMask:
             ch = latent_stitcher['crop_h_pixel']
 
             orig = latent_stitcher['original_samples']
-            if orig.ndim == 5:
-                H_l, W_l = orig.shape[-2], orig.shape[-1]
-            else:
-                H_l, W_l = orig.shape[-2], orig.shape[-1]
+            H_l, W_l = orig.shape[-2], orig.shape[-1]
             frame_h = H_l * VAE_STRIDE
             frame_w = W_l * VAE_STRIDE
             source = "latent_stitcher"
+
+        elif bbox_mask is not None:
+            if latent is None:
+                raise ValueError(
+                    "[NV_StitchBoundaryMask] bbox_mask requires a latent input "
+                    "for frame dimensions. Connect the VAE-encoded stitched frame."
+                )
+            samples = latent["samples"]
+            H_l, W_l = samples.shape[-2], samples.shape[-1]
+            frame_h = H_l * VAE_STRIDE
+            frame_w = W_l * VAE_STRIDE
+
+            # Rescale mask to match frame dimensions if needed
+            bm = bbox_mask
+            if bm.dim() == 2:
+                bm = bm.unsqueeze(0)
+            mask_h, mask_w = bm.shape[-2], bm.shape[-1]
+            if mask_h != frame_h or mask_w != frame_w:
+                bm = F.interpolate(
+                    bm.unsqueeze(1).float(),
+                    size=(frame_h, frame_w),
+                    mode='bilinear', align_corners=False
+                ).squeeze(1)
+
+            result = _union_bbox_from_mask(bm)
+            if result is None:
+                raise ValueError(
+                    "[NV_StitchBoundaryMask] bbox_mask has no non-zero pixels."
+                )
+            cx, cy, cw, ch = result
+            num_frames = bbox_mask.shape[0] if bbox_mask.dim() == 3 else 1
+            source = f"bbox_mask (union of {num_frames} frames)"
 
         elif pixel_stitcher is not None:
             if latent is None:
@@ -181,7 +244,7 @@ class NV_StitchBoundaryMask:
 
         else:
             raise ValueError(
-                "[NV_StitchBoundaryMask] Connect either latent_stitcher or pixel_stitcher."
+                "[NV_StitchBoundaryMask] Connect one of: latent_stitcher, bbox_mask, or pixel_stitcher."
             )
 
         # --- Build boundary strip ---
