@@ -256,10 +256,13 @@ def mask_to_sdf(mask_np, narrow_band=0):
 def sdf_to_mask(sdf):
     """Convert SDF back to mask. Zero-crossing becomes the boundary.
 
-    Returns soft mask with smooth transition at boundary (1px sigmoid).
+    Uses a steep sigmoid so the output is near-binary (solid white inside,
+    solid black outside) with only a ~1px transition at the boundary.
+    The steepness (scale=5.0) means pixels >1px inside are already >0.99.
     """
-    # Sigmoid with ~2px transition band for smooth edges
-    return 1.0 / (1.0 + np.exp(sdf * 2.0))
+    # Steep sigmoid: scale=5.0 means 1px from boundary → 0.993 or 0.007
+    # This prevents the soft gradient artifacts that a gentle sigmoid creates
+    return 1.0 / (1.0 + np.exp(sdf * 5.0))
 
 
 def temporal_sdf_smooth(masks, sigma_temporal=2.0, sigma_spatial=1.0, narrow_band=64):
@@ -357,10 +360,12 @@ def detect_and_fix_outliers(original_masks, consensus_masks, sdf_smoothed_masks,
             # Outlier frame — use SDF-smoothed consensus entirely
             fixed[t] = sdf_smoothed_masks[t]
         else:
-            # Blend: higher IoU → more original, lower → more correction
-            # Map IoU from [threshold, 1.0] to blend weight [0, 1] with power curve
-            alpha = ((iou - iou_threshold) / (1.0 - iou_threshold)) ** blend_power
-            fixed[t] = alpha * orig + (1.0 - alpha) * sdf_smoothed_masks[t]
+            # Non-outlier: use SDF-smoothed version (which already incorporates
+            # the original via consensus). This avoids alpha-blending two different
+            # masks which creates gradient artifacts.
+            # The SDF-smoothed consensus is the best estimate — use it for all frames.
+            # The IoU test only controls whether we log it as an outlier.
+            fixed[t] = sdf_smoothed_masks[t]
 
     return fixed, iou_scores
 
@@ -433,6 +438,7 @@ def run_stabilization_pipeline(masks, images=None,
                                guided_radius=8, guided_eps=0.01,
                                enable_flow=True, enable_sdf=True,
                                enable_outlier=True, enable_edge_refine=True,
+                               output_mode="binary",
                                info_lines=None):
     """Run the full 5-stage temporal mask stabilization pipeline.
 
@@ -451,6 +457,7 @@ def run_stabilization_pipeline(masks, images=None,
         enable_sdf: run SDF smoothing stage
         enable_outlier: run outlier detection stage
         enable_edge_refine: run guided filter edge refinement (requires images)
+        output_mode: "binary" (threshold at 0.5, clean masks) or "soft" (keep gradients)
         info_lines: list to append diagnostic strings to
 
     Returns:
@@ -515,7 +522,14 @@ def run_stabilization_pipeline(masks, images=None,
     elif enable_edge_refine:
         info_lines.append("[Stage 5] Skipped — no IMAGE input for edge guidance.")
 
-    result = result.clamp(0, 1)
+    # --- Final Output ---
+    if output_mode == "binary":
+        result = (result > 0.5).float()
+        info_lines.append("[Output] Binarized at 0.5 threshold (clean binary masks).")
+    else:
+        result = result.clamp(0, 1)
+        info_lines.append("[Output] Soft output (gradients preserved).")
+
     info_lines.append(f"[TemporalStabilizer] Done. {len(info_lines)} diagnostic lines.")
     return result
 
@@ -543,12 +557,12 @@ class NV_TemporalMaskStabilizer:
                     "tooltip": "Temporal consensus window radius (frames on each side). Larger = more temporal context but slower."
                 }),
                 "sdf_sigma_temporal": ("FLOAT", {
-                    "default": 2.0, "min": 0.0, "max": 10.0, "step": 0.1,
-                    "tooltip": "SDF temporal smoothing strength (Gaussian sigma in frames). Higher = smoother boundaries over time. 0 = skip."
+                    "default": 1.5, "min": 0.0, "max": 10.0, "step": 0.1,
+                    "tooltip": "SDF temporal smoothing strength (Gaussian sigma in frames). Higher = smoother boundaries over time but more shape loss. 0 = skip."
                 }),
                 "sdf_sigma_spatial": ("FLOAT", {
-                    "default": 1.0, "min": 0.0, "max": 5.0, "step": 0.1,
-                    "tooltip": "SDF spatial cleanup (Gaussian sigma in pixels). Removes boundary noise. 0 = skip."
+                    "default": 0.5, "min": 0.0, "max": 5.0, "step": 0.1,
+                    "tooltip": "SDF spatial cleanup (Gaussian sigma in pixels). Removes boundary noise. 0 = skip. Keep low to preserve shape."
                 }),
                 "iou_threshold": ("FLOAT", {
                     "default": 0.85, "min": 0.5, "max": 0.99, "step": 0.01,
@@ -561,6 +575,10 @@ class NV_TemporalMaskStabilizer:
                 "guided_eps": ("FLOAT", {
                     "default": 0.01, "min": 0.001, "max": 0.5, "step": 0.001,
                     "tooltip": "Guided filter edge sensitivity. Smaller = stronger edge snapping. 0.01 = sharp edges, 0.1 = softer."
+                }),
+                "output_mode": (["binary", "soft"], {
+                    "default": "binary",
+                    "tooltip": "binary = clean solid masks (threshold at 0.5). soft = preserve gradients (for blend masks)."
                 }),
             },
             "optional": {
@@ -597,7 +615,7 @@ class NV_TemporalMaskStabilizer:
     )
 
     def execute(self, mask, flow_window, sdf_sigma_temporal, sdf_sigma_spatial,
-                iou_threshold, guided_radius, guided_eps,
+                iou_threshold, guided_radius, guided_eps, output_mode="binary",
                 image=None, enable_flow=True, enable_sdf=True,
                 enable_outlier=True, enable_edge_refine=True):
 
@@ -618,6 +636,7 @@ class NV_TemporalMaskStabilizer:
             enable_sdf=enable_sdf,
             enable_outlier=enable_outlier,
             enable_edge_refine=enable_edge_refine,
+            output_mode=output_mode,
             info_lines=info_lines,
         )
 
