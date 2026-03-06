@@ -18,6 +18,7 @@ from .chunk_utils import (
     is_wan_aligned,
     video_to_latent_frames,
 )
+from .latent_constants import LATENT_SAFE_KEYS
 from .mask_tracking_bbox import extract_bboxes
 from .inpaint_crop import compute_auto_resolution, WAN_PRESETS
 from .latent_inpaint_crop import snap_to_vae_grid
@@ -449,6 +450,216 @@ class NV_AspectChunkPlanner:
         return {"ui": {"text": [info]}, "result": (filepath, plan["num_chunks"], info)}
 
 
+class NV_AspectChunkReader:
+    """Load a specific chunk from an aspect plan, slicing video and controls.
+
+    Reads a plan (JSON string or file path), extracts per-chunk metadata
+    (frame range, bbox, target resolution), and temporally slices video
+    and control inputs to the chunk's frame range.
+
+    Supports both full-video and pre-sliced inputs (auto-detected).
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": ("IMAGE", {
+                    "tooltip": "Full input video frames [T,H,W,C] or pre-sliced chunk.",
+                }),
+                "plan_json": ("STRING", {
+                    "default": "",
+                    "tooltip": (
+                        "Aspect chunk plan — either a JSON string (from AspectChunkPreview) "
+                        "or a file path (from AspectChunkPlanner)."
+                    ),
+                }),
+                "chunk_index": ("INT", {
+                    "default": 0, "min": 0, "max": 99,
+                    "tooltip": "Which chunk to read (0-indexed).",
+                }),
+            },
+            "optional": {
+                "control_1": ("IMAGE", {
+                    "tooltip": "First control video (depth, edge, etc.) — sliced in sync.",
+                }),
+                "control_2": ("IMAGE", {
+                    "tooltip": "Second control video — sliced in sync.",
+                }),
+                "control_3": ("IMAGE", {
+                    "tooltip": "Third control video — sliced in sync.",
+                }),
+                "control_4": ("IMAGE", {
+                    "tooltip": "Fourth control video — sliced in sync.",
+                }),
+                "latent": ("LATENT", {
+                    "tooltip": (
+                        "Pre-pass latent (full video). Temporally sliced to chunk range "
+                        "using WAN VAE frame mapping."
+                    ),
+                }),
+            },
+        }
+
+    RETURN_TYPES = (
+        "IMAGE", "IMAGE", "IMAGE", "IMAGE", "IMAGE",
+        "INT", "INT", "INT", "INT",
+        "INT", "INT", "INT", "INT",
+        "INT", "INT",
+        "FLOAT", "BOOLEAN",
+        "INT",
+        "LATENT",
+        "STRING",
+    )
+    RETURN_NAMES = (
+        "chunk_video", "chunk_ctrl_1", "chunk_ctrl_2", "chunk_ctrl_3", "chunk_ctrl_4",
+        "start_frame", "end_frame", "frame_count", "latent_frames",
+        "bbox_x", "bbox_y", "bbox_w", "bbox_h",
+        "target_width", "target_height",
+        "mean_aspect", "wan_aligned",
+        "num_chunks",
+        "chunk_latent",
+        "chunk_info",
+    )
+    FUNCTION = "execute"
+    CATEGORY = "NV_Utils"
+    DESCRIPTION = (
+        "Reads an aspect chunk plan and slices video + controls to the "
+        "specified chunk's frame range. Outputs bbox crop region and "
+        "target resolution for downstream processing."
+    )
+
+    def execute(
+        self, video, plan_json, chunk_index,
+        control_1=None, control_2=None, control_3=None, control_4=None,
+        latent=None,
+    ):
+        # ---- Parse plan (JSON string or file path) ----
+        plan_str = plan_json.strip()
+        if not plan_str:
+            raise ValueError("[NV_AspectChunkReader] plan_json is empty.")
+
+        if plan_str.startswith("{"):
+            plan = json.loads(plan_str)
+        else:
+            with open(plan_str, "r") as f:
+                plan = json.load(f)
+
+        chunks = plan.get("chunks", [])
+        num_chunks = len(chunks)
+        if chunk_index >= num_chunks:
+            raise ValueError(
+                f"[NV_AspectChunkReader] chunk_index {chunk_index} out of range. "
+                f"Plan has {num_chunks} chunks (0-{num_chunks - 1})."
+            )
+
+        chunk = chunks[chunk_index]
+        start_frame = chunk["start_frame"]
+        end_frame = chunk["end_frame"]
+        expected_frames = chunk.get("frame_count", end_frame - start_frame)
+
+        video_meta = plan.get("video_metadata", {})
+        expected_total = video_meta.get("total_frames", 0)
+
+        # ---- Detect pre-sliced vs full video ----
+        input_frames = video.shape[0]
+        is_pre_sliced = (input_frames == expected_frames)
+        is_full_video = (expected_total > 0 and input_frames == expected_total)
+
+        if not is_pre_sliced and not is_full_video:
+            raise ValueError(
+                f"[NV_AspectChunkReader] Video has {input_frames} frames.\n"
+                f"Expected either:\n"
+                f"  - Pre-sliced chunk: {expected_frames} frames\n"
+                f"  - Full video: {expected_total} frames"
+            )
+
+        if is_full_video and not is_pre_sliced:
+            chunk_video = video[start_frame:end_frame].clone()
+            slice_mode = "sliced"
+        else:
+            chunk_video = video
+            slice_mode = "pre-sliced"
+
+        # ---- Slice control videos ----
+        controls = [control_1, control_2, control_3, control_4]
+        chunk_controls = []
+
+        for i, ctrl in enumerate(controls):
+            if ctrl is not None:
+                ctrl_frames = ctrl.shape[0]
+                ctrl_pre = (ctrl_frames == expected_frames)
+                ctrl_full = (expected_total > 0 and ctrl_frames == expected_total)
+
+                if not ctrl_pre and not ctrl_full:
+                    raise ValueError(
+                        f"[NV_AspectChunkReader] Control {i + 1} has {ctrl_frames} frames.\n"
+                        f"Expected either {expected_frames} (pre-sliced) or {expected_total} (full)."
+                    )
+
+                if ctrl_full and not ctrl_pre:
+                    chunk_controls.append(ctrl[start_frame:end_frame].clone())
+                else:
+                    chunk_controls.append(ctrl)
+            else:
+                chunk_controls.append(None)
+
+        # ---- Slice latent (WAN VAE temporal mapping) ----
+        chunk_latent = None
+        if latent is not None:
+            samples = latent["samples"]  # [B, C, T, H, W]
+            total_latent_t = samples.shape[2]
+            chunk_latent_t = (expected_frames - 1) // 4 + 1
+
+            if total_latent_t == chunk_latent_t:
+                chunk_latent = latent
+            else:
+                latent_start = 0 if start_frame == 0 else (start_frame - 1) // 4 + 1
+                latent_end = min(latent_start + chunk_latent_t, total_latent_t)
+                chunk_samples = samples[:, :, latent_start:latent_end, :, :].clone()
+                chunk_latent = {"samples": chunk_samples}
+                for k in LATENT_SAFE_KEYS:
+                    if k in latent:
+                        chunk_latent[k] = latent[k]
+
+        # ---- Extract aspect-specific fields ----
+        bbox_x = chunk.get("bbox_x", 0)
+        bbox_y = chunk.get("bbox_y", 0)
+        bbox_w = chunk.get("bbox_w", video_meta.get("width", 0))
+        bbox_h = chunk.get("bbox_h", video_meta.get("height", 0))
+        target_w = chunk.get("target_width", 0)
+        target_h = chunk.get("target_height", 0)
+        mean_aspect = chunk.get("mean_aspect", 1.0)
+        wan_ok = chunk.get("wan_aligned", False)
+        l_frames = chunk.get("latent_frames", (expected_frames - 1) // 4 + 1)
+
+        # ---- Info ----
+        num_ctrls = sum(1 for c in chunk_controls if c is not None)
+        wan_tag = "WAN OK" if wan_ok else "WAN MISS"
+        info_lines = [
+            f"[AspectChunkReader] Chunk {chunk_index}/{num_chunks - 1} ({slice_mode})",
+            f"  Frames: {start_frame}-{end_frame - 1} ({expected_frames}f, {l_frames}L) [{wan_tag}]",
+            f"  BBox: x={bbox_x} y={bbox_y} w={bbox_w} h={bbox_h}",
+            f"  Target: {target_w}x{target_h}  AR={mean_aspect:.2f}",
+            f"  Controls: {num_ctrls}",
+        ]
+        if chunk_latent is not None:
+            info_lines.append(f"  Latent: {chunk_latent['samples'].shape[2]} temporal frames")
+        chunk_info = "\n".join(info_lines)
+        print(chunk_info)
+
+        return (
+            chunk_video, chunk_controls[0], chunk_controls[1], chunk_controls[2], chunk_controls[3],
+            start_frame, end_frame, expected_frames, l_frames,
+            bbox_x, bbox_y, bbox_w, bbox_h,
+            target_w, target_h,
+            mean_aspect, wan_ok,
+            num_chunks,
+            chunk_latent,
+            chunk_info,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
@@ -456,9 +667,11 @@ class NV_AspectChunkPlanner:
 NODE_CLASS_MAPPINGS = {
     "NV_AspectChunkPlanner": NV_AspectChunkPlanner,
     "NV_AspectChunkPreview": NV_AspectChunkPreview,
+    "NV_AspectChunkReader": NV_AspectChunkReader,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "NV_AspectChunkPlanner": "NV Aspect Chunk Planner",
     "NV_AspectChunkPreview": "NV Aspect Chunk Preview",
+    "NV_AspectChunkReader": "NV Aspect Chunk Reader",
 }

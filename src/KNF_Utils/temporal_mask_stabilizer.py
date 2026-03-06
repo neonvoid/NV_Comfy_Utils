@@ -65,6 +65,7 @@ def compute_optical_flow(images, device):
 
     with torch.no_grad():
         for t in range(B - 1):
+            print(f"  [RAFT] Computing flow pair {t + 1}/{B - 1}...", end="\r")
             img1, img2 = transforms(imgs[t:t + 1], imgs[t + 1:t + 2])
             # RAFT returns list of flow refinements — take the last (most refined)
             fwd = model(img1, img2)[-1][0]  # [2, H_pad, W_pad]
@@ -73,6 +74,7 @@ def compute_optical_flow(images, device):
             # Remove padding
             forward_flows.append(fwd[:, :H, :W].cpu())
             backward_flows.append(bwd[:, :H, :W].cpu())
+        print(f"  [RAFT] Computed {B - 1} flow pairs.{' ' * 20}")
 
     del model
     comfy.model_management.soft_empty_cache()
@@ -577,13 +579,16 @@ def run_stabilization_pipeline(masks, images=None,
 
     # --- Stage 1 + 2: Optical Flow + Temporal Consensus ---
     if enable_flow and images is not None and B > 1:
+        print(f"[TemporalStabilizer] Stage 1: RAFT optical flow ({B - 1} pairs)...")
         info_lines.append(f"[Stage 1] Computing RAFT optical flow ({B - 1} pairs)...")
         flow_device = comfy.model_management.get_torch_device()
         forward_flows, backward_flows = compute_optical_flow(images, flow_device)
+        print(f"[TemporalStabilizer] Stage 2: Flow-warped consensus (window={flow_window})...")
         info_lines.append(f"[Stage 2] Flow-warped temporal consensus (window={flow_window})...")
         consensus = compute_temporal_consensus(masks, forward_flows, backward_flows, window_size=flow_window)
         del forward_flows, backward_flows
     elif B > 1:
+        print(f"[TemporalStabilizer] Stage 2: Temporal median consensus (no flow, window={flow_window})...")
         info_lines.append(f"[Stage 2] Temporal median consensus (no flow, window={flow_window})...")
         consensus = compute_temporal_consensus_no_flow(masks, window_size=flow_window)
     else:
@@ -592,6 +597,7 @@ def run_stabilization_pipeline(masks, images=None,
 
     # --- Stage 3: SDF Temporal Smoothing ---
     if enable_sdf and B > 1:
+        print(f"[TemporalStabilizer] Stage 3: SDF temporal smoothing (sigma_t={sdf_sigma_temporal}, sigma_s={sdf_sigma_spatial})...")
         info_lines.append(f"[Stage 3] SDF temporal smoothing (sigma_t={sdf_sigma_temporal}, sigma_s={sdf_sigma_spatial})...")
         sdf_smoothed = temporal_sdf_smooth(consensus, sigma_temporal=sdf_sigma_temporal,
                                            sigma_spatial=sdf_sigma_spatial, narrow_band=sdf_narrow_band)
@@ -605,6 +611,7 @@ def run_stabilization_pipeline(masks, images=None,
 
     # --- Stage 4: IoU Outlier Detection ---
     if enable_outlier and B > 1:
+        print(f"[TemporalStabilizer] Stage 4: IoU outlier detection (threshold={iou_threshold})...")
         info_lines.append(f"[Stage 4] IoU outlier detection (threshold={iou_threshold})...")
         result, iou_scores = detect_and_fix_outliers(masks, consensus, sdf_smoothed,
                                                       iou_threshold=iou_threshold,
@@ -617,6 +624,7 @@ def run_stabilization_pipeline(masks, images=None,
 
     # --- Stage 5: Guided Filter Edge Refinement ---
     if enable_edge_refine and images is not None:
+        print(f"[TemporalStabilizer] Stage 5: Guided filter edge refinement (radius={guided_radius}, eps={guided_eps})...")
         info_lines.append(f"[Stage 5] Guided filter edge refinement (radius={guided_radius}, eps={guided_eps})...")
         result_np = result.cpu().numpy()
         images_np = images.cpu().numpy()
@@ -763,6 +771,8 @@ class NV_TemporalMaskStabilizer:
                 enable_outlier=True, enable_edge_refine=True):
 
         info_lines = []
+        B = mask.shape[0]
+        print(f"[NV_TemporalMaskStabilizer] Starting: {B} frames, {mask.shape[1]}x{mask.shape[2]}")
 
         # --- Resolve mask config (config bus overrides local widgets) ---
         from .mask_processing_config import apply_mask_config
@@ -830,6 +840,7 @@ class NV_TemporalMaskStabilizer:
 
         # --- Post-stabilization spatial cleanup ---
         if has_spatial_cleanup:
+            print(f"[NV_TemporalMaskStabilizer] Applying spatial cleanup...")
             cleanup_parts = []
             if post_fill_holes > 0:
                 cleanup_parts.append(f"fill_holes={post_fill_holes}")
@@ -853,7 +864,7 @@ class NV_TemporalMaskStabilizer:
                 result = (result > 0.5).float()
 
         info = "\n".join(info_lines)
-        print(info)
+        print(f"[NV_TemporalMaskStabilizer] Done. {B} frames processed.")
 
         return (result, info)
 
