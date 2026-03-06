@@ -27,6 +27,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - NV_MaskTrackingBBox: new `ema` smoothing mode — bidirectional exponential moving average with single `alpha` parameter. Zero lag from forward+backward pass averaging.
 - NV_MaskTrackingBBox: new `smooth_strength` parameter (0-1) — lerps between raw and smoothed coordinates. Works with all smoothing modes for easy partial-smoothing control.
 - NV_AspectChunkPlanner — temporal segmentation by bounding-box aspect ratio changes. Analyzes per-frame bbox masks, detects aspect change points via log-ratio threshold, and segments the video into chunks where each has a stable aspect. Per-chunk union bbox and WAN-aligned target resolution exported as JSON plan file. Greedy segmentation with small-segment merge and optional WAN frame alignment.
+- NV_TemporalMaskStabilizer — multi-stage temporal mask stabilization that fixes SAM3 mask pops. 5-stage pipeline: RAFT optical flow, flow-warped temporal consensus, SDF boundary smoothing, IoU outlier detection, and guided filter edge refinement. Optional bbox_mask input for cropped processing (faster, higher detail). Integrates with NV_MaskProcessingConfig for shared spatial cleanup settings. Binary/soft output modes.
 
 ## [0.1.0] - 2026-02-26
 

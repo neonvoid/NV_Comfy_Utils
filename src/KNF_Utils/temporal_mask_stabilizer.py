@@ -9,8 +9,8 @@ Fixes mask "pops" (sudden shape changes between frames) using a 5-stage pipeline
   Stage 4: IoU Outlier Detection — detect pop frames, replace with consensus
   Stage 5: Edge Refinement — guided filter snaps mask edges to RGB boundaries
 
-Each stage builds on the previous. The pipeline produces temporally consistent masks
-with smooth boundaries that respect image edges.
+Optional bbox_mask input crops to the mask region before processing (faster + higher detail).
+Optional MASK_PROCESSING_CONFIG applies spatial cleanup (erode/dilate, fill_holes, etc.) after stabilization.
 
 Input:  MASK [B, H, W] — per-frame segmentation masks (e.g. from SAM3)
         IMAGE [B, H, W, C] — optional RGB frames for edge-guided refinement (Stage 5)
@@ -127,8 +127,8 @@ def compute_temporal_consensus(masks, forward_flows, backward_flows, window_size
 
     Args:
         masks: [B, H, W] float tensor
-        forward_flows: list of [2, H, W] — flow t→t+1
-        backward_flows: list of [2, H, W] — flow t+1→t
+        forward_flows: list of [2, H, W] — flow t->t+1
+        backward_flows: list of [2, H, W] — flow t+1->t
         window_size: number of frames on each side to consider
 
     Returns:
@@ -143,12 +143,12 @@ def compute_temporal_consensus(masks, forward_flows, backward_flows, window_size
         weight_sum = torch.ones(H, W, device=masks.device)
 
         # Chain flows to reach frame t from neighboring frames
-        # Forward direction: frames before t → warp forward to t
+        # Forward direction: frames before t -> warp forward to t
         for k in range(1, half + 1):
             src = t - k
             if src < 0:
                 break
-            # Chain forward flows from src to t: src→src+1→...→t
+            # Chain forward flows from src to t: src->src+1->...->t
             flow_chain = torch.zeros(2, H, W)
             valid = True
             for step in range(src, t):
@@ -169,12 +169,12 @@ def compute_temporal_consensus(masks, forward_flows, backward_flows, window_size
             weighted_sum += warped * w
             weight_sum += w
 
-        # Backward direction: frames after t → warp backward to t
+        # Backward direction: frames after t -> warp backward to t
         for k in range(1, half + 1):
             src = t + k
             if src >= B:
                 break
-            # Chain backward flows from src to t: src→src-1→...→t
+            # Chain backward flows from src to t: src->src-1->...->t
             flow_chain = torch.zeros(2, H, W)
             valid = True
             for step in range(src - 1, t - 1, -1):
@@ -260,7 +260,7 @@ def sdf_to_mask(sdf):
     solid black outside) with only a ~1px transition at the boundary.
     The steepness (scale=5.0) means pixels >1px inside are already >0.99.
     """
-    # Steep sigmoid: scale=5.0 means 1px from boundary → 0.993 or 0.007
+    # Steep sigmoid: scale=5.0 means 1px from boundary -> 0.993 or 0.007
     # This prevents the soft gradient artifacts that a gentle sigmoid creates
     return 1.0 / (1.0 + np.exp(sdf * 5.0))
 
@@ -324,16 +324,15 @@ def detect_and_fix_outliers(original_masks, consensus_masks, sdf_smoothed_masks,
     For each frame, compute IoU between the original mask and the flow-warped consensus.
     Low IoU = the frame's mask disagrees with its temporal neighbors = pop.
 
-    - Frames with IoU < threshold: fully replaced by SDF-smoothed consensus
-    - Frames with IoU >= threshold: soft blend weighted by IoU score
-      (higher IoU = mostly original, lower = more correction)
+    All frames use the SDF-smoothed consensus as output. The IoU score is diagnostic
+    only — it tells you which frames were outliers (pops) vs clean.
 
     Args:
         original_masks: [B, H, W] — raw input masks
         consensus_masks: [B, H, W] — flow-warped temporal consensus (Stage 2)
         sdf_smoothed_masks: [B, H, W] — SDF-smoothed masks (Stage 3 applied to consensus)
         iou_threshold: below this, frame is considered an outlier
-        blend_power: exponent for IoU→blend weight curve. Higher = more aggressive correction.
+        blend_power: unused (kept for API compat)
 
     Returns:
         fixed_masks: [B, H, W] — outlier-corrected masks
@@ -356,16 +355,8 @@ def detect_and_fix_outliers(original_masks, consensus_masks, sdf_smoothed_masks,
         iou = (intersection / union.clamp(min=1)).item()
         iou_scores[t] = iou
 
-        if iou < iou_threshold:
-            # Outlier frame — use SDF-smoothed consensus entirely
-            fixed[t] = sdf_smoothed_masks[t]
-        else:
-            # Non-outlier: use SDF-smoothed version (which already incorporates
-            # the original via consensus). This avoids alpha-blending two different
-            # masks which creates gradient artifacts.
-            # The SDF-smoothed consensus is the best estimate — use it for all frames.
-            # The IoU test only controls whether we log it as an outlier.
-            fixed[t] = sdf_smoothed_masks[t]
+        # Use SDF-smoothed consensus for all frames — avoids gradient artifacts from blending
+        fixed[t] = sdf_smoothed_masks[t]
 
     return fixed, iou_scores
 
@@ -401,7 +392,6 @@ def guided_filter(guide, source, radius=8, eps=1e-3):
     guide_u8 = (guide * 255).clip(0, 255).astype(np.uint8)
     source_f32 = source.astype(np.float32)
 
-    # OpenCV's guided filter — operates per-channel then combines
     # Use (2*radius+1) as diameter for cv2 convention
     d = 2 * radius + 1
 
@@ -428,6 +418,121 @@ def guided_filter(guide, source, radius=8, eps=1e-3):
 
 
 # =============================================================================
+# Bbox Crop/Paste Helpers
+# =============================================================================
+
+def compute_union_bbox(masks, padding_frac=0.1):
+    """Compute the union bounding box across all frames of a mask batch.
+
+    Args:
+        masks: [B, H, W] float tensor
+        padding_frac: fractional padding to add around the union bbox
+
+    Returns:
+        (x, y, w, h) tuple or None if all masks are empty
+    """
+    B, H, W = masks.shape
+    # Union across all frames
+    union_mask = (masks > 0.01).any(dim=0)  # [H, W]
+    non_zero = torch.nonzero(union_mask)
+
+    if non_zero.numel() == 0:
+        return None
+
+    y_min = non_zero[:, 0].min().item()
+    y_max = non_zero[:, 0].max().item()
+    x_min = non_zero[:, 1].min().item()
+    x_max = non_zero[:, 1].max().item()
+
+    bw = x_max - x_min + 1
+    bh = y_max - y_min + 1
+
+    # Add padding
+    pad_x = int(bw * padding_frac)
+    pad_y = int(bh * padding_frac)
+
+    x = max(0, x_min - pad_x)
+    y = max(0, y_min - pad_y)
+    x2 = min(W, x_max + 1 + pad_x)
+    y2 = min(H, y_max + 1 + pad_y)
+
+    return (x, y, x2 - x, y2 - y)
+
+
+def crop_tensors(masks, images, bbox):
+    """Crop mask and image tensors to a bounding box region.
+
+    Args:
+        masks: [B, H, W]
+        images: [B, H, W, C] or None
+        bbox: (x, y, w, h)
+
+    Returns:
+        cropped_masks: [B, h, w]
+        cropped_images: [B, h, w, C] or None
+    """
+    x, y, w, h = bbox
+    cropped_masks = masks[:, y:y + h, x:x + w].clone()
+    cropped_images = None
+    if images is not None:
+        cropped_images = images[:, y:y + h, x:x + w, :].clone()
+    return cropped_masks, cropped_images
+
+
+def paste_masks(result_full, cropped_result, bbox):
+    """Paste cropped stabilized masks back into full-frame masks.
+
+    Args:
+        result_full: [B, H, W] — full-frame mask (will be modified)
+        cropped_result: [B, crop_h, crop_w] — stabilized crop
+        bbox: (x, y, w, h)
+
+    Returns:
+        result_full with crop region replaced
+    """
+    x, y, w, h = bbox
+    result_full[:, y:y + h, x:x + w] = cropped_result
+    return result_full
+
+
+# =============================================================================
+# Post-Stabilization Spatial Cleanup (from mask config)
+# =============================================================================
+
+def apply_spatial_cleanup(masks, mask_erode_dilate=0, mask_fill_holes=0,
+                          mask_remove_noise=0, mask_smooth=0):
+    """Apply per-frame spatial mask operations after temporal stabilization.
+
+    Uses the same functions as InpaintCrop to ensure identical behavior.
+
+    Args:
+        masks: [B, H, W] float tensor
+        mask_erode_dilate: erosion (<0) or dilation (>0) amount
+        mask_fill_holes: grey closing kernel size (0 = skip)
+        mask_remove_noise: grey opening kernel size (0 = skip)
+        mask_smooth: Gaussian blur after binarization (0 = skip)
+
+    Returns:
+        processed: [B, H, W] float tensor
+    """
+    from .inpaint_crop import mask_erode_dilate as _erode_dilate
+    from .inpaint_crop import mask_fill_holes as _fill_holes
+    from .inpaint_crop import mask_remove_noise as _remove_noise
+    from .inpaint_crop import mask_smooth as _smooth
+
+    result = masks
+    if mask_fill_holes > 0:
+        result = _fill_holes(result, mask_fill_holes)
+    if mask_remove_noise > 0:
+        result = _remove_noise(result, mask_remove_noise)
+    if mask_erode_dilate != 0:
+        result = _erode_dilate(result, mask_erode_dilate)
+    if mask_smooth > 0:
+        result = _smooth(result, mask_smooth)
+    return result
+
+
+# =============================================================================
 # Full Pipeline
 # =============================================================================
 
@@ -450,7 +555,7 @@ def run_stabilization_pipeline(masks, images=None,
         sdf_sigma_spatial: spatial SDF cleanup (Stage 3)
         sdf_narrow_band: SDF clamping distance in pixels (Stage 3)
         iou_threshold: outlier detection sensitivity (Stage 4)
-        iou_blend_power: correction aggressiveness (Stage 4)
+        iou_blend_power: unused (kept for API compat)
         guided_radius: edge refinement radius (Stage 5)
         guided_eps: edge refinement sensitivity (Stage 5)
         enable_flow: use optical flow (True) or simple temporal median (False)
@@ -543,6 +648,12 @@ class NV_TemporalMaskStabilizer:
 
     Eliminates mask "pops" (sudden shape changes) using optical flow, signed distance
     field smoothing, outlier detection, and edge-guided refinement.
+
+    Optional bbox_mask crops to the region of interest before processing — faster and
+    higher quality since RAFT/SDF operates on a smaller, more detailed region.
+
+    Optional MASK_PROCESSING_CONFIG applies spatial cleanup after stabilization using
+    the same shared settings as InpaintCrop, LatentInpaintCrop, etc.
     """
 
     @classmethod
@@ -580,10 +691,39 @@ class NV_TemporalMaskStabilizer:
                     "default": "binary",
                     "tooltip": "binary = clean solid masks (threshold at 0.5). soft = preserve gradients (for blend masks)."
                 }),
+                "crop_padding": ("FLOAT", {
+                    "default": 0.15, "min": 0.0, "max": 0.5, "step": 0.01,
+                    "tooltip": "Padding around crop region as fraction of bbox size. Only used when bbox_mask is connected."
+                }),
             },
             "optional": {
                 "image": ("IMAGE", {
-                    "tooltip": "RGB frames [B, H, W, C] for optical flow (Stage 1) and edge refinement (Stage 5). Without this, falls back to temporal median + no edge refinement."
+                    "tooltip": "RGB frames [B, H, W, C] for optical flow (Stage 1) and edge refinement (Stage 5). "
+                              "Without this, falls back to temporal median + no edge refinement."
+                }),
+                "bbox_mask": ("MASK", {
+                    "tooltip": "Bounding box mask from MaskTrackingBBox. When connected, stabilization runs only on the "
+                              "cropped region (faster, higher detail). Result is pasted back to full frame."
+                }),
+                "mask_config": ("MASK_PROCESSING_CONFIG", {
+                    "tooltip": "Shared mask processing config from NV_MaskProcessingConfig. Applies spatial cleanup "
+                              "(erode/dilate, fill_holes, remove_noise, smooth) after temporal stabilization."
+                }),
+                "mask_erode_dilate": ("INT", {
+                    "default": 0, "min": -64, "max": 64, "step": 1,
+                    "tooltip": "Post-stabilization erosion (<0) or dilation (>0). Overridden by mask_config if connected."
+                }),
+                "mask_fill_holes": ("INT", {
+                    "default": 0, "min": 0, "max": 64, "step": 1,
+                    "tooltip": "Post-stabilization hole filling (grey closing). Overridden by mask_config if connected."
+                }),
+                "mask_remove_noise": ("INT", {
+                    "default": 0, "min": 0, "max": 64, "step": 1,
+                    "tooltip": "Post-stabilization noise removal (grey opening). Overridden by mask_config if connected."
+                }),
+                "mask_smooth": ("INT", {
+                    "default": 0, "min": 0, "max": 64, "step": 1,
+                    "tooltip": "Post-stabilization edge smoothing (binarize + blur). Overridden by mask_config if connected."
                 }),
                 "enable_flow": ("BOOLEAN", {
                     "default": True,
@@ -611,19 +751,58 @@ class NV_TemporalMaskStabilizer:
     DESCRIPTION = (
         "Multi-stage temporal mask stabilization. Fixes mask pops using optical flow consensus, "
         "SDF boundary smoothing, outlier detection, and edge-guided refinement. "
-        "Connect IMAGE for full pipeline (RAFT flow + guided filter) or use mask-only mode."
+        "Connect bbox_mask to crop first (faster). Connect mask_config for shared spatial cleanup."
     )
 
     def execute(self, mask, flow_window, sdf_sigma_temporal, sdf_sigma_spatial,
                 iou_threshold, guided_radius, guided_eps, output_mode="binary",
-                image=None, enable_flow=True, enable_sdf=True,
+                crop_padding=0.15,
+                image=None, bbox_mask=None, mask_config=None,
+                mask_erode_dilate=0, mask_fill_holes=0, mask_remove_noise=0, mask_smooth=0,
+                enable_flow=True, enable_sdf=True,
                 enable_outlier=True, enable_edge_refine=True):
 
         info_lines = []
 
-        result = run_stabilization_pipeline(
-            masks=mask,
-            images=image,
+        # --- Resolve mask config (config bus overrides local widgets) ---
+        from .mask_processing_config import apply_mask_config
+        vals = apply_mask_config(mask_config,
+            mask_erode_dilate=mask_erode_dilate,
+            mask_fill_holes=mask_fill_holes,
+            mask_remove_noise=mask_remove_noise,
+            mask_smooth=mask_smooth,
+        )
+        post_erode_dilate = vals["mask_erode_dilate"]
+        post_fill_holes = vals["mask_fill_holes"]
+        post_remove_noise = vals["mask_remove_noise"]
+        post_smooth = vals["mask_smooth"]
+
+        has_spatial_cleanup = (post_erode_dilate != 0 or post_fill_holes > 0
+                               or post_remove_noise > 0 or post_smooth > 0)
+
+        # --- Bbox crop mode ---
+        use_crop = bbox_mask is not None
+        crop_bbox = None
+
+        if use_crop:
+            crop_bbox = compute_union_bbox(bbox_mask, padding_frac=crop_padding)
+            if crop_bbox is not None:
+                x, y, w, h = crop_bbox
+                info_lines.append(f"[Crop] Cropping to bbox region: ({x},{y}) {w}x{h} (padding={crop_padding:.0%})")
+                work_masks, work_images = crop_tensors(mask, image, crop_bbox)
+            else:
+                info_lines.append("[Crop] bbox_mask is empty — processing full frame.")
+                use_crop = False
+                work_masks = mask
+                work_images = image
+        else:
+            work_masks = mask
+            work_images = image
+
+        # --- Run temporal stabilization pipeline on work region ---
+        stabilized = run_stabilization_pipeline(
+            masks=work_masks,
+            images=work_images,
             flow_window=flow_window,
             sdf_sigma_temporal=sdf_sigma_temporal,
             sdf_sigma_spatial=sdf_sigma_spatial,
@@ -639,6 +818,39 @@ class NV_TemporalMaskStabilizer:
             output_mode=output_mode,
             info_lines=info_lines,
         )
+
+        # --- Paste back if cropped ---
+        if use_crop and crop_bbox is not None:
+            # Start with zeros (black outside crop region)
+            result = torch.zeros_like(mask)
+            result = paste_masks(result, stabilized, crop_bbox)
+            info_lines.append(f"[Crop] Pasted stabilized region back to full {mask.shape[1]}x{mask.shape[2]} frame.")
+        else:
+            result = stabilized
+
+        # --- Post-stabilization spatial cleanup ---
+        if has_spatial_cleanup:
+            cleanup_parts = []
+            if post_fill_holes > 0:
+                cleanup_parts.append(f"fill_holes={post_fill_holes}")
+            if post_remove_noise > 0:
+                cleanup_parts.append(f"remove_noise={post_remove_noise}")
+            if post_erode_dilate != 0:
+                cleanup_parts.append(f"erode_dilate={post_erode_dilate}")
+            if post_smooth > 0:
+                cleanup_parts.append(f"smooth={post_smooth}")
+            info_lines.append(f"[Spatial] Applying post-stabilization cleanup: {', '.join(cleanup_parts)}")
+
+            result = apply_spatial_cleanup(result,
+                mask_erode_dilate=post_erode_dilate,
+                mask_fill_holes=post_fill_holes,
+                mask_remove_noise=post_remove_noise,
+                mask_smooth=post_smooth,
+            )
+
+            # Re-binarize after spatial cleanup if binary mode
+            if output_mode == "binary":
+                result = (result > 0.5).float()
 
         info = "\n".join(info_lines)
         print(info)

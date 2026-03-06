@@ -207,8 +207,192 @@ def _compute_segment_union_bbox(x1s, y1s, x2s, y2s, start, end, padding, H, W):
 
 
 # ---------------------------------------------------------------------------
-# Node
+# Core analysis (shared by planner + preview)
 # ---------------------------------------------------------------------------
+
+def analyze_aspect_chunks(
+    mask: torch.Tensor,
+    aspect_threshold: float,
+    min_chunk_frames: int,
+    wan_alignment: bool,
+    auto_preset: str,
+    padding: float,
+):
+    """Run the full aspect-ratio segmentation pipeline.
+
+    Returns (plan_dict, info_lines).
+    """
+    if mask.dim() == 2:
+        mask = mask.unsqueeze(0)
+    B, H, W = mask.shape
+    info_lines = [f"[AspectChunkPlanner] {B} frames, {W}x{H}px"]
+
+    # ---- 1. Per-frame bboxes ----
+    x1s, y1s, x2s, y2s, present = extract_bboxes(mask, info_lines)
+    aspects = _compute_per_frame_aspects(x1s, y1s, x2s, y2s)
+
+    valid_count = sum(1 for a in aspects if a > 0)
+    if valid_count == 0:
+        info_lines.append("  WARNING: no valid bboxes — returning single full-frame chunk")
+        segments = [(0, B)]
+    else:
+        # ---- 2. Greedy segmentation ----
+        segments = _greedy_segment(aspects, aspect_threshold)
+        info_lines.append(f"  Greedy: {len(segments)} raw segments")
+
+        # ---- 3. Merge small segments ----
+        segments = _merge_small_segments(segments, aspects, min_chunk_frames)
+        info_lines.append(f"  After merge: {len(segments)} segments")
+
+    # ---- 4. WAN alignment ----
+    if wan_alignment:
+        segments = _snap_segments_to_wan(segments, B)
+        info_lines.append(f"  After WAN snap: {len(segments)} segments")
+
+    # ---- 5. Build chunk descriptors ----
+    chunks = []
+    for seg_idx, (start, end) in enumerate(segments):
+        frame_count = end - start
+        latent_frames = video_to_latent_frames(frame_count)
+        wan_ok = is_wan_aligned(frame_count)
+        mean_ar = _segment_mean_ar(aspects, start, end)
+
+        bbox = _compute_segment_union_bbox(
+            x1s, y1s, x2s, y2s, start, end, padding, H, W,
+        )
+        if bbox:
+            bx, by, bw, bh = bbox
+            bbox_aspect = bw / bh if bh > 0 else 1.0
+        else:
+            bx, by, bw, bh = 0, 0, W, H
+            bbox_aspect = W / H
+
+        target_w, target_h = compute_auto_resolution(bbox_aspect, auto_preset, 0)
+
+        chunks.append({
+            "chunk_idx": seg_idx,
+            "start_frame": start,
+            "end_frame": end,
+            "frame_count": frame_count,
+            "latent_frames": latent_frames,
+            "wan_aligned": wan_ok,
+            "mean_aspect": round(mean_ar, 4),
+            "bbox_x": int(bx),
+            "bbox_y": int(by),
+            "bbox_w": int(bw),
+            "bbox_h": int(bh),
+            "target_width": target_w,
+            "target_height": target_h,
+            "aspect_segment_id": seg_idx,
+        })
+
+    # ---- 6. Build plan dict ----
+    plan = {
+        "version": "1.0",
+        "planner": "aspect_ratio",
+        "video_metadata": {
+            "total_frames": B,
+            "height": H,
+            "width": W,
+        },
+        "aspect_config": {
+            "threshold": aspect_threshold,
+            "min_chunk_frames": min_chunk_frames,
+            "wan_aligned": wan_alignment,
+            "auto_preset": auto_preset,
+            "padding": padding,
+        },
+        "num_chunks": len(chunks),
+        "chunks": chunks,
+    }
+
+    # ---- 7. Info summary ----
+    info_lines.append("")
+    info_lines.append(f"Plan: {len(chunks)} aspect-based chunks")
+    for c in chunks:
+        wan_tag = "WAN OK" if c["wan_aligned"] else "WAN MISS"
+        info_lines.append(
+            f"  Chunk {c['chunk_idx']}: frames {c['start_frame']}-{c['end_frame'] - 1} "
+            f"({c['frame_count']}f, {c['latent_frames']}L) "
+            f"AR={c['mean_aspect']:.2f} bbox={c['bbox_w']}x{c['bbox_h']} "
+            f"target={c['target_width']}x{c['target_height']} [{wan_tag}]"
+        )
+
+    return plan, info_lines
+
+
+# ---------------------------------------------------------------------------
+# Shared input definitions
+# ---------------------------------------------------------------------------
+
+_ANALYSIS_INPUTS = {
+    "mask": ("MASK", {
+        "tooltip": "Per-frame masks [B,H,W] from MaskTrackingBBox or SAM3.",
+    }),
+    "aspect_threshold": ("FLOAT", {
+        "default": 0.25, "min": 0.05, "max": 1.0, "step": 0.05,
+        "tooltip": (
+            "Log-ratio threshold for splitting. "
+            "0.25 catches 4:3 to 16:9 transitions. "
+            "Lower = more splits, higher = fewer."
+        ),
+    }),
+    "min_chunk_frames": ("INT", {
+        "default": 21, "min": 5, "max": 201, "step": 4,
+        "tooltip": (
+            "Minimum video frames per chunk. Segments smaller "
+            "than this merge into the nearest neighbour by AR."
+        ),
+    }),
+    "wan_alignment": ("BOOLEAN", {
+        "default": True,
+        "tooltip": "Snap boundaries to WAN frame alignment (frame_count % 4 == 1).",
+    }),
+    "auto_preset": (list(WAN_PRESETS.keys()), {
+        "default": "WAN_480p",
+        "tooltip": "Resolution preset for target dimensions from aspect ratio.",
+    }),
+    "padding": ("FLOAT", {
+        "default": 0.1, "min": 0.0, "max": 0.5, "step": 0.05,
+        "tooltip": "Expand union bbox by this fraction per side before VAE snap.",
+    }),
+}
+
+
+# ---------------------------------------------------------------------------
+# Nodes
+# ---------------------------------------------------------------------------
+
+class NV_AspectChunkPreview:
+    """Preview aspect-ratio segmentation without saving any files.
+
+    Shows chunk breakdown, bbox regions, and target resolutions.
+    Outputs plan as a JSON string for inspection or downstream use.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": dict(_ANALYSIS_INPUTS)}
+
+    RETURN_TYPES = ("STRING", "INT", "STRING")
+    RETURN_NAMES = ("plan_json", "num_chunks", "info")
+    OUTPUT_NODE = True
+    FUNCTION = "execute"
+    CATEGORY = "NV_Utils"
+    DESCRIPTION = (
+        "Preview aspect-ratio chunk segmentation without saving files. "
+        "Shows how the video would be split based on bbox AR changes."
+    )
+
+    def execute(self, mask, aspect_threshold, min_chunk_frames, wan_alignment, auto_preset, padding):
+        plan, info_lines = analyze_aspect_chunks(
+            mask, aspect_threshold, min_chunk_frames, wan_alignment, auto_preset, padding,
+        )
+        info = "\n".join(info_lines)
+        plan_json = json.dumps(plan, indent=2)
+        print(info)
+        return {"ui": {"text": [info]}, "result": (plan_json, plan["num_chunks"], info)}
+
 
 class NV_AspectChunkPlanner:
     """Segment video temporally by bounding-box aspect ratio changes.
@@ -219,48 +403,16 @@ class NV_AspectChunkPlanner:
 
     @classmethod
     def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "mask": ("MASK", {
-                    "tooltip": "Per-frame masks [B,H,W] from MaskTrackingBBox or SAM3.",
-                }),
-                "aspect_threshold": ("FLOAT", {
-                    "default": 0.25, "min": 0.05, "max": 1.0, "step": 0.05,
-                    "tooltip": (
-                        "Log-ratio threshold for splitting. "
-                        "0.25 catches 4:3 to 16:9 transitions. "
-                        "Lower = more splits, higher = fewer."
-                    ),
-                }),
-                "min_chunk_frames": ("INT", {
-                    "default": 21, "min": 5, "max": 201, "step": 4,
-                    "tooltip": (
-                        "Minimum video frames per chunk. Segments smaller "
-                        "than this merge into the nearest neighbour by AR."
-                    ),
-                }),
-                "wan_alignment": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "Snap boundaries to WAN frame alignment (frame_count % 4 == 1).",
-                }),
-                "auto_preset": (list(WAN_PRESETS.keys()), {
-                    "default": "WAN_480p",
-                    "tooltip": "Resolution preset for target dimensions from aspect ratio.",
-                }),
-                "padding": ("FLOAT", {
-                    "default": 0.1, "min": 0.0, "max": 0.5, "step": 0.05,
-                    "tooltip": "Expand union bbox by this fraction per side before VAE snap.",
-                }),
-                "output_dir": ("STRING", {
-                    "default": "",
-                    "tooltip": "JSON output directory. Empty = ComfyUI output dir.",
-                }),
-                "filename_prefix": ("STRING", {
-                    "default": "aspect_chunk_plan",
-                    "tooltip": "Prefix for the output JSON filename.",
-                }),
-            },
-        }
+        inputs = dict(_ANALYSIS_INPUTS)
+        inputs["output_dir"] = ("STRING", {
+            "default": "",
+            "tooltip": "JSON output directory. Empty = ComfyUI output dir.",
+        })
+        inputs["filename_prefix"] = ("STRING", {
+            "default": "aspect_chunk_plan",
+            "tooltip": "Prefix for the output JSON filename.",
+        })
+        return {"required": inputs}
 
     RETURN_TYPES = ("STRING", "INT", "STRING")
     RETURN_NAMES = ("plan_json", "num_chunks", "info")
@@ -274,101 +426,14 @@ class NV_AspectChunkPlanner:
     )
 
     def execute(
-        self,
-        mask: torch.Tensor,
-        aspect_threshold: float,
-        min_chunk_frames: int,
-        wan_alignment: bool,
-        auto_preset: str,
-        padding: float,
-        output_dir: str,
-        filename_prefix: str,
+        self, mask, aspect_threshold, min_chunk_frames, wan_alignment,
+        auto_preset, padding, output_dir, filename_prefix,
     ):
-        # Normalise mask shape
-        if mask.dim() == 2:
-            mask = mask.unsqueeze(0)
-        B, H, W = mask.shape
-        info_lines = [f"[AspectChunkPlanner] {B} frames, {W}x{H}px"]
+        plan, info_lines = analyze_aspect_chunks(
+            mask, aspect_threshold, min_chunk_frames, wan_alignment, auto_preset, padding,
+        )
 
-        # ---- 1. Per-frame bboxes ----
-        x1s, y1s, x2s, y2s, present = extract_bboxes(mask, info_lines)
-        aspects = _compute_per_frame_aspects(x1s, y1s, x2s, y2s)
-
-        valid_count = sum(1 for a in aspects if a > 0)
-        if valid_count == 0:
-            info_lines.append("  WARNING: no valid bboxes — returning single full-frame chunk")
-            segments = [(0, B)]
-        else:
-            # ---- 2. Greedy segmentation ----
-            segments = _greedy_segment(aspects, aspect_threshold)
-            info_lines.append(f"  Greedy: {len(segments)} raw segments")
-
-            # ---- 3. Merge small segments ----
-            segments = _merge_small_segments(segments, aspects, min_chunk_frames)
-            info_lines.append(f"  After merge: {len(segments)} segments")
-
-        # ---- 4. WAN alignment ----
-        if wan_alignment:
-            segments = _snap_segments_to_wan(segments, B)
-            info_lines.append(f"  After WAN snap: {len(segments)} segments")
-
-        # ---- 5. Build chunk descriptors ----
-        chunks = []
-        for seg_idx, (start, end) in enumerate(segments):
-            frame_count = end - start
-            latent_frames = video_to_latent_frames(frame_count)
-            wan_ok = is_wan_aligned(frame_count)
-            mean_ar = _segment_mean_ar(aspects, start, end)
-
-            bbox = _compute_segment_union_bbox(
-                x1s, y1s, x2s, y2s, start, end, padding, H, W,
-            )
-            if bbox:
-                bx, by, bw, bh = bbox
-                bbox_aspect = bw / bh if bh > 0 else 1.0
-            else:
-                bx, by, bw, bh = 0, 0, W, H
-                bbox_aspect = W / H
-
-            target_w, target_h = compute_auto_resolution(bbox_aspect, auto_preset, 0)
-
-            chunks.append({
-                "chunk_idx": seg_idx,
-                "start_frame": start,
-                "end_frame": end,
-                "frame_count": frame_count,
-                "latent_frames": latent_frames,
-                "wan_aligned": wan_ok,
-                "mean_aspect": round(mean_ar, 4),
-                "bbox_x": int(bx),
-                "bbox_y": int(by),
-                "bbox_w": int(bw),
-                "bbox_h": int(bh),
-                "target_width": target_w,
-                "target_height": target_h,
-                "aspect_segment_id": seg_idx,
-            })
-
-        # ---- 6. Write JSON ----
-        plan = {
-            "version": "1.0",
-            "planner": "aspect_ratio",
-            "video_metadata": {
-                "total_frames": B,
-                "height": H,
-                "width": W,
-            },
-            "aspect_config": {
-                "threshold": aspect_threshold,
-                "min_chunk_frames": min_chunk_frames,
-                "wan_aligned": wan_alignment,
-                "auto_preset": auto_preset,
-                "padding": padding,
-            },
-            "num_chunks": len(chunks),
-            "chunks": chunks,
-        }
-
+        # Write JSON
         out_dir = output_dir.strip() or folder_paths.get_output_directory()
         os.makedirs(out_dir, exist_ok=True)
         filepath = _get_unique_filepath(
@@ -377,23 +442,11 @@ class NV_AspectChunkPlanner:
         with open(filepath, "w") as f:
             json.dump(plan, f, indent=2)
 
-        # ---- 7. Info summary ----
-        info_lines.append("")
-        info_lines.append(f"Plan: {len(chunks)} aspect-based chunks")
-        for c in chunks:
-            wan_tag = "WAN OK" if c["wan_aligned"] else "WAN MISS"
-            info_lines.append(
-                f"  Chunk {c['chunk_idx']}: frames {c['start_frame']}-{c['end_frame'] - 1} "
-                f"({c['frame_count']}f, {c['latent_frames']}L) "
-                f"AR={c['mean_aspect']:.2f} bbox={c['bbox_w']}x{c['bbox_h']} "
-                f"target={c['target_width']}x{c['target_height']} [{wan_tag}]"
-            )
         info_lines.append(f"\nSaved: {filepath}")
-
         info = "\n".join(info_lines)
         print(info)
 
-        return {"ui": {"text": [info]}, "result": (filepath, len(chunks), info)}
+        return {"ui": {"text": [info]}, "result": (filepath, plan["num_chunks"], info)}
 
 
 # ---------------------------------------------------------------------------
@@ -402,8 +455,10 @@ class NV_AspectChunkPlanner:
 
 NODE_CLASS_MAPPINGS = {
     "NV_AspectChunkPlanner": NV_AspectChunkPlanner,
+    "NV_AspectChunkPreview": NV_AspectChunkPreview,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "NV_AspectChunkPlanner": "NV Aspect Chunk Planner",
+    "NV_AspectChunkPreview": "NV Aspect Chunk Preview",
 }
