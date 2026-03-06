@@ -170,35 +170,61 @@ app.registerExtension({
         // Mouse handlers
         // =====================================================================
 
-        nodeType.prototype.handleMouseDown = function (e) {
+        // Map mouse event to canvas pixel coordinates, accounting for
+        // object-fit: contain letterboxing
+        nodeType.prototype.mouseToCanvas = function (e) {
             const pp = this._pointPicker;
             const rect = pp.canvas.getBoundingClientRect();
-            const x = ((e.clientX - rect.left) / rect.width) * pp.canvas.width;
-            const y = ((e.clientY - rect.top) / rect.height) * pp.canvas.height;
+
+            // Compute the actual rendered image area within the element
+            const elemW = rect.width;
+            const elemH = rect.height;
+            const canvasAspect = pp.canvas.width / pp.canvas.height;
+            const elemAspect = elemW / elemH;
+
+            let renderW, renderH, offsetX, offsetY;
+            if (canvasAspect > elemAspect) {
+                // Canvas is wider than element — letterbox top/bottom
+                renderW = elemW;
+                renderH = elemW / canvasAspect;
+                offsetX = 0;
+                offsetY = (elemH - renderH) / 2;
+            } else {
+                // Canvas is taller than element — letterbox left/right
+                renderH = elemH;
+                renderW = elemH * canvasAspect;
+                offsetX = (elemW - renderW) / 2;
+                offsetY = 0;
+            }
+
+            const x = ((e.clientX - rect.left - offsetX) / renderW) * pp.canvas.width;
+            const y = ((e.clientY - rect.top - offsetY) / renderH) * pp.canvas.height;
+            return { x, y };
+        };
+
+        nodeType.prototype.handleMouseDown = function (e) {
+            const { x, y } = this.mouseToCanvas(e);
 
             if (e.button === 2 || e.shiftKey) {
                 // Right-click or shift: remove nearest point
                 const nearIdx = this.findNearestPoint(x, y);
                 if (nearIdx >= 0) {
-                    const removed = pp.points.splice(nearIdx, 1)[0];
+                    const removed = this._pointPicker.points.splice(nearIdx, 1)[0];
                     console.log(`[NV_PointPicker] Removed point ${nearIdx + 1} at (${removed.x.toFixed(1)}, ${removed.y.toFixed(1)})`);
                     this.syncPointData();
                     this.redrawCanvas();
                 }
             } else {
                 // Left-click: add point
-                pp.points.push({ x, y });
-                console.log(`[NV_PointPicker] Added point ${pp.points.length} at (${x.toFixed(1)}, ${y.toFixed(1)})`);
+                this._pointPicker.points.push({ x, y });
+                console.log(`[NV_PointPicker] Added point ${this._pointPicker.points.length} at (${x.toFixed(1)}, ${y.toFixed(1)})`);
                 this.syncPointData();
                 this.redrawCanvas();
             }
         };
 
         nodeType.prototype.handleMouseMove = function (e) {
-            const pp = this._pointPicker;
-            const rect = pp.canvas.getBoundingClientRect();
-            const x = ((e.clientX - rect.left) / rect.width) * pp.canvas.width;
-            const y = ((e.clientY - rect.top) / rect.height) * pp.canvas.height;
+            const { x, y } = this.mouseToCanvas(e);
 
             const oldHover = pp.hoveredIndex;
             pp.hoveredIndex = this.findNearestPoint(x, y);
@@ -211,9 +237,12 @@ app.registerExtension({
             const pp = this._pointPicker;
             let bestIdx = -1;
             let bestDist = REMOVE_RADIUS;
-            // Scale threshold by display ratio
+            // Scale threshold by actual rendered size (not element size)
             const rect = pp.canvas.getBoundingClientRect();
-            const scale = pp.canvas.width / rect.width;
+            const canvasAspect = pp.canvas.width / pp.canvas.height;
+            const elemAspect = rect.width / rect.height;
+            const renderW = canvasAspect > elemAspect ? rect.width : rect.height * canvasAspect;
+            const scale = pp.canvas.width / renderW;
             const threshold = REMOVE_RADIUS * scale;
 
             for (let i = 0; i < pp.points.length; i++) {

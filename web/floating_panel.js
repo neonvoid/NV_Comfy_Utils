@@ -405,6 +405,16 @@ class FloatingPanel {
     show() {
         this.isVisible = true;
         this.container.style.display = 'block';
+
+        // Reset position if off-screen
+        const maxX = window.innerWidth - 50;
+        const maxY = window.innerHeight - 50;
+        if (this.position.x < 0 || this.position.x > maxX || this.position.y < 0 || this.position.y > maxY) {
+            this.position = { ...DEFAULT_POSITION };
+            this.container.style.left = `${this.position.x}px`;
+            this.container.style.top = `${this.position.y}px`;
+        }
+
         this.saveState();
         this.refreshGroups();
     }
