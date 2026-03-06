@@ -1112,6 +1112,8 @@ class NV_InpaintCrop:
         stitcher = {
             'resize_algorithm': resize_algorithm,
             'blend_pixels': mask_blend_pixels,
+            'crop_target_w': target_width,
+            'crop_target_h': target_height,
             'canvas_to_orig_x': [],
             'canvas_to_orig_y': [],
             'canvas_to_orig_w': [],

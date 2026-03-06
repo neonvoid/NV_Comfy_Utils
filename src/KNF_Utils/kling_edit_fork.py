@@ -57,6 +57,52 @@ KLING_UPLOAD_CONFIG = _IOCustom("KLING_UPLOAD_CONFIG")
 # ---------------------------------------------------------------------------
 
 _KLING_REF_MIN_PX = 300
+_KLING_VIDEO_MIN_PX = 720
+_KLING_VIDEO_MAX_PX = 2160
+
+
+def _fit_to_kling(img, min_px=_KLING_VIDEO_MIN_PX, max_px=_KLING_VIDEO_MAX_PX):
+    """Resize IMAGE tensor [B,H,W,C] so both sides are in [min_px, max_px] and even.
+
+    Preserves aspect ratio.  Handles small InpaintCrop outputs (e.g. 384x512)
+    by upscaling, and large inputs by downscaling.  Ensures even dimensions
+    (required by most video codecs / APIs).
+
+    Returns (img, did_resize) — did_resize is True if dimensions changed.
+    """
+    import torch.nn.functional as F
+
+    h, w = img.shape[1], img.shape[2]
+
+    # Compute scale to bring smallest side to min_px
+    scale = 1.0
+    if h < min_px or w < min_px:
+        scale = max(min_px / h, min_px / w)
+
+    new_h = round(h * scale)
+    new_w = round(w * scale)
+
+    # Clamp if largest side exceeds max
+    if new_h > max_px or new_w > max_px:
+        down = min(max_px / new_h, max_px / new_w)
+        new_h = round(new_h * down)
+        new_w = round(new_w * down)
+
+    # Snap to even (video codec requirement)
+    new_h = new_h + (new_h % 2)
+    new_w = new_w + (new_w % 2)
+
+    # Final clamp
+    new_h = max(min_px, min(max_px, new_h))
+    new_w = max(min_px, min(max_px, new_w))
+
+    did_resize = (new_h != h or new_w != w)
+    if did_resize:
+        x = img.permute(0, 3, 1, 2)
+        x = F.interpolate(x, size=(new_h, new_w), mode="bilinear", align_corners=False)
+        img = x.permute(0, 2, 3, 1)
+
+    return img, did_resize
 
 
 def _normalize_omni_prompt_references(prompt: str) -> str:
@@ -288,13 +334,12 @@ class NV_KlingUploadPreview(IO.ComfyNode):
 
         # --- video frame processing ---
         num_frames = images.shape[0]
-        h, w = images.shape[1], images.shape[2]
+        input_h, input_w = images.shape[1], images.shape[2]
 
-        if h < 720 or w < 720:
-            images = _ensure_min_size(images, min_px=720)
-            new_h, new_w = images.shape[1], images.shape[2]
-            print(f"[NV_KlingUploadPreview] Video {w}x{h} → upscaled to {new_w}x{new_h}")
-            h, w = new_h, new_w
+        images, did_resize = _fit_to_kling(images)
+        h, w = images.shape[1], images.shape[2]
+        if did_resize:
+            print(f"[NV_KlingUploadPreview] Video {input_w}x{input_h} → fitted to {w}x{h} for Kling")
 
         # --- resolve encode fps ---
         if upload_fps == "match input":
@@ -423,6 +468,7 @@ class NV_KlingUploadPreview(IO.ComfyNode):
             "api_aspect_ratio": api_aspect,
             "num_ref_images": num_ref,
             "ref_frames": ref_frames,  # original tensors at native resolution
+            "input_resolution": (input_w, input_h),  # pre-Kling-fit crop resolution
         }
 
         # --- build metadata preview ---
@@ -431,7 +477,8 @@ class NV_KlingUploadPreview(IO.ComfyNode):
                 "frames": num_frames,
                 "fps": fps,
                 "upload_fps": encode_fps,
-                "resolution": f"{w}x{h}",
+                "original_resolution": f"{input_w}x{input_h}",
+                "upload_resolution": f"{w}x{h}",
                 "duration_exact": round(input_duration_exact, 3),
                 "upload_duration_exact": round(upload_duration_exact, 3),
             },
