@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- NV_StitchBoundaryMask — per-frame gradient mask along stitch boundaries for boundary diffusion seam harmonization. Accepts bbox_mask (per-frame tracking), LATENT_STITCHER (static latent crop), or pixel STITCHER (per-frame canvas coordinates). Use with SetLatentNoiseMask + low-denoise KSampler to let WAN 2.2's native mask handling harmonize inpaint seams. Works for both latent-path (LatentInpaintStitch hard paste) and pixel-path (Kling API → InpaintStitch2) workflows.
 - NV_KlingStitchAdapter — bridges Kling API output back to InpaintStitch2. Handles resolution mismatch (resizes to crop target), frame count mismatch (nearest-frame resampling), and validates against stitcher data. Wire between NV Kling Edit Video and NV Inpaint Stitch v2.
 - NV_KlingUploadPreview now auto-fits arbitrary crop sizes to Kling-friendly dimensions (720-2160px, even, aspect-preserved). Stores original crop resolution in upload_config for downstream use.
 - InpaintCrop2 stitcher now includes `crop_target_w/h` for downstream resolution bridging.
@@ -19,6 +20,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Fixed snap_to_vae_grid in NV_LatentInpaintCrop clamping dimensions before origin — could theoretically produce out-of-bounds crop if called with unclamped coordinates. Now clamps origin first, then dimensions.
 - Fixed FloatingPanel (Quick Toggle) becoming invisible when its saved position was off-screen — `show()` now auto-resets position to default if outside the viewport
 - Fixed NV_PointPicker placing points at wrong coordinates when canvas aspect ratio doesn't match the available display area — mouse mapping now accounts for `object-fit: contain` letterboxing
 - Fixed InpaintStitch2 pasting stabilized face at wrong position (double-head artifact) when CoTrackerBridge stabilization is used with InpaintCrop2's target_mode resize. Root cause: inverse content warp dx/dy were computed at target resolution but applied after resize to canvas scale, amplifying the shift by the resize ratio. Also fixed blend mask being incorrectly inverse-warped (causing halo/seam) — the blend mask from InpaintCrop is already in original coordinates and should not be warped. (see `bug_tracker/inpaint_stitch/2026-03-05_inverse_warp_resolution_mismatch.md`)

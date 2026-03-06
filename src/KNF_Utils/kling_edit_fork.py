@@ -172,6 +172,19 @@ def _ensure_min_size(img, min_px: int = _KLING_REF_MIN_PX):
     return x.permute(0, 2, 3, 1)
 
 
+def _snap_to_kling_temporal(num_frames: int) -> int:
+    """Return the next valid Kling frame count (8k+1 rule).
+
+    Kling uses 8x temporal compression internally, requiring frame counts
+    of the form T = 8k + 1 (i.e., 9, 17, 25, ..., 89, 97, 105, ...).
+    If num_frames is already valid, returns it unchanged.
+    """
+    remainder = (num_frames - 1) % 8
+    if remainder == 0:
+        return num_frames
+    return num_frames + (8 - remainder)
+
+
 def _build_alias_legend(aliases: list[str | None], connected: list[bool]) -> str:
     """Build a [References: @image1 = desc, ...] legend for connected slots."""
     parts = []
@@ -341,6 +354,25 @@ class NV_KlingUploadPreview(IO.ComfyNode):
         if did_resize:
             print(f"[NV_KlingUploadPreview] Video {input_w}x{input_h} → fitted to {w}x{h} for Kling")
 
+        # --- 8k+1 temporal alignment ---
+        # Kling uses 8x temporal compression: valid frame counts are 8k+1.
+        # Pad with repeated last frame if needed; trim back in NV_KlingEditVideo.
+        original_num_frames = num_frames
+        valid_frames = _snap_to_kling_temporal(num_frames)
+        if valid_frames != num_frames:
+            pad_count = valid_frames - num_frames
+            last_frame = images[-1:].expand(pad_count, -1, -1, -1)
+            images = torch.cat([images, last_frame], dim=0)
+            num_frames = valid_frames
+            print(
+                f"[NV_KlingUploadPreview] WARNING: Frame count {original_num_frames} is not 8k+1 aligned. "
+                f"Padded to {valid_frames} (+{pad_count} repeated last frame). "
+                f"Output will be trimmed back to {original_num_frames}. "
+                f"Recommend adjusting your source to a valid frame count: "
+                f"...{_snap_to_kling_temporal(original_num_frames - 8)}, {original_num_frames - (original_num_frames - 1) % 8}, "
+                f"{valid_frames}, {valid_frames + 8}..."
+            )
+
         # --- resolve encode fps ---
         if upload_fps == "match input":
             encode_fps = fps
@@ -469,12 +501,15 @@ class NV_KlingUploadPreview(IO.ComfyNode):
             "num_ref_images": num_ref,
             "ref_frames": ref_frames,  # original tensors at native resolution
             "input_resolution": (input_w, input_h),  # pre-Kling-fit crop resolution
+            "original_num_frames": original_num_frames,  # pre-padding count for trim
         }
 
         # --- build metadata preview ---
         metadata = {
             "input": {
                 "frames": num_frames,
+                "original_frames": original_num_frames,
+                "padded": num_frames != original_num_frames,
                 "fps": fps,
                 "upload_fps": encode_fps,
                 "original_resolution": f"{input_w}x{input_h}",
@@ -494,6 +529,15 @@ class NV_KlingUploadPreview(IO.ComfyNode):
                 "reference_images": num_ref,
             },
         }
+
+        if original_num_frames != num_frames:
+            prev_valid = original_num_frames - ((original_num_frames - 1) % 8)
+            next_valid = valid_frames
+            metadata["warning"] = (
+                f"Frame count {original_num_frames} is not Kling-aligned (8k+1). "
+                f"Padded to {num_frames}, output will be auto-trimmed to {original_num_frames}. "
+                f"To avoid padding, use a frame count like {prev_valid}, {next_valid}, or {next_valid + 8}."
+            )
 
         return IO.NodeOutput(
             images,
@@ -692,8 +736,21 @@ class NV_KlingEditVideo(IO.ComfyNode):
         components = result_video.get_components()
         output_images = components.images
         output_fps = float(components.frame_rate)
-        output_frames = output_images.shape[0]
+        raw_output_frames = output_images.shape[0]
+        output_frames = raw_output_frames
         out_h, out_w = output_images.shape[1], output_images.shape[2]
+
+        # --- trim padded frames back to original count ---
+        original_num_frames = upload_config.get("original_num_frames", num_frames)
+        trimmed = False
+        if output_frames > original_num_frames:
+            output_images = output_images[:original_num_frames]
+            trimmed = True
+            print(
+                f"[NV_KlingEditVideo] Trimmed {output_frames} → {original_num_frames} frames "
+                f"(removing {output_frames - original_num_frames} padded frames)"
+            )
+            output_frames = original_num_frames
 
         t_end = time.time()
 
@@ -724,6 +781,8 @@ class NV_KlingEditVideo(IO.ComfyNode):
             },
             "output": {
                 "frames": output_frames,
+                "frames_from_api": raw_output_frames,
+                "trimmed": trimmed,
                 "fps": output_fps,
                 "resolution": f"{out_w}x{out_h}",
                 "duration_exact": round(output_frames / output_fps, 3) if output_fps > 0 else None,
