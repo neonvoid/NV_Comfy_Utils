@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- NV_KlingStitchAdapter — bridges Kling API output back to InpaintStitch2. Handles resolution mismatch (resizes to crop target), frame count mismatch (nearest-frame resampling), and validates against stitcher data. Wire between NV Kling Edit Video and NV Inpaint Stitch v2.
+- NV_KlingUploadPreview now auto-fits arbitrary crop sizes to Kling-friendly dimensions (720-2160px, even, aspect-preserved). Stores original crop resolution in upload_config for downstream use.
+- InpaintCrop2 stitcher now includes `crop_target_w/h` for downstream resolution bridging.
+
 ### Changed
 
 - NodeBypasser action widgets (Bypass/Enable/List) changed from BOOLEAN toggles to button widgets for reliable click handling. Existing nodes must be re-added.

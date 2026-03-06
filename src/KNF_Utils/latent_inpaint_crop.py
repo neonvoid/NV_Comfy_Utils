@@ -88,15 +88,15 @@ def snap_to_vae_grid(x, y, w, h, spatial_h_px, spatial_w_px, stride=VAE_STRIDE):
     w = max(stride, ((int(w) + stride - 1) // stride) * stride)
     h = max(stride, ((int(h) + stride - 1) // stride) * stride)
 
-    # Clamp to image bounds
+    # Clamp origin first, then clamp dimensions to stay in bounds
+    x = max(0, min(x, spatial_w_px - stride))
+    y = max(0, min(y, spatial_h_px - stride))
     if x + w > spatial_w_px:
         w = ((spatial_w_px - x) // stride) * stride
         w = max(stride, w)
     if y + h > spatial_h_px:
         h = ((spatial_h_px - y) // stride) * stride
         h = max(stride, h)
-    x = max(0, min(x, spatial_w_px - stride))
-    y = max(0, min(y, spatial_h_px - stride))
 
     return x, y, w, h
 

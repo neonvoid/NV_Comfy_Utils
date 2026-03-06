@@ -1218,8 +1218,13 @@ class NV_InpaintCrop:
                 # "tight" — original unprocessed mask (default)
                 blend_mask = cropped_mask_orig.clone()
 
-            if mask_blend_pixels > 0 and stitch_source != "bbox":
-                blend_mask = mask_erode_dilate_fn(blend_mask, mask_blend_pixels)
+            if mask_blend_pixels > 0:
+                if stitch_source == "bbox":
+                    # Bbox is all-ones — erode INWARD from edges to create a border, then blur
+                    blend_mask = mask_erode_dilate_fn(blend_mask, -mask_blend_pixels)
+                else:
+                    # Tight/processed — dilate OUTWARD to extend blend beyond mask edge
+                    blend_mask = mask_erode_dilate_fn(blend_mask, mask_blend_pixels)
                 blend_mask = mask_blur(blend_mask, mask_blend_pixels)
 
             # Store in stitcher
