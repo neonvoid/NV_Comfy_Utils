@@ -60,7 +60,7 @@ class NV_RetimePrep:
                     "min": 1.0,
                     "max": 120.0,
                     "step": 0.1,
-                    "tooltip": "FPS of input video. Used to compute target fps for the interpolator."
+                    "tooltip": "FPS of input video. Target fps = source * factor (GIMM-VFI needs higher target to generate more frames)."
                 }),
             },
         }
@@ -74,7 +74,11 @@ class NV_RetimePrep:
     def execute(self, images, slowdown_factor, source_fps):
         original_count = images.shape[0]
         slowed_count = _compute_slowed_frame_count(original_count, slowdown_factor)
-        target_fps = source_fps / slowdown_factor
+
+        # To create MORE frames (slowdown), GIMM-VFI needs target_fps > source_fps.
+        # GIMM-VFI formula: output = round((N-1) * target/source) + 1
+        # So target = source * factor gives: round((N-1) * factor) + 1 = slowed_count
+        target_fps = source_fps * slowdown_factor
 
         wan_note = ""
         if is_wan_aligned(original_count) and is_wan_aligned(slowed_count):
