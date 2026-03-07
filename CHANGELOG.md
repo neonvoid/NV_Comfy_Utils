@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- NV_MultiBandBlendStitch — standalone Laplacian pyramid multi-band blending node for stitch seam repair. Decomposes images into frequency bands and blends each at appropriate spatial scale. Pure PyTorch, ~2-5ms per frame.
+- NV_BoundaryColorMatch — Reinhard color transfer at stitch boundaries in Lab color space. Samples color stats from strips on both sides of the seam and applies mean/std matching with gradient falloff. Temporal smoothing (default 0.8) prevents per-frame flicker on video.
+- InpaintStitch2 now supports `blend_mode` parameter: `alpha` (default, backward compat), `multiband` (Laplacian pyramid — best for VAE roundtrip seams), and `hard` (binary paste). Multiband mode blends low frequencies broadly and high frequencies narrowly, directly at the composite step — no double-blending.
 - NV_StitchBoundaryMask — per-frame gradient mask along stitch boundaries for boundary diffusion seam harmonization. Accepts bbox_mask (per-frame tracking), LATENT_STITCHER (static latent crop), or pixel STITCHER (per-frame canvas coordinates). Use with SetLatentNoiseMask + low-denoise KSampler to let WAN 2.2's native mask handling harmonize inpaint seams. Works for both latent-path (LatentInpaintStitch hard paste) and pixel-path (Kling API → InpaintStitch2) workflows.
 - NV_KlingStitchAdapter — bridges Kling API output back to InpaintStitch2. Handles resolution mismatch (resizes to crop target), frame count mismatch (nearest-frame resampling), and validates against stitcher data. Wire between NV Kling Edit Video and NV Inpaint Stitch v2.
 - NV_KlingUploadPreview now auto-fits arbitrary crop sizes to Kling-friendly dimensions (720-2160px, even, aspect-preserved). Stores original crop resolution in upload_config for downstream use.

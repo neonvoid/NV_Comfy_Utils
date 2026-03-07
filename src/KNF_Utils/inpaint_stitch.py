@@ -18,6 +18,7 @@ import torch.nn.functional as TF
 import comfy.model_management
 
 from .inpaint_crop import rescale_image, rescale_mask
+from .multiband_blend_stitch import multiband_blend
 
 
 # =============================================================================
@@ -92,7 +93,8 @@ def stitch_single_frame(canvas_image, inpainted_image, mask,
                         ctc_x, ctc_y, ctc_w, ctc_h,
                         cto_x, cto_y, cto_w, cto_h,
                         resize_algorithm,
-                        warp_mode=None, warp_entry=None):
+                        warp_mode=None, warp_entry=None,
+                        blend_mode="alpha", multiband_levels=5):
     """Blend one inpainted crop back into its canvas and extract the original region.
 
     Args:
@@ -104,6 +106,8 @@ def stitch_single_frame(canvas_image, inpainted_image, mask,
         resize_algorithm: Interpolation method for resizing crop back to canvas scale.
         warp_mode: Optional content warp mode ('centroid' or 'optical_flow').
         warp_entry: Optional per-frame warp data dict.
+        blend_mode: 'alpha' (standard), 'multiband' (Laplacian pyramid), or 'hard' (no blend).
+        multiband_levels: Pyramid levels for multiband mode (default 5).
 
     Returns:
         [1, cto_h, cto_w, C] output image (original image region with inpainted area blended in).
@@ -145,7 +149,22 @@ def stitch_single_frame(canvas_image, inpainted_image, mask,
 
     # Extract canvas region, blend, paste back
     canvas_crop = canvas_image[:, ctc_y:ctc_y + ctc_h, ctc_x:ctc_x + ctc_w, :]
-    blended = resized_mask * resized_image + (1.0 - resized_mask) * canvas_crop
+
+    if blend_mode == "multiband":
+        # Laplacian pyramid: blend each frequency band at appropriate spatial scale.
+        # Operates on [B,C,H,W] — convert from [1,H,W,C].
+        inp_nchw = resized_image.permute(0, 3, 1, 2)
+        cvs_nchw = canvas_crop.permute(0, 3, 1, 2)
+        mask_nchw = resized_mask.permute(0, 3, 1, 2)[:, :1]  # [1, 1, H, W]
+        blended_nchw = multiband_blend(inp_nchw, cvs_nchw, mask_nchw, num_levels=multiband_levels)
+        blended = blended_nchw.clamp(0.0, 1.0).permute(0, 2, 3, 1)
+    elif blend_mode == "hard":
+        # Hard paste: no blending, just overwrite (useful for latent path comparisons)
+        blended = resized_mask * resized_image + (1.0 - resized_mask) * canvas_crop
+    else:
+        # Standard alpha composite
+        blended = resized_mask * resized_image + (1.0 - resized_mask) * canvas_crop
+
     canvas_image[:, ctc_y:ctc_y + ctc_h, ctc_x:ctc_x + ctc_w, :] = blended
 
     # Extract the original image area from canvas
@@ -176,7 +195,21 @@ class NV_InpaintStitch:
             "required": {
                 "stitcher": ("STITCHER",),
                 "inpainted_image": ("IMAGE",),
-            }
+                "blend_mode": (["alpha", "multiband", "hard"], {
+                    "default": "alpha",
+                    "tooltip": "alpha: standard feathered blend (default). "
+                               "multiband: Laplacian pyramid — blends low freq broadly, "
+                               "high freq narrowly (best for VAE roundtrip seams). "
+                               "hard: binary mask paste, no feathering."
+                }),
+            },
+            "optional": {
+                "multiband_levels": ("INT", {
+                    "default": 5, "min": 2, "max": 8, "step": 1,
+                    "tooltip": "Pyramid levels for multiband mode. 5 = good for 720p-1080p. "
+                               "More levels = broader low-frequency blending."
+                }),
+            },
         }
 
     RETURN_TYPES = ("IMAGE",)
@@ -185,10 +218,11 @@ class NV_InpaintStitch:
     CATEGORY = "NV_Utils/Inpaint"
     DESCRIPTION = (
         "Composites inpainted crops back into the original frames. "
-        "Pairs with NV Inpaint Crop v2. Handles frame skipping automatically."
+        "Pairs with NV Inpaint Crop v2. Handles frame skipping automatically. "
+        "Supports alpha, multiband (Laplacian pyramid), or hard blend modes."
     )
 
-    def stitch(self, stitcher, inpainted_image):
+    def stitch(self, stitcher, inpainted_image, blend_mode="alpha", multiband_levels=5):
         device = comfy.model_management.get_torch_device()
         intermediate = comfy.model_management.intermediate_device()
         resize_algorithm = _get_resize_algorithm(stitcher)
@@ -227,6 +261,8 @@ class NV_InpaintStitch:
                     resize_algorithm,
                     warp_mode=content_warp_mode,
                     warp_entry=warp_entry,
+                    blend_mode=blend_mode,
+                    multiband_levels=multiband_levels,
                 )
                 results.append(out.squeeze(0).to(intermediate))
         else:
@@ -255,13 +291,16 @@ class NV_InpaintStitch:
                         resize_algorithm,
                         warp_mode=content_warp_mode,
                         warp_entry=warp_entry,
+                        blend_mode=blend_mode,
+                        multiband_levels=multiband_levels,
                     )
                     results.append(out.squeeze(0).to(intermediate))
                     inpainted_idx += 1
 
         result_batch = torch.stack(results, dim=0)
         print(f"[NV_InpaintStitch] Stitched {result_batch.shape[0]} frames "
-              f"({len(skipped_indices)} skipped, {inpainted_image.shape[0]} inpainted)")
+              f"({len(skipped_indices)} skipped, {inpainted_image.shape[0]} inpainted, "
+              f"blend={blend_mode})")
 
         return (result_batch,)
 
