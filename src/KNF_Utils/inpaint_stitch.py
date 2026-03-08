@@ -159,8 +159,9 @@ def stitch_single_frame(canvas_image, inpainted_image, mask,
         blended_nchw = multiband_blend(inp_nchw, cvs_nchw, mask_nchw, num_levels=multiband_levels)
         blended = blended_nchw.clamp(0.0, 1.0).permute(0, 2, 3, 1)
     elif blend_mode == "hard":
-        # Hard paste: no blending, just overwrite (useful for latent path comparisons)
-        blended = resized_mask * resized_image + (1.0 - resized_mask) * canvas_crop
+        # Hard paste: binary threshold mask, no feathering
+        hard_mask = (resized_mask > 0.5).float()
+        blended = hard_mask * resized_image + (1.0 - hard_mask) * canvas_crop
     else:
         # Standard alpha composite
         blended = resized_mask * resized_image + (1.0 - resized_mask) * canvas_crop
@@ -171,6 +172,36 @@ def stitch_single_frame(canvas_image, inpainted_image, mask,
     output_image = canvas_image[:, cto_y:cto_y + cto_h, cto_x:cto_x + cto_w, :]
 
     return output_image
+
+
+def _build_stitch_mask(blend_mask, ctc_x, ctc_y, ctc_w, ctc_h,
+                       cto_x, cto_y, cto_w, cto_h, resize_algorithm):
+    """Build a per-frame mask [cto_h, cto_w] showing where inpainted content was composited.
+
+    1.0 = inpainted region, 0.0 = original content. Useful for downstream
+    BoundaryColorMatch or StitchBoundaryMask nodes.
+    """
+    # Resize blend mask to canvas crop size
+    if blend_mask.dim() == 2:
+        blend_mask = blend_mask.unsqueeze(0)
+
+    if ctc_w != blend_mask.shape[-1] or ctc_h != blend_mask.shape[-2]:
+        blend_mask = rescale_mask(blend_mask, ctc_w, ctc_h, resize_algorithm)
+
+    blend_mask = blend_mask.clamp(0, 1)
+
+    # Create full canvas-sized mask
+    canvas_h = cto_y + cto_h
+    canvas_w = cto_x + cto_w
+    # Canvas must be at least large enough for both crop region and orig region
+    canvas_h = max(canvas_h, ctc_y + ctc_h)
+    canvas_w = max(canvas_w, ctc_x + ctc_w)
+
+    canvas_mask = torch.zeros(canvas_h, canvas_w, device=blend_mask.device)
+    canvas_mask[ctc_y:ctc_y + ctc_h, ctc_x:ctc_x + ctc_w] = blend_mask.squeeze(0)
+
+    # Extract the original image region
+    return canvas_mask[cto_y:cto_y + cto_h, cto_x:cto_x + cto_w]
 
 
 def _get_resize_algorithm(stitcher):
@@ -212,8 +243,8 @@ class NV_InpaintStitch:
             },
         }
 
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("image",)
+    RETURN_TYPES = ("IMAGE", "MASK")
+    RETURN_NAMES = ("image", "stitch_mask")
     FUNCTION = "stitch"
     CATEGORY = "NV_Utils/Inpaint"
     DESCRIPTION = (
@@ -236,6 +267,7 @@ class NV_InpaintStitch:
         content_warp_data = stitcher.get('content_warp_data', None)
 
         results = []
+        mask_results = []
 
         if len(skipped_indices) == 0:
             # Simple path: all frames were inpainted
@@ -265,6 +297,15 @@ class NV_InpaintStitch:
                     multiband_levels=multiband_levels,
                 )
                 results.append(out.squeeze(0).to(intermediate))
+                sm = _build_stitch_mask(
+                    stitcher['cropped_mask_for_blend'][idx],
+                    stitcher['cropped_to_canvas_x'][idx], stitcher['cropped_to_canvas_y'][idx],
+                    stitcher['cropped_to_canvas_w'][idx], stitcher['cropped_to_canvas_h'][idx],
+                    stitcher['canvas_to_orig_x'][idx], stitcher['canvas_to_orig_y'][idx],
+                    stitcher['canvas_to_orig_w'][idx], stitcher['canvas_to_orig_h'][idx],
+                    resize_algorithm,
+                )
+                mask_results.append(sm.to(intermediate))
         else:
             # Reconstruct full batch with skipped frames reinserted
             inpainted_idx = 0
@@ -272,7 +313,9 @@ class NV_InpaintStitch:
 
             for frame_idx in range(total_frames):
                 if frame_idx in skipped_indices:
-                    results.append(original_frames[original_idx].to(intermediate))
+                    orig = original_frames[original_idx].to(intermediate)
+                    results.append(orig)
+                    mask_results.append(torch.zeros(orig.shape[0], orig.shape[1], device=intermediate))
                     original_idx += 1
                 else:
                     warp_entry = content_warp_data[inpainted_idx] if content_warp_data else None
@@ -295,14 +338,24 @@ class NV_InpaintStitch:
                         multiband_levels=multiband_levels,
                     )
                     results.append(out.squeeze(0).to(intermediate))
+                    sm = _build_stitch_mask(
+                        stitcher['cropped_mask_for_blend'][inpainted_idx],
+                        stitcher['cropped_to_canvas_x'][inpainted_idx], stitcher['cropped_to_canvas_y'][inpainted_idx],
+                        stitcher['cropped_to_canvas_w'][inpainted_idx], stitcher['cropped_to_canvas_h'][inpainted_idx],
+                        stitcher['canvas_to_orig_x'][inpainted_idx], stitcher['canvas_to_orig_y'][inpainted_idx],
+                        stitcher['canvas_to_orig_w'][inpainted_idx], stitcher['canvas_to_orig_h'][inpainted_idx],
+                        resize_algorithm,
+                    )
+                    mask_results.append(sm.to(intermediate))
                     inpainted_idx += 1
 
         result_batch = torch.stack(results, dim=0)
+        stitch_mask_batch = torch.stack(mask_results, dim=0)
         print(f"[NV_InpaintStitch] Stitched {result_batch.shape[0]} frames "
               f"({len(skipped_indices)} skipped, {inpainted_image.shape[0]} inpainted, "
               f"blend={blend_mode})")
 
-        return (result_batch,)
+        return (result_batch, stitch_mask_batch)
 
 
 # =============================================================================

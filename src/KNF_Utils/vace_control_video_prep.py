@@ -301,6 +301,15 @@ class NV_VaceControlVideoPrep:
                                "artifacts since the blend happens in VACE's clean interior zone. "
                                "Trade-off: pastes everything VACE generated inside the bbox."
                 }),
+                "halo_pixels": ("INT", {
+                    "default": 0, "min": 0, "max": 48, "step": 4,
+                    "tooltip": "Seam-Absorbing Control Halo: expand the VACE conditioning mask "
+                               "OUTWARD by this many pixels beyond the stitch boundary. "
+                               "WAN repaints this strip, so the stitch falls inside VACE-repainted content "
+                               "rather than at its edge — eliminating seam memory in downstream stages. "
+                               "8-16px = subtle (1-2 VAE blocks), 24px = aggressive. "
+                               "0 = disabled (default, backward-compatible)."
+                }),
                 "stitch_erosion": ("INT", {
                     "default": 0, "min": -32, "max": 32, "step": 1,
                     "tooltip": "Erode (negative) or dilate (positive) the stitch mask for "
@@ -334,7 +343,7 @@ class NV_VaceControlVideoPrep:
                 fill_value=0.5, threshold=False,
                 mask_grow=0, mask_fill_holes=0, mask_remove_noise=0, mask_smooth=0,
                 vae_stride=8,
-                stitch_source="tight", stitch_erosion=0, stitch_feather=8):
+                stitch_source="tight", halo_pixels=0, stitch_erosion=0, stitch_feather=8):
 
         # Apply shared config override if connected
         from .mask_processing_config import apply_vace_mask_config
@@ -405,6 +414,9 @@ class NV_VaceControlVideoPrep:
             result_mask = result_mask.clamp(0.0, 1.0)
             info_lines.append(f"  Mask pre-processing: {', '.join(preproc_applied)}")
 
+        # Save preprocessed mask before bbox conversion (used for stitch mask recomputation)
+        preprocessed_mask = result_mask.clone()
+
         # --- Step 2: BBox conversion (before erosion/feather) ---
         if mask_shape == "bbox":
             result_mask = masks_to_bboxes(
@@ -468,6 +480,17 @@ class NV_VaceControlVideoPrep:
         if erosion_px > 0:
             result_mask = mask_erode_dilate(result_mask, -erosion_px)
 
+        # --- Step 5b: Seam-Absorbing Control Halo ---
+        # Expand the BINARY eroded mask outward BEFORE feathering, so the halo gets a
+        # clean uniform expansion. Dilating after feather would distort the gradient profile
+        # (grey morphology expands high-value contours more than low-value).
+        if halo_pixels > 0:
+            result_mask = mask_erode_dilate(result_mask, halo_pixels)  # positive = dilate outward
+            info_lines.append(
+                f"  Halo: expanded VACE mask outward by {halo_pixels}px "
+                f"({halo_pixels / vae_stride:.1f} VAE blocks) — applied pre-feather"
+            )
+
         # --- Step 6: Blur (feather) ---
         if feather_px > 0:
             result_mask = mask_blur(result_mask, feather_px)
@@ -528,9 +551,9 @@ class NV_VaceControlVideoPrep:
             # result_mask at this point has VACE erosion+feather applied, so we rebuild
             # from the bbox step output. We can use the binary bbox by thresholding result_mask
             # before VACE feathering was applied — but we already modified result_mask.
-            # Instead, recompute bboxes from the original mask.
+            # Recompute bboxes from preprocessed mask (matches VACE bbox input).
             bbox_binary = masks_to_bboxes(
-                (mask > 0.5).float() if threshold else mask,
+                preprocessed_mask,
                 bbox_padding, bbox_smooth_frames, vae_stride, []  # discard info
             )
             stitch_mask = bbox_binary.clone()

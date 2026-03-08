@@ -21,8 +21,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - NodeBypasser action widgets (Bypass/Enable/List) changed from BOOLEAN toggles to button widgets for reliable click handling. Existing nodes must be re-added.
 - `extensions.js` now uses dynamic imports with per-module error isolation — one broken extension no longer kills all others.
 
+- InpaintStitch2 now outputs `stitch_mask` — per-frame mask [B,H,W] at full canvas resolution showing where inpainted content was composited (1.0=inpainted, 0.0=original). Feed directly into NV_BoundaryColorMatch or NV_StitchBoundaryMask.
+- NV_VaceControlVideoPrep gains `halo_pixels` parameter (Seam-Absorbing Control Halo). Expands the VACE conditioning mask outward by N pixels beyond the stitch boundary so WAN repaints across the seam — eliminates seam memory in downstream stages. Default 0 (off, backward-compatible), recommended 8-16px.
+
 ### Fixed
 
+- Fixed `hard` blend mode in InpaintStitch2 being identical to `alpha` mode — now correctly thresholds the mask at 0.5 for true binary paste with no feathering.
+- Fixed `mask_smooth` in InpaintCrop2 crashing on 2D mask input — `binary` was computed before `unsqueeze`, creating wrong shape for `gaussian_blur`. Now ensures 3D before binarization.
+- Fixed VACE bbox stitch desync in VaceControlVideoPrep — stitch mask recomputed bboxes from raw input mask instead of preprocessed mask (after threshold/grow/fill_holes/smooth), causing mismatch with the VACE conditioning mask.
+- Fixed CoTracker `grid_sample` using `padding_mode='zeros'` which injected dark pixels at warp edges. Changed to `padding_mode='border'` (edge replication).
+- Fixed CoTracker error path not calling `model.cpu()`, leaking GPU memory on inference failure.
 - Fixed snap_to_vae_grid in NV_LatentInpaintCrop clamping dimensions before origin — could theoretically produce out-of-bounds crop if called with unclamped coordinates. Now clamps origin first, then dimensions.
 - Fixed FloatingPanel (Quick Toggle) becoming invisible when its saved position was off-screen — `show()` now auto-resets position to default if outside the viewport
 - Fixed NV_PointPicker placing points at wrong coordinates when canvas aspect ratio doesn't match the available display area — mouse mapping now accounts for `object-fit: contain` letterboxing

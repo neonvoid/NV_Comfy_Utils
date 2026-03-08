@@ -600,13 +600,14 @@ def mask_smooth(mask, amount):
     if amount % 2 == 0:
         amount += 1
 
+    # Ensure at least 3D for gaussian_blur
+    if mask.dim() == 2:
+        mask = mask.unsqueeze(0)
+
     # Binarize first (threshold at 0.5)
     binary = mask > 0.5
 
     # Then blur
-    if mask.dim() == 2:
-        mask = mask.unsqueeze(0)
-
     smoothed = T.functional.gaussian_blur(binary.unsqueeze(1).float(), amount).squeeze(1)
 
     return smoothed

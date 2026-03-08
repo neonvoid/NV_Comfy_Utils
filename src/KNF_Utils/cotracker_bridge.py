@@ -224,6 +224,9 @@ class NV_CoTrackerBridge:
             torch.cuda.empty_cache()
 
         except Exception as e:
+            if "model" in locals():
+                model.cpu()
+            torch.cuda.empty_cache()
             info = f"CoTracker3 inference failed: {e}. Images passed through unchanged."
             print(f"[NV_CoTrackerBridge] ERROR: {info}")
             return (stitcher, cropped_image, cropped_mask, cropped_mask_processed, info)
@@ -377,7 +380,7 @@ class NV_CoTrackerBridge:
                 grid = _build_translation_grid(dx, dy, expanded_h_b, expanded_w_b, device)
 
                 wi = TF.grid_sample(img_nchw, grid, mode='bilinear',
-                                    padding_mode='zeros', align_corners=False)
+                                    padding_mode='border', align_corners=False)
                 wi = wi[:, :, trim_top:trim_top + H, trim_left:trim_left + W]
 
                 # Warp masks if provided
