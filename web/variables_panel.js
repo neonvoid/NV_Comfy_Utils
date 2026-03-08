@@ -606,6 +606,20 @@ class VariablesPanel {
         // Insert chevron at the start of mainRow (before dot)
         mainRow.insertBefore(chevron, dot);
 
+        // --- Source Pool chips ---
+        const pool = variableManager.getPool(info.name);
+        if (pool.length > 0) {
+            const poolSection = this._createPoolChips(info, pool);
+            details.appendChild(poolSection);
+        }
+
+        // Add to Pool button (always visible in expanded view)
+        const addToPoolRow = document.createElement("div");
+        addToPoolRow.style.cssText = "padding: 4px 8px;";
+        const addToPoolBtn = this._createActionButton("+ Add Source", "#3a5a3a", () => this._showSourcePicker(info));
+        addToPoolRow.appendChild(addToPoolBtn);
+        details.appendChild(addToPoolRow);
+
         // Source sub-row
         if (sourceInfo) {
             const sourceRow = this._createSourceSubRow(sourceInfo);
@@ -1273,6 +1287,405 @@ class VariablesPanel {
         document.body.appendChild(overlay);
         document.body.appendChild(dialog);
         select.focus();
+    }
+
+    // ===== Source Pool UI =====
+
+    _createPoolChips(info, pool) {
+        const container = document.createElement("div");
+        container.style.cssText = `
+            padding: 4px 8px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+            align-items: center;
+            max-height: 60px;
+            overflow-y: auto;
+        `;
+
+        const label = document.createElement("span");
+        label.textContent = "Pool:";
+        label.style.cssText = "font-size: 10px; color: #888; margin-right: 2px; flex-shrink: 0;";
+        container.appendChild(label);
+
+        const typeColor = variableManager.getTypeColor(info.type);
+
+        for (const candidate of pool) {
+            const chip = document.createElement("button");
+            chip.style.cssText = `
+                padding: 2px 8px;
+                border-radius: 10px;
+                font-size: 10px;
+                font-weight: 500;
+                cursor: pointer;
+                transition: all 0.15s;
+                white-space: nowrap;
+                max-width: 120px;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                border: 1px solid ${candidate.isActive ? typeColor : '#555'};
+                background: ${candidate.isActive ? typeColor + '33' : '#333'};
+                color: ${candidate.status === 'stale' ? '#666' : (candidate.isActive ? '#fff' : '#bbb')};
+                ${candidate.status === 'stale' ? 'text-decoration: line-through;' : ''}
+            `;
+
+            // Build display text
+            let displayText = candidate.label;
+            if (candidate.status === "stale") {
+                displayText += " (missing)";
+            } else if (candidate.status === "type_mismatch") {
+                displayText += " (type!)";
+            }
+            chip.textContent = displayText;
+            chip.title = `${candidate.label}\nNode: ${candidate.nodeTitle} (${candidate.nodeType})\nSlot: ${candidate.slotIndex}\nStatus: ${candidate.status}`;
+
+            // Click to switch
+            if (!candidate.isActive && candidate.status === "ok") {
+                chip.addEventListener("click", (e) => {
+                    e.stopPropagation();
+                    variableManager.switchCandidate(info.name, candidate.id);
+                    this._lastHash = "";
+                    this.refresh();
+                });
+                chip.addEventListener("mouseenter", () => {
+                    chip.style.borderColor = typeColor;
+                    chip.style.background = typeColor + '22';
+                });
+                chip.addEventListener("mouseleave", () => {
+                    chip.style.borderColor = '#555';
+                    chip.style.background = '#333';
+                });
+            }
+
+            // Right-click for chip context menu
+            chip.addEventListener("contextmenu", (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                this._showChipContextMenu(info, candidate, e);
+            });
+
+            container.appendChild(chip);
+        }
+
+        return container;
+    }
+
+    _showChipContextMenu(info, candidate, event) {
+        const existing = document.getElementById("nv-var-context-menu");
+        if (existing) existing.remove();
+        // Clean up any previous close handler
+        if (this._chipMenuCloseHandler) {
+            document.removeEventListener("mousedown", this._chipMenuCloseHandler);
+            this._chipMenuCloseHandler = null;
+        }
+
+        const menu = document.createElement("div");
+        menu.id = "nv-var-context-menu";
+        menu.style.cssText = `
+            position: fixed;
+            left: ${event.clientX}px;
+            top: ${event.clientY}px;
+            background: #1a1a1a;
+            border: 1px solid #444;
+            border-radius: 6px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+            z-index: 10002;
+            min-width: 140px;
+            padding: 4px 0;
+        `;
+
+        const items = [
+            {
+                label: "Go to Source Node",
+                enabled: candidate.status === "ok",
+                action: () => {
+                    const node = app.graph.getNodeById(candidate.nodeId);
+                    if (node) this._navigateToNode(node);
+                }
+            },
+            {
+                label: "Rename Label",
+                enabled: true,
+                action: () => this._showRenameCandidateDialog(info, candidate)
+            },
+            null,
+            {
+                label: "Remove from Pool",
+                enabled: true,
+                color: "#f44",
+                action: () => {
+                    variableManager.removeFromPool(info.name, candidate.id);
+                    this._lastHash = "";
+                    this.refresh();
+                }
+            },
+        ];
+
+        for (const item of items) {
+            if (item === null) {
+                const sep = document.createElement("div");
+                sep.style.cssText = "height: 1px; background: #333; margin: 4px 0;";
+                menu.appendChild(sep);
+                continue;
+            }
+
+            const row = document.createElement("div");
+            row.textContent = item.label;
+            row.style.cssText = `
+                padding: 6px 12px;
+                cursor: ${item.enabled ? 'pointer' : 'default'};
+                color: ${!item.enabled ? '#555' : (item.color || '#e0e0e0')};
+                font-size: 12px;
+                transition: background 0.1s;
+            `;
+            if (item.enabled) {
+                row.addEventListener("mouseenter", () => row.style.background = "#333");
+                row.addEventListener("mouseleave", () => row.style.background = "transparent");
+                row.addEventListener("click", () => {
+                    menu.remove();
+                    item.action();
+                });
+            }
+            menu.appendChild(row);
+        }
+
+        document.body.appendChild(menu);
+
+        const closeMenu = (e) => {
+            if (!menu.contains(e.target)) {
+                menu.remove();
+                document.removeEventListener("mousedown", closeMenu);
+                this._chipMenuCloseHandler = null;
+            }
+        };
+        this._chipMenuCloseHandler = closeMenu;
+        setTimeout(() => document.addEventListener("mousedown", closeMenu), 0);
+    }
+
+    _showRenameCandidateDialog(info, candidate) {
+        const overlay = document.createElement("div");
+        overlay.style.cssText = `
+            position: fixed; inset: 0;
+            background: rgba(0,0,0,0.5);
+            z-index: 10000;
+        `;
+
+        const dialog = document.createElement("div");
+        dialog.style.cssText = `
+            position: fixed; left: 50%; top: 50%;
+            transform: translate(-50%, -50%);
+            background: #1a1a1a; border: 1px solid #444;
+            border-radius: 8px; padding: 16px;
+            z-index: 10001; min-width: 280px;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.6);
+        `;
+
+        const title = document.createElement("h3");
+        title.textContent = "Rename Source Label";
+        title.style.cssText = "margin: 0 0 12px 0; color: #e0e0e0; font-size: 14px;";
+
+        const input = document.createElement("input");
+        input.type = "text";
+        input.value = candidate.label;
+        input.style.cssText = `
+            width: 100%; padding: 8px; margin-bottom: 16px;
+            background: #2a2a2a; border: 1px solid #444;
+            border-radius: 4px; color: #e0e0e0;
+            box-sizing: border-box; font-size: 12px; outline: none;
+        `;
+
+        const buttons = document.createElement("div");
+        buttons.style.cssText = "display: flex; gap: 8px; justify-content: flex-end;";
+
+        const cleanup = () => {
+            document.body.removeChild(dialog);
+            document.body.removeChild(overlay);
+        };
+
+        const cancelBtn = document.createElement("button");
+        cancelBtn.textContent = "Cancel";
+        cancelBtn.style.cssText = "padding: 8px 16px; background: #333; border: none; border-radius: 4px; color: #e0e0e0; cursor: pointer; font-size: 12px;";
+        cancelBtn.addEventListener("click", cleanup);
+
+        const applyBtn = document.createElement("button");
+        applyBtn.textContent = "Rename";
+        applyBtn.style.cssText = "padding: 8px 16px; background: #5a5; border: none; border-radius: 4px; color: white; cursor: pointer; font-size: 12px; font-weight: 500;";
+        applyBtn.addEventListener("click", () => {
+            const newLabel = input.value.trim();
+            if (newLabel && newLabel !== candidate.label) {
+                variableManager.renameCandidateLabel(info.name, candidate.id, newLabel);
+                this._lastHash = "";
+                this.refresh();
+            }
+            cleanup();
+        });
+
+        input.addEventListener("keydown", (e) => {
+            if (e.key === "Enter") applyBtn.click();
+            else if (e.key === "Escape") cleanup();
+            e.stopPropagation();
+        });
+
+        overlay.addEventListener("click", cleanup);
+        buttons.appendChild(cancelBtn);
+        buttons.appendChild(applyBtn);
+        dialog.appendChild(title);
+        dialog.appendChild(input);
+        dialog.appendChild(buttons);
+        document.body.appendChild(overlay);
+        document.body.appendChild(dialog);
+        input.focus();
+        input.select();
+    }
+
+    _showSourcePicker(info) {
+        const existing = document.getElementById("nv-source-picker-menu");
+        if (existing) existing.remove();
+        // Clean up any previous close handler
+        if (this._sourcePickerCloseHandler) {
+            document.removeEventListener("mousedown", this._sourcePickerCloseHandler);
+            this._sourcePickerCloseHandler = null;
+        }
+
+        const compatible = variableManager.getCompatibleSources(info.name);
+
+        // Filter out sources already in the pool
+        const pool = variableManager.getPool(info.name);
+        const poolKeys = new Set(pool.map(c => `${c.nodeId}:${c.slotIndex}`));
+        const available = compatible.filter(s => !poolKeys.has(`${s.nodeId}:${s.slotIndex}`));
+
+        const menu = document.createElement("div");
+        menu.id = "nv-source-picker-menu";
+
+        // Position to the right of panel, flip left if it would clip viewport
+        const panelRect = this.container.getBoundingClientRect();
+        const menuWidth = 280;
+        let menuLeft = panelRect.right + 4;
+        if (menuLeft + menuWidth > window.innerWidth) {
+            menuLeft = panelRect.left - menuWidth - 4;
+        }
+        menuLeft = Math.max(4, menuLeft);
+        const menuTop = Math.min(panelRect.top, window.innerHeight - 410);
+
+        menu.style.cssText = `
+            position: fixed;
+            left: ${menuLeft}px;
+            top: ${Math.max(4, menuTop)}px;
+            background: #1a1a1a;
+            border: 1px solid #444;
+            border-radius: 6px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+            z-index: 10002;
+            min-width: 220px;
+            max-width: 320px;
+            max-height: 400px;
+            overflow-y: auto;
+            padding: 4px 0;
+        `;
+
+        // Header
+        const header = document.createElement("div");
+        header.style.cssText = "padding: 8px 12px; font-size: 11px; color: #888; border-bottom: 1px solid #333;";
+        header.textContent = `Add source to "${info.name}" pool`;
+        menu.appendChild(header);
+
+        // Search filter
+        const searchRow = document.createElement("div");
+        searchRow.style.cssText = "padding: 4px 8px;";
+        const searchInput = document.createElement("input");
+        searchInput.type = "text";
+        searchInput.placeholder = "Filter sources...";
+        searchInput.style.cssText = `
+            width: 100%; padding: 6px 8px;
+            background: #2a2a2a; border: 1px solid #444;
+            border-radius: 4px; color: #e0e0e0;
+            box-sizing: border-box; font-size: 11px; outline: none;
+        `;
+        searchInput.addEventListener("keydown", (e) => e.stopPropagation());
+        searchRow.appendChild(searchInput);
+        menu.appendChild(searchRow);
+
+        // Source list
+        const listContainer = document.createElement("div");
+
+        const renderList = (filterText) => {
+            listContainer.innerHTML = "";
+            const filter = (filterText || "").toLowerCase();
+
+            const filtered = available.filter(s =>
+                !filter || s.label.toLowerCase().includes(filter) || s.nodeType.toLowerCase().includes(filter)
+            );
+
+            if (filtered.length === 0) {
+                const empty = document.createElement("div");
+                empty.textContent = available.length === 0 ? "No compatible sources found" : "No matches";
+                empty.style.cssText = "padding: 12px; color: #666; font-style: italic; text-align: center; font-size: 11px;";
+                listContainer.appendChild(empty);
+                return;
+            }
+
+            for (const source of filtered) {
+                const row = document.createElement("div");
+                row.style.cssText = `
+                    padding: 6px 12px;
+                    cursor: pointer;
+                    font-size: 11px;
+                    color: #e0e0e0;
+                    transition: background 0.1s;
+                    display: flex;
+                    align-items: center;
+                    gap: 6px;
+                `;
+                row.addEventListener("mouseenter", () => row.style.background = "#333");
+                row.addEventListener("mouseleave", () => row.style.background = "transparent");
+
+                const typeDot = document.createElement("span");
+                const srcColor = variableManager.getTypeColor(source.outputType);
+                typeDot.style.cssText = `
+                    width: 8px; height: 8px; border-radius: 50%;
+                    background: ${srcColor}; flex-shrink: 0;
+                `;
+
+                const labelSpan = document.createElement("span");
+                labelSpan.textContent = source.label;
+                labelSpan.style.cssText = "flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;";
+
+                const typeSpan = document.createElement("span");
+                typeSpan.textContent = source.outputType;
+                typeSpan.style.cssText = `font-size: 9px; color: ${srcColor}; flex-shrink: 0;`;
+
+                row.appendChild(typeDot);
+                row.appendChild(labelSpan);
+                row.appendChild(typeSpan);
+
+                row.addEventListener("click", () => {
+                    variableManager.addToPool(info.name, source.nodeId, source.slotIndex, source.label);
+                    menu.remove();
+                    this._lastHash = "";
+                    this.refresh();
+                });
+
+                listContainer.appendChild(row);
+            }
+        };
+
+        searchInput.addEventListener("input", () => renderList(searchInput.value));
+        renderList("");
+
+        menu.appendChild(listContainer);
+        document.body.appendChild(menu);
+
+        // Close on click outside
+        const closeMenu = (e) => {
+            if (!menu.contains(e.target)) {
+                menu.remove();
+                document.removeEventListener("mousedown", closeMenu);
+                this._sourcePickerCloseHandler = null;
+            }
+        };
+        this._sourcePickerCloseHandler = closeMenu;
+        setTimeout(() => document.addEventListener("mousedown", closeMenu), 0);
+        searchInput.focus();
     }
 
     // ===== Search Filter =====

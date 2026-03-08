@@ -356,6 +356,330 @@ class VariableManager {
         return true;
     }
 
+    // ===== Source Pool =====
+
+    /**
+     * Add a source node to a variable's candidate pool.
+     * @param {string} varName - Variable name
+     * @param {number} nodeId - Source node ID
+     * @param {number} slotIndex - Output slot index on the source node
+     * @param {string} [label] - User-friendly label (defaults to "NodeTitle:slotName")
+     * @returns {string|null} The candidate ID if added, null on failure
+     */
+    addToPool(varName, nodeId, slotIndex, label) {
+        if (!app.graph) return null;
+
+        const setter = this._findSetter(varName);
+        if (!setter) {
+            console.warn(`[VariableManager] Variable "${varName}" not found`);
+            return null;
+        }
+
+        const sourceNode = app.graph.getNodeById(nodeId);
+        if (!sourceNode) {
+            console.warn(`[VariableManager] Source node ${nodeId} not found`);
+            return null;
+        }
+
+        // Type check: verify the source output is compatible
+        const varType = this._resolveType(setter);
+        const outputSlot = sourceNode.outputs?.[slotIndex];
+        if (!outputSlot) {
+            console.warn(`[VariableManager] Node ${nodeId} has no output slot ${slotIndex}`);
+            return null;
+        }
+        if (varType !== "*" && varType !== "unconnected" && outputSlot.type !== "*" && outputSlot.type !== varType) {
+            console.warn(`[VariableManager] Type mismatch: variable "${varName}" is ${varType}, source outputs ${outputSlot.type}`);
+            return null;
+        }
+
+        // Initialize pool if needed
+        if (!setter.properties.sourceCandidates) {
+            setter.properties.sourceCandidates = [];
+        }
+
+        // Check for duplicate (same nodeId + slotIndex)
+        const existing = setter.properties.sourceCandidates.find(
+            c => c.nodeId === nodeId && c.slotIndex === slotIndex
+        );
+        if (existing) {
+            console.log(`[VariableManager] Source already in pool for "${varName}"`);
+            return existing.id;
+        }
+
+        // Generate a stable ID
+        const id = `pool_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+        // Build label from node info if not provided
+        const outputName = outputSlot.name || `output_${slotIndex}`;
+        const nodeTitle = sourceNode.title || sourceNode.type;
+        const finalLabel = label || `${nodeTitle}:${outputName}`;
+
+        const candidate = {
+            id,
+            nodeId,
+            nodeTitle,
+            nodeType: sourceNode.type,
+            slotIndex,
+            outputType: outputSlot.type,
+            label: finalLabel,
+        };
+
+        setter.properties.sourceCandidates.push(candidate);
+
+        // If this is the first candidate and variable has no source, auto-activate it
+        if (setter.properties.sourceCandidates.length === 1 && !this._isSetterConnected(setter)) {
+            this._activateCandidate(setter, candidate);
+        }
+
+        app.graph.setDirtyCanvas(true, false);
+        console.log(`[VariableManager] Added "${finalLabel}" to pool for "${varName}"`);
+        return id;
+    }
+
+    /**
+     * Remove a candidate from a variable's source pool.
+     * If the removed candidate was active, switches to the first remaining candidate.
+     */
+    removeFromPool(varName, candidateId) {
+        if (!app.graph) return false;
+
+        const setter = this._findSetter(varName);
+        if (!setter || !setter.properties.sourceCandidates) return false;
+
+        const idx = setter.properties.sourceCandidates.findIndex(c => c.id === candidateId);
+        if (idx === -1) return false;
+
+        const wasActive = setter.properties.activeSourceId === candidateId;
+        setter.properties.sourceCandidates.splice(idx, 1);
+
+        // If the active candidate was removed, switch to first valid remaining
+        if (wasActive) {
+            const validNext = this._findFirstValidCandidate(setter);
+            if (validNext) {
+                this._activateCandidate(setter, validNext);
+            } else {
+                setter.properties.activeSourceId = null;
+                this.unassignSource(varName);
+            }
+        }
+
+        app.graph.setDirtyCanvas(true, false);
+        console.log(`[VariableManager] Removed candidate ${candidateId} from pool for "${varName}"`);
+        return true;
+    }
+
+    /**
+     * Switch the active source for a variable to a different pool candidate.
+     * Performs a real relink (unassign old → assign new) so wires update on canvas.
+     */
+    switchCandidate(varName, candidateId) {
+        if (!app.graph) return false;
+
+        const setter = this._findSetter(varName);
+        if (!setter || !setter.properties.sourceCandidates) return false;
+
+        const candidate = setter.properties.sourceCandidates.find(c => c.id === candidateId);
+        if (!candidate) {
+            console.warn(`[VariableManager] Candidate ${candidateId} not found in pool for "${varName}"`);
+            return false;
+        }
+
+        // Validate candidate is usable before attempting activation
+        const sourceNode = app.graph.getNodeById(candidate.nodeId);
+        if (!sourceNode) {
+            console.warn(`[VariableManager] Cannot switch: source node ${candidate.nodeId} not found`);
+            return false;
+        }
+
+        return this._activateCandidate(setter, candidate);
+    }
+
+    /**
+     * Get the source pool for a variable.
+     * Returns the candidates array with a `status` field added to each:
+     * - "ok": node exists and type matches
+     * - "stale": node no longer exists
+     * - "type_mismatch": node exists but output type changed
+     */
+    getPool(varName) {
+        const setter = this._findSetter(varName);
+        if (!setter || !setter.properties.sourceCandidates) return [];
+
+        const varType = this._resolveType(setter);
+
+        return setter.properties.sourceCandidates.map(c => {
+            const node = app.graph.getNodeById(c.nodeId);
+            let status = "ok";
+
+            if (!node) {
+                // Attempt fuzzy re-bind by nodeType + title
+                const rebound = this._fuzzyRebind(c);
+                if (rebound) {
+                    c.nodeId = rebound.id;
+                    status = "ok";
+                } else {
+                    status = "stale";
+                }
+            } else {
+                const outputSlot = node.outputs?.[c.slotIndex];
+                if (!outputSlot) {
+                    status = "stale";
+                } else if (varType !== "*" && varType !== "unconnected" && outputSlot.type !== "*" && outputSlot.type !== varType) {
+                    status = "type_mismatch";
+                }
+            }
+
+            return {
+                ...c,
+                status,
+                isActive: c.id === setter.properties.activeSourceId,
+            };
+        });
+    }
+
+    /**
+     * Rename a pool candidate's label.
+     */
+    renameCandidateLabel(varName, candidateId, newLabel) {
+        const setter = this._findSetter(varName);
+        if (!setter || !setter.properties.sourceCandidates) return false;
+
+        const candidate = setter.properties.sourceCandidates.find(c => c.id === candidateId);
+        if (!candidate) return false;
+
+        candidate.label = newLabel;
+        app.graph.setDirtyCanvas(true, false);
+        return true;
+    }
+
+    /**
+     * Get all nodes with outputs compatible with a variable's type.
+     * Used by the "Add to Pool" picker dropdown.
+     */
+    getCompatibleSources(varName) {
+        if (!app.graph) return [];
+
+        const setter = this._findSetter(varName);
+        if (!setter) return [];
+
+        const varType = this._resolveType(setter);
+        const explicitType = setter.properties?.explicitType;
+        const filterType = (explicitType && explicitType !== "*") ? explicitType : varType;
+        const nodes = app.graph._nodes || [];
+        const results = [];
+
+        for (const node of nodes) {
+            // Skip hidden/managed setter nodes
+            if (node.properties?._nv_managed) continue;
+            if (!node.outputs) continue;
+
+            for (let i = 0; i < node.outputs.length; i++) {
+                const output = node.outputs[i];
+                if (!output || !output.type) continue;
+
+                // Match if wildcard or type matches
+                if (filterType === "*" || filterType === "unconnected" || output.type === "*" || output.type === filterType) {
+                    const nodeTitle = node.title || node.type;
+                    const outputName = output.name || `output_${i}`;
+                    results.push({
+                        nodeId: node.id,
+                        nodeTitle,
+                        nodeType: node.type,
+                        slotIndex: i,
+                        outputType: output.type,
+                        outputName,
+                        label: `${nodeTitle}:${outputName}`,
+                    });
+                }
+            }
+        }
+
+        return results;
+    }
+
+    /** @private Activate a pool candidate — performs real relink */
+    _activateCandidate(setter, candidate) {
+        if (!setter?.inputs?.[0]) return false;
+
+        const sourceNode = app.graph.getNodeById(candidate.nodeId);
+        if (!sourceNode) {
+            console.warn(`[VariableManager] Cannot activate: source node ${candidate.nodeId} not found`);
+            return false;
+        }
+
+        // Validate output slot exists
+        const outputSlot = sourceNode.outputs?.[candidate.slotIndex];
+        if (!outputSlot) {
+            console.warn(`[VariableManager] Cannot activate: slot ${candidate.slotIndex} missing on node ${candidate.nodeId}`);
+            return false;
+        }
+
+        // Validate type compatibility
+        const varType = this._resolveType(setter);
+        if (varType !== "*" && varType !== "unconnected" && outputSlot.type !== "*" && outputSlot.type !== varType) {
+            console.warn(`[VariableManager] Cannot activate: type mismatch (${varType} vs ${outputSlot.type})`);
+            return false;
+        }
+
+        const varName = setter.widgets?.[0]?.value;
+
+        // Remove existing input link
+        if (setter.inputs[0].link != null) {
+            app.graph.removeLink(setter.inputs[0].link);
+        }
+
+        // Create new link
+        sourceNode.connect(candidate.slotIndex, setter, 0);
+
+        // Update tracking
+        setter.properties.activeSourceId = candidate.id;
+        setter.properties.sourceNodeId = sourceNode.id;
+        setter.properties.sourceSlotIndex = candidate.slotIndex;
+
+        // Propagate type to getters
+        if (setter.updateGetters) {
+            setter.updateGetters();
+        }
+
+        app.graph.setDirtyCanvas(true, false);
+        console.log(`[VariableManager] Activated "${candidate.label}" for "${varName}"`);
+        return true;
+    }
+
+    /** @private Find first valid (non-stale, type-compatible) candidate in pool */
+    _findFirstValidCandidate(setter) {
+        if (!setter.properties?.sourceCandidates) return null;
+        const varType = this._resolveType(setter);
+
+        for (const c of setter.properties.sourceCandidates) {
+            const node = app.graph.getNodeById(c.nodeId);
+            if (!node) continue;
+            const outputSlot = node.outputs?.[c.slotIndex];
+            if (!outputSlot) continue;
+            if (varType !== "*" && varType !== "unconnected" && outputSlot.type !== "*" && outputSlot.type !== varType) continue;
+            return c;
+        }
+        return null;
+    }
+
+    /** @private Attempt to re-bind a stale candidate by matching nodeType + title */
+    _fuzzyRebind(candidate) {
+        if (!app.graph) return null;
+        const nodes = app.graph._nodes || [];
+
+        // Try to find a node with matching type and similar title
+        for (const node of nodes) {
+            if (node.type === candidate.nodeType) {
+                const title = node.title || node.type;
+                if (title === candidate.nodeTitle && node.outputs?.[candidate.slotIndex]) {
+                    return node;
+                }
+            }
+        }
+        return null;
+    }
+
     // ===== Getter Creation (drag-and-drop targets) =====
 
     /**
@@ -550,7 +874,7 @@ class VariableManager {
         let hash = "";
         for (const n of nodes) {
             if (n.type === "SetVariableNode" || n.type === "GetVariableNode") {
-                hash += `${n.id}=${n.widgets?.[0]?.value}|${n.inputs?.[0]?.type}|${n.inputs?.[0]?.link}|${n.properties?.explicitType},`;
+                hash += `${n.id}=${n.widgets?.[0]?.value}|${n.inputs?.[0]?.type}|${n.inputs?.[0]?.link}|${n.properties?.explicitType}|${n.properties?.activeSourceId || ""},`;
             }
         }
         return hash;

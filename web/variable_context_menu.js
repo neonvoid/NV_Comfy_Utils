@@ -23,6 +23,45 @@ function addMenuHandler(nodeType, cb) {
 }
 
 /**
+ * Build the "Add to Pool" submenu for a given node + output slot.
+ * Lists variables whose type is compatible with this output.
+ */
+function buildPoolOptions(sourceNode, slotIndex) {
+    const existingVars = variableManager.getVariableNames();
+    const outputType = sourceNode.outputs?.[slotIndex]?.type || "*";
+
+    const options = [];
+    for (const varName of existingVars) {
+        const varInfo = variableManager.getVariable(varName);
+        if (!varInfo) continue;
+
+        // Type compatibility check
+        const varType = varInfo.type;
+        if (varType !== "*" && varType !== "unconnected" && outputType !== "*" && outputType !== varType) {
+            continue;
+        }
+
+        // Check if already in pool
+        const pool = variableManager.getPool(varName);
+        const alreadyInPool = pool.some(c => c.nodeId === sourceNode.id && c.slotIndex === slotIndex);
+
+        options.push({
+            content: alreadyInPool ? `${varName} (already added)` : varName,
+            disabled: alreadyInPool,
+            callback: alreadyInPool ? null : () => {
+                variableManager.addToPool(varName, sourceNode.id, slotIndex);
+            }
+        });
+    }
+
+    if (options.length === 0) {
+        options.push({ content: "(no compatible variables)", disabled: true });
+    }
+
+    return options;
+}
+
+/**
  * Build the variable selection submenu for a given node + output slot.
  */
 function buildVariableOptions(sourceNode, slotIndex) {
@@ -242,6 +281,19 @@ app.registerExtension({
                         options: buildVariableOptions(node, 0),
                     }
                 });
+
+                // Add to Pool (only show if variables exist)
+                const poolOpts = buildPoolOptions(node, 0);
+                if (variableManager.getVariableNames().length > 0) {
+                    options.push({
+                        content: `Add to Variable Pool (${outputLabel})`,
+                        has_submenu: true,
+                        submenu: {
+                            title: "Add to Pool",
+                            options: poolOpts,
+                        }
+                    });
+                }
             } else {
                 // Multiple outputs — show slot picker first
                 const outputSubmenus = node.outputs.map((output, slotIdx) => {
@@ -265,6 +317,30 @@ app.registerExtension({
                         options: outputSubmenus,
                     }
                 });
+
+                // Add to Pool (multi-output)
+                if (variableManager.getVariableNames().length > 0) {
+                    const poolSubmenus = node.outputs.map((output, slotIdx) => {
+                        const outputLabel = output.name || output.type || `output_${slotIdx}`;
+                        return {
+                            content: `${outputLabel} (${output.type})`,
+                            has_submenu: true,
+                            submenu: {
+                                title: "Add to Pool",
+                                options: buildPoolOptions(node, slotIdx),
+                            }
+                        };
+                    });
+
+                    options.push({
+                        content: "Add to Variable Pool",
+                        has_submenu: true,
+                        submenu: {
+                            title: "Select Output",
+                            options: poolSubmenus,
+                        }
+                    });
+                }
             }
         });
     }
