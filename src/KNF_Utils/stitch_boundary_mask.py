@@ -35,17 +35,10 @@ def _gaussian_blur_batch(mask, blur_radius):
     kernel_1d = _make_gaussian_kernel(blur_radius)
     B = mask.shape[0]
 
-    # Treat B as batch channel for grouped conv: [B, 1, H, W]
+    # [B, 1, H, W] — conv2d handles batch dim automatically with single-channel kernel
     mask_4d = mask.unsqueeze(1)
 
-    # Horizontal pass — [B, 1, H, W+pad] → conv → [B, 1, H, W]
-    kh = kernel_1d.view(1, 1, 1, -1).expand(B, -1, -1, -1)
-    mask_4d = F.pad(mask_4d, (blur_radius, blur_radius, 0, 0), mode='reflect')
-    mask_4d = F.conv2d(mask_4d, kh[0:1], groups=1)  # single kernel shared across batch
-    # Actually, conv2d with [1,1,1,K] kernel works on all batch items automatically
-
-    # Redo properly: single-channel kernel, conv2d handles batch dim
-    mask_4d = mask.unsqueeze(1)  # [B, 1, H, W]
+    # Horizontal pass
     kh = kernel_1d.view(1, 1, 1, -1)
     mask_4d = F.pad(mask_4d, (blur_radius, blur_radius, 0, 0), mode='reflect')
     mask_4d = F.conv2d(mask_4d, kh)
@@ -217,30 +210,35 @@ class NV_StitchBoundaryMask:
             source = f"latent_stitcher (static, {num_frames} frames)"
 
         # =================================================================
-        # Mode 3: pixel_stitcher — per-frame canvas_to_orig coordinates
+        # Mode 3: pixel_stitcher — per-frame crop coordinates in original-image space
         # =================================================================
         elif pixel_stitcher is not None:
-            if latent is None:
-                raise ValueError(
-                    "[NV_StitchBoundaryMask] pixel_stitcher requires latent for frame dimensions."
-                )
-            samples = latent["samples"]
-            H_l, W_l = samples.shape[-2], samples.shape[-1]
-            frame_h = H_l * VAE_STRIDE
-            frame_w = W_l * VAE_STRIDE
+            # Frame dimensions come from canvas_to_orig (the original image size)
+            cto_ws = pixel_stitcher['canvas_to_orig_w']
+            cto_hs = pixel_stitcher['canvas_to_orig_h']
+            frame_h = int(cto_hs[0])
+            frame_w = int(cto_ws[0])
 
-            xs = pixel_stitcher['canvas_to_orig_x']
-            ys = pixel_stitcher['canvas_to_orig_y']
-            ws = pixel_stitcher['canvas_to_orig_w']
-            hs = pixel_stitcher['canvas_to_orig_h']
-            num_frames = len(xs)
+            # Crop-in-original coords = cropped_to_canvas - canvas_to_orig offset
+            cto_xs = pixel_stitcher['canvas_to_orig_x']
+            cto_ys = pixel_stitcher['canvas_to_orig_y']
+            ctc_xs = pixel_stitcher['cropped_to_canvas_x']
+            ctc_ys = pixel_stitcher['cropped_to_canvas_y']
+            ctc_ws = pixel_stitcher['cropped_to_canvas_w']
+            ctc_hs = pixel_stitcher['cropped_to_canvas_h']
+            num_frames = len(ctc_xs)
 
             frames = []
             for i in range(num_frames):
+                # Convert canvas coords to original-image coords
+                crop_x = int(ctc_xs[i]) - int(cto_xs[i])
+                crop_y = int(ctc_ys[i]) - int(cto_ys[i])
+                crop_w = int(ctc_ws[i])
+                crop_h = int(ctc_hs[i])
                 frames.append(
                     _build_boundary_strip_frame(
                         frame_h, frame_w,
-                        int(xs[i]), int(ys[i]), int(ws[i]), int(hs[i]),
+                        crop_x, crop_y, crop_w, crop_h,
                         inner_px, outer_px
                     )
                 )

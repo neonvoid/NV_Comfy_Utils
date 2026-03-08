@@ -23,9 +23,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - InpaintStitch2 now outputs `stitch_mask` — per-frame mask [B,H,W] at full canvas resolution showing where inpainted content was composited (1.0=inpainted, 0.0=original). Feed directly into NV_BoundaryColorMatch or NV_StitchBoundaryMask.
 - NV_VaceControlVideoPrep gains `halo_pixels` parameter (Seam-Absorbing Control Halo). Expands the VACE conditioning mask outward by N pixels beyond the stitch boundary so WAN repaints across the seam — eliminates seam memory in downstream stages. Default 0 (off, backward-compatible), recommended 8-16px.
+- NV_BoundaryColorMatch now runs on GPU when available — was CPU-only, causing 20-40s processing time for 105-frame video batches. Now sub-second.
+
+### Removed
+
+- Deregistered NV_PixelToLatentStitcher — architecturally broken (SHELVED). File remains on disk but node no longer appears in ComfyUI.
+- Removed unused `blend_power`/`iou_blend_power` parameter chain from NV_TemporalMaskStabilizer (was documented "kept for API compat" but never wired to any behavior).
+- Removed dead first-attempt code in NV_StitchBoundaryMask `_gaussian_blur_batch`.
+- Removed unused `MASK_CONFIG_TOOLTIP` constant from mask_processing_config.py.
+- Deduplicated `compute_inscribed_radius` — vace_mask_prep.py now imports from vace_control_video_prep.py.
 
 ### Fixed
 
+- Fixed NV_StitchBoundaryMask `pixel_stitcher` mode producing boundary mask around the entire frame edge instead of the stitch boundary — was using `canvas_to_orig` coordinates (original-in-canvas) instead of deriving crop-in-original coordinates from `cropped_to_canvas - canvas_to_orig`.
+- Fixed NV_VacePrePassReference `ref_scale` blowing out latent values when `strength` is near-zero — `ref_strength / strength` now clamped to max 10x.
 - Fixed `hard` blend mode in InpaintStitch2 being identical to `alpha` mode — now correctly thresholds the mask at 0.5 for true binary paste with no feathering.
 - Fixed `mask_smooth` in InpaintCrop2 crashing on 2D mask input — `binary` was computed before `unsqueeze`, creating wrong shape for `gaussian_blur`. Now ensures 3D before binarization.
 - Fixed VACE bbox stitch desync in VaceControlVideoPrep — stitch mask recomputed bboxes from raw input mask instead of preprocessed mask (after threshold/grow/fill_holes/smooth), causing mismatch with the VACE conditioning mask.

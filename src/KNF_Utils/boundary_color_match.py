@@ -176,7 +176,11 @@ class NV_BoundaryColorMatch:
         if strength <= 0.0:
             return (image,)
 
-        device = image.device
+        import time
+        t0 = time.perf_counter()
+
+        # Process on GPU if available (ComfyUI IMAGE tensors are CPU)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # IMAGE: [B, H, W, C] → [B, C, H, W]
         img = image.permute(0, 3, 1, 2).to(device).float()
@@ -272,12 +276,13 @@ class NV_BoundaryColorMatch:
         if C > 3:
             final_rgb = torch.cat([final_rgb, img[:, 3:]], dim=1)
 
-        # Back to [B, H, W, C]
-        result = final_rgb.permute(0, 2, 3, 1)
+        # Back to [B, H, W, C] and return to CPU
+        result = final_rgb.permute(0, 2, 3, 1).cpu()
 
-        print(f"[NV_BoundaryColorMatch] Corrected {B} frames, "
+        elapsed = time.perf_counter() - t0
+        print(f"[NV_BoundaryColorMatch] Corrected {B} frames in {elapsed:.2f}s ({elapsed/B*1000:.1f}ms/frame), "
               f"strip_width={strip_width}, strength={strength:.2f}, falloff={falloff_radius}, "
-              f"temporal_smooth={temporal_smooth:.2f}")
+              f"temporal_smooth={temporal_smooth:.2f}, device={device}")
 
         return (result,)
 

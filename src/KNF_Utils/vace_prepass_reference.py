@@ -241,7 +241,7 @@ class NV_VacePrePassReference:
         #   effective_ref = ref_latent * ref_scale * vace_strength = ref_latent * ref_strength
         # This allows e.g. beauty control at 0.35 with references at 1.0
         if strength > 0 and abs(ref_strength - strength) > 1e-6:
-            ref_scale = ref_strength / strength
+            ref_scale = min(ref_strength / strength, 10.0)  # cap at 10x to prevent latent blowout
             ref_latent = ref_latent * ref_scale
             print(f"[NV_VacePrePassReference] Pre-scaled reference latent by {ref_scale:.2f}x "
                   f"(ref_strength={ref_strength}, vace_strength={strength}, "

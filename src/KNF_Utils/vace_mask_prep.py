@@ -23,24 +23,7 @@ import numpy as np
 from scipy.ndimage import distance_transform_edt
 
 from .inpaint_crop import mask_erode_dilate, mask_blur
-
-
-def compute_inscribed_radius(mask: torch.Tensor) -> tuple[list[float], int]:
-    """Compute inscribed radius per frame via EDT. Returns (radii_list, min_radius_frame_idx)."""
-    if mask.dim() == 2:
-        mask = mask.unsqueeze(0)
-
-    radii = []
-    for b in range(mask.shape[0]):
-        mask_bin = (mask[b] > 0.5).cpu().numpy().astype(np.uint8)
-        if np.any(mask_bin):
-            dist = distance_transform_edt(mask_bin)
-            radii.append(float(np.max(dist)))
-        else:
-            radii.append(0.0)
-
-    min_idx = int(np.argmin(radii)) if radii else 0
-    return radii, min_idx
+from .vace_control_video_prep import compute_inscribed_radius  # canonical source
 
 
 class NV_VaceMaskPrep:

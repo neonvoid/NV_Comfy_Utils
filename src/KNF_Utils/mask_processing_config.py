@@ -69,12 +69,6 @@ def apply_vace_mask_config(mask_config, **local_values):
     return result
 
 
-MASK_CONFIG_TOOLTIP = (
-    "Optional shared config from NV_MaskProcessingConfig. "
-    "When connected, overrides this node's local mask processing widgets."
-)
-
-
 class NV_MaskProcessingConfig:
     """Emit a shared mask processing config dict for consistent settings across nodes."""
 

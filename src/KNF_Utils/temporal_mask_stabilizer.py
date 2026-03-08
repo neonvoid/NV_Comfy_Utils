@@ -320,7 +320,7 @@ def temporal_sdf_smooth(masks, sigma_temporal=2.0, sigma_spatial=1.0, narrow_ban
 # =============================================================================
 
 def detect_and_fix_outliers(original_masks, consensus_masks, sdf_smoothed_masks,
-                            iou_threshold=0.85, blend_power=2.0):
+                            iou_threshold=0.85):
     """Detect temporal outlier frames (pops) and replace them with consensus.
 
     For each frame, compute IoU between the original mask and the flow-warped consensus.
@@ -334,7 +334,6 @@ def detect_and_fix_outliers(original_masks, consensus_masks, sdf_smoothed_masks,
         consensus_masks: [B, H, W] — flow-warped temporal consensus (Stage 2)
         sdf_smoothed_masks: [B, H, W] — SDF-smoothed masks (Stage 3 applied to consensus)
         iou_threshold: below this, frame is considered an outlier
-        blend_power: unused (kept for API compat)
 
     Returns:
         fixed_masks: [B, H, W] — outlier-corrected masks
@@ -541,7 +540,7 @@ def apply_spatial_cleanup(masks, mask_erode_dilate=0, mask_fill_holes=0,
 def run_stabilization_pipeline(masks, images=None,
                                flow_window=5, sdf_sigma_temporal=2.0,
                                sdf_sigma_spatial=1.0, sdf_narrow_band=64,
-                               iou_threshold=0.85, iou_blend_power=2.0,
+                               iou_threshold=0.85,
                                guided_radius=8, guided_eps=0.01,
                                enable_flow=True, enable_sdf=True,
                                enable_outlier=True, enable_edge_refine=True,
@@ -557,7 +556,6 @@ def run_stabilization_pipeline(masks, images=None,
         sdf_sigma_spatial: spatial SDF cleanup (Stage 3)
         sdf_narrow_band: SDF clamping distance in pixels (Stage 3)
         iou_threshold: outlier detection sensitivity (Stage 4)
-        iou_blend_power: unused (kept for API compat)
         guided_radius: edge refinement radius (Stage 5)
         guided_eps: edge refinement sensitivity (Stage 5)
         enable_flow: use optical flow (True) or simple temporal median (False)
@@ -614,8 +612,7 @@ def run_stabilization_pipeline(masks, images=None,
         print(f"[TemporalStabilizer] Stage 4: IoU outlier detection (threshold={iou_threshold})...")
         info_lines.append(f"[Stage 4] IoU outlier detection (threshold={iou_threshold})...")
         result, iou_scores = detect_and_fix_outliers(masks, consensus, sdf_smoothed,
-                                                      iou_threshold=iou_threshold,
-                                                      blend_power=iou_blend_power)
+                                                      iou_threshold=iou_threshold)
         outlier_count = (iou_scores < iou_threshold).sum().item()
         min_iou = iou_scores.min().item()
         info_lines.append(f"  -> {outlier_count}/{B} outlier frames detected (min IoU={min_iou:.3f})")
@@ -818,7 +815,6 @@ class NV_TemporalMaskStabilizer:
             sdf_sigma_spatial=sdf_sigma_spatial,
             sdf_narrow_band=64,
             iou_threshold=iou_threshold,
-            iou_blend_power=2.0,
             guided_radius=guided_radius,
             guided_eps=guided_eps,
             enable_flow=enable_flow,
