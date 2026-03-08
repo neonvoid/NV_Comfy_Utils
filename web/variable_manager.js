@@ -590,7 +590,11 @@ class VariableManager {
             return null;
         }
 
-        const link = app.graph.links[setter.inputs[0].link];
+        // graph._links is a Map in ComfyUI frontend >= 1.10 — use .get()
+        const linkId = setter.inputs[0].link;
+        const link = app.graph._links?.get(linkId)
+            ?? app.graph.links?.[linkId]
+            ?? null;
         if (!link) return null;
 
         const sourceNode = app.graph.getNodeById(link.origin_id);

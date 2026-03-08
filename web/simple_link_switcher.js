@@ -272,7 +272,7 @@ class SimpleLinkSwitcher extends LGraphNode {
     getSwitchValue() {
         // Check if switch_input is connected (input slot 0)
         if (this.inputs[0] && this.inputs[0].link != null) {
-            const link = this.graph.links[this.inputs[0].link];
+            const link = this.graph._links?.get(this.inputs[0].link) ?? this.graph.links?.[this.inputs[0].link];
             if (link) {
                 const originNode = this.graph.getNodeById(link.origin_id);
                 if (originNode) {
@@ -315,7 +315,7 @@ class SimpleLinkSwitcher extends LGraphNode {
     getTriggerValue() {
         // Check if trigger_input is connected (input slot 1)
         if (this.inputs[1] && this.inputs[1].link != null) {
-            const link = this.graph.links[this.inputs[1].link];
+            const link = this.graph._links?.get(this.inputs[1].link) ?? this.graph.links?.[this.inputs[1].link];
             if (link) {
                 const originNode = this.graph.getNodeById(link.origin_id);
                 if (originNode) {

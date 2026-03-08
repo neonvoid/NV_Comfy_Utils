@@ -8,6 +8,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Macro Groups in Quick Toggle floating panel — bundle multiple ComfyUI groups into a single toggle. Create/edit/delete macros via dialog with group checkbox list. Tri-state indicators (green=all on, amber=partial, red=all off) with `[enabled/total]` count badge. Collapsible macro sections with indented child rows. Macros persist in separate localStorage key (`NV_FloatingPanel_Macros`).
+- MacroManager class separates macro CRUD/state logic from panel rendering. Versioned storage schema with migration on load.
+
+### Changed
+
+- Quick Toggle panel now has three sections when macros exist: MACROS → GROUPS (ungrouped) → CUSTOM PATTERNS. Groups assigned to macros appear only under their macro, not in the ungrouped list.
+- All group/pattern toggle operations now wrapped in `beforeChange()`/`afterChange()` for undo batching (single Ctrl+Z undoes a macro toggle instead of N individual changes).
+- Pattern dialog help text changed from innerHTML to textContent (XSS hardening).
+- Polling loop now wrapped in try/catch (one refresh error no longer kills the loop permanently).
+- Polling pauses while any dialog is open (prevents stale DOM references and checkbox state loss).
+- `hide()` now cleans up any open dialogs via `_activeDialogs` tracking.
+- Dialog z-index bumped: overlay=100002, dialog=100003 (was 100001/100002).
+- Dirty-check hash added to `refreshGroups()` — skips DOM rebuild when group titles, modes, and macro state haven't changed.
+
+### Fixed
+
+- Variables system completely broken — `graph.links[id]` returned undefined because ComfyUI switched to `graph._links` (a Map). GetVariableNode data flow, NodeBypasser input reading, and LinkSwitcher all silently failed. Fixed all 7 usages across 4 JS files to use `graph._links.get()` with fallback.
+- SetVariableNode visible on canvas at [-5000, Y] — `onDrawForeground`/`onDrawBackground` overrides only suppressed hook drawing, not the main node body rendered by `LGraphCanvas.drawNode()`. Added canvas patches to skip rendering, connection lines, and selection for managed setters.
+- GetVariableNode `getInputLink` used `setter.inputs[slot]` where `slot` is the output slot index — now always uses `setter.inputs[0]` (the setter's single input) regardless of output slot queried.
+- GetVariableNode output type always showed `*` (wildcard) instead of the actual data type — `updateType()` checked `setter.inputs[0].type` which stays `*` on wildcard slots. Now follows the link to the source node's actual output type (e.g., IMAGE, MODEL, LATENT).
 - NV_MultiBandBlendStitch — standalone Laplacian pyramid multi-band blending node for stitch seam repair. Decomposes images into frequency bands and blends each at appropriate spatial scale. Pure PyTorch, ~2-5ms per frame.
 - NV_BoundaryColorMatch — Reinhard color transfer at stitch boundaries in Lab color space. Samples color stats from strips on both sides of the seam and applies mean/std matching with gradient falloff. Temporal smoothing (default 0.8) prevents per-frame flicker on video.
 - InpaintStitch2 now supports `blend_mode` parameter: `alpha` (default, backward compat), `multiband` (Laplacian pyramid — best for VAE roundtrip seams), and `hard` (binary paste). Multiband mode blends low frequencies broadly and high frequencies narrowly, directly at the composite step — no double-blending.

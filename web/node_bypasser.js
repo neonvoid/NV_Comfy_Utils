@@ -140,7 +140,7 @@ function defineNodeBypasser() {
             const bypassInputSlot = this.inputs.findIndex(i => i.name === "bypass_input");
 
             if (bypassInputSlot >= 0 && this.inputs[bypassInputSlot].link != null) {
-                const link = this.graph.links[this.inputs[bypassInputSlot].link];
+                const link = this.graph._links?.get(this.inputs[bypassInputSlot].link) ?? this.graph.links?.[this.inputs[bypassInputSlot].link];
                 if (link) {
                     const originNode = this.graph.getNodeById(link.origin_id);
                     if (originNode) {
@@ -172,7 +172,7 @@ function defineNodeBypasser() {
             const enableInputSlot = this.inputs.findIndex(i => i.name === "enable_input");
 
             if (enableInputSlot >= 0 && this.inputs[enableInputSlot].link != null) {
-                const link = this.graph.links[this.inputs[enableInputSlot].link];
+                const link = this.graph._links?.get(this.inputs[enableInputSlot].link) ?? this.graph.links?.[this.inputs[enableInputSlot].link];
                 if (link) {
                     const originNode = this.graph.getNodeById(link.origin_id);
                     if (originNode) {
@@ -202,7 +202,7 @@ function defineNodeBypasser() {
             const selectorInputSlot = this.inputs.findIndex(i => i.name === "selector");
 
             if (selectorInputSlot >= 0 && this.inputs[selectorInputSlot].link != null) {
-                const link = this.graph.links[this.inputs[selectorInputSlot].link];
+                const link = this.graph._links?.get(this.inputs[selectorInputSlot].link) ?? this.graph.links?.[this.inputs[selectorInputSlot].link];
                 if (link) {
                     const originNode = this.graph.getNodeById(link.origin_id);
                     if (originNode && originNode.widgets && originNode.widgets.length > 0) {
@@ -224,7 +224,7 @@ function defineNodeBypasser() {
             const overrideInputSlot = this.inputs.findIndex(i => i.name === "override_input");
 
             if (overrideInputSlot >= 0 && this.inputs[overrideInputSlot].link != null) {
-                const link = this.graph.links[this.inputs[overrideInputSlot].link];
+                const link = this.graph._links?.get(this.inputs[overrideInputSlot].link) ?? this.graph.links?.[this.inputs[overrideInputSlot].link];
                 if (link) {
                     const originNode = this.graph.getNodeById(link.origin_id);
                     if (originNode) {

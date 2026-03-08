@@ -21,6 +21,79 @@ app.registerExtension({
         console.log("[NV_Comfy_Utils] Registering simple variable nodes...");
 
         // =====================================================
+        // Global Canvas Patches for Hiding Managed Nodes
+        // =====================================================
+
+        function isManagedSetter(node) {
+            return node?.type === "SetVariableNode" && node?.properties?._nv_managed === true;
+        }
+
+        // Patch 1: Suppress node rendering
+        if (!LGraphCanvas.prototype._origDrawNode_nv) {
+            LGraphCanvas.prototype._origDrawNode_nv = LGraphCanvas.prototype.drawNode;
+            LGraphCanvas.prototype.drawNode = function(node, ctx) {
+                if (isManagedSetter(node)) return;
+                return this._origDrawNode_nv(node, ctx);
+            };
+        }
+
+        // Patch 2: Suppress connection lines.
+        // _renderAllLinkSegments is the low-level bottleneck for drawing bezier curves.
+        // If it doesn't exist in this LiteGraph version, fall back to patching drawConnections.
+        if (LGraphCanvas.prototype._renderAllLinkSegments) {
+            if (!LGraphCanvas.prototype._origRenderAllLinkSegments_nv) {
+                LGraphCanvas.prototype._origRenderAllLinkSegments_nv = LGraphCanvas.prototype._renderAllLinkSegments;
+                LGraphCanvas.prototype._renderAllLinkSegments = function(ctx, link, startPos, endPos, ...rest) {
+                    if (link && this.graph) {
+                        // Cache the hidden state on the link object to avoid getNodeById every frame.
+                        // Invalidate cache if endpoints changed (e.g. after link reconnection).
+                        if (link._nv_last_origin !== link.origin_id || link._nv_last_target !== link.target_id) {
+                            const originNode = this.graph.getNodeById(link.origin_id);
+                            const targetNode = this.graph.getNodeById(link.target_id);
+                            link._nv_hidden = isManagedSetter(originNode) || isManagedSetter(targetNode);
+                            link._nv_last_origin = link.origin_id;
+                            link._nv_last_target = link.target_id;
+                        }
+                        if (link._nv_hidden) return;
+                    }
+                    return this._origRenderAllLinkSegments_nv(ctx, link, startPos, endPos, ...rest);
+                };
+            }
+        } else {
+            // Fallback for LiteGraph versions that don't have _renderAllLinkSegments.
+            // Patch drawConnections to temporarily skip links touching managed setters.
+            if (!LGraphCanvas.prototype._origDrawConnections_nv) {
+                LGraphCanvas.prototype._origDrawConnections_nv = LGraphCanvas.prototype.drawConnections;
+                LGraphCanvas.prototype.drawConnections = function(ctx) {
+                    // Build a set of managed-setter node ids for fast O(1) lookup.
+                    const hiddenIds = new Set();
+                    if (this.graph) {
+                        for (const n of this.graph._nodes) {
+                            if (isManagedSetter(n)) hiddenIds.add(n.id);
+                        }
+                    }
+                    this._nv_hiddenLinkIds = hiddenIds;
+                    const result = this._origDrawConnections_nv(ctx);
+                    this._nv_hiddenLinkIds = null;
+                    return result;
+                };
+            }
+        }
+
+        // Patch 3: Exclude managed setters from Ctrl+A (select-all).
+        // LGraphCanvas.selectItems() calls this.graph.positionableItems() which is a
+        // generator that yields ALL nodes including hidden setters. We wrap it so
+        // managed setters are filtered before any selection code sees them.
+        if (LGraph && LGraph.prototype.positionableItems && !LGraph.prototype._origPositionableItems_nv) {
+            LGraph.prototype._origPositionableItems_nv = LGraph.prototype.positionableItems;
+            LGraph.prototype.positionableItems = function* () {
+                for (const item of this._origPositionableItems_nv()) {
+                    if (!isManagedSetter(item)) yield item;
+                }
+            };
+        }
+
+        // =====================================================
         // SetVariableNode — Hidden, auto-managed by console
         // =====================================================
         class SetVariableNode extends LGraphNode {
@@ -110,26 +183,10 @@ app.registerExtension({
 
                 // ===== Hidden rendering for managed setters =====
 
-                // Store original draw methods
-                const _origDrawForeground = this.onDrawForeground;
-                const _origDrawBackground = this.onDrawBackground;
-
-                this.onDrawForeground = function(ctx) {
-                    if (this.properties._nv_managed) return; // Don't render
-                    if (_origDrawForeground) _origDrawForeground.call(this, ctx);
-                };
-
-                this.onDrawBackground = function(ctx) {
-                    if (this.properties._nv_managed) return; // Don't render
-                    if (_origDrawBackground) _origDrawBackground.call(this, ctx);
-                };
-
-                // Make managed setters invisible to box-select
-                const _origIsPointInside = this.isPointInside;
-                this.isPointInside = function(x, y, margin) {
-                    if (this.properties._nv_managed) return false;
-                    if (_origIsPointInside) return _origIsPointInside.call(this, x, y, margin);
-                    return LGraphNode.prototype.isPointInside.call(this, x, y, margin);
+                // Completely disable hit-testing — SetVariableNode is always managed,
+                // so always return false regardless of coordinates.
+                this.isPointInside = function(_x, _y, _margin) {
+                    return false;
                 };
 
                 // On configure (deserialization), ensure managed mode
@@ -191,7 +248,7 @@ app.registerExtension({
                     );
                 };
 
-                // Update output type based on setter (explicit type > connection-inferred)
+                // Update output type based on setter (explicit type > source output type)
                 this.updateType = function() {
                     const setter = this.findSetter();
                     if (!setter) {
@@ -208,27 +265,52 @@ app.registerExtension({
                         return;
                     }
 
-                    // Fall back to connection-inferred type
-                    if (setter.inputs[0].type && setter.inputs[0].type !== "*") {
-                        this.outputs[0].type = setter.inputs[0].type;
-                        this.outputs[0].name = setter.inputs[0].type;
-                    } else {
-                        this.outputs[0].type = "*";
-                        this.outputs[0].name = "*";
+                    // Follow the setter's input link to the source node's output type.
+                    // The setter's own input type stays "*" (wildcard), so we must look
+                    // at the actual source node's output slot for the real type.
+                    const graph = node.graph;
+                    const setterInput = setter.inputs?.[0];
+                    if (graph && setterInput && setterInput.link != null) {
+                        const link = graph._links?.get(setterInput.link)
+                            ?? graph.links?.[setterInput.link];
+                        if (link) {
+                            const sourceNode = graph.getNodeById(link.origin_id);
+                            const sourceType = sourceNode?.outputs?.[link.origin_slot]?.type;
+                            if (sourceType && sourceType !== "*") {
+                                this.outputs[0].type = sourceType;
+                                this.outputs[0].name = sourceType;
+                                return;
+                            }
+                        }
                     }
+
+                    this.outputs[0].type = "*";
+                    this.outputs[0].name = "*";
                 };
 
-                // Override getInputLink to pass through the setter's input link
-                this.getInputLink = function(slot) {
+                // Override getInputLink to pass through the setter's input link.
+                // The execution engine calls getInputLink(outputSlotIndex) on virtual nodes
+                // asking "what link feeds output slot N?". We always resolve through the
+                // setter's single input (index 0), regardless of which output slot is queried.
+                // NOTE: graph._links is a Map in ComfyUI frontend >= 1.10 — use .get().
+                this.getInputLink = function(_slot) {
                     const setter = this.findSetter();
-                    if (setter && setter.inputs[slot]) {
-                        const slotInfo = setter.inputs[slot];
-                        const link = node.graph.links[slotInfo.link];
-                        return link;
-                    } else {
+                    if (!setter) {
                         console.warn("[GetVariableNode] No setter found for:", this.widgets[0].value);
+                        return null;
                     }
-                    return null;
+                    // Always use setter.inputs[0] — the setter has exactly one input.
+                    const setterInput = setter.inputs[0];
+                    if (!setterInput || setterInput.link == null) {
+                        return null;
+                    }
+                    const graph = node.graph;
+                    if (!graph) return null;
+                    // graph._links is a Map; fall back to graph.links for older LiteGraph versions.
+                    const link = graph._links?.get(setterInput.link)
+                        ?? graph.links?.[setterInput.link]
+                        ?? null;
+                    return link;
                 };
 
                 // Navigate to the setter node (still useful for debugging)

@@ -1,5 +1,5 @@
 /**
- * Floating Panel - Viewport-fixed group/node muter/bypasser
+ * Floating Panel - Viewport-fixed group/node muter/bypasser with Macro Groups
  *
  * A panel that stays fixed to the viewport (doesn't move when panning)
  * and provides quick access to mute/bypass groups and node patterns.
@@ -10,6 +10,7 @@
  * - Collapsible to minimize screen space
  * - Auto-discovers groups like rgthree's fast groups muter
  * - Supports custom node patterns for bypass control
+ * - Macro Groups: bundle multiple groups into one toggle
  */
 
 import { app } from "../../scripts/app.js";
@@ -19,7 +20,148 @@ const MODE_BYPASS = 4;
 const MODE_NEVER = 2;
 
 const STORAGE_KEY = "NV_FloatingPanel_State";
+const MACRO_STORAGE_KEY = "NV_FloatingPanel_Macros";
 const DEFAULT_POSITION = { x: 20, y: 100 };
+const STATE_VERSION = 1;
+
+// ─── MacroManager ─────────────────────────────────────────────────────────────
+// Handles CRUD, state computation, and serialization for macro groups.
+// Never touches DOM or ComfyUI globals directly — the panel mediates.
+
+class MacroManager {
+    constructor() {
+        this.macros = [];
+        this.macroOrder = [];
+        this._load();
+    }
+
+    _load() {
+        try {
+            const saved = localStorage.getItem(MACRO_STORAGE_KEY);
+            if (saved) {
+                const data = JSON.parse(saved);
+                this.macros = Array.isArray(data.macros) ? data.macros : [];
+                this.macroOrder = Array.isArray(data.macroOrder) ? data.macroOrder : [];
+                // Migration: ensure all macros have required fields
+                for (const m of this.macros) {
+                    if (!m.id) m.id = "m_" + Date.now() + "_" + Math.random().toString(36).slice(2, 6);
+                    if (!Array.isArray(m.groupTitles)) m.groupTitles = [];
+                    if (typeof m.collapsed !== "boolean") m.collapsed = false;
+                    if (typeof m.name !== "string") m.name = "Untitled Macro";
+                }
+                // Prune macroOrder to only valid IDs
+                const idSet = new Set(this.macros.map(m => m.id));
+                this.macroOrder = this.macroOrder.filter(id => idSet.has(id));
+                // Add any macros not in order
+                for (const m of this.macros) {
+                    if (!this.macroOrder.includes(m.id)) this.macroOrder.push(m.id);
+                }
+            }
+        } catch (e) {
+            console.warn("[MacroManager] Failed to load macros, resetting:", e);
+            this.macros = [];
+            this.macroOrder = [];
+        }
+    }
+
+    _save() {
+        try {
+            localStorage.setItem(MACRO_STORAGE_KEY, JSON.stringify({
+                version: STATE_VERSION,
+                macros: this.macros,
+                macroOrder: this.macroOrder,
+            }));
+        } catch (e) {
+            console.warn("[MacroManager] Failed to save macros:", e);
+        }
+    }
+
+    getMacros() {
+        // Return macros in display order
+        const byId = new Map(this.macros.map(m => [m.id, m]));
+        return this.macroOrder.map(id => byId.get(id)).filter(Boolean);
+    }
+
+    createMacro(name, groupTitles) {
+        const macro = {
+            id: "m_" + Date.now() + "_" + Math.random().toString(36).slice(2, 6),
+            name,
+            groupTitles: [...groupTitles],
+            collapsed: false,
+        };
+        this.macros.push(macro);
+        this.macroOrder.push(macro.id);
+        this._save();
+        return macro;
+    }
+
+    updateMacro(id, changes) {
+        const macro = this.macros.find(m => m.id === id);
+        if (!macro) return null;
+        if (changes.name !== undefined) macro.name = changes.name;
+        if (changes.groupTitles !== undefined) macro.groupTitles = [...changes.groupTitles];
+        if (changes.collapsed !== undefined) macro.collapsed = changes.collapsed;
+        this._save();
+        return macro;
+    }
+
+    deleteMacro(id) {
+        this.macros = this.macros.filter(m => m.id !== id);
+        this.macroOrder = this.macroOrder.filter(i => i !== id);
+        this._save();
+    }
+
+    reorderMacros(newOrder) {
+        this.macroOrder = newOrder;
+        this._save();
+    }
+
+    /**
+     * Compute tri-state for a macro given live groups.
+     * @param {object} macro
+     * @param {Map<string, object[]>} groupMap - title -> [group objects]
+     * @returns {{ state: 'all'|'partial'|'none', enabled: number, total: number, stale: string[] }}
+     */
+    computeTriState(macro, groupMap) {
+        let enabled = 0;
+        let total = 0;
+        const stale = [];
+
+        for (const title of macro.groupTitles) {
+            const groups = groupMap.get(title);
+            if (!groups || groups.length === 0) {
+                stale.push(title);
+                continue;
+            }
+            for (const group of groups) {
+                const nodes = group._nodes || [];
+                if (nodes.length === 0) continue;
+                total++;
+                const allActive = nodes.every(n => n.mode === MODE_ALWAYS);
+                if (allActive) enabled++;
+            }
+        }
+
+        let state;
+        if (total === 0) state = "none";
+        else if (enabled === total) state = "all";
+        else if (enabled === 0) state = "none";
+        else state = "partial";
+
+        return { state, enabled, total, stale };
+    }
+
+    /** Get set of all group titles claimed by any macro */
+    getClaimedTitles() {
+        const claimed = new Set();
+        for (const m of this.macros) {
+            for (const t of m.groupTitles) claimed.add(t);
+        }
+        return claimed;
+    }
+}
+
+// ─── FloatingPanel ────────────────────────────────────────────────────────────
 
 class FloatingPanel {
     constructor() {
@@ -37,6 +179,17 @@ class FloatingPanel {
         this.isDraggingGroup = false; // True during group row drag-and-drop
         this.refreshInterval = null;
         this.isVisible = true;
+        this._dialogOpen = false; // P0: pause polling during dialogs
+        this._activeDialogs = []; // P1: track open dialogs for cleanup
+        this._lastStateHash = ""; // Performance: dirty-check to skip DOM rebuilds
+
+        // Macro manager (error-isolated — P1: corrupt state won't kill the panel)
+        try {
+            this.macroManager = new MacroManager();
+        } catch (e) {
+            console.error("[FloatingPanel] MacroManager init failed, macros disabled:", e);
+            this.macroManager = null;
+        }
 
         this.loadState();
         this.createPanel();
@@ -62,6 +215,7 @@ class FloatingPanel {
     saveState() {
         try {
             const state = {
+                version: STATE_VERSION,
                 position: this.position,
                 isCollapsed: this.isCollapsed,
                 customPatterns: this.customPatterns,
@@ -145,7 +299,7 @@ class FloatingPanel {
             display: ${this.isCollapsed ? 'none' : 'block'};
         `;
 
-        // Groups section (with reset order button)
+        // Groups section (with reset order button) — will contain macros + ungrouped
         const groupsSection = this.createSection("Groups", "groupsList");
         this.groupsList = groupsSection.list;
 
@@ -302,7 +456,7 @@ class FloatingPanel {
             onToggle(!isActive);
         });
 
-        // Name
+        // Name (always textContent — P0: XSS safe)
         const label = document.createElement("span");
         label.textContent = name;
         label.style.cssText = `
@@ -422,6 +576,8 @@ class FloatingPanel {
     hide() {
         this.isVisible = false;
         this.container.style.display = 'none';
+        // P1: clean up any open dialogs
+        this._closeAllDialogs();
         this.saveState();
     }
 
@@ -433,10 +589,80 @@ class FloatingPanel {
         }
     }
 
+    // ─── Dirty-check: skip DOM rebuild if nothing changed ──────────────
+
+    _computeStateHash(groups) {
+        // Build a hash of group titles + modes + macro definitions
+        // O(N) string ops — sub-millisecond even for 100+ groups
+        let hash = "";
+        for (const g of groups) {
+            const title = g.title || "";
+            const modes = (g._nodes || []).map(n => n.mode).join("");
+            hash += title + ":" + modes + "|";
+        }
+        if (this.macroManager) {
+            for (const m of this.macroManager.macros) {
+                hash += "M" + m.id + ":" + m.name + ":" + m.groupTitles.join(",") + ":" + (m.collapsed ? "1" : "0") + "|";
+            }
+            hash += "O:" + this.macroManager.macroOrder.join(",");
+        }
+        return hash;
+    }
+
+    // ─── Build group lookup map ────────────────────────────────────────
+
+    _buildGroupMap(groups) {
+        const groupMap = new Map();
+        for (const g of groups) {
+            const title = g.title || "Untitled Group";
+            if (!groupMap.has(title)) groupMap.set(title, []);
+            groupMap.get(title).push(g);
+        }
+        return groupMap;
+    }
+
+    // ─── Sort groups helper ────────────────────────────────────────────
+
+    _sortGroups(groups) {
+        if (this.groupOrder.length > 0) {
+            const orderMap = new Map(this.groupOrder.map((title, i) => [title, i]));
+            return [...groups].sort((a, b) => {
+                const aTitle = a.title || "Untitled Group";
+                const bTitle = b.title || "Untitled Group";
+                const aIdx = orderMap.has(aTitle) ? orderMap.get(aTitle) : Infinity;
+                const bIdx = orderMap.has(bTitle) ? orderMap.get(bTitle) : Infinity;
+                if (aIdx !== bIdx) return aIdx - bIdx;
+                const aY = Math.floor(a._pos[1] / 30);
+                const bY = Math.floor(b._pos[1] / 30);
+                if (aY === bY) return Math.floor(a._pos[0] / 30) - Math.floor(b._pos[0] / 30);
+                return aY - bY;
+            });
+        }
+        return [...groups].sort((a, b) => {
+            const aY = Math.floor(a._pos[1] / 30);
+            const bY = Math.floor(b._pos[1] / 30);
+            if (aY === bY) return Math.floor(a._pos[0] / 30) - Math.floor(b._pos[0] / 30);
+            return aY - bY;
+        });
+    }
+
+    // ─── Main refresh (macros + ungrouped + patterns) ──────────────────
+
     refreshGroups() {
         if (!app.graph || this.isDraggingGroup) return;
 
         const groups = app.graph._groups || [];
+
+        // Recompute nodes for all groups
+        for (const group of groups) {
+            if (group.recomputeInsideNodes) group.recomputeInsideNodes();
+        }
+
+        // Dirty-check: skip DOM rebuild if nothing changed
+        const stateHash = this._computeStateHash(groups);
+        if (stateHash === this._lastStateHash) return;
+        this._lastStateHash = stateHash;
+
         this.groupsList.innerHTML = "";
 
         if (groups.length === 0) {
@@ -447,57 +673,195 @@ class FloatingPanel {
             return;
         }
 
-        // Sort groups: use custom order if available, fall back to position sort
-        let sortedGroups;
-        if (this.groupOrder.length > 0) {
-            const orderMap = new Map(this.groupOrder.map((title, i) => [title, i]));
-            sortedGroups = [...groups].sort((a, b) => {
-                const aTitle = a.title || "Untitled Group";
-                const bTitle = b.title || "Untitled Group";
-                const aIdx = orderMap.has(aTitle) ? orderMap.get(aTitle) : Infinity;
-                const bIdx = orderMap.has(bTitle) ? orderMap.get(bTitle) : Infinity;
-                if (aIdx !== bIdx) return aIdx - bIdx;
-                // Tie-break: position sort for groups not in custom order
-                const aY = Math.floor(a._pos[1] / 30);
-                const bY = Math.floor(b._pos[1] / 30);
-                if (aY === bY) {
-                    return Math.floor(a._pos[0] / 30) - Math.floor(b._pos[0] / 30);
+        const groupMap = this._buildGroupMap(groups);
+        const sortedGroups = this._sortGroups(groups);
+
+        // ── Macros section ──
+        if (this.macroManager && this.macroManager.macros.length > 0) {
+            const macroHeader = document.createElement("div");
+            macroHeader.style.cssText = `
+                display: flex; align-items: center; justify-content: space-between;
+                padding: 4px 8px; font-size: 10px; color: #777; text-transform: uppercase;
+                letter-spacing: 0.5px;
+            `;
+            const macroLabel = document.createElement("span");
+            macroLabel.textContent = "Macros";
+            macroHeader.appendChild(macroLabel);
+
+            const addMacroBtn = this.createIconButton("+", "Create macro group", () => this.showMacroDialog());
+            addMacroBtn.style.fontSize = "13px";
+            addMacroBtn.style.padding = "0 4px";
+            macroHeader.appendChild(addMacroBtn);
+            this.groupsList.appendChild(macroHeader);
+
+            const macros = this.macroManager.getMacros();
+            for (const macro of macros) {
+                this._renderMacro(macro, groupMap);
+            }
+
+            // ── Ungrouped separator ──
+            const claimedTitles = this.macroManager.getClaimedTitles();
+            const ungrouped = sortedGroups.filter(g => !claimedTitles.has(g.title || "Untitled Group"));
+
+            if (ungrouped.length > 0) {
+                const ungroupedHeader = document.createElement("div");
+                ungroupedHeader.style.cssText = `
+                    padding: 4px 8px; font-size: 10px; color: #777; text-transform: uppercase;
+                    letter-spacing: 0.5px; margin-top: 4px;
+                `;
+                ungroupedHeader.textContent = "Groups";
+                this.groupsList.appendChild(ungroupedHeader);
+
+                for (const group of ungrouped) {
+                    this._renderGroupRow(group, true);
                 }
-                return aY - bY;
-            });
+            }
         } else {
-            sortedGroups = [...groups].sort((a, b) => {
-                const aY = Math.floor(a._pos[1] / 30);
-                const bY = Math.floor(b._pos[1] / 30);
-                if (aY === bY) {
-                    return Math.floor(a._pos[0] / 30) - Math.floor(b._pos[0] / 30);
-                }
-                return aY - bY;
-            });
+            // No macros — render add button + all groups flat
+            if (this.macroManager) {
+                const addMacroBtn = this.createIconButton("+", "Create macro group", () => this.showMacroDialog());
+                addMacroBtn.style.fontSize = "13px";
+                addMacroBtn.style.padding = "0 4px";
+                addMacroBtn.style.float = "right";
+                this.groupsList.appendChild(addMacroBtn);
+            }
+
+            for (const group of sortedGroups) {
+                this._renderGroupRow(group, true);
+            }
+        }
+    }
+
+    // ─── Render a single macro with its children ───────────────────────
+
+    _renderMacro(macro, groupMap) {
+        const triState = this.macroManager.computeTriState(macro, groupMap);
+
+        // Macro header row
+        const macroRow = document.createElement("div");
+        const bgColor = triState.state === "all" ? "#1e2e1e" :
+                        triState.state === "none" ? "#2e1e1e" : "#2e2e1e";
+        macroRow.style.cssText = `
+            display: flex; align-items: center; padding: 6px 8px; margin: 2px 0;
+            background: ${bgColor}; border-radius: 4px; transition: background 0.15s;
+            border-left: 3px solid ${triState.state === "all" ? "#5a5" : triState.state === "partial" ? "#aa5" : "#555"};
+        `;
+        macroRow.addEventListener("mouseenter", () => { macroRow.style.filter = "brightness(1.15)"; });
+        macroRow.addEventListener("mouseleave", () => { macroRow.style.filter = "none"; });
+
+        // Tri-state toggle indicator
+        const toggle = document.createElement("div");
+        const toggleColor = triState.state === "all" ? "#5a5" :
+                           triState.state === "partial" ? "#aa5" : "#555";
+        toggle.style.cssText = `
+            width: 12px; height: 12px; border-radius: 50%; background: ${toggleColor};
+            margin-right: 8px; cursor: pointer; flex-shrink: 0;
+        `;
+        if (triState.state === "partial") {
+            // Half-filled effect for partial state
+            toggle.style.background = `linear-gradient(90deg, #5a5 50%, #555 50%)`;
+        }
+        toggle.addEventListener("click", () => this.toggleMacro(macro, groupMap));
+        macroRow.appendChild(toggle);
+
+        // Macro name
+        const label = document.createElement("span");
+        label.textContent = macro.name;
+        label.style.cssText = `
+            flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+            cursor: pointer; font-weight: 600;
+        `;
+        label.addEventListener("click", () => this.toggleMacro(macro, groupMap));
+        macroRow.appendChild(label);
+
+        // Count badge
+        const badge = document.createElement("span");
+        badge.textContent = `${triState.enabled}/${triState.total}`;
+        badge.style.cssText = `
+            font-size: 10px; color: #888; margin-left: 4px; margin-right: 4px; flex-shrink: 0;
+        `;
+        macroRow.appendChild(badge);
+
+        // Stale warning
+        if (triState.stale.length > 0) {
+            const warnBtn = document.createElement("span");
+            warnBtn.textContent = "!";
+            warnBtn.title = "Missing groups: " + triState.stale.join(", ");
+            warnBtn.style.cssText = `
+                color: #a55; font-weight: bold; font-size: 12px; margin-right: 4px; cursor: help;
+            `;
+            macroRow.appendChild(warnBtn);
         }
 
-        for (const group of sortedGroups) {
-            // Recompute nodes in group
-            if (group.recomputeInsideNodes) {
-                group.recomputeInsideNodes();
+        // Collapse chevron
+        const chevron = this.createIconButton(macro.collapsed ? "▶" : "▼", "Expand/collapse", () => {
+            this.macroManager.updateMacro(macro.id, { collapsed: !macro.collapsed });
+            this._lastStateHash = ""; // force refresh
+            this.refreshGroups();
+        });
+        chevron.style.fontSize = "10px";
+        chevron.style.padding = "0 3px";
+        macroRow.appendChild(chevron);
+
+        // Edit button (visible on hover via CSS-in-JS)
+        const editBtn = this.createIconButton("✎", "Edit macro", () => this.showMacroDialog(macro));
+        editBtn.style.fontSize = "11px";
+        editBtn.style.padding = "0 3px";
+        macroRow.appendChild(editBtn);
+
+        this.groupsList.appendChild(macroRow);
+
+        // ── Child group rows (if expanded) ──
+        if (!macro.collapsed) {
+            const childContainer = document.createElement("div");
+            childContainer.style.cssText = "padding-left: 16px; border-left: 1px solid #444; margin-left: 14px;";
+
+            for (const title of macro.groupTitles) {
+                const matchingGroups = groupMap.get(title);
+                if (!matchingGroups || matchingGroups.length === 0) {
+                    // Stale reference row
+                    const staleRow = document.createElement("div");
+                    staleRow.style.cssText = `
+                        display: flex; align-items: center; padding: 4px 8px; margin: 1px 0;
+                        background: #2a2222; border-radius: 4px; color: #777;
+                    `;
+                    const staleLabel = document.createElement("span");
+                    staleLabel.textContent = title;
+                    staleLabel.style.cssText = "flex: 1; text-decoration: line-through; font-style: italic;";
+                    staleRow.appendChild(staleLabel);
+                    childContainer.appendChild(staleRow);
+                    continue;
+                }
+
+                // Render each matching group (usually 1, but handles duplicates)
+                for (const group of matchingGroups) {
+                    this._renderGroupRow(group, false, childContainer);
+                }
             }
+            this.groupsList.appendChild(childContainer);
+        }
+    }
 
-            const hasActiveNodes = (group._nodes || []).some(n => n.mode === MODE_ALWAYS);
-            const groupTitle = group.title || "Untitled Group";
+    // ─── Render a single group row ─────────────────────────────────────
 
-            const row = this.createToggleRow(
-                groupTitle,
-                hasActiveNodes,
-                (enable) => this.toggleGroup(group, enable),
-                () => this.navigateToGroup(group)
-            );
+    _renderGroupRow(group, enableDrag, appendTarget = null) {
+        const hasActiveNodes = (group._nodes || []).some(n => n.mode === MODE_ALWAYS);
+        const groupTitle = group.title || "Untitled Group";
 
-            // Add color indicator matching group color
-            if (group.color) {
-                row.style.borderLeft = `3px solid ${group.color}`;
-            }
+        const row = this.createToggleRow(
+            groupTitle,
+            hasActiveNodes,
+            (enable) => this.toggleGroup(group, enable),
+            () => this.navigateToGroup(group)
+        );
 
-            // Make row draggable for reordering
+        // Add color indicator matching group color
+        if (group.color) {
+            row.style.borderLeft = `3px solid ${group.color}`;
+        }
+
+        if (enableDrag) {
+            // Make row draggable for reordering (P1: only for top-level, not macro children)
             row.draggable = true;
             row.dataset.groupTitle = groupTitle;
             row.style.cursor = "grab";
@@ -513,7 +877,6 @@ class FloatingPanel {
             row.addEventListener("dragend", () => {
                 this.isDraggingGroup = false;
                 row.style.opacity = "1";
-                // Remove any lingering drop indicators
                 this.groupsList.querySelectorAll("[data-group-title]").forEach(el => {
                     el.style.borderTop = "";
                     el.style.borderBottom = "";
@@ -523,7 +886,6 @@ class FloatingPanel {
             row.addEventListener("dragover", (e) => {
                 e.preventDefault();
                 e.dataTransfer.dropEffect = "move";
-                // Show drop indicator
                 const rect = row.getBoundingClientRect();
                 const midY = rect.top + rect.height / 2;
                 this.groupsList.querySelectorAll("[data-group-title]").forEach(el => {
@@ -551,7 +913,6 @@ class FloatingPanel {
                 const targetTitle = groupTitle;
                 if (!draggedTitle || draggedTitle === targetTitle) return;
 
-                // Build current visual order from DOM
                 const currentOrder = Array.from(
                     this.groupsList.querySelectorAll("[data-group-title]")
                 ).map(el => el.dataset.groupTitle);
@@ -560,11 +921,9 @@ class FloatingPanel {
                 const toIdx = currentOrder.indexOf(targetTitle);
                 if (fromIdx === -1 || toIdx === -1) return;
 
-                // Determine insert position based on mouse position
-                const rect = row.getBoundingClientRect();
-                const insertAfter = e.clientY >= rect.top + rect.height / 2;
+                const rect2 = row.getBoundingClientRect();
+                const insertAfter = e.clientY >= rect2.top + rect2.height / 2;
 
-                // Remove dragged item and reinsert
                 currentOrder.splice(fromIdx, 1);
                 let insertIdx = currentOrder.indexOf(targetTitle);
                 if (insertAfter) insertIdx++;
@@ -575,9 +934,284 @@ class FloatingPanel {
                 this.isDraggingGroup = false;
                 this.refreshGroups();
             });
-
-            this.groupsList.appendChild(row);
         }
+
+        (appendTarget || this.groupsList).appendChild(row);
+    }
+
+    // ─── Macro toggle ──────────────────────────────────────────────────
+
+    toggleMacro(macro, groupMap) {
+        const triState = this.macroManager.computeTriState(macro, groupMap);
+        // any-on → turn all off; all-off → turn all on
+        const targetMode = (triState.state === "none") ? MODE_ALWAYS : MODE_BYPASS;
+
+        // P0: Wrap in undo transaction (Gemini review finding)
+        if (app.graph.beforeChange) app.graph.beforeChange();
+
+        for (const title of macro.groupTitles) {
+            const groups = groupMap.get(title);
+            if (!groups) continue;
+            for (const group of groups) {
+                for (const node of group._nodes || []) {
+                    node.mode = targetMode;
+                }
+            }
+        }
+
+        if (app.graph.afterChange) app.graph.afterChange();
+        app.graph.setDirtyCanvas(true, false);
+        this._lastStateHash = ""; // force refresh
+        this.refreshGroups();
+    }
+
+    // ─── Macro dialog (create / edit) ──────────────────────────────────
+
+    showMacroDialog(existingMacro = null) {
+        this._dialogOpen = true; // P0: pause polling
+
+        const isEdit = !!existingMacro;
+        const groups = app.graph?._groups || [];
+
+        // Overlay
+        const overlay = document.createElement("div");
+        overlay.style.cssText = `
+            position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 100002;
+        `;
+
+        // Dialog
+        const dialog = document.createElement("div");
+        dialog.style.cssText = `
+            position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
+            background: #1a1a1a; border: 1px solid #444; border-radius: 8px; padding: 16px;
+            z-index: 100003; min-width: 320px; max-width: 400px;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.6);
+        `;
+
+        const closeDialog = () => {
+            this._dialogOpen = false;
+            if (dialog.parentElement) dialog.parentElement.removeChild(dialog);
+            if (overlay.parentElement) overlay.parentElement.removeChild(overlay);
+            this._activeDialogs = this._activeDialogs.filter(d => d !== dialog && d !== overlay);
+        };
+
+        overlay.addEventListener("click", closeDialog);
+
+        // Title
+        const titleEl = document.createElement("h3");
+        titleEl.textContent = isEdit ? "Edit Macro" : "New Macro";
+        titleEl.style.cssText = "margin: 0 0 12px 0; color: #e0e0e0;";
+        dialog.appendChild(titleEl);
+
+        // Name input
+        const nameLabel = document.createElement("label");
+        nameLabel.textContent = "Name:";
+        nameLabel.style.cssText = "display: block; margin-bottom: 4px; color: #999;";
+        dialog.appendChild(nameLabel);
+
+        const nameInput = document.createElement("input");
+        nameInput.type = "text";
+        nameInput.placeholder = "e.g., Stage 1: Low Res";
+        nameInput.value = isEdit ? existingMacro.name : "";
+        nameInput.style.cssText = `
+            width: 100%; padding: 8px; margin-bottom: 12px; background: #2a2a2a;
+            border: 1px solid #444; border-radius: 4px; color: #e0e0e0; box-sizing: border-box;
+        `;
+        dialog.appendChild(nameInput);
+
+        // Group checklist
+        const checkLabel = document.createElement("label");
+        checkLabel.textContent = "Select groups:";
+        checkLabel.style.cssText = "display: block; margin-bottom: 4px; color: #999;";
+        dialog.appendChild(checkLabel);
+
+        const checkContainer = document.createElement("div");
+        checkContainer.style.cssText = `
+            max-height: 250px; overflow-y: auto; border: 1px solid #333; border-radius: 4px;
+            padding: 4px; margin-bottom: 12px; background: #222;
+        `;
+
+        // Deduplicate group titles for the checklist
+        const seenTitles = new Set();
+        const selectedTitles = new Set(isEdit ? existingMacro.groupTitles : []);
+        const checkboxes = [];
+
+        // Also include stale titles from the existing macro so user can see them
+        if (isEdit) {
+            for (const t of existingMacro.groupTitles) {
+                if (!groups.some(g => (g.title || "Untitled Group") === t)) {
+                    // Stale title — show as disabled
+                    const staleRow = document.createElement("div");
+                    staleRow.style.cssText = "display: flex; align-items: center; padding: 4px 6px; color: #777;";
+                    const staleCb = document.createElement("input");
+                    staleCb.type = "checkbox";
+                    staleCb.checked = true;
+                    staleCb.disabled = true;
+                    staleCb.style.marginRight = "8px";
+                    const staleLabel2 = document.createElement("span");
+                    staleLabel2.textContent = t + " (missing)";
+                    staleLabel2.style.textDecoration = "line-through";
+                    staleRow.appendChild(staleCb);
+                    staleRow.appendChild(staleLabel2);
+                    checkContainer.appendChild(staleRow);
+                }
+            }
+        }
+
+        for (const group of groups) {
+            const title = group.title || "Untitled Group";
+            if (seenTitles.has(title)) continue;
+            seenTitles.add(title);
+
+            const checkRow = document.createElement("div");
+            checkRow.style.cssText = `
+                display: flex; align-items: center; padding: 4px 6px; cursor: pointer;
+                border-radius: 3px; transition: background 0.1s;
+            `;
+            checkRow.addEventListener("mouseenter", () => checkRow.style.background = "#333");
+            checkRow.addEventListener("mouseleave", () => checkRow.style.background = "transparent");
+
+            const cb = document.createElement("input");
+            cb.type = "checkbox";
+            cb.checked = selectedTitles.has(title);
+            cb.style.marginRight = "8px";
+            cb.style.cursor = "pointer";
+            cb.dataset.title = title;
+            checkboxes.push(cb);
+
+            if (group.color) {
+                const swatch = document.createElement("div");
+                swatch.style.cssText = `
+                    width: 8px; height: 8px; border-radius: 50%; background: ${group.color};
+                    margin-right: 6px; flex-shrink: 0;
+                `;
+                checkRow.appendChild(swatch);
+            }
+
+            const cbLabel = document.createElement("span");
+            cbLabel.textContent = title;
+            cbLabel.style.cssText = "flex: 1; cursor: pointer;";
+
+            // Show which macros this group belongs to
+            if (this.macroManager) {
+                const otherMacros = this.macroManager.macros.filter(m =>
+                    m.groupTitles.includes(title) && (!isEdit || m.id !== existingMacro.id)
+                );
+                if (otherMacros.length > 0) {
+                    const inLabel = document.createElement("span");
+                    inLabel.textContent = `(in: ${otherMacros.map(m => m.name).join(", ")})`;
+                    inLabel.style.cssText = "font-size: 10px; color: #666; margin-left: 4px;";
+                    checkRow.appendChild(inLabel);
+                }
+            }
+
+            checkRow.addEventListener("click", (e) => {
+                if (e.target !== cb) cb.checked = !cb.checked;
+            });
+
+            checkRow.appendChild(cb);
+            checkRow.appendChild(cbLabel);
+            checkContainer.appendChild(checkRow);
+        }
+
+        dialog.appendChild(checkContainer);
+
+        // Buttons
+        const buttons = document.createElement("div");
+        buttons.style.cssText = "display: flex; gap: 8px; justify-content: space-between;";
+
+        const leftBtns = document.createElement("div");
+        const rightBtns = document.createElement("div");
+        rightBtns.style.cssText = "display: flex; gap: 8px;";
+
+        // Delete button (edit mode only)
+        if (isEdit) {
+            const deleteBtn = document.createElement("button");
+            deleteBtn.textContent = "Delete";
+            deleteBtn.style.cssText = `
+                padding: 8px 16px; background: #533; border: none; border-radius: 4px;
+                color: #e0e0e0; cursor: pointer;
+            `;
+            let deleteConfirm = false;
+            deleteBtn.addEventListener("click", () => {
+                if (!deleteConfirm) {
+                    deleteConfirm = true;
+                    deleteBtn.textContent = "Click again to confirm";
+                    deleteBtn.style.background = "#a33";
+                    setTimeout(() => {
+                        deleteConfirm = false;
+                        deleteBtn.textContent = "Delete";
+                        deleteBtn.style.background = "#533";
+                    }, 2000);
+                } else {
+                    this.macroManager.deleteMacro(existingMacro.id);
+                    closeDialog();
+                    this._lastStateHash = "";
+                    this.refreshGroups();
+                }
+            });
+            leftBtns.appendChild(deleteBtn);
+        }
+
+        const cancelBtn = document.createElement("button");
+        cancelBtn.textContent = "Cancel";
+        cancelBtn.style.cssText = `
+            padding: 8px 16px; background: #333; border: none; border-radius: 4px;
+            color: #e0e0e0; cursor: pointer;
+        `;
+        cancelBtn.addEventListener("click", closeDialog);
+
+        const saveBtn = document.createElement("button");
+        saveBtn.textContent = isEdit ? "Save" : "Create";
+        saveBtn.style.cssText = `
+            padding: 8px 16px; background: #5a5; border: none; border-radius: 4px;
+            color: white; cursor: pointer;
+        `;
+        saveBtn.addEventListener("click", () => {
+            const name = nameInput.value.trim();
+            if (!name) {
+                nameInput.style.borderColor = "#a55";
+                return;
+            }
+            const selected = checkboxes.filter(cb => cb.checked).map(cb => cb.dataset.title);
+            if (selected.length === 0) {
+                checkContainer.style.borderColor = "#a55";
+                return;
+            }
+
+            if (isEdit) {
+                this.macroManager.updateMacro(existingMacro.id, { name, groupTitles: selected });
+            } else {
+                this.macroManager.createMacro(name, selected);
+            }
+
+            closeDialog();
+            this._lastStateHash = "";
+            this.refreshGroups();
+        });
+
+        rightBtns.appendChild(cancelBtn);
+        rightBtns.appendChild(saveBtn);
+        buttons.appendChild(leftBtns);
+        buttons.appendChild(rightBtns);
+        dialog.appendChild(buttons);
+
+        // Track dialogs for cleanup (P1)
+        this._activeDialogs.push(dialog, overlay);
+
+        document.body.appendChild(overlay);
+        document.body.appendChild(dialog);
+        nameInput.focus();
+    }
+
+    // ─── Dialog cleanup helper ─────────────────────────────────────────
+
+    _closeAllDialogs() {
+        for (const el of this._activeDialogs) {
+            if (el.parentElement) el.parentElement.removeChild(el);
+        }
+        this._activeDialogs = [];
+        this._dialogOpen = false;
     }
 
     refreshPatterns() {
@@ -608,7 +1242,6 @@ class FloatingPanel {
     }
 
     toggleGroup(group, enable) {
-        // Recompute which nodes are inside this group
         if (group.recomputeInsideNodes) {
             group.recomputeInsideNodes();
         }
@@ -618,15 +1251,17 @@ class FloatingPanel {
             return;
         }
 
-        // Use BYPASS mode when disabling (not mute)
         const newMode = enable ? MODE_ALWAYS : MODE_BYPASS;
         console.log(`[FloatingPanel] Setting ${group._nodes.length} nodes in "${group.title}" to mode ${newMode}`);
 
+        if (app.graph.beforeChange) app.graph.beforeChange();
         for (const node of group._nodes) {
             node.mode = newMode;
         }
+        if (app.graph.afterChange) app.graph.afterChange();
 
         app.graph.setDirtyCanvas(true, false);
+        this._lastStateHash = ""; // force refresh
         this.refreshGroups();
     }
 
@@ -634,7 +1269,6 @@ class FloatingPanel {
         const canvas = app.canvas;
         canvas.centerOnNode(group);
 
-        // Zoom to fit group
         const zoomCurrent = canvas.ds?.scale || 1;
         const zoomX = canvas.canvas.width / group._size[0] - 0.02;
         const zoomY = canvas.canvas.height / group._size[1] - 0.02;
@@ -647,6 +1281,7 @@ class FloatingPanel {
 
     setAllGroupsMode(mode) {
         const groups = app.graph._groups || [];
+        if (app.graph.beforeChange) app.graph.beforeChange();
         for (const group of groups) {
             if (group.recomputeInsideNodes) {
                 group.recomputeInsideNodes();
@@ -655,7 +1290,9 @@ class FloatingPanel {
                 node.mode = mode;
             }
         }
+        if (app.graph.afterChange) app.graph.afterChange();
         app.graph.setDirtyCanvas(true, false);
+        this._lastStateHash = "";
         this.refreshGroups();
     }
 
@@ -665,18 +1302,15 @@ class FloatingPanel {
 
         const nodes = app.graph._nodes || [];
 
-        // Check if it's a group pattern
         if (pattern.startsWith('@')) {
             const groupName = pattern.substring(1);
-            return this.findNodesInGroup(groupName, nodes);
+            return this.findNodesInGroup(groupName);
         }
 
-        // Check if it's a regex pattern
         if (this.isRegexPattern(pattern)) {
             return this.findNodesByRegex(pattern, nodes);
         }
 
-        // Simple string matching
         return nodes.filter(node =>
             node.type.toLowerCase().includes(pattern.toLowerCase()) ||
             (node.title && node.title.toLowerCase().includes(pattern.toLowerCase()))
@@ -719,7 +1353,7 @@ class FloatingPanel {
         }
     }
 
-    findNodesInGroup(groupName, nodes) {
+    findNodesInGroup(groupName) {
         const groups = app.graph._groups || [];
         const matchingGroups = groups.filter(g =>
             g.title && g.title.toLowerCase().includes(groupName.toLowerCase())
@@ -747,15 +1381,19 @@ class FloatingPanel {
         const nodes = this.findNodesByPattern(pattern.pattern);
         const newMode = enable ? MODE_ALWAYS : (pattern.mode === 'bypass' ? MODE_BYPASS : MODE_NEVER);
 
+        if (app.graph.beforeChange) app.graph.beforeChange();
         for (const node of nodes) {
             node.mode = newMode;
         }
+        if (app.graph.afterChange) app.graph.afterChange();
 
         app.graph.setDirtyCanvas(true, false);
         this.refreshPatterns();
     }
 
     showAddPatternDialog() {
+        this._dialogOpen = true; // P0: pause polling
+
         const dialog = document.createElement("div");
         dialog.style.cssText = `
             position: fixed;
@@ -766,7 +1404,7 @@ class FloatingPanel {
             border: 1px solid #444;
             border-radius: 8px;
             padding: 16px;
-            z-index: 100002;
+            z-index: 100003;
             min-width: 300px;
             box-shadow: 0 8px 24px rgba(0,0,0,0.6);
         `;
@@ -802,13 +1440,10 @@ class FloatingPanel {
         patternInput.placeholder = "e.g., KSampler*, @GroupName, LoadImage";
         patternInput.style.cssText = nameInput.style.cssText;
 
+        // P0: XSS safe — use textContent, not innerHTML for help text
         const helpText = document.createElement("div");
-        helpText.innerHTML = `
-            <small style="color: #666;">
-                Patterns: <code>*</code> = wildcard, <code>@GroupName</code> = group, <code>!</code> = exclude
-            </small>
-        `;
-        helpText.style.marginBottom = "12px";
+        helpText.style.cssText = "margin-bottom: 12px; font-size: 11px; color: #666;";
+        helpText.textContent = "Patterns: * = wildcard, @GroupName = group, ! = exclude";
 
         const modeLabel = document.createElement("label");
         modeLabel.textContent = "Off Mode:";
@@ -824,13 +1459,24 @@ class FloatingPanel {
             border-radius: 4px;
             color: #e0e0e0;
         `;
-        modeSelect.innerHTML = `
-            <option value="mute">Mute (completely disabled)</option>
-            <option value="bypass">Bypass (pass-through)</option>
-        `;
+        const optMute = document.createElement("option");
+        optMute.value = "mute";
+        optMute.textContent = "Mute (completely disabled)";
+        const optBypass = document.createElement("option");
+        optBypass.value = "bypass";
+        optBypass.textContent = "Bypass (pass-through)";
+        modeSelect.appendChild(optMute);
+        modeSelect.appendChild(optBypass);
 
         const buttons = document.createElement("div");
         buttons.style.cssText = "display: flex; gap: 8px; justify-content: flex-end;";
+
+        const closeDialog = () => {
+            this._dialogOpen = false;
+            if (dialog.parentElement) document.body.removeChild(dialog);
+            if (overlay.parentElement) document.body.removeChild(overlay);
+            this._activeDialogs = this._activeDialogs.filter(d => d !== dialog && d !== overlay);
+        };
 
         const cancelBtn = document.createElement("button");
         cancelBtn.textContent = "Cancel";
@@ -842,10 +1488,7 @@ class FloatingPanel {
             color: #e0e0e0;
             cursor: pointer;
         `;
-        cancelBtn.addEventListener("click", () => {
-            document.body.removeChild(dialog);
-            document.body.removeChild(overlay);
-        });
+        cancelBtn.addEventListener("click", closeDialog);
 
         const addBtn = document.createElement("button");
         addBtn.textContent = "Add";
@@ -871,8 +1514,7 @@ class FloatingPanel {
                 this.refreshPatterns();
             }
 
-            document.body.removeChild(dialog);
-            document.body.removeChild(overlay);
+            closeDialog();
         });
 
         buttons.appendChild(cancelBtn);
@@ -894,12 +1536,12 @@ class FloatingPanel {
             position: fixed;
             inset: 0;
             background: rgba(0,0,0,0.5);
-            z-index: 100001;
+            z-index: 100002;
         `;
-        overlay.addEventListener("click", () => {
-            document.body.removeChild(dialog);
-            document.body.removeChild(overlay);
-        });
+        overlay.addEventListener("click", closeDialog);
+
+        // Track for cleanup (P1)
+        this._activeDialogs.push(dialog, overlay);
 
         document.body.appendChild(overlay);
         document.body.appendChild(dialog);
@@ -916,11 +1558,17 @@ class FloatingPanel {
     }
 
     startRefreshLoop() {
-        // Refresh every 500ms to catch group changes
         this.refreshInterval = setInterval(() => {
+            // P0: pause during dialogs, skip if not visible
+            if (this._dialogOpen) return;
             if (this.isVisible && !this.isCollapsed && app.graph) {
-                this.refreshGroups();
-                this.refreshPatterns();
+                // P0: try/catch prevents one crash from killing the loop
+                try {
+                    this.refreshGroups();
+                    this.refreshPatterns();
+                } catch (e) {
+                    console.error("[FloatingPanel] Refresh error:", e);
+                }
             }
         }, 500);
     }
@@ -929,6 +1577,7 @@ class FloatingPanel {
         if (this.refreshInterval) {
             clearInterval(this.refreshInterval);
         }
+        this._closeAllDialogs();
         if (this.container && this.container.parentElement) {
             this.container.parentElement.removeChild(this.container);
         }
@@ -955,7 +1604,7 @@ app.registerExtension({
 
         // Wait for app to be ready, with timeout to avoid infinite hang
         if (!app.graph) {
-            await new Promise((resolve, reject) => {
+            await new Promise((resolve) => {
                 let elapsed = 0;
                 const check = setInterval(() => {
                     elapsed += 100;
