@@ -3,14 +3,19 @@ NV VACE Pre-Pass Reference
 
 Multi-frame VACE reference conditioning for cascaded video generation.
 
-Accepts hero frames (identity anchors) and optional bridge frames (temporal
-continuity from previous chunk) and composes them as R2V conditioning
-alongside the V2V control video.
+Accepts reference frames (current chunk's Kling output) and an optional
+identity anchor (chunk 0's Kling output, frozen across all chunks) to
+combat identity drift in chunked pipelines.
+
+Prepend order: [identity_anchor, reference_frames, control_video]
+- identity_anchor at t=0: exploits WAN 2.2 training prior (t=0 = identity source)
+- reference_frames after: RoPE locality gives stronger attention to generation start
+- control_video last: grey masked inpaint target (mask=1, generate regions)
 
 Key differences from native WanVaceToVideo:
-- Separate hero and bridge frame inputs for identity-aware reference selection
-- Hero-first prepend ordering (exploits WAN 2.2 t=0 training prior + RoPE locality)
-- Bridge quality floor via Laplacian variance sharpness gating
+- Multiple reference frames (not just 1)
+- Optional cross-chunk identity anchor for drift prevention
+- Sharpness quality floor on identity anchor frames
 - Frame repeat (4x default) for 3D VAE temporal compression preservation
 - Uniform or adaptive (IFS) sampling of N reference frames from each pool
 - Internal upscaling of reference frames to target resolution
@@ -22,10 +27,10 @@ Based on research validation:
 - VINs (arXiv 2503.17539): parallel chunks converge with shared global signal
 - LongDiff (CVPR 2025): Informative Frame Selection +1.8% subject consistency vs uniform
 
-Hero-first ordering validated against WAN 2.2 VACE architecture:
+Identity-anchor-first ordering validated against WAN 2.2 VACE architecture:
 - Conv3d(kernel=(1,2,2)): no temporal mixing in patch embedding
 - Full self-attention (non-causal) in VaceWanAttentionBlock
-- RoPE encodes relative (t,h,w) distance — locality bias for bridges near generation
+- RoPE encodes relative (t,h,w) distance — locality bias for refs near generation
 - Training prior: t=0 = identity anchor (R2V conditioning pattern)
 See: ref_selection_debate/vace_ordering_synthesis.md
 
@@ -154,18 +159,17 @@ class NV_VacePrePassReference:
     """
     Multi-frame VACE reference conditioning for pre-pass cascaded generation.
 
-    Accepts hero frames (identity anchors, typically from chunk 0's raw Kling crop)
-    and optional bridge frames (last N frames from previous chunk's raw Kling crop)
-    and composes them into VACE conditioning where:
-    - Reference frames: mask=0 (preserve), encoded with neutral reactive channel
-    - Control video: mask=1 (generate), encoded with concept decoupling
+    Accepts reference frames (current chunk's Kling output) and an optional
+    identity anchor (chunk 0's Kling output) to combat cross-chunk identity drift.
 
-    Hero-first prepend ordering: [heroes, bridges, control_video]
-    - Heroes at t=0 exploit WAN 2.2's R2V training prior (t=0 = identity anchor)
-    - Bridges closest to generation start exploit RoPE locality for smooth transitions
+    Prepend order: [identity_anchor, reference_frames, control_video]
+    - identity_anchor at t=0: WAN 2.2 training prior treats t=0 as identity source
+    - reference_frames after: RoPE locality for pose/expression guidance
+    - control_video: grey masked inpaint target (mask=1 generate)
 
-    Use this for cascaded workflows where a low-res pre-pass pins style,
-    and parallel high-res chunks reference those frames for consistency.
+    Wiring per chunk:
+    - Chunk 0: reference_frames=Chunk0 Kling, identity_anchor=not connected
+    - Chunk N: reference_frames=ChunkN Kling, identity_anchor=Chunk0 Kling
     """
 
     @classmethod
@@ -188,47 +192,49 @@ class NV_VacePrePassReference:
                                            "reference latents are pre-scaled so their effective influence equals this value "
                                            "after the model applies vace_strength. E.g., strength=0.35 + ref_strength=1.0 "
                                            "means beauty control at 0.35, references at 1.0."}),
-                "hero_frames": ("IMAGE", {
-                    "tooltip": "Identity anchor frames — typically from chunk 0's raw Kling crop output (pre-stitch). "
-                               "User-curated, frozen across all chunks. These are prepended FIRST at t=0, "
-                               "exploiting WAN 2.2's training prior that treats t=0 as the primary identity source."
+                "reference_frames": ("IMAGE", {
+                    "tooltip": "This chunk's Kling output — the primary identity/pose/expression reference. "
+                               "These frames tell VACE what the face/body should look like in the masked region. "
+                               "Sampled down to num_refs frames using ref_sampling mode."
                 }),
-                "num_heroes": ("INT", {"default": 3, "min": 1, "max": 10, "step": 1,
-                               "tooltip": "Number of hero frames to sample from hero_frames input. "
-                                          "1-5 is the sweet spot; >5 gives diminishing returns."}),
-                "hero_sampling": (["uniform", "adaptive (IFS)"], {
+                "num_refs": ("INT", {"default": 5, "min": 1, "max": 20, "step": 1,
+                             "tooltip": "Number of reference frames to sample from reference_frames. "
+                                        "1-5 is the sweet spot; >5 gives diminishing returns."}),
+                "ref_sampling": (["uniform", "adaptive (IFS)"], {
                     "default": "uniform",
-                    "tooltip": "How to select hero frames. 'uniform' = evenly spaced. "
-                               "'adaptive (IFS)' = LongDiff-style Informative Frame Selection."
+                    "tooltip": "How to select reference frames. 'uniform' = evenly spaced. "
+                               "'adaptive (IFS)' = LongDiff-style Informative Frame Selection: "
+                               "scores each frame by image entropy + temporal change, picks the "
+                               "best per temporal bin. Better for content with uneven motion."
                 }),
                 "frame_repeat": ("INT", {"default": 4, "min": 1, "max": 8, "step": 1,
                                 "tooltip": "Repeat each reference N times for 3D VAE temporal compression "
                                            "(4 recommended for Wan 2.1, prevents 6.5%% identity drop per SkyReels-A2)"}),
             },
             "optional": {
-                "bridge_frames": ("IMAGE", {
-                    "tooltip": "Temporal continuity frames — typically last 2 frames from previous chunk's "
-                               "raw Kling crop output (pre-stitch). Slide forward per chunk. "
-                               "Prepended AFTER heroes, closest to generation start for RoPE locality benefit. "
+                "identity_anchor": ("IMAGE", {
+                    "tooltip": "Cross-chunk identity lock — typically chunk 0's Kling output, frozen for all chunks. "
+                               "Prepended FIRST at t=0, exploiting WAN 2.2's training prior that treats t=0 as the "
+                               "primary identity source. Only needed for chunks 1+ to prevent identity drift. "
                                "Subject to sharpness quality floor (min_sharpness)."
                 }),
-                "num_bridges": ("INT", {"default": 2, "min": 1, "max": 10, "step": 1,
-                                "tooltip": "Number of bridge frames to sample from bridge_frames input."}),
-                "bridge_sampling": (["uniform", "adaptive (IFS)"], {
-                    "default": "adaptive (IFS)",
-                    "tooltip": "How to select bridge frames. 'adaptive (IFS)' recommended — "
-                               "bridges benefit from content-change-aware selection."
+                "num_anchors": ("INT", {"default": 3, "min": 1, "max": 10, "step": 1,
+                                "tooltip": "Number of identity anchor frames to sample. "
+                                           "1-3 recommended for identity anchoring."}),
+                "anchor_sampling": (["uniform", "adaptive (IFS)"], {
+                    "default": "uniform",
+                    "tooltip": "How to select identity anchor frames."
                 }),
                 "min_sharpness": ("FLOAT", {"default": 50.0, "min": 0.0, "max": 10000.0, "step": 1.0,
-                                  "tooltip": "Minimum Laplacian variance for bridge frames. Frames below this "
+                                  "tooltip": "Minimum Laplacian variance for identity anchor frames. Frames below this "
                                              "threshold are rejected before sampling. Set to 0 to disable. "
-                                             "Heroes bypass this filter (user-curated)."}),
+                                             "reference_frames bypass this filter (current chunk's own output)."}),
                 "control_video": ("IMAGE", {
-                    "tooltip": "Control video for VACE V2V conditioning (e.g., 3D render). "
-                               "Will be sliced to 'length' frames."
+                    "tooltip": "Grey masked inpaint video — the generation target. Mask=1 regions are where "
+                               "VACE will paint new content using the reference frames as identity guide."
                 }),
                 "control_masks": ("MASK", {
-                    "tooltip": "Optional mask for control video regions."
+                    "tooltip": "Inpaint mask for control video. mask=1 = generate, mask=0 = preserve."
                 }),
             }
         }
@@ -238,82 +244,79 @@ class NV_VacePrePassReference:
     FUNCTION = "execute"
     CATEGORY = "NV_Utils"
     DESCRIPTION = (
-        "Multi-frame VACE reference for cascaded pre-pass workflows with hero/bridge separation. "
-        "Heroes (identity anchors from chunk 0) are prepended first at t=0. "
-        "Bridges (tail frames from previous chunk) are prepended after, closest to generation. "
-        "Connect raw Kling crop outputs — NOT stitched composites."
+        "Multi-frame VACE reference for cascaded pre-pass workflows. "
+        "Wire this chunk's Kling output to reference_frames. "
+        "Optionally wire chunk 0's Kling output to identity_anchor for cross-chunk identity lock. "
+        "Wire grey masked inpaint video to control_video."
     )
 
     def execute(self, positive, negative, vae, width, height, length, batch_size, strength,
-                ref_strength, hero_frames, num_heroes, hero_sampling, frame_repeat,
-                bridge_frames=None, num_bridges=2, bridge_sampling="adaptive (IFS)",
+                ref_strength, reference_frames, num_refs, ref_sampling, frame_repeat,
+                identity_anchor=None, num_anchors=3, anchor_sampling="uniform",
                 min_sharpness=50.0, control_video=None, control_masks=None):
 
         latent_length = ((length - 1) // 4) + 1
 
-        # === Step 1a: Sample hero frames ===
-        hero_indices, hero_scores = _sample_frames(hero_frames, num_heroes, hero_sampling)
-        sampled_heroes = hero_frames[hero_indices]
-        print(f"[NV_VacePrePassReference] Sampled {len(hero_indices)} hero frames "
-              f"(indices: {hero_indices}, mode: {hero_sampling}) from {hero_frames.shape[0]} available")
-        if hero_scores is not None:
-            print(f"[NV_VacePrePassReference] Hero IFS scores: "
-                  f"{', '.join(f'[{idx}]={hero_scores[idx]:.3f}' for idx in hero_indices)}")
+        # === Step 1a: Sample reference frames (current chunk's Kling output) ===
+        ref_indices, ref_scores = _sample_frames(reference_frames, num_refs, ref_sampling)
+        sampled_refs = reference_frames[ref_indices]
+        print(f"[NV_VacePrePassReference] Sampled {len(ref_indices)} reference frames "
+              f"(indices: {ref_indices}, mode: {ref_sampling}) from {reference_frames.shape[0]} available")
+        if ref_scores is not None:
+            print(f"[NV_VacePrePassReference] Ref IFS scores: "
+                  f"{', '.join(f'[{idx}]={ref_scores[idx]:.3f}' for idx in ref_indices)}")
 
-        # === Step 1b: Sample bridge frames (optional, with quality floor) ===
-        sampled_bridges = None
-        if bridge_frames is not None:
-            total_bridges_available = bridge_frames.shape[0]
+        # === Step 1b: Sample identity anchor frames (optional, with quality floor) ===
+        sampled_anchors = None
+        if identity_anchor is not None:
+            total_anchors_available = identity_anchor.shape[0]
 
-            # Apply sharpness quality floor (heroes bypass this — user-curated)
+            # Apply sharpness quality floor (reference_frames bypass this — current chunk's own output)
             if min_sharpness > 0:
-                sharpness = _compute_sharpness(bridge_frames)
+                sharpness = _compute_sharpness(identity_anchor)
                 passed_mask = sharpness >= min_sharpness
                 passed_count = int(passed_mask.sum())
-                print(f"[NV_VacePrePassReference] Bridge sharpness filter: "
-                      f"{passed_count}/{total_bridges_available} passed "
+                print(f"[NV_VacePrePassReference] Identity anchor sharpness filter: "
+                      f"{passed_count}/{total_anchors_available} passed "
                       f"(threshold={min_sharpness:.1f}, "
                       f"range={sharpness.min():.1f}-{sharpness.max():.1f})")
 
                 if passed_count == 0:
-                    print(f"[NV_VacePrePassReference] WARNING: All bridge frames below sharpness threshold. "
-                          f"Skipping bridges entirely.")
+                    print(f"[NV_VacePrePassReference] WARNING: All identity anchor frames below sharpness threshold. "
+                          f"Skipping identity anchor entirely.")
                 else:
-                    # Extract passing frames and sample from them
                     passed_indices = np.where(passed_mask)[0]
-                    passed_frames = bridge_frames[passed_indices]
-                    bridge_count = min(num_bridges, passed_count)
-                    sub_indices, bridge_scores = _sample_frames(passed_frames, bridge_count, bridge_sampling)
-                    # Map sub-indices back to original bridge_frames indices
+                    passed_frames = identity_anchor[passed_indices]
+                    anchor_count = min(num_anchors, passed_count)
+                    sub_indices, anchor_scores = _sample_frames(passed_frames, anchor_count, anchor_sampling)
                     original_indices = [int(passed_indices[i]) for i in sub_indices]
-                    sampled_bridges = bridge_frames[original_indices]
-                    print(f"[NV_VacePrePassReference] Sampled {len(original_indices)} bridge frames "
-                          f"(original indices: {original_indices}, mode: {bridge_sampling})")
-                    if bridge_scores is not None:
-                        print(f"[NV_VacePrePassReference] Bridge IFS scores: "
-                              f"{', '.join(f'[{sub_indices[j]}]={bridge_scores[sub_indices[j]]:.3f}' for j in range(len(sub_indices)))}")
+                    sampled_anchors = identity_anchor[original_indices]
+                    print(f"[NV_VacePrePassReference] Sampled {len(original_indices)} identity anchor frames "
+                          f"(original indices: {original_indices}, mode: {anchor_sampling})")
+                    if anchor_scores is not None:
+                        print(f"[NV_VacePrePassReference] Anchor IFS scores: "
+                              f"{', '.join(f'[{sub_indices[j]}]={anchor_scores[sub_indices[j]]:.3f}' for j in range(len(sub_indices)))}")
             else:
-                # No quality floor — sample directly
-                bridge_indices, bridge_scores = _sample_frames(bridge_frames, num_bridges, bridge_sampling)
-                sampled_bridges = bridge_frames[bridge_indices]
-                print(f"[NV_VacePrePassReference] Sampled {len(bridge_indices)} bridge frames "
-                      f"(indices: {bridge_indices}, mode: {bridge_sampling}) "
-                      f"from {total_bridges_available} available")
-                if bridge_scores is not None:
-                    print(f"[NV_VacePrePassReference] Bridge IFS scores: "
-                          f"{', '.join(f'[{idx}]={bridge_scores[idx]:.3f}' for idx in bridge_indices)}")
+                anchor_indices, anchor_scores = _sample_frames(identity_anchor, num_anchors, anchor_sampling)
+                sampled_anchors = identity_anchor[anchor_indices]
+                print(f"[NV_VacePrePassReference] Sampled {len(anchor_indices)} identity anchor frames "
+                      f"(indices: {anchor_indices}, mode: {anchor_sampling}) "
+                      f"from {total_anchors_available} available")
+                if anchor_scores is not None:
+                    print(f"[NV_VacePrePassReference] Anchor IFS scores: "
+                          f"{', '.join(f'[{idx}]={anchor_scores[idx]:.3f}' for idx in anchor_indices)}")
 
-        # === Step 1c: Concatenate [heroes, bridges] — heroes FIRST ===
-        # Hero-first ordering exploits:
+        # === Step 1c: Concatenate [identity_anchor, reference_frames] — anchor FIRST ===
+        # Anchor-first ordering exploits:
         # 1. WAN 2.2 training prior: t=0 = identity anchor
-        # 2. RoPE locality: bridges closest to generation start get stronger local attention
-        if sampled_bridges is not None:
-            all_refs = torch.cat([sampled_heroes, sampled_bridges], dim=0)
-            print(f"[NV_VacePrePassReference] Combined refs: {sampled_heroes.shape[0]} heroes + "
-                  f"{sampled_bridges.shape[0]} bridges = {all_refs.shape[0]} total (hero-first order)")
+        # 2. RoPE locality: reference_frames closest to generation start get stronger local attention
+        if sampled_anchors is not None:
+            all_refs = torch.cat([sampled_anchors, sampled_refs], dim=0)
+            print(f"[NV_VacePrePassReference] Combined refs: {sampled_anchors.shape[0]} anchors + "
+                  f"{sampled_refs.shape[0]} refs = {all_refs.shape[0]} total (anchor-first order)")
         else:
-            all_refs = sampled_heroes
-            print(f"[NV_VacePrePassReference] Refs: {all_refs.shape[0]} heroes only (no bridges)")
+            all_refs = sampled_refs
+            print(f"[NV_VacePrePassReference] Refs: {all_refs.shape[0]} reference frames only (no identity anchor)")
 
         # Frame repeat: duplicate each reference frame_repeat times in pixel space
         # [r1,r1,r1,r1, r2,r2,r2,r2, ...] for 3D VAE temporal compression
@@ -347,9 +350,9 @@ class NV_VacePrePassReference:
         ref_latent_16ch = ref_latent.clone()
 
         # Free pixel-space reference tensors
-        del repeated, all_refs, sampled_heroes
-        if sampled_bridges is not None:
-            del sampled_bridges
+        del repeated, all_refs, sampled_refs
+        if sampled_anchors is not None:
+            del sampled_anchors
 
         # Build 32ch reference: 16ch encoded + 16ch neutral reactive
         # This matches native WanVaceToVideo reference_image encoding:

@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- NV_VacePrePassReference: separate hero/bridge frame inputs with hero-first prepend ordering for identity-aware VACE reference conditioning. Heroes (identity anchors from chunk 0) prepended at t=0, bridges (tail frames from previous chunk) prepended closest to generation start. Bridge quality floor via Laplacian variance sharpness gating. Validated against WAN 2.2 VACE architecture (Conv3d kernel, RoPE locality, training prior).
+- NV_VacePrePassReference: optional `identity_anchor` input for cross-chunk identity lock. Wire chunk 0's Kling output to anchor identity across all chunks. Prepended at t=0 (WAN 2.2 training prior), with sharpness quality floor. Original `reference_frames` input unchanged (current chunk's Kling output). IFS adaptive sampling available for both pools.
 - Variables Pool system — each variable can have multiple candidate source connections. Switch between candidates via pool chips in the Variables Panel. Right-click any node output → "Add to Variable Pool" to register candidates.
 - `healPool()` migration — automatically repairs orphaned pool entries and stale metadata from older variable system versions on workflow load.
 - Pool purge controls — refresh button purges all stale candidates; per-variable "Purge Stale Pool Entries" in row context menu.
