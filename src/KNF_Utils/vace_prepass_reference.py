@@ -113,7 +113,9 @@ def _compute_sharpness(frames):
         [T] numpy array of sharpness scores (Laplacian variance)
     """
     gray = (0.299 * frames[..., 0] + 0.587 * frames[..., 1] + 0.114 * frames[..., 2])
-    gray = gray.to(torch.float32).unsqueeze(1)  # [T, 1, H, W]
+    # Scale to [0, 255] so Laplacian variance matches OpenCV convention
+    # (threshold=50 is meaningful; [0,1] range would give ~0.001 values)
+    gray = (gray * 255.0).to(torch.float32).unsqueeze(1)  # [T, 1, H, W]
     kernel = torch.tensor(
         [[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]],
         dtype=torch.float32, device=gray.device
@@ -279,7 +281,7 @@ class NV_VacePrePassReference:
                 print(f"[NV_VacePrePassReference] Identity anchor sharpness filter: "
                       f"{passed_count}/{total_anchors_available} passed "
                       f"(threshold={min_sharpness:.1f}, "
-                      f"range={sharpness.min():.1f}-{sharpness.max():.1f})")
+                      f"range={sharpness.min():.2f}-{sharpness.max():.2f})")
 
                 if passed_count == 0:
                     print(f"[NV_VacePrePassReference] WARNING: All identity anchor frames below sharpness threshold. "
