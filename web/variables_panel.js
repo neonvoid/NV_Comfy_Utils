@@ -131,7 +131,11 @@ class VariablesPanel {
         addBtn.style.fontWeight = "bold";
         addBtn.style.fontSize = "16px";
 
-        const refreshBtn = this._createIconButton("\u21BB", "Refresh", () => {
+        const refreshBtn = this._createIconButton("\u21BB", "Refresh & purge stale", () => {
+            const purged = variableManager.purgeAllStale();
+            if (purged > 0) {
+                console.log(`[VariablesPanel] Purged ${purged} stale pool entries`);
+            }
             this._lastHash = "";
             this.refresh();
         });
@@ -816,6 +820,11 @@ class VariablesPanel {
         // Build a simple dropdown menu at click position
         const existing = document.getElementById("nv-var-context-menu");
         if (existing) existing.remove();
+        // Clean up any previous close handler
+        if (this._rowMenuCloseHandler) {
+            document.removeEventListener("mousedown", this._rowMenuCloseHandler);
+            this._rowMenuCloseHandler = null;
+        }
 
         const menu = document.createElement("div");
         menu.id = "nv-var-context-menu";
@@ -866,6 +875,18 @@ class VariablesPanel {
                     this.refresh();
                 }
             },
+            {
+                label: "Purge Stale Pool Entries",
+                enabled: variableManager.getPool(info.name).some(c => c.status === "stale"),
+                action: () => {
+                    const purged = variableManager.purgeStale(info.name);
+                    if (purged > 0) {
+                        console.log(`[VariablesPanel] Purged ${purged} stale entries from "${info.name}"`);
+                    }
+                    this._lastHash = "";
+                    this.refresh();
+                }
+            },
             null, // separator
             {
                 label: "Delete Variable",
@@ -910,8 +931,10 @@ class VariablesPanel {
             if (!menu.contains(e.target)) {
                 menu.remove();
                 document.removeEventListener("mousedown", closeMenu);
+                this._rowMenuCloseHandler = null;
             }
         };
+        this._rowMenuCloseHandler = closeMenu;
         setTimeout(() => document.addEventListener("mousedown", closeMenu), 0);
     }
 
@@ -1320,12 +1343,12 @@ class VariablesPanel {
                 cursor: pointer;
                 transition: all 0.15s;
                 white-space: nowrap;
-                max-width: 120px;
+                max-width: 140px;
                 overflow: hidden;
                 text-overflow: ellipsis;
-                border: 1px solid ${candidate.isActive ? typeColor : '#555'};
-                background: ${candidate.isActive ? typeColor + '33' : '#333'};
-                color: ${candidate.status === 'stale' ? '#666' : (candidate.isActive ? '#fff' : '#bbb')};
+                border: 1px ${candidate.status === 'rebindable' ? 'dashed' : 'solid'} ${candidate.isActive ? typeColor : (candidate.status === 'rebindable' ? '#d97706' : '#555')};
+                background: ${candidate.isActive ? typeColor + '33' : (candidate.status === 'rebindable' ? '#44330a' : '#333')};
+                color: ${candidate.status === 'stale' ? '#666' : (candidate.status === 'rebindable' ? '#d97706' : (candidate.isActive ? '#fff' : '#bbb'))};
                 ${candidate.status === 'stale' ? 'text-decoration: line-through;' : ''}
             `;
 
@@ -1333,13 +1356,15 @@ class VariablesPanel {
             let displayText = candidate.label;
             if (candidate.status === "stale") {
                 displayText += " (missing)";
+            } else if (candidate.status === "rebindable") {
+                displayText += " (rebind?)";
             } else if (candidate.status === "type_mismatch") {
                 displayText += " (type!)";
             }
             chip.textContent = displayText;
-            chip.title = `${candidate.label}\nNode: ${candidate.nodeTitle} (${candidate.nodeType})\nSlot: ${candidate.slotIndex}\nStatus: ${candidate.status}`;
+            chip.title = `${candidate.label}\nNode: ${candidate.nodeTitle} (${candidate.nodeType})\nSlot: ${candidate.slotIndex}\nStatus: ${candidate.status}${candidate.reboundNodeId ? `\nSuggested rebind → node ${candidate.reboundNodeId}` : ''}`;
 
-            // Click to switch
+            // Click to switch (ok status) or accept rebind (rebindable status)
             if (!candidate.isActive && candidate.status === "ok") {
                 chip.addEventListener("click", (e) => {
                     e.stopPropagation();
@@ -1354,6 +1379,26 @@ class VariablesPanel {
                 chip.addEventListener("mouseleave", () => {
                     chip.style.borderColor = '#555';
                     chip.style.background = '#333';
+                });
+            } else if (candidate.status === "rebindable" && candidate.reboundNodeId) {
+                // Click to accept the rebind suggestion
+                chip.addEventListener("click", (e) => {
+                    e.stopPropagation();
+                    const success = variableManager.rebindCandidate(info.name, candidate.id, candidate.reboundNodeId);
+                    if (!success) {
+                        // Rebind target may have been deleted between render and click — refresh to update status
+                        console.warn(`[VariablesPanel] Rebind failed for "${candidate.label}" — target node may have changed`);
+                    }
+                    this._lastHash = "";
+                    this.refresh();
+                });
+                chip.addEventListener("mouseenter", () => {
+                    chip.style.borderColor = '#f59e0b';
+                    chip.style.background = '#553a0a';
+                });
+                chip.addEventListener("mouseleave", () => {
+                    chip.style.borderColor = '#d97706';
+                    chip.style.background = '#44330a';
                 });
             }
 
@@ -1408,18 +1453,33 @@ class VariablesPanel {
                 enabled: true,
                 action: () => this._showRenameCandidateDialog(info, candidate)
             },
-            null,
-            {
-                label: "Remove from Pool",
+        ];
+
+        // Rebind option for rebindable candidates
+        if (candidate.status === "rebindable" && candidate.reboundNodeId) {
+            items.push({
+                label: "Accept Rebind",
                 enabled: true,
-                color: "#f44",
+                color: "#d97706",
                 action: () => {
-                    variableManager.removeFromPool(info.name, candidate.id);
+                    variableManager.rebindCandidate(info.name, candidate.id, candidate.reboundNodeId);
                     this._lastHash = "";
                     this.refresh();
                 }
-            },
-        ];
+            });
+        }
+
+        items.push(null); // separator
+        items.push({
+            label: "Remove from Pool",
+            enabled: true,
+            color: "#f44",
+            action: () => {
+                variableManager.removeFromPool(info.name, candidate.id);
+                this._lastHash = "";
+                this.refresh();
+            }
+        });
 
         for (const item of items) {
             if (item === null) {
@@ -1764,7 +1824,11 @@ class VariablesPanel {
             pointer-events: none;
             white-space: nowrap;
         `;
-        ghost.innerHTML = `<span style="color:${typeColor}; margin-right: 4px;">\u25CF</span> ${varName}`;
+        const ghostDot = document.createElement("span");
+        ghostDot.style.cssText = `color:${typeColor}; margin-right: 4px;`;
+        ghostDot.textContent = "\u25CF";
+        ghost.appendChild(ghostDot);
+        ghost.appendChild(document.createTextNode(` ${varName}`));
         document.body.appendChild(ghost);
         this._varDrag.ghost = ghost;
     }

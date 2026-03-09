@@ -121,6 +121,7 @@ const MANAGED_SETTER_Y_SPACING = 60;
 class VariableManager {
     constructor() {
         this._setterClass = null; // Stored after registration
+        this._inUndo = false; // Reentrancy guard for nested _withUndo calls
     }
 
     // ===== CRUD =====
@@ -134,42 +135,44 @@ class VariableManager {
     createVariable(name, explicitType = "*") {
         if (!name || !app.graph) return null;
 
-        // Check for duplicate name
-        const existing = this._findSetter(name);
-        if (existing) {
-            console.warn(`[VariableManager] Variable "${name}" already exists`);
-            return null;
-        }
+        return this._withUndo(() => {
+            // Check for duplicate name
+            const existing = this._findSetter(name);
+            if (existing) {
+                console.warn(`[VariableManager] Variable "${name}" already exists`);
+                return null;
+            }
 
-        // Create the SetVariableNode programmatically
-        const setter = LiteGraph.createNode("SetVariableNode");
-        if (!setter) {
-            console.error("[VariableManager] Failed to create SetVariableNode");
-            return null;
-        }
+            // Create the SetVariableNode programmatically
+            const setter = LiteGraph.createNode("SetVariableNode");
+            if (!setter) {
+                console.error("[VariableManager] Failed to create SetVariableNode");
+                return null;
+            }
 
-        // Configure as managed
-        setter.properties._nv_managed = true;
-        setter.properties.explicitType = explicitType;
-        setter.widgets[0].value = name;
-        setter.properties.previousName = name;
-        setter.title = `_var_${name}`;
+            // Configure as managed
+            setter.properties._nv_managed = true;
+            setter.properties.explicitType = explicitType;
+            setter.widgets[0].value = name;
+            setter.properties.previousName = name;
+            setter.title = `_var_${name}`;
 
-        // Set the input/output slot types to match the explicit type
-        if (explicitType && explicitType !== "*") {
-            setter.inputs[0].type = explicitType;
-            setter.outputs[0].type = explicitType;
-        }
+            // Set the input/output slot types to match the explicit type
+            if (explicitType && explicitType !== "*") {
+                setter.inputs[0].type = explicitType;
+                setter.outputs[0].type = explicitType;
+            }
 
-        // Position offscreen
-        const index = this._countManagedSetters();
-        setter.pos = [MANAGED_SETTER_X, index * MANAGED_SETTER_Y_SPACING];
+            // Position offscreen
+            const index = this._countManagedSetters();
+            setter.pos = [MANAGED_SETTER_X, index * MANAGED_SETTER_Y_SPACING];
 
-        app.graph.add(setter);
-        app.graph.setDirtyCanvas(true, false);
+            app.graph.add(setter);
+            app.graph.setDirtyCanvas(true, false);
 
-        console.log(`[VariableManager] Created variable "${name}" (type: ${explicitType})`);
-        return setter;
+            console.log(`[VariableManager] Created variable "${name}" (type: ${explicitType})`);
+            return setter;
+        });
     }
 
     /**
@@ -178,32 +181,34 @@ class VariableManager {
     deleteVariable(name) {
         if (!name || !app.graph) return;
 
-        const nodes = app.graph._nodes || [];
+        this._withUndo(() => {
+            const nodes = app.graph._nodes || [];
 
-        // Find all getters for this variable
-        const getters = nodes.filter(n =>
-            n.type === "GetVariableNode" &&
-            n.widgets?.[0]?.value === name
-        );
+            // Find all getters for this variable
+            const getters = nodes.filter(n =>
+                n.type === "GetVariableNode" &&
+                n.widgets?.[0]?.value === name
+            );
 
-        // Find all setters for this variable (should be 1, but handle duplicates)
-        const setters = nodes.filter(n =>
-            n.type === "SetVariableNode" &&
-            n.widgets?.[0]?.value === name
-        );
+            // Find all setters for this variable (should be 1, but handle duplicates)
+            const setters = nodes.filter(n =>
+                n.type === "SetVariableNode" &&
+                n.widgets?.[0]?.value === name
+            );
 
-        // Remove getters first
-        for (const getter of getters) {
-            app.graph.remove(getter);
-        }
+            // Remove getters first
+            for (const getter of getters) {
+                app.graph.remove(getter);
+            }
 
-        // Remove setters
-        for (const setter of setters) {
-            app.graph.remove(setter);
-        }
+            // Remove setters
+            for (const setter of setters) {
+                app.graph.remove(setter);
+            }
 
-        app.graph.setDirtyCanvas(true, false);
-        console.log(`[VariableManager] Deleted variable "${name}" (${setters.length} setter(s), ${getters.length} getter(s))`);
+            app.graph.setDirtyCanvas(true, false);
+            console.log(`[VariableManager] Deleted variable "${name}" (${setters.length} setter(s), ${getters.length} getter(s))`);
+        });
     }
 
     /**
@@ -212,45 +217,47 @@ class VariableManager {
     renameVariable(oldName, newName) {
         if (!oldName || !newName || oldName === newName || !app.graph) return false;
 
-        // Check for collision
-        const existingTarget = this._findSetter(newName);
-        if (existingTarget) {
-            console.warn(`[VariableManager] Cannot rename: "${newName}" already exists`);
-            return false;
-        }
-
-        const nodes = app.graph._nodes || [];
-
-        // Update all setters
-        const setters = nodes.filter(n =>
-            n.type === "SetVariableNode" &&
-            n.widgets?.[0]?.value === oldName
-        );
-        for (const setter of setters) {
-            setter.widgets[0].value = newName;
-            setter.properties.previousName = newName;
-            setter.title = `_var_${newName}`;
-        }
-
-        // Update all getters
-        const getters = nodes.filter(n =>
-            n.type === "GetVariableNode" &&
-            n.widgets?.[0]?.value === oldName
-        );
-        for (const getter of getters) {
-            getter.widgets[0].value = newName;
-        }
-
-        // Trigger type propagation
-        for (const setter of setters) {
-            if (setter.updateGetters) {
-                setter.updateGetters();
+        return this._withUndo(() => {
+            // Check for collision
+            const existingTarget = this._findSetter(newName);
+            if (existingTarget) {
+                console.warn(`[VariableManager] Cannot rename: "${newName}" already exists`);
+                return false;
             }
-        }
 
-        app.graph.setDirtyCanvas(true, false);
-        console.log(`[VariableManager] Renamed "${oldName}" → "${newName}"`);
-        return true;
+            const nodes = app.graph._nodes || [];
+
+            // Update all setters
+            const setters = nodes.filter(n =>
+                n.type === "SetVariableNode" &&
+                n.widgets?.[0]?.value === oldName
+            );
+            for (const setter of setters) {
+                setter.widgets[0].value = newName;
+                setter.properties.previousName = newName;
+                setter.title = `_var_${newName}`;
+            }
+
+            // Update all getters
+            const getters = nodes.filter(n =>
+                n.type === "GetVariableNode" &&
+                n.widgets?.[0]?.value === oldName
+            );
+            for (const getter of getters) {
+                getter.widgets[0].value = newName;
+            }
+
+            // Trigger type propagation
+            for (const setter of setters) {
+                if (setter.updateGetters) {
+                    setter.updateGetters();
+                }
+            }
+
+            app.graph.setDirtyCanvas(true, false);
+            console.log(`[VariableManager] Renamed "${oldName}" → "${newName}"`);
+            return true;
+        });
     }
 
     // ===== Source Assignment =====
@@ -262,32 +269,34 @@ class VariableManager {
     assignSource(varName, sourceNode, slotIndex) {
         if (!app.graph) return false;
 
-        let setter = this._findSetter(varName);
-        if (!setter) {
-            console.warn(`[VariableManager] Variable "${varName}" not found`);
-            return false;
-        }
+        return this._withUndo(() => {
+            let setter = this._findSetter(varName);
+            if (!setter) {
+                console.warn(`[VariableManager] Variable "${varName}" not found`);
+                return false;
+            }
 
-        // Remove existing input link on the setter
-        if (setter.inputs[0] && setter.inputs[0].link != null) {
-            app.graph.removeLink(setter.inputs[0].link);
-        }
+            // Remove existing input link on the setter
+            if (setter.inputs[0] && setter.inputs[0].link != null) {
+                app.graph.removeLink(setter.inputs[0].link);
+            }
 
-        // Create new link from source output to setter input
-        sourceNode.connect(slotIndex, setter, 0);
+            // Create new link from source output to setter input
+            sourceNode.connect(slotIndex, setter, 0);
 
-        // Store source reference in properties
-        setter.properties.sourceNodeId = sourceNode.id;
-        setter.properties.sourceSlotIndex = slotIndex;
+            // Store source reference in properties
+            setter.properties.sourceNodeId = sourceNode.id;
+            setter.properties.sourceSlotIndex = slotIndex;
 
-        // Update all getters to reflect the new type
-        if (setter.updateGetters) {
-            setter.updateGetters();
-        }
+            // Update all getters to reflect the new type
+            if (setter.updateGetters) {
+                setter.updateGetters();
+            }
 
-        app.graph.setDirtyCanvas(true, false);
-        console.log(`[VariableManager] Assigned source for "${varName}": node ${sourceNode.id} slot ${slotIndex}`);
-        return true;
+            app.graph.setDirtyCanvas(true, false);
+            console.log(`[VariableManager] Assigned source for "${varName}": node ${sourceNode.id} slot ${slotIndex}`);
+            return true;
+        });
     }
 
     /**
@@ -297,29 +306,31 @@ class VariableManager {
     setVariableType(varName, newType) {
         if (!app.graph) return false;
 
-        const setter = this._findSetter(varName);
-        if (!setter) return false;
+        return this._withUndo(() => {
+            const setter = this._findSetter(varName);
+            if (!setter) return false;
 
-        setter.properties.explicitType = newType;
+            setter.properties.explicitType = newType;
 
-        // Update setter slot types
-        if (newType && newType !== "*") {
-            setter.inputs[0].type = newType;
-            setter.outputs[0].type = newType;
-        } else {
-            // Revert to wildcard or connection-inferred type
-            setter.inputs[0].type = "*";
-            setter.outputs[0].type = "*";
-        }
+            // Update setter slot types
+            if (newType && newType !== "*") {
+                setter.inputs[0].type = newType;
+                setter.outputs[0].type = newType;
+            } else {
+                // Revert to wildcard or connection-inferred type
+                setter.inputs[0].type = "*";
+                setter.outputs[0].type = "*";
+            }
 
-        // Propagate to all getters
-        if (setter.updateGetters) {
-            setter.updateGetters();
-        }
+            // Propagate to all getters
+            if (setter.updateGetters) {
+                setter.updateGetters();
+            }
 
-        app.graph.setDirtyCanvas(true, false);
-        console.log(`[VariableManager] Set type for "${varName}" → ${newType}`);
-        return true;
+            app.graph.setDirtyCanvas(true, false);
+            console.log(`[VariableManager] Set type for "${varName}" → ${newType}`);
+            return true;
+        });
     }
 
     /**
@@ -338,22 +349,24 @@ class VariableManager {
     unassignSource(varName) {
         if (!app.graph) return false;
 
-        const setter = this._findSetter(varName);
-        if (!setter) return false;
+        return this._withUndo(() => {
+            const setter = this._findSetter(varName);
+            if (!setter) return false;
 
-        if (setter.inputs[0] && setter.inputs[0].link != null) {
-            app.graph.removeLink(setter.inputs[0].link);
-        }
+            if (setter.inputs[0] && setter.inputs[0].link != null) {
+                app.graph.removeLink(setter.inputs[0].link);
+            }
 
-        setter.properties.sourceNodeId = null;
-        setter.properties.sourceSlotIndex = null;
+            setter.properties.sourceNodeId = null;
+            setter.properties.sourceSlotIndex = null;
 
-        if (setter.updateGetters) {
-            setter.updateGetters();
-        }
+            if (setter.updateGetters) {
+                setter.updateGetters();
+            }
 
-        app.graph.setDirtyCanvas(true, false);
-        return true;
+            app.graph.setDirtyCanvas(true, false);
+            return true;
+        });
     }
 
     // ===== Source Pool =====
@@ -369,72 +382,74 @@ class VariableManager {
     addToPool(varName, nodeId, slotIndex, label) {
         if (!app.graph) return null;
 
-        const setter = this._findSetter(varName);
-        if (!setter) {
-            console.warn(`[VariableManager] Variable "${varName}" not found`);
-            return null;
-        }
+        return this._withUndo(() => {
+            const setter = this._findSetter(varName);
+            if (!setter) {
+                console.warn(`[VariableManager] Variable "${varName}" not found`);
+                return null;
+            }
 
-        const sourceNode = app.graph.getNodeById(nodeId);
-        if (!sourceNode) {
-            console.warn(`[VariableManager] Source node ${nodeId} not found`);
-            return null;
-        }
+            const sourceNode = app.graph.getNodeById(nodeId);
+            if (!sourceNode) {
+                console.warn(`[VariableManager] Source node ${nodeId} not found`);
+                return null;
+            }
 
-        // Type check: verify the source output is compatible
-        const varType = this._resolveType(setter);
-        const outputSlot = sourceNode.outputs?.[slotIndex];
-        if (!outputSlot) {
-            console.warn(`[VariableManager] Node ${nodeId} has no output slot ${slotIndex}`);
-            return null;
-        }
-        if (varType !== "*" && varType !== "unconnected" && outputSlot.type !== "*" && outputSlot.type !== varType) {
-            console.warn(`[VariableManager] Type mismatch: variable "${varName}" is ${varType}, source outputs ${outputSlot.type}`);
-            return null;
-        }
+            // Type check: verify the source output is compatible
+            const varType = this._resolveType(setter);
+            const outputSlot = sourceNode.outputs?.[slotIndex];
+            if (!outputSlot) {
+                console.warn(`[VariableManager] Node ${nodeId} has no output slot ${slotIndex}`);
+                return null;
+            }
+            if (this._isTypeIncompatible(varType, outputSlot.type)) {
+                console.warn(`[VariableManager] Type mismatch: variable "${varName}" is ${varType}, source outputs ${outputSlot.type}`);
+                return null;
+            }
 
-        // Initialize pool if needed
-        if (!setter.properties.sourceCandidates) {
-            setter.properties.sourceCandidates = [];
-        }
+            // Initialize pool if needed
+            if (!setter.properties.sourceCandidates) {
+                setter.properties.sourceCandidates = [];
+            }
 
-        // Check for duplicate (same nodeId + slotIndex)
-        const existing = setter.properties.sourceCandidates.find(
-            c => c.nodeId === nodeId && c.slotIndex === slotIndex
-        );
-        if (existing) {
-            console.log(`[VariableManager] Source already in pool for "${varName}"`);
-            return existing.id;
-        }
+            // Check for duplicate (same nodeId + slotIndex)
+            const existing = setter.properties.sourceCandidates.find(
+                c => c.nodeId === nodeId && c.slotIndex === slotIndex
+            );
+            if (existing) {
+                console.log(`[VariableManager] Source already in pool for "${varName}"`);
+                return existing.id;
+            }
 
-        // Generate a stable ID
-        const id = `pool_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+            // Generate a stable ID
+            const id = `pool_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
-        // Build label from node info if not provided
-        const outputName = outputSlot.name || `output_${slotIndex}`;
-        const nodeTitle = sourceNode.title || sourceNode.type;
-        const finalLabel = label || `${nodeTitle}:${outputName}`;
+            // Build label from node info if not provided
+            const outputName = outputSlot.name || `output_${slotIndex}`;
+            const nodeTitle = sourceNode.title || sourceNode.type;
+            const finalLabel = label || `${nodeTitle}:${outputName}`;
 
-        const candidate = {
-            id,
-            nodeId,
-            nodeTitle,
-            nodeType: sourceNode.type,
-            slotIndex,
-            outputType: outputSlot.type,
-            label: finalLabel,
-        };
+            const candidate = {
+                id,
+                nodeId,
+                nodeTitle,
+                nodeType: sourceNode.type,
+                slotIndex,
+                outputType: outputSlot.type,
+                label: finalLabel,
+            };
 
-        setter.properties.sourceCandidates.push(candidate);
+            setter.properties.sourceCandidates.push(candidate);
 
-        // If this is the first candidate and variable has no source, auto-activate it
-        if (setter.properties.sourceCandidates.length === 1 && !this._isSetterConnected(setter)) {
-            this._activateCandidate(setter, candidate);
-        }
+            // If this is the first candidate and variable has no source, auto-activate it
+            if (setter.properties.sourceCandidates.length === 1 && !this._isSetterConnected(setter)) {
+                this._activateCandidate(setter, candidate);
+            }
 
-        app.graph.setDirtyCanvas(true, false);
-        console.log(`[VariableManager] Added "${finalLabel}" to pool for "${varName}"`);
-        return id;
+            app.graph.setDirtyCanvas(true, false);
+            console.log(`[VariableManager] Added "${finalLabel}" to pool for "${varName}"`);
+            return id;
+        });
     }
 
     /**
@@ -444,29 +459,31 @@ class VariableManager {
     removeFromPool(varName, candidateId) {
         if (!app.graph) return false;
 
-        const setter = this._findSetter(varName);
-        if (!setter || !setter.properties.sourceCandidates) return false;
+        return this._withUndo(() => {
+            const setter = this._findSetter(varName);
+            if (!setter || !setter.properties.sourceCandidates) return false;
 
-        const idx = setter.properties.sourceCandidates.findIndex(c => c.id === candidateId);
-        if (idx === -1) return false;
+            const idx = setter.properties.sourceCandidates.findIndex(c => c.id === candidateId);
+            if (idx === -1) return false;
 
-        const wasActive = setter.properties.activeSourceId === candidateId;
-        setter.properties.sourceCandidates.splice(idx, 1);
+            const wasActive = setter.properties.activeSourceId === candidateId;
+            setter.properties.sourceCandidates.splice(idx, 1);
 
-        // If the active candidate was removed, switch to first valid remaining
-        if (wasActive) {
-            const validNext = this._findFirstValidCandidate(setter);
-            if (validNext) {
-                this._activateCandidate(setter, validNext);
-            } else {
-                setter.properties.activeSourceId = null;
-                this.unassignSource(varName);
+            // If the active candidate was removed, switch to first valid remaining
+            if (wasActive) {
+                const validNext = this._findFirstValidCandidate(setter);
+                if (validNext) {
+                    this._activateCandidate(setter, validNext);
+                } else {
+                    setter.properties.activeSourceId = null;
+                    this.unassignSource(varName);
+                }
             }
-        }
 
-        app.graph.setDirtyCanvas(true, false);
-        console.log(`[VariableManager] Removed candidate ${candidateId} from pool for "${varName}"`);
-        return true;
+            app.graph.setDirtyCanvas(true, false);
+            console.log(`[VariableManager] Removed candidate ${candidateId} from pool for "${varName}"`);
+            return true;
+        });
     }
 
     /**
@@ -476,30 +493,33 @@ class VariableManager {
     switchCandidate(varName, candidateId) {
         if (!app.graph) return false;
 
-        const setter = this._findSetter(varName);
-        if (!setter || !setter.properties.sourceCandidates) return false;
+        return this._withUndo(() => {
+            const setter = this._findSetter(varName);
+            if (!setter || !setter.properties.sourceCandidates) return false;
 
-        const candidate = setter.properties.sourceCandidates.find(c => c.id === candidateId);
-        if (!candidate) {
-            console.warn(`[VariableManager] Candidate ${candidateId} not found in pool for "${varName}"`);
-            return false;
-        }
+            const candidate = setter.properties.sourceCandidates.find(c => c.id === candidateId);
+            if (!candidate) {
+                console.warn(`[VariableManager] Candidate ${candidateId} not found in pool for "${varName}"`);
+                return false;
+            }
 
-        // Validate candidate is usable before attempting activation
-        const sourceNode = app.graph.getNodeById(candidate.nodeId);
-        if (!sourceNode) {
-            console.warn(`[VariableManager] Cannot switch: source node ${candidate.nodeId} not found`);
-            return false;
-        }
+            // Validate candidate is usable before attempting activation
+            const sourceNode = app.graph.getNodeById(candidate.nodeId);
+            if (!sourceNode) {
+                console.warn(`[VariableManager] Cannot switch: source node ${candidate.nodeId} not found`);
+                return false;
+            }
 
-        return this._activateCandidate(setter, candidate);
+            return this._activateCandidate(setter, candidate);
+        });
     }
 
     /**
-     * Get the source pool for a variable.
+     * Get the source pool for a variable (read-only — does NOT mutate candidates).
      * Returns the candidates array with a `status` field added to each:
      * - "ok": node exists and type matches
-     * - "stale": node no longer exists
+     * - "stale": node no longer exists (and no fuzzy match found)
+     * - "rebindable": node missing but a fuzzy match exists (call rebindCandidate to accept)
      * - "type_mismatch": node exists but output type changed
      */
     getPool(varName) {
@@ -507,17 +527,24 @@ class VariableManager {
         if (!setter || !setter.properties.sourceCandidates) return [];
 
         const varType = this._resolveType(setter);
+        const activeId = setter.properties.activeSourceId;
+
+        // Check if activeSourceId references a valid candidate (read-only — no mutation)
+        const activeExists = activeId
+            ? setter.properties.sourceCandidates.some(c => c.id === activeId)
+            : false;
 
         return setter.properties.sourceCandidates.map(c => {
             const node = app.graph.getNodeById(c.nodeId);
             let status = "ok";
+            let reboundNodeId = null;
 
             if (!node) {
-                // Attempt fuzzy re-bind by nodeType + title
+                // Check for fuzzy match but do NOT mutate — return as suggestion
                 const rebound = this._fuzzyRebind(c);
                 if (rebound) {
-                    c.nodeId = rebound.id;
-                    status = "ok";
+                    status = "rebindable";
+                    reboundNodeId = rebound.id;
                 } else {
                     status = "stale";
                 }
@@ -525,7 +552,7 @@ class VariableManager {
                 const outputSlot = node.outputs?.[c.slotIndex];
                 if (!outputSlot) {
                     status = "stale";
-                } else if (varType !== "*" && varType !== "unconnected" && outputSlot.type !== "*" && outputSlot.type !== varType) {
+                } else if (this._isTypeIncompatible(varType, outputSlot.type)) {
                     status = "type_mismatch";
                 }
             }
@@ -533,8 +560,50 @@ class VariableManager {
             return {
                 ...c,
                 status,
-                isActive: c.id === setter.properties.activeSourceId,
+                // Only mark as active if the activeSourceId still points to a real candidate
+                isActive: activeExists && c.id === activeId,
+                reboundNodeId,
             };
+        });
+    }
+
+    /**
+     * Accept a fuzzy rebind suggestion for a stale candidate.
+     * Call this after getPool() returns a candidate with status "rebindable".
+     */
+    rebindCandidate(varName, candidateId, newNodeId) {
+        return this._withUndo(() => {
+            const setter = this._findSetter(varName);
+            if (!setter?.properties?.sourceCandidates) return false;
+
+            const candidate = setter.properties.sourceCandidates.find(c => c.id === candidateId);
+            if (!candidate) return false;
+
+            const node = app.graph.getNodeById(newNodeId);
+            if (!node?.outputs?.[candidate.slotIndex]) return false;
+
+            // Validate type compatibility
+            const varType = this._resolveType(setter);
+            const outputSlot = node.outputs[candidate.slotIndex];
+            if (this._isTypeIncompatible(varType, outputSlot.type)) {
+                console.warn(`[VariableManager] Rebind rejected: type mismatch (${varType} vs ${outputSlot.type})`);
+                return false;
+            }
+
+            // Update all candidate fields to match the new node
+            candidate.nodeId = newNodeId;
+            candidate.nodeTitle = node.title || node.type;
+            candidate.nodeType = node.type;
+            candidate.outputType = outputSlot.type;
+
+            // Re-activate if this was the active candidate
+            if (setter.properties.activeSourceId === candidateId) {
+                this._activateCandidate(setter, candidate);
+            }
+
+            app.graph.setDirtyCanvas(true, false);
+            console.log(`[VariableManager] Rebound candidate "${candidate.label}" → node ${newNodeId}`);
+            return true;
         });
     }
 
@@ -542,15 +611,150 @@ class VariableManager {
      * Rename a pool candidate's label.
      */
     renameCandidateLabel(varName, candidateId, newLabel) {
-        const setter = this._findSetter(varName);
-        if (!setter || !setter.properties.sourceCandidates) return false;
+        return this._withUndo(() => {
+            const setter = this._findSetter(varName);
+            if (!setter || !setter.properties.sourceCandidates) return false;
 
-        const candidate = setter.properties.sourceCandidates.find(c => c.id === candidateId);
-        if (!candidate) return false;
+            const candidate = setter.properties.sourceCandidates.find(c => c.id === candidateId);
+            if (!candidate) return false;
 
-        candidate.label = newLabel;
-        app.graph.setDirtyCanvas(true, false);
-        return true;
+            candidate.label = newLabel;
+            app.graph.setDirtyCanvas(true, false);
+            return true;
+        });
+    }
+
+    /**
+     * Remove all stale candidates (node deleted, slot missing) from a variable's pool.
+     * Returns the number of entries purged.
+     */
+    purgeStale(varName) {
+        return this._withUndo(() => {
+            const setter = this._findSetter(varName);
+            if (!setter || !setter.properties.sourceCandidates) return 0;
+
+            const before = setter.properties.sourceCandidates.length;
+            setter.properties.sourceCandidates = setter.properties.sourceCandidates.filter(c => {
+                const node = app.graph.getNodeById(c.nodeId);
+                if (!node) return false;
+                if (!node.outputs?.[c.slotIndex]) return false;
+                return true;
+            });
+            const purged = before - setter.properties.sourceCandidates.length;
+
+            // If the active candidate was purged, fall back
+            if (purged > 0 && setter.properties.activeSourceId) {
+                const stillExists = setter.properties.sourceCandidates.some(
+                    c => c.id === setter.properties.activeSourceId
+                );
+                if (!stillExists) {
+                    const validNext = this._findFirstValidCandidate(setter);
+                    if (validNext) {
+                        this._activateCandidate(setter, validNext);
+                    } else {
+                        setter.properties.activeSourceId = null;
+                        this.unassignSource(varName);
+                    }
+                }
+            }
+
+            if (purged > 0) {
+                app.graph.setDirtyCanvas(true, false);
+                console.log(`[VariableManager] Purged ${purged} stale candidate(s) from "${varName}"`);
+            }
+            return purged;
+        });
+    }
+
+    /**
+     * Purge stale candidates across ALL variables.
+     * Returns total number of entries purged.
+     */
+    purgeAllStale() {
+        return this._withUndo(() => {
+            let total = 0;
+            for (const name of this.getVariableNames()) {
+                total += this.purgeStale(name);
+            }
+            return total;
+        });
+    }
+
+    /**
+     * Heal pool candidates across all variables on workflow load.
+     * Fixes issues from older versions where _fuzzyRebind silently mutated
+     * candidate nodeId/nodeTitle without updating other fields:
+     * - Removes candidates pointing to nonexistent nodes
+     * - Fixes stale nodeTitle/nodeType/outputType on valid candidates
+     * - Clears activeSourceId if it references a removed candidate
+     * - Cleans up orphaned sourceNodeId references on setters
+     * Called once during migrateExistingSetters().
+     * NOTE: Intentionally NOT wrapped in _withUndo() — this is a migration/repair
+     * operation that runs on workflow load, not a user-interactive action.
+     */
+    healPool() {
+        if (!app.graph) return;
+        let totalHealed = 0;
+        let totalPurged = 0;
+
+        for (const name of this.getVariableNames()) {
+            const setter = this._findSetter(name);
+            if (!setter?.properties?.sourceCandidates) continue;
+
+            const before = setter.properties.sourceCandidates.length;
+
+            // Filter out truly dead candidates and fix stale metadata on living ones
+            setter.properties.sourceCandidates = setter.properties.sourceCandidates.filter(c => {
+                const node = app.graph.getNodeById(c.nodeId);
+                if (!node) return false; // Purge — node is gone
+                const outputSlot = node.outputs?.[c.slotIndex];
+                if (!outputSlot) return false; // Purge — slot is gone
+
+                // Heal stale metadata fields
+                const currentTitle = node.title || node.type;
+                let healed = false;
+                if (c.nodeTitle !== currentTitle) {
+                    c.nodeTitle = currentTitle;
+                    healed = true;
+                }
+                if (c.nodeType !== node.type) {
+                    c.nodeType = node.type;
+                    healed = true;
+                }
+                if (c.outputType !== outputSlot.type) {
+                    c.outputType = outputSlot.type;
+                    healed = true;
+                }
+                if (healed) totalHealed++;
+                return true;
+            });
+
+            totalPurged += before - setter.properties.sourceCandidates.length;
+
+            // Validate activeSourceId
+            if (setter.properties.activeSourceId) {
+                const exists = setter.properties.sourceCandidates.some(
+                    c => c.id === setter.properties.activeSourceId
+                );
+                if (!exists) {
+                    setter.properties.activeSourceId = null;
+                }
+            }
+
+            // Clean up orphaned sourceNodeId reference
+            if (setter.properties.sourceNodeId) {
+                const sourceNode = app.graph.getNodeById(setter.properties.sourceNodeId);
+                if (!sourceNode) {
+                    setter.properties.sourceNodeId = null;
+                    setter.properties.sourceSlotIndex = null;
+                }
+            }
+        }
+
+        if (totalPurged > 0 || totalHealed > 0) {
+            console.log(`[VariableManager] healPool: purged ${totalPurged} dead candidates, healed ${totalHealed} stale metadata entries`);
+            app.graph.setDirtyCanvas(true, false);
+        }
     }
 
     /**
@@ -617,7 +821,7 @@ class VariableManager {
 
         // Validate type compatibility
         const varType = this._resolveType(setter);
-        if (varType !== "*" && varType !== "unconnected" && outputSlot.type !== "*" && outputSlot.type !== varType) {
+        if (this._isTypeIncompatible(varType, outputSlot.type)) {
             console.warn(`[VariableManager] Cannot activate: type mismatch (${varType} vs ${outputSlot.type})`);
             return false;
         }
@@ -657,25 +861,39 @@ class VariableManager {
             if (!node) continue;
             const outputSlot = node.outputs?.[c.slotIndex];
             if (!outputSlot) continue;
-            if (varType !== "*" && varType !== "unconnected" && outputSlot.type !== "*" && outputSlot.type !== varType) continue;
+            if (this._isTypeIncompatible(varType, outputSlot.type)) continue;
             return c;
         }
         return null;
     }
 
-    /** @private Attempt to re-bind a stale candidate by matching nodeType + title */
+    /**
+     * @private Attempt to find a fuzzy match for a stale candidate by nodeType + title + output type.
+     * Returns the matching node or null. Does NOT mutate the candidate.
+     */
     _fuzzyRebind(candidate) {
         if (!app.graph) return null;
         const nodes = app.graph._nodes || [];
+        let match = null;
+        let matchCount = 0;
 
-        // Try to find a node with matching type and similar title
         for (const node of nodes) {
-            if (node.type === candidate.nodeType) {
-                const title = node.title || node.type;
-                if (title === candidate.nodeTitle && node.outputs?.[candidate.slotIndex]) {
-                    return node;
-                }
-            }
+            if (node.type !== candidate.nodeType) continue;
+            const title = node.title || node.type;
+            if (title !== candidate.nodeTitle) continue;
+            const outputSlot = node.outputs?.[candidate.slotIndex];
+            if (!outputSlot) continue;
+            // Validate output type matches what the candidate originally had
+            if (candidate.outputType && outputSlot.type !== candidate.outputType) continue;
+
+            match = node;
+            matchCount++;
+        }
+
+        // Only return if exactly one match — ambiguous matches are unsafe
+        if (matchCount === 1) return match;
+        if (matchCount > 1) {
+            console.warn(`[VariableManager] Fuzzy rebind ambiguous: ${matchCount} nodes match "${candidate.nodeTitle}" (${candidate.nodeType})`);
         }
         return null;
     }
@@ -871,10 +1089,19 @@ class VariableManager {
     computeQuickHash() {
         if (!app.graph) return "";
         const nodes = app.graph._nodes || [];
+        // Build a set of live node IDs once for O(1) staleness checks
+        const liveNodeIds = new Set(nodes.map(n => n.id));
         let hash = "";
         for (const n of nodes) {
             if (n.type === "SetVariableNode" || n.type === "GetVariableNode") {
-                hash += `${n.id}=${n.widgets?.[0]?.value}|${n.inputs?.[0]?.type}|${n.inputs?.[0]?.link}|${n.properties?.explicitType}|${n.properties?.activeSourceId || ""},`;
+                let part = `${n.id}=${n.widgets?.[0]?.value}|${n.inputs?.[0]?.type}|${n.inputs?.[0]?.link}|${n.properties?.explicitType}|${n.properties?.activeSourceId || ""}`;
+                // Include pool candidate count + alive count so deletions trigger refresh
+                const candidates = n.properties?.sourceCandidates;
+                if (candidates && candidates.length > 0) {
+                    const aliveCount = candidates.filter(c => liveNodeIds.has(c.nodeId)).length;
+                    part += `|pool:${candidates.length}/${aliveCount}`;
+                }
+                hash += part + ",";
             }
         }
         return hash;
@@ -964,6 +1191,9 @@ class VariableManager {
         if (setters.length > 0) {
             app.graph.setDirtyCanvas(true, false);
         }
+
+        // Heal pool candidates — fix orphaned refs from older versions
+        this.healPool();
     }
 
     /**
@@ -991,6 +1221,27 @@ class VariableManager {
     }
 
     // ===== Private Helpers =====
+
+    /** @private Check if two types are incompatible (neither is wildcard/unconnected) */
+    _isTypeIncompatible(varType, slotType) {
+        if (varType === "*" || varType === "unconnected") return false;
+        if (slotType === "*") return false;
+        return slotType !== varType;
+    }
+
+    /** @private Wrap a graph-mutating operation in LiteGraph undo tracking.
+     *  Reentrant-safe: nested calls skip the bracket so only one undo entry is created. */
+    _withUndo(fn) {
+        if (this._inUndo) return fn(); // Already inside a transaction
+        this._inUndo = true;
+        if (app.graph?.beforeChange) app.graph.beforeChange();
+        try {
+            return fn();
+        } finally {
+            if (app.graph?.afterChange) app.graph.afterChange();
+            this._inUndo = false;
+        }
+    }
 
     _findSetter(name) {
         if (!app.graph) return null;

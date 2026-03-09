@@ -15,8 +15,11 @@ so they all match. Place this node between your VACE conditioning chain and
 the sampler.
 
 Padding semantics:
-- vace_frames pad: [neutral_16ch, process_out(zeros_16ch)] — matches the
-  "no control video" signal that WanVaceToVideo produces for empty regions
+- vace_frames pad: plain zeros for all 32ch — matches model_base.py
+  WAN21_Vace.extra_conds() default when no VACE conditioning exists.
+  After process_in, both 16ch halves become (-mean/std), a symmetric
+  neutral signal. Do NOT use process_out(zeros) — Wan21 adds latents_mean,
+  creating an asymmetric signal.
 - vace_mask pad: ones — mask=1 means "generate freely, no guidance here"
 - vace_strength: unchanged (per-entry scalar, not temporal)
 """

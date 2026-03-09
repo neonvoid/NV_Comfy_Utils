@@ -8,6 +8,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- NV_VacePrePassReference: separate hero/bridge frame inputs with hero-first prepend ordering for identity-aware VACE reference conditioning. Heroes (identity anchors from chunk 0) prepended at t=0, bridges (tail frames from previous chunk) prepended closest to generation start. Bridge quality floor via Laplacian variance sharpness gating. Validated against WAN 2.2 VACE architecture (Conv3d kernel, RoPE locality, training prior).
+- Variables Pool system — each variable can have multiple candidate source connections. Switch between candidates via pool chips in the Variables Panel. Right-click any node output → "Add to Variable Pool" to register candidates.
+- `healPool()` migration — automatically repairs orphaned pool entries and stale metadata from older variable system versions on workflow load.
+- Pool purge controls — refresh button purges all stale candidates; per-variable "Purge Stale Pool Entries" in row context menu.
+- Rebind UI for deleted source nodes — pool chips show dashed amber border when a candidate's source was deleted but a matching replacement node exists. Click to accept rebind or purge via context menu.
+
+### Changed
+
+- All variable/pool mutations now support Ctrl+Z undo via `_withUndo()` wrapper with reentrancy-safe nesting (LiteGraph `beforeChange()`/`afterChange()`).
+- `getPool()` is now fully non-mutating — returns status annotations (`ok`/`stale`/`rebindable`/`type_mismatch`) and rebind suggestions without modifying candidate data. Mutations require explicit `rebindCandidate()` or `purgeStale()` calls.
+- `_fuzzyRebind()` hardened — validates output type match and rejects ambiguous matches (>1 candidate with same nodeType + title + slotIndex). Previously could silently mis-bind to wrong node.
+- Variables Panel refresh button now purges stale pool entries in addition to refreshing the UI.
+- Pool hash includes alive/total candidate counts — panel auto-refreshes when source nodes are added or deleted.
+
+### Fixed
+
+- Variables Pool: deleted source nodes no longer silently rebind during read operations. Previously `getPool()` would mutate `candidate.nodeId` via `_fuzzyRebind()`, potentially binding to the wrong node without user confirmation.
+- Variables Pool: innerHTML XSS vulnerability in drag-and-drop ghost element — now uses `createElement`/`textContent` for user-controlled variable names.
+- Variables Pool: stale candidates no longer accumulate forever in workflow JSON — purge controls and `healPool()` migration clean up dead references.
+
+### Added
+
+- NV VACE Temporal Align node — automatically aligns all VACE conditioning entries to a common temporal dimension. Required when combining multiple VACE sources (e.g., WanVaceToVideo + NV_VacePrePassReference) that produce entries with different frame counts. Place between VACE conditioning chain and the sampler.
 - Macro Groups in Quick Toggle floating panel — bundle multiple ComfyUI groups into a single toggle. Create/edit/delete macros via dialog with group checkbox list. Tri-state indicators (green=all on, amber=partial, red=all off) with `[enabled/total]` count badge. Collapsible macro sections with indented child rows. Macros persist in separate localStorage key (`NV_FloatingPanel_Macros`).
 - MacroManager class separates macro CRUD/state logic from panel rendering. Versioned storage schema with migration on load.
 
