@@ -226,11 +226,11 @@ class NV_InpaintStitch:
             "required": {
                 "stitcher": ("STITCHER",),
                 "inpainted_image": ("IMAGE",),
-                "blend_mode": (["alpha", "multiband", "hard"], {
-                    "default": "alpha",
-                    "tooltip": "alpha: standard feathered blend (default). "
-                               "multiband: Laplacian pyramid — blends low freq broadly, "
-                               "high freq narrowly (best for VAE roundtrip seams). "
+                "blend_mode": (["multiband", "alpha", "hard"], {
+                    "default": "multiband",
+                    "tooltip": "multiband: Laplacian pyramid — blends low freq broadly, "
+                               "high freq narrowly (best for structural seam hiding, recommended default). "
+                               "alpha: standard feathered blend (simpler, faster). "
                                "hard: binary mask paste, no feathering."
                 }),
             },
@@ -253,7 +253,7 @@ class NV_InpaintStitch:
         "Supports alpha, multiband (Laplacian pyramid), or hard blend modes."
     )
 
-    def stitch(self, stitcher, inpainted_image, blend_mode="alpha", multiband_levels=5):
+    def stitch(self, stitcher, inpainted_image, blend_mode="multiband", multiband_levels=5):
         device = comfy.model_management.get_torch_device()
         intermediate = comfy.model_management.intermediate_device()
         resize_algorithm = _get_resize_algorithm(stitcher)

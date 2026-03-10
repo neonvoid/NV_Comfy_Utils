@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Inpaint pipeline defaults hardened** (multi-AI consensus: Claude+Codex+Gemini):
+  - `NV_InpaintStitch2` `blend_mode` default changed from `alpha` → `multiband` (Laplacian pyramid handles structural seam mismatch, not just color)
+  - `NV_VaceControlVideoPrep` `halo_pixels` default changed from `0` → `16` (2 VAE blocks covers decoder receptive field, eliminates seam memory at stitch boundary)
+  - `NV_InpaintCrop2` `mask_erode_dilate` tooltip updated: recommends 8-12 for character inpainting, warns against >24 (excess erosion widens blend transition zone)
 - **Mask processing suite refactor**: Extracted shared utilities into `mask_ops.py` (7 morphology functions) and `bbox_ops.py` (12 bbox/smoothing functions). All mask nodes now use a single source of truth — no more duplicated implementations across files.
 - `NV_MaskTrackingBBox` reduced from 610 to 251 lines by removing 5 local function copies that now live in `bbox_ops.py`.
 - `NV_TemporalMaskStabilizer`: renamed `flow_window` → `consensus_window` (was a vestige of removed optical flow code). Harmonized mask parameter ranges to match the Config Bus standard (erode_dilate ±128, fill_holes 0-128, remove_noise 0-32, smooth 0-127, crop_padding 0-1.0).

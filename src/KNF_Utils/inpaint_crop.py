@@ -245,8 +245,10 @@ class NV_InpaintCrop:
                 "mask_erode_dilate": ("INT", {
                     "default": 0, "min": -128, "max": 128, "step": 1,
                     "tooltip": "Shrink (negative) or expand (positive) the mask using grey morphology. "
-                               "Recommended: -8 to -16 for tighter face boundaries, +8 to +16 for object removal safety margin, "
-                               "+32 to +64 for large area inpainting. Uses scipy grey_erosion/dilation to preserve gradient edges."
+                               "Recommended: 8-12 for character inpainting (keeps blend zone tight, reduces structural mismatch). "
+                               "-8 to -16 for tighter face boundaries, +32 to +64 for large area inpainting. "
+                               "Avoid >24 — excess erosion widens the blend transition zone. "
+                               "Uses scipy grey_erosion/dilation to preserve gradient edges."
                 }),
                 "mask_fill_holes": ("INT", {
                     "default": 0, "min": 0, "max": 128, "step": 1,

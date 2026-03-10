@@ -200,13 +200,13 @@ class NV_VaceControlVideoPrep:
                                "Trade-off: pastes everything VACE generated inside the bbox."
                 }),
                 "halo_pixels": ("INT", {
-                    "default": 0, "min": 0, "max": 48, "step": 4,
+                    "default": 16, "min": 0, "max": 48, "step": 4,
                     "tooltip": "Seam-Absorbing Control Halo: expand the VACE conditioning mask "
                                "OUTWARD by this many pixels beyond the stitch boundary. "
                                "WAN repaints this strip, so the stitch falls inside VACE-repainted content "
                                "rather than at its edge — eliminating seam memory in downstream stages. "
-                               "8-16px = subtle (1-2 VAE blocks), 24px = aggressive. "
-                               "0 = disabled (default, backward-compatible)."
+                               "16px = recommended default (2 VAE blocks, covers decoder receptive field). "
+                               "8px = subtle (1 VAE block), 24px = aggressive. 0 = disabled."
                 }),
                 "stitch_erosion": ("INT", {
                     "default": 0, "min": -32, "max": 32, "step": 1,
@@ -241,7 +241,7 @@ class NV_VaceControlVideoPrep:
                 fill_value=0.5, threshold=False,
                 mask_grow=0, mask_fill_holes=0, mask_remove_noise=0, mask_smooth=0,
                 vae_stride=8,
-                stitch_source="tight", halo_pixels=0, stitch_erosion=0, stitch_feather=8):
+                stitch_source="tight", halo_pixels=16, stitch_erosion=0, stitch_feather=8):
 
         # Apply shared config override if connected
         from .mask_processing_config import apply_vace_mask_config
