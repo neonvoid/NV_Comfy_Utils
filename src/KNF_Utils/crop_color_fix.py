@@ -246,12 +246,14 @@ class NV_CropColorFix:
                 temporal_smooth=0.0, multiband_levels=4, min_ref_pixels=100,
                 motion_sensitivity=1.5, boundary_lock=True):
         device = original_crop.device
+        TAG = "[NV_CropColorFix]"
 
         # --- Batch / spatial alignment ---
         B_orig = original_crop.shape[0]
         B_gen = generated_crop.shape[0]
         B = min(B_orig, B_gen)
         H, W, C = original_crop.shape[1], original_crop.shape[2], original_crop.shape[3]
+        print(f"{TAG} Starting: {B} frames, {H}x{W}, correction={color_correction}, composite={composite_mode}")
 
         gen = generated_crop[:B].float()
         orig = original_crop[:B].float()
@@ -280,6 +282,7 @@ class NV_CropColorFix:
         # =================================================================
         # Motion analysis (Phase 1B + Phase 2)
         # =================================================================
+        print(f"{TAG} Analyzing motion...")
         centroids, velocity, has_mask = _compute_mask_centroids_and_velocity(m)
         if B > 1:
             fast_count = (velocity > 5.0).sum().item()
@@ -294,6 +297,7 @@ class NV_CropColorFix:
         # =====================================================================
         # STEP 1: Color correction
         # =====================================================================
+        print(f"{TAG} Step 1: Color correction ({color_correction})...")
         corrected = gen.clone()
 
         if color_correction != "none":
@@ -416,6 +420,7 @@ class NV_CropColorFix:
         # =====================================================================
         # STEP 2: Boundary-local residual correction
         # =====================================================================
+        print(f"{TAG} Step 2: Boundary correction (enabled={boundary_correction})...")
         if boundary_correction and color_correction != "none":
             # Build boundary ring on the exterior (original) side
             mask_binary = (m > 0.5).float()  # [B, H, W]
@@ -467,6 +472,7 @@ class NV_CropColorFix:
         # =====================================================================
         # STEP 3: Composite — replace non-masked pixels with originals
         # =====================================================================
+        print(f"{TAG} Step 3: Composite ({composite_mode}, blend={blend_pixels}px, expansion={blend_expansion}px)...")
         # Build the composite mask
         comp_mask = m.clone()
 
@@ -476,6 +482,7 @@ class NV_CropColorFix:
 
         # --- Phase 2: Temporal EMA on blend weight map (centroid-aligned) ---
         if temporal_smooth > 0 and B > 1:
+            print(f"{TAG}   Phase 2: Temporal EMA (smooth={temporal_smooth})...")
             for b in range(1, B):
                 # Skip EMA on mask appearance/disappearance transitions to avoid ghosting
                 if not (has_mask[b] and has_mask[b - 1]):
@@ -500,6 +507,7 @@ class NV_CropColorFix:
             )
 
         # --- Phase 1B: Velocity-adaptive blend width ---
+        print(f"{TAG}   Phase 1B: Velocity-adaptive blend (K={motion_sensitivity})...")
         use_per_frame = motion_sensitivity > 0 and B > 1
         blend_base = float(blend_pixels)
         # Ensure adaptive mode has a nonzero floor so velocity can actually widen the blend
@@ -526,7 +534,10 @@ class NV_CropColorFix:
             if use_per_frame:
                 # Per-frame composite: each frame gets velocity-adapted blend width
                 out_frames = []
+                log_interval = max(B // 10, 1)
                 for b in range(B):
+                    if b % log_interval == 0:
+                        print(f"{TAG}   Multiband blend: frame {b}/{B}...")
                     mask_b = comp_mask[b:b + 1].unsqueeze(1)  # [1, 1, H, W]
                     sigma_b = effective_blend[b].item() / 3.0
                     if sigma_b > 0:
@@ -586,6 +597,7 @@ class NV_CropColorFix:
         # =====================================================================
         # Phase 1A: Hard boundary lock — force pristine source outside blend zone
         # =====================================================================
+        print(f"{TAG} Phase 1A: Boundary lock (enabled={boundary_lock})...")
         if boundary_lock:
             # Erode the inverse mask inward by blend transition width + safety margin
             # so the lock doesn't truncate the blending transition zone
@@ -612,6 +624,7 @@ class NV_CropColorFix:
             info_lines.append("  No reference zone pixels to measure residual")
 
         info_text = "\n".join(info_lines)
+        print(f"{TAG} Done. {B} frames processed.")
         return (output, info_text,)
 
 
