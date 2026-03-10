@@ -44,8 +44,14 @@ class NV_CropColorFix:
                 }),
                 "blend_pixels": ("INT", {
                     "default": 8, "min": 0, "max": 64, "step": 1,
-                    "tooltip": "Feather width (pixels) for the mask-to-original transition inside the crop. "
-                               "Higher = softer transition between generated and original pixels."
+                    "tooltip": "Gaussian blur sigma for the feather gradient. "
+                               "Controls how soft the transition is (higher = smoother gradient)."
+                }),
+                "blend_expansion": ("INT", {
+                    "default": 0, "min": 0, "max": 64, "step": 1,
+                    "tooltip": "Dilate the mask outward by N pixels BEFORE blurring. "
+                               "Pushes the blend zone further into original pixels. "
+                               "0 = no expansion (blur only). 16-32 = wider gradient reaching into original."
                 }),
             },
             "optional": {
@@ -78,14 +84,20 @@ class NV_CropColorFix:
     )
 
     def execute(self, original_crop, generated_crop, mask, color_correction,
-                blend_pixels, ref_threshold=0.01, temporal_smooth=0.0, min_ref_pixels=100):
-        B, H, W, C = original_crop.shape
+                blend_pixels, blend_expansion=0, ref_threshold=0.01, temporal_smooth=0.0, min_ref_pixels=100):
         device = original_crop.device
 
-        # Ensure shapes match
-        gen = generated_crop.float()
-        orig = original_crop.float()
-        if gen.shape != orig.shape:
+        # Use the minimum batch size — generated_crop may have fewer frames
+        # (e.g., VAE decode after trim_latent removes reference frames)
+        B_orig = original_crop.shape[0]
+        B_gen = generated_crop.shape[0]
+        B = min(B_orig, B_gen)
+        H, W, C = original_crop.shape[1], original_crop.shape[2], original_crop.shape[3]
+
+        # Truncate to matching batch size and ensure spatial match
+        gen = generated_crop[:B].float()
+        orig = original_crop[:B].float()
+        if gen.shape[1:3] != orig.shape[1:3]:
             gen = gen.permute(0, 3, 1, 2)
             gen = F.interpolate(gen, size=(H, W), mode="bilinear", align_corners=False)
             gen = gen.permute(0, 2, 3, 1)
@@ -96,12 +108,17 @@ class NV_CropColorFix:
             m = m.unsqueeze(0)
         if m.shape[1:] != (H, W):
             m = F.interpolate(m.unsqueeze(1), size=(H, W), mode="bilinear", align_corners=False).squeeze(1)
-        if m.shape[0] == 1 and B > 1:
+        # Truncate or expand mask to match B
+        if m.shape[0] > B:
+            m = m[:B]
+        elif m.shape[0] == 1 and B > 1:
             m = m.expand(B, -1, -1)
 
         # --- Step 1: Color correction ---
         corrected = gen.clone()
         info_lines = [f"NV_CropColorFix: {B} frames, {H}x{W}, method={color_correction}"]
+        if B_orig != B_gen:
+            info_lines.append(f"  Batch mismatch: original_crop={B_orig}, generated_crop={B_gen}, using {B}")
 
         if color_correction != "none":
             # Track EMA state for temporal smoothing
@@ -167,16 +184,25 @@ class NV_CropColorFix:
 
         # --- Step 2: Pixel composite — replace non-masked pixels with originals ---
         # Build feathered mask for compositing
+        feathered = m  # default: use mask as-is
+
+        # Dilate mask outward to push blend zone into original pixels
+        if blend_expansion > 0:
+            dk = blend_expansion * 2 + 1
+            dilate_kernel = torch.ones(1, 1, dk, dk, device=device)
+            expanded = F.conv2d(m.unsqueeze(1), dilate_kernel, padding=blend_expansion)
+            feathered = (expanded > 0).float().squeeze(1)  # [B, H, W] — binary dilated
+        else:
+            feathered = m
+
         if blend_pixels > 0:
-            # Blur the mask to create a soft transition
+            # Gaussian blur for soft transition
             k = blend_pixels * 2 + 1
             sigma = blend_pixels / 3.0
-            # Create 1D Gaussian kernel
             x = torch.arange(k, dtype=torch.float32, device=device) - (k - 1) / 2
             gauss_1d = torch.exp(-0.5 * (x / max(sigma, 1e-6)) ** 2)
             gauss_1d = gauss_1d / gauss_1d.sum()
-            # Separable 2D blur
-            feathered = m.unsqueeze(1)  # [B, 1, H, W]
+            feathered = feathered.unsqueeze(1)  # [B, 1, H, W]
             feathered = F.conv2d(feathered, gauss_1d.view(1, 1, -1, 1), padding=(k // 2, 0))
             feathered = F.conv2d(feathered, gauss_1d.view(1, 1, 1, -1), padding=(0, k // 2))
             feathered = feathered.squeeze(1).clamp(0, 1)  # [B, H, W]
@@ -198,7 +224,7 @@ class NV_CropColorFix:
         else:
             info_lines.append("  No reference zone pixels to measure residual")
 
-        info_lines.append(f"  Blend pixels: {blend_pixels}, Temporal smooth: {temporal_smooth}")
+        info_lines.append(f"  Blend pixels: {blend_pixels}, Expansion: {blend_expansion}, Temporal smooth: {temporal_smooth}")
         info_text = "\n".join(info_lines)
 
         return (output, info_text,)
