@@ -21,8 +21,7 @@ import torchvision.transforms.v2 as T
 # =============================================================================
 
 def _pad_for_pool(x, kernel_size):
-    """Same-padding for pooling ops (odd kernels only). Even kernels forced odd via |1."""
-    kernel_size = kernel_size | 1  # Force odd - even kernels break output shape with stride=1
+    """Same-padding for pooling ops. kernel_size must already be odd."""
     pad = kernel_size // 2
     _, _, h, w = x.shape
     mode = "reflect" if (h > pad and w > pad) else "replicate"
@@ -33,6 +32,7 @@ def _grey_dilate_gpu(x, kernel_size):
     """Grey dilation via max_pool2d. x: [B, 1, H, W]."""
     if kernel_size <= 1:
         return x
+    kernel_size = kernel_size | 1  # Force odd for shape preservation
     return F.max_pool2d(_pad_for_pool(x, kernel_size), kernel_size=kernel_size, stride=1)
 
 
@@ -40,6 +40,7 @@ def _grey_erode_gpu(x, kernel_size):
     """Grey erosion via negated max_pool2d. x: [B, 1, H, W]."""
     if kernel_size <= 1:
         return x
+    kernel_size = kernel_size | 1  # Force odd for shape preservation
     return -F.max_pool2d(_pad_for_pool(-x, kernel_size), kernel_size=kernel_size, stride=1)
 
 
