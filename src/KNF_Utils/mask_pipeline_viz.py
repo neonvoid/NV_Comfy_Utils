@@ -14,7 +14,7 @@ import torch
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-from .inpaint_crop import (
+from .mask_ops import (
     mask_erode_dilate as _mask_erode_dilate,
     mask_fill_holes as _mask_fill_holes,
     mask_remove_noise as _mask_remove_noise,

@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Mask processing suite refactor**: Extracted shared utilities into `mask_ops.py` (7 morphology functions) and `bbox_ops.py` (12 bbox/smoothing functions). All mask nodes now use a single source of truth — no more duplicated implementations across files.
+- `NV_MaskTrackingBBox` reduced from 610 to 251 lines by removing 5 local function copies that now live in `bbox_ops.py`.
+- `NV_TemporalMaskStabilizer`: renamed `flow_window` → `consensus_window` (was a vestige of removed optical flow code). Harmonized mask parameter ranges to match the Config Bus standard (erode_dilate ±128, fill_holes 0-128, remove_noise 0-32, smooth 0-127, crop_padding 0-1.0).
+- `NV_VaceControlVideoPrep`: `mask_smooth` step changed from 2 to 1 (consistent with all other nodes). `feather_blocks` default changed from 2.0 to 1.5 (matches Config Bus default).
+- Removed all dead stabilization code from `NV_InpaintCrop2` (centroid stabilization, RAFT-small, `_stabilize_bboxes`, `_stabilize_content_flow`). Removed IoU Stage 4 no-op from `NV_TemporalMaskStabilizer`. Removed duplicate `masks_to_bboxes`/`compute_union_bbox` from `vace_control_video_prep` and `temporal_mask_stabilizer`.
+
 ### Added
 
 - NV_VacePrePassReference: optional `identity_anchor` input for cross-chunk identity lock. Wire chunk 0's Kling output to anchor identity across all chunks. Prepended at t=0 (WAN 2.2 training prior), with sharpness quality floor. Original `reference_frames` input unchanged (current chunk's Kling output). IFS adaptive sampling available for both pools.

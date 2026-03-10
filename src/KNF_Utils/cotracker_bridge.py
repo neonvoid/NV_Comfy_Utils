@@ -19,7 +19,7 @@ import torch.nn.functional as TF
 import comfy.model_management
 
 from .ae_tracking_bridge import _build_translation_grid, _stitcher_val
-from .inpaint_crop import rescale_image
+from .mask_ops import rescale_image
 
 
 # =============================================================================

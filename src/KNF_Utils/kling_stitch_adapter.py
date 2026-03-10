@@ -24,7 +24,7 @@ Workflow:
 
 import torch
 
-from .inpaint_crop import rescale_image
+from .mask_ops import rescale_image
 
 
 class NV_KlingStitchAdapter:

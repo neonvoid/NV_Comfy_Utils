@@ -21,7 +21,7 @@ import comfy.model_management
 
 from .latent_inpaint_crop import snap_to_vae_grid, VAE_STRIDE
 from .latent_constants import LATENT_SAFE_KEYS
-from .inpaint_crop import rescale_mask
+from .mask_ops import rescale_mask
 
 
 class NV_PixelToLatentStitcher:

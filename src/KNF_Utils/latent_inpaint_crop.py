@@ -23,16 +23,15 @@ import comfy.model_management
 import comfy.utils
 
 from .latent_constants import LATENT_SAFE_KEYS
-from .inpaint_crop import (
+from .mask_ops import (
     mask_erode_dilate as _mask_erode_dilate,
     mask_fill_holes as _mask_fill_holes,
     mask_remove_noise as _mask_remove_noise,
     mask_smooth as _mask_smooth,
     mask_blur as _mask_blur,
     rescale_mask as _rescale_mask,
-    compute_auto_resolution,
-    WAN_PRESETS,
 )
+from .inpaint_crop import compute_auto_resolution, WAN_PRESETS
 
 VAE_STRIDE = 8  # WAN 2.1 spatial compression factor
 

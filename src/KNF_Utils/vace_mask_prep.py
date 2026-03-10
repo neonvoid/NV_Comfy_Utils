@@ -22,7 +22,7 @@ import torch
 import numpy as np
 from scipy.ndimage import distance_transform_edt
 
-from .inpaint_crop import mask_erode_dilate, mask_blur
+from .mask_ops import mask_erode_dilate, mask_blur
 from .vace_control_video_prep import compute_inscribed_radius  # canonical source
 
 

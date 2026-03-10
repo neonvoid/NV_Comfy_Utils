@@ -15,7 +15,7 @@ import torch
 import comfy.model_management
 import comfy.utils
 
-from .inpaint_crop import rescale_mask, mask_blur
+from .mask_ops import rescale_mask, mask_blur
 
 
 # =============================================================================

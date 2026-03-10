@@ -40,11 +40,10 @@ import torch
 import numpy as np
 from scipy.ndimage import distance_transform_edt
 
-from .inpaint_crop import (
-    mask_erode_dilate, mask_blur, gaussian_smooth_1d, median_filter_1d,
-    mask_fill_holes as _mask_fill_holes,
-    mask_remove_noise as _mask_remove_noise,
-    mask_smooth as _mask_smooth,
+from .mask_ops import mask_erode_dilate, mask_blur, mask_fill_holes, mask_remove_noise, mask_smooth
+from .bbox_ops import (
+    extract_bboxes, build_bbox_masks,
+    gaussian_smooth_1d, median_filter_1d,
 )
 
 
@@ -66,131 +65,30 @@ def compute_inscribed_radius(mask: torch.Tensor) -> tuple[list[float], int]:
     return radii, min_idx
 
 
-def _snap_down(val: int, stride: int) -> int:
-    """Snap value down to nearest multiple of stride."""
-    return (val // stride) * stride
-
-
-def _snap_up(val: int, stride: int) -> int:
-    """Snap value up to nearest multiple of stride."""
-    return ((val + stride - 1) // stride) * stride
-
-
-def masks_to_bboxes(mask: torch.Tensor, padding: float, smooth_window: int,
-                    vae_stride: int, info_lines: list) -> torch.Tensor:
+def masks_to_bboxes(mask, padding, smooth_window, vae_stride, info_lines):
     """Convert per-frame masks to temporally-smoothed, padded, VAE-aligned bounding box masks.
 
-    Args:
-        mask: [B, H, W] binary/soft mask tensor
-        padding: Fractional expansion of bbox dimensions (0.15 = 15%)
-        smooth_window: Temporal smoothing window size (0 = disabled)
-        vae_stride: VAE spatial stride for boundary alignment
-        info_lines: Mutable list for diagnostic output
-
-    Returns:
-        [B, H, W] tensor of rectangular masks (binary, 0 or 1)
+    Delegates to bbox_ops for extraction, smoothing, and mask building.
     """
     B, H, W = mask.shape
 
-    # --- Step 1: Per-frame tight bounding boxes ---
-    x1s, y1s, x2s, y2s = [], [], [], []
-    present = []
-
-    for b in range(B):
-        ys, xs = torch.where(mask[b] > 0.5)
-        if len(xs) == 0:
-            # Empty frame — mark as absent, fill with placeholder
-            present.append(False)
-            x1s.append(0.0)
-            y1s.append(0.0)
-            x2s.append(0.0)
-            y2s.append(0.0)
-        else:
-            present.append(True)
-            x1s.append(float(xs.min().item()))
-            y1s.append(float(ys.min().item()))
-            x2s.append(float(xs.max().item() + 1))
-            y2s.append(float(ys.max().item() + 1))
-
-    # --- Step 2: Forward/backward fill empty frames ---
-    # So smoothing has valid data everywhere
-    coords = [x1s, y1s, x2s, y2s]
-    for c in coords:
-        # Forward fill
-        last_valid = None
-        for i in range(B):
-            if present[i]:
-                last_valid = c[i]
-            elif last_valid is not None:
-                c[i] = last_valid
-        # Backward fill (for leading empty frames)
-        last_valid = None
-        for i in range(B - 1, -1, -1):
-            if present[i]:
-                last_valid = c[i]
-            elif last_valid is not None:
-                c[i] = last_valid
+    x1s, y1s, x2s, y2s, present = extract_bboxes(mask, info_lines)
 
     num_present = sum(present)
     if num_present == 0:
-        info_lines.append("  BBox: no mask content in any frame — returning zero masks")
         return torch.zeros_like(mask)
 
-    info_lines.append(f"  BBox: {num_present}/{B} frames with mask content")
-
-    # --- Step 3: Temporal smoothing ---
+    # Temporal smoothing (median + gaussian)
     if smooth_window > 1 and B > 1:
-        # Median filter first (removes outlier frames), then Gaussian smooth
-        x1s = median_filter_1d(x1s, min(smooth_window, B))
-        y1s = median_filter_1d(y1s, min(smooth_window, B))
-        x2s = median_filter_1d(x2s, min(smooth_window, B))
-        y2s = median_filter_1d(y2s, min(smooth_window, B))
-
-        x1s = gaussian_smooth_1d(x1s, min(smooth_window, B))
-        y1s = gaussian_smooth_1d(y1s, min(smooth_window, B))
-        x2s = gaussian_smooth_1d(x2s, min(smooth_window, B))
-        y2s = gaussian_smooth_1d(y2s, min(smooth_window, B))
-
+        win = min(smooth_window, B)
+        x1s = gaussian_smooth_1d(median_filter_1d(x1s, win), win)
+        y1s = gaussian_smooth_1d(median_filter_1d(y1s, win), win)
+        x2s = gaussian_smooth_1d(median_filter_1d(x2s, win), win)
+        y2s = gaussian_smooth_1d(median_filter_1d(y2s, win), win)
         info_lines.append(f"  BBox smoothing: median + gaussian, window={smooth_window}")
 
-    # --- Step 4: Padding + VAE stride alignment ---
-    result = torch.zeros_like(mask)
-
-    bbox_sizes = []
-    for b in range(B):
-        bx1, by1, bx2, by2 = x1s[b], y1s[b], x2s[b], y2s[b]
-        bw = bx2 - bx1
-        bh = by2 - by1
-
-        if bw < 1 or bh < 1:
-            continue
-
-        # Apply padding (percentage of bbox dimensions)
-        pad_x = bw * padding
-        pad_y = bh * padding
-        bx1 -= pad_x
-        by1 -= pad_y
-        bx2 += pad_x
-        by2 += pad_y
-
-        # Snap to VAE stride boundaries (outward)
-        bx1 = max(0, _snap_down(int(bx1), vae_stride))
-        by1 = max(0, _snap_down(int(by1), vae_stride))
-        bx2 = min(W, _snap_up(int(bx2), vae_stride))
-        by2 = min(H, _snap_up(int(by2), vae_stride))
-
-        result[b, by1:by2, bx1:bx2] = 1.0
-        bbox_sizes.append((bx2 - bx1, by2 - by1))
-
-    if bbox_sizes:
-        avg_w = sum(s[0] for s in bbox_sizes) / len(bbox_sizes)
-        avg_h = sum(s[1] for s in bbox_sizes) / len(bbox_sizes)
-        info_lines.append(
-            f"  BBox size (avg): {avg_w:.0f}x{avg_h:.0f}px "
-            f"(padding={padding:.0%}, aligned to {vae_stride}px)"
-        )
-
-    return result
+    return build_bbox_masks(x1s, y1s, x2s, y2s, padding, H, W,
+                            info_lines=info_lines, vae_stride=vae_stride)
 
 
 class NV_VaceControlVideoPrep:
@@ -222,9 +120,9 @@ class NV_VaceControlVideoPrep:
                                "0.5 blocks = 4px for WAN."
                 }),
                 "feather_blocks": ("FLOAT", {
-                    "default": 2.0, "min": 0.0, "max": 8.0, "step": 0.25,
+                    "default": 1.5, "min": 0.0, "max": 8.0, "step": 0.25,
                     "tooltip": "Feather mask edge over this many VAE blocks. "
-                               "2.0 blocks = 16px = 2 full VAE encoding blocks = 1 VACE attention patch. "
+                               "1.5 blocks = 12px for WAN. "
                                "In auto mode, this is the target value capped by mask geometry."
                 }),
                 "fill_mode": (["soft", "none"], {
@@ -283,7 +181,7 @@ class NV_VaceControlVideoPrep:
                                "larger regions. Value is the kernel size in pixels."
                 }),
                 "mask_smooth": ("INT", {
-                    "default": 0, "min": 0, "max": 127, "step": 2,
+                    "default": 0, "min": 0, "max": 127, "step": 1,
                     "tooltip": "Smooth jagged mask edges by binarizing at 0.5 then blurring. "
                                "Creates cleaner edges without shifting the boundary. "
                                "Value is the blur kernel size in pixels (odd)."
@@ -356,9 +254,9 @@ class NV_VaceControlVideoPrep:
             stitch_erosion=stitch_erosion,
             stitch_feather=stitch_feather,
         )
-        mask_fill_holes = vals["mask_fill_holes"]
-        mask_remove_noise = vals["mask_remove_noise"]
-        mask_smooth = vals["mask_smooth"]
+        fill_holes_v = vals["mask_fill_holes"]
+        remove_noise_v = vals["mask_remove_noise"]
+        smooth_v = vals["mask_smooth"]
         erosion_blocks = vals["erosion_blocks"]
         feather_blocks = vals["feather_blocks"]
         stitch_erosion = vals["stitch_erosion"]
@@ -401,15 +299,15 @@ class NV_VaceControlVideoPrep:
         if mask_grow != 0:
             result_mask = mask_erode_dilate(result_mask, mask_grow)
             preproc_applied.append(f"grow={mask_grow}px")
-        if mask_fill_holes > 0:
-            result_mask = _mask_fill_holes(result_mask, mask_fill_holes)
-            preproc_applied.append(f"fill_holes={mask_fill_holes}px")
-        if mask_remove_noise > 0:
-            result_mask = _mask_remove_noise(result_mask, mask_remove_noise)
-            preproc_applied.append(f"remove_noise={mask_remove_noise}px")
-        if mask_smooth > 0:
-            result_mask = _mask_smooth(result_mask, mask_smooth)
-            preproc_applied.append(f"smooth={mask_smooth}px")
+        if fill_holes_v > 0:
+            result_mask = mask_fill_holes(result_mask, fill_holes_v)
+            preproc_applied.append(f"fill_holes={fill_holes_v}px")
+        if remove_noise_v > 0:
+            result_mask = mask_remove_noise(result_mask, remove_noise_v)
+            preproc_applied.append(f"remove_noise={remove_noise_v}px")
+        if smooth_v > 0:
+            result_mask = mask_smooth(result_mask, smooth_v)
+            preproc_applied.append(f"smooth={smooth_v}px")
         if preproc_applied:
             result_mask = result_mask.clamp(0.0, 1.0)
             info_lines.append(f"  Mask pre-processing: {', '.join(preproc_applied)}")

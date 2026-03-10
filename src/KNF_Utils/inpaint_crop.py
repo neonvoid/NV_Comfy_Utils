@@ -11,396 +11,16 @@ Key features:
 """
 
 import math
-import time
 import torch
 import comfy.model_management
 import comfy.utils
 import nodes
-import numpy as np
-import scipy.ndimage
-from scipy.ndimage import gaussian_filter1d, median_filter
-import torchvision.transforms.v2 as T
-import torch.nn.functional as TF
 
-
-# =============================================================================
-# Content Stabilization (within-crop pixel locking)
-# =============================================================================
-
-def _compute_mask_centroids(masks):
-    """Compute weighted centroid per frame from cropped masks [B, H, W]."""
-    B, H, W = masks.shape
-    cx_list, cy_list, valid = [], [], []
-    ys = torch.arange(H, device=masks.device, dtype=masks.dtype)
-    xs = torch.arange(W, device=masks.device, dtype=masks.dtype)
-
-    for b in range(B):
-        m = masks[b]
-        total = m.sum()
-        if total < 1.0:
-            valid.append(False)
-            cx_list.append(W / 2.0)
-            cy_list.append(H / 2.0)
-        else:
-            cy = float((m.sum(dim=1) * ys).sum() / total)
-            cx = float((m.sum(dim=0) * xs).sum() / total)
-            valid.append(True)
-            cx_list.append(cx)
-            cy_list.append(cy)
-
-    # Forward/backward fill invalid frames
-    last = None
-    for i in range(B):
-        if valid[i]:
-            last = (cx_list[i], cy_list[i])
-        elif last is not None:
-            cx_list[i], cy_list[i] = last
-    last = None
-    for i in range(B - 1, -1, -1):
-        if valid[i]:
-            last = (cx_list[i], cy_list[i])
-        elif last is not None:
-            cx_list[i], cy_list[i] = last
-
-    return cx_list, cy_list, valid
-
-
-def _smooth_centroid_trajectory(cx_list, cy_list, valid):
-    """Smooth centroid trajectory using Kalman+RTS (>=10 frames) or One-Euro."""
-    B = len(cx_list)
-    if B <= 2:
-        return cx_list, cy_list
-
-    if B >= 10:
-        from .kalman_rts_smoother import kalman_rts_smooth
-        # Fake-bbox trick: x1=cx, x2=cx+1 — only position matters
-        x2s = [cx + 1.0 for cx in cx_list]
-        y2s = [cy + 1.0 for cy in cy_list]
-        sx1, sy1, _, _ = kalman_rts_smooth(
-            cx_list, cy_list, x2s, y2s, valid,
-            q_pos=4.0, q_dim=0.01, r_pos=9.0, r_dim=0.01
-        )
-        return sx1, sy1
-
-    # Short sequences: One-Euro (lazy import to avoid circular dependency)
-    from .mask_tracking_bbox import one_euro_smooth_1d
-    return one_euro_smooth_1d(cx_list, 0.05, 0.7), one_euro_smooth_1d(cy_list, 0.05, 0.7)
-
-
-def _build_translation_grid(dx, dy, H, W, device):
-    """Build affine_grid for pure translation. dx/dy in pixels."""
-    norm_dx = 2.0 * dx / W
-    norm_dy = 2.0 * dy / H
-    theta = torch.tensor([
-        [1.0, 0.0, norm_dx],
-        [0.0, 1.0, norm_dy]
-    ], device=device, dtype=torch.float32).unsqueeze(0)
-    return TF.affine_grid(theta, (1, 1, H, W), align_corners=False)
-
-
-def _stabilize_content_centroid(images, masks_orig, masks_proc, stitcher=None,
-                                target_w=None, target_h=None, resize_algorithm='lanczos',
-                                strength=1.0):
-    """Centroid-lock stabilization: translate each frame to lock mask centroid.
-
-    Uses expand-crop-trim to avoid edge spillage: expands each frame from
-    its stored canvas by the max displacement margin, warps at the expanded
-    resolution, then center-crops back to target size.  All output pixels
-    come from real image content — no padding artifacts.
-
-    Args:
-        images: [B, H, W, C] cropped frames at target resolution
-        masks_orig: [B, H, W] original masks
-        masks_proc: [B, H, W] processed masks
-        stitcher: STITCHER dict with canvas_image and crop coordinates
-        target_w, target_h: target output dimensions
-        resize_algorithm: algorithm for rescaling expanded crops
-        strength: 0.0-2.0, controls how aggressively centroids are locked.
-            0.0 = no correction.
-            0.5 = smoothed centroids only (conservative).
-            1.0 = raw centroids (full lock, default).
-            >1.0 = overcorrect (compensate for centroid bias).
-
-    Returns:
-        (warped_images, warped_masks_orig, warped_masks_proc, warp_data)
-    """
-    B, H, W, C = images.shape
-    device = images.device
-
-    cx_raw, cy_raw, valid = _compute_mask_centroids(masks_orig)
-    cx_smooth, cy_smooth = _smooth_centroid_trajectory(cx_raw, cy_raw, valid)
-
-    # Reference = temporal median of smoothed centroids (stable anchor)
-    ref_cx = float(sorted(cx_smooth)[B // 2])
-    ref_cy = float(sorted(cy_smooth)[B // 2])
-
-    # Effective centroids: interpolate between smoothed and raw based on strength.
-    # strength=0 → smoothed (conservative), strength=1 → raw (full lock),
-    # strength>1 → extrapolate past raw (overcorrect).
-    cx_eff = [cx_smooth[b] + (cx_raw[b] - cx_smooth[b]) * strength for b in range(B)]
-    cy_eff = [cy_smooth[b] + (cy_raw[b] - cy_smooth[b]) * strength for b in range(B)]
-
-    # Compute max displacement to determine expansion margin
-    max_dx = max(abs(cx - ref_cx) for cx in cx_eff)
-    max_dy = max(abs(cy - ref_cy) for cy in cy_eff)
-    margin = int(math.ceil(max(max_dx, max_dy))) + 1
-
-    # Determine target dimensions
-    tw = target_w if target_w is not None else W
-    th = target_h if target_h is not None else H
-
-    # Can we do expand-crop-trim? Need stitcher with canvas data.
-    use_expansion = (margin > 0 and stitcher is not None
-                     and len(stitcher.get('canvas_image', [])) == B)
-
-    warp_data = []
-    warped_imgs, warped_mo, warped_mp = [], [], []
-    n_clamped = 0
-
-    for b in range(B):
-        dx = cx_eff[b] - ref_cx
-        dy = cy_eff[b] - ref_cy
-
-        if use_expansion:
-            # Expand: re-crop a larger region from the stored canvas
-            canvas = stitcher['canvas_image'][b].to(device)
-            if canvas.dim() == 3:
-                canvas = canvas.unsqueeze(0)  # [1, H_c, W_c, C]
-            ctc_x = stitcher['cropped_to_canvas_x'][b]
-            ctc_y = stitcher['cropped_to_canvas_y'][b]
-            ctc_w = stitcher['cropped_to_canvas_w'][b]
-            ctc_h = stitcher['cropped_to_canvas_h'][b]
-            canvas_h, canvas_w = canvas.shape[1], canvas.shape[2]
-
-            # Scale factors: canvas-space → target-space
-            sx = tw / ctc_w
-            sy = th / ctc_h
-
-            # Available canvas margin per side (in target-space pixels)
-            avail_l = ctc_x * sx
-            avail_r = (canvas_w - ctc_x - ctc_w) * sx
-            avail_t = ctc_y * sy
-            avail_b = (canvas_h - ctc_y - ctc_h) * sy
-
-            # Clamp displacement to available canvas margins so we never
-            # need content beyond what the canvas provides.
-            # dx > 0 → grid samples rightward → needs right-side content
-            dx_orig, dy_orig = dx, dy
-            dx = max(-avail_l, min(avail_r, dx))
-            dy = max(-avail_t, min(avail_b, dy))
-            if dx != dx_orig or dy != dy_orig:
-                n_clamped += 1
-
-            # Per-side margins: just enough for the clamped displacement + 1px safety
-            need_l = (int(math.ceil(abs(dx))) + 1) if dx < 0 else 1
-            need_r = (int(math.ceil(abs(dx))) + 1) if dx > 0 else 1
-            need_t = (int(math.ceil(abs(dy))) + 1) if dy < 0 else 1
-            need_b = (int(math.ceil(abs(dy))) + 1) if dy > 0 else 1
-
-            # Canvas-space margins per side (proportional to target margins)
-            mc_l = int(math.ceil(need_l / sx)) + 1
-            mc_r = int(math.ceil(need_r / sx)) + 1
-            mc_t = int(math.ceil(need_t / sy)) + 1
-            mc_b = int(math.ceil(need_b / sy)) + 1
-
-            # Expanded crop region in canvas space (safety-clamped)
-            ex = max(0, ctc_x - mc_l)
-            ey = max(0, ctc_y - mc_t)
-            ex2 = min(canvas_w, ctc_x + ctc_w + mc_r)
-            ey2 = min(canvas_h, ctc_y + ctc_h + mc_b)
-
-            # Actual canvas margins obtained
-            actual_l_c = ctc_x - ex
-            actual_t_c = ctc_y - ey
-
-            # Target-space dimensions of expanded image (proportional resize)
-            total_c_w = ex2 - ex
-            total_c_h = ey2 - ey
-            expanded_w_b = int(round(total_c_w * sx))
-            expanded_h_b = int(round(total_c_h * sy))
-
-            # Trim offsets: where the crop content starts in the expanded image
-            trim_left = int(round(actual_l_c * sx))
-            trim_top = int(round(actual_t_c * sy))
-
-            # Crop from canvas and resize (proportional — no spatial distortion)
-            exp_img = canvas[:, ey:ey2, ex:ex2, :]
-            exp_img = rescale_image(exp_img, expanded_w_b, expanded_h_b, resize_algorithm)
-
-            # Masks: pad at target resolution with per-side margins
-            pad_right = max(0, expanded_w_b - trim_left - tw)
-            pad_bottom = max(0, expanded_h_b - trim_top - th)
-            mo_padded = TF.pad(masks_orig[b].unsqueeze(0).unsqueeze(0),
-                               (trim_left, pad_right, trim_top, pad_bottom),
-                               mode='constant', value=0).squeeze(0).squeeze(0)
-            mp_padded = TF.pad(masks_proc[b].unsqueeze(0).unsqueeze(0),
-                               (trim_left, pad_right, trim_top, pad_bottom),
-                               mode='constant', value=0).squeeze(0).squeeze(0)
-
-            img_nchw = exp_img.permute(0, 3, 1, 2)  # [1, C, eH, eW]
-            mo_4d = mo_padded.unsqueeze(0).unsqueeze(0)  # [1, 1, eH, eW]
-            mp_4d = mp_padded.unsqueeze(0).unsqueeze(0)
-
-            grid = _build_translation_grid(dx, dy, expanded_h_b, expanded_w_b, device)
-
-            wi = TF.grid_sample(img_nchw, grid, mode='bilinear',
-                                padding_mode='zeros', align_corners=False)
-            wmo = TF.grid_sample(mo_4d, grid, mode='bilinear',
-                                 padding_mode='zeros', align_corners=False)
-            wmp = TF.grid_sample(mp_4d, grid, mode='bilinear',
-                                 padding_mode='zeros', align_corners=False)
-
-            # Trim back to target resolution at computed offsets
-            wi = wi[:, :, trim_top:trim_top+th, trim_left:trim_left+tw]
-            wmo = wmo[:, :, trim_top:trim_top+th, trim_left:trim_left+tw]
-            wmp = wmp[:, :, trim_top:trim_top+th, trim_left:trim_left+tw]
-        else:
-            # No expansion available — pass through without stabilization
-            wi = images[b:b+1].permute(0, 3, 1, 2)
-            wmo = masks_orig[b:b+1].unsqueeze(1)
-            wmp = masks_proc[b:b+1].unsqueeze(1)
-            dx, dy = 0.0, 0.0
-
-        warp_data.append({"dx": dx, "dy": dy})
-        warped_imgs.append(wi.permute(0, 2, 3, 1).squeeze(0))
-        warped_mo.append(wmo.squeeze(0).squeeze(0))
-        warped_mp.append(wmp.squeeze(0).squeeze(0))
-
-    max_disp = max(max(abs(d["dx"]) for d in warp_data), max(abs(d["dy"]) for d in warp_data))
-    mode_str = "expand-crop-trim" if use_expansion else "no-stitcher"
-    clamp_str = f", {n_clamped} edge-clamped" if n_clamped > 0 else ""
-    print(f"[ContentStabilize/centroid] {B} frames, strength={strength:.2f}, "
-          f"ref=({ref_cx:.1f},{ref_cy:.1f}), max_disp={max_disp:.1f}px, "
-          f"margin={margin}px ({mode_str}{clamp_str})")
-
-    return (torch.stack(warped_imgs), torch.stack(warped_mo), torch.stack(warped_mp), warp_data)
-
-
-# Module-level RAFT model cache
-_raft_model = None
-
-
-def _get_raft_model(device):
-    """Lazy-load and cache RAFT-small model."""
-    global _raft_model
-    if _raft_model is None:
-        from torchvision.models.optical_flow import raft_small, Raft_Small_Weights
-        _raft_model = raft_small(weights=Raft_Small_Weights.DEFAULT)
-        _raft_model.eval()
-        print("[ContentStabilize/flow] Loaded RAFT-small model")
-    return _raft_model.to(device)
-
-
-def _warp_with_flow(img_nchw, flow, padding_mode='border'):
-    """Warp image using optical flow field.
-
-    Args:
-        img_nchw: [1, C, H, W]
-        flow: [1, 2, H, W] or [2, H, W] — (dx, dy) pixel displacement
-    """
-    if flow.dim() == 3:
-        flow = flow.unsqueeze(0)
-    _, _, H, W = img_nchw.shape
-    device = img_nchw.device
-
-    y = torch.arange(H, device=device, dtype=torch.float32)
-    x = torch.arange(W, device=device, dtype=torch.float32)
-    yy, xx = torch.meshgrid(y, x, indexing='ij')
-
-    xx_warped = xx + flow[0, 0]
-    yy_warped = yy + flow[0, 1]
-
-    # Normalize to [-1, 1]
-    xx_norm = 2.0 * xx_warped / (W - 1) - 1.0
-    yy_norm = 2.0 * yy_warped / (H - 1) - 1.0
-    grid = torch.stack([xx_norm, yy_norm], dim=-1).unsqueeze(0)
-
-    return TF.grid_sample(img_nchw, grid, mode='bilinear', padding_mode=padding_mode, align_corners=True)
-
-
-def _stabilize_content_flow(images, masks_orig, masks_proc):
-    """Optical flow stabilization: RAFT-based alignment to reference frame.
-
-    Args:
-        images: [B, H, W, C] cropped frames
-        masks_orig: [B, H, W]
-        masks_proc: [B, H, W]
-
-    Returns:
-        (warped_images, warped_masks_orig, warped_masks_proc, warp_data)
-    """
-    B, H, W, C = images.shape
-    device = images.device
-    ref_idx = B // 2
-
-    # Convert to NCHW [0,255] for RAFT
-    imgs_nchw = images.permute(0, 3, 1, 2) * 255.0  # [B, C, H, W]
-
-    # Pad to multiple of 8 if needed
-    pad_h = (8 - H % 8) % 8
-    pad_w = (8 - W % 8) % 8
-    if pad_h > 0 or pad_w > 0:
-        imgs_nchw = TF.pad(imgs_nchw, (0, pad_w, 0, pad_h), mode='replicate')
-
-    model = _get_raft_model(device)
-
-    # Compute pairwise forward flows
-    pairwise_flows = []
-    with torch.no_grad():
-        for i in range(B - 1):
-            flow_list = model(imgs_nchw[i:i+1], imgs_nchw[i+1:i+1+1])
-            flow = flow_list[-1]  # [1, 2, H_pad, W_pad]
-            # Crop back to original size
-            if pad_h > 0 or pad_w > 0:
-                flow = flow[:, :, :H, :W]
-            pairwise_flows.append(flow.squeeze(0))  # [2, H, W]
-
-    # Accumulate flow to reference frame
-    accumulated = []
-    for i in range(B):
-        if i == ref_idx:
-            accumulated.append(torch.zeros(2, H, W, device=device))
-        elif i < ref_idx:
-            # Chain forward: frame i → i+1 → ... → ref
-            acc = torch.zeros(2, H, W, device=device)
-            for j in range(i, ref_idx):
-                acc = acc + pairwise_flows[j]
-            accumulated.append(acc)
-        else:
-            # Chain backward: frame i → i-1 → ... → ref (negate forward flows)
-            acc = torch.zeros(2, H, W, device=device)
-            for j in range(ref_idx, i):
-                acc = acc - pairwise_flows[j]
-            accumulated.append(acc)
-
-    # Warp all frames to reference
-    warp_data = []
-    warped_imgs, warped_mo, warped_mp = [], [], []
-
-    for b in range(B):
-        flow = accumulated[b]
-        warp_data.append({"flow": flow.cpu()})  # Store on CPU for stitcher
-
-        # Warp image (negate flow: forward flow points src→ref, but grid_sample
-        # needs backward mapping ref→src, so we sample from src at (x - flow_x))
-        neg_flow = -flow
-        img_nchw_b = images[b:b+1].permute(0, 3, 1, 2)
-        wi = _warp_with_flow(img_nchw_b, neg_flow, padding_mode='reflection')
-        warped_imgs.append(wi.permute(0, 2, 3, 1).squeeze(0))
-
-        # Warp masks
-        mo_4d = masks_orig[b:b+1].unsqueeze(1)
-        wmo = _warp_with_flow(mo_4d, neg_flow, padding_mode='zeros')
-        warped_mo.append(wmo.squeeze(0).squeeze(0))
-
-        mp_4d = masks_proc[b:b+1].unsqueeze(1)
-        wmp = _warp_with_flow(mp_4d, neg_flow, padding_mode='zeros')
-        warped_mp.append(wmp.squeeze(0).squeeze(0))
-
-    max_flow = max(f.abs().max().item() for f in accumulated)
-    print(f"[ContentStabilize/flow] {B} frames, ref={ref_idx}, max_flow={max_flow:.1f}px")
-
-    return (torch.stack(warped_imgs), torch.stack(warped_mo), torch.stack(warped_mp), warp_data)
+from .mask_ops import (
+    mask_erode_dilate, mask_fill_holes, mask_remove_noise, mask_smooth, mask_blur,
+    rescale_image, rescale_mask,
+)
+from .bbox_ops import find_bbox, detect_bbox_anomalies
 
 
 # =============================================================================
@@ -455,328 +75,6 @@ def compute_auto_resolution(bbox_aspect, preset_name, padding_multiple):
 # =============================================================================
 # Utility Functions
 # =============================================================================
-
-def gaussian_smooth_1d(values, window_size):
-    """Apply Gaussian smoothing to 1D sequence for crop stabilization."""
-    if len(values) <= 1:
-        return values
-    sigma = window_size / 4.0
-    smoothed = gaussian_filter1d(values, sigma, mode='nearest')
-    return smoothed.tolist()
-
-
-def median_filter_1d(values, window_size):
-    """Apply median filter to 1D sequence for crop stabilization."""
-    if len(values) <= 1:
-        return values
-    filtered = median_filter(np.array(values), size=window_size, mode='nearest')
-    return filtered.tolist()
-
-
-def rescale_image(samples, width, height, algorithm='bicubic'):
-    """Resize image tensor [B, H, W, C] using GPU."""
-    algorithm_map = {
-        'nearest': 'nearest',
-        'bilinear': 'bilinear',
-        'bicubic': 'bicubic',
-        'lanczos': 'bicubic',
-        'area': 'area',
-    }
-    mode = algorithm_map.get(algorithm.lower(), 'bicubic')
-
-    # [B, H, W, C] -> [B, C, H, W]
-    samples = samples.movedim(-1, 1)
-
-    samples = torch.nn.functional.interpolate(
-        samples,
-        size=(height, width),
-        mode=mode,
-        align_corners=False if mode in ['bilinear', 'bicubic'] else None
-    )
-
-    # [B, C, H, W] -> [B, H, W, C]
-    return samples.movedim(1, -1)
-
-
-def rescale_mask(samples, width, height, algorithm='bilinear'):
-    """Resize mask tensor [B, H, W] using GPU."""
-    algorithm_map = {
-        'nearest': 'nearest',
-        'bilinear': 'bilinear',
-        'bicubic': 'bicubic',
-        'lanczos': 'bicubic',
-        'area': 'area',
-    }
-    mode = algorithm_map.get(algorithm.lower(), 'bilinear')
-
-    # [B, H, W] -> [B, 1, H, W]
-    samples = samples.unsqueeze(1)
-
-    samples = torch.nn.functional.interpolate(
-        samples,
-        size=(height, width),
-        mode=mode,
-        align_corners=False if mode in ['bilinear', 'bicubic'] else None
-    )
-
-    # [B, 1, H, W] -> [B, H, W]
-    return samples.squeeze(1)
-
-
-# =============================================================================
-# Mask Processing Functions (using scipy grey morphology)
-# =============================================================================
-
-def mask_erode_dilate(mask, amount):
-    """
-    Erode (negative) or dilate (positive) mask using scipy grey morphology.
-    Grey operations preserve grayscale gradients unlike binary operations.
-    """
-    if amount == 0:
-        return mask
-
-    device = mask.device
-    results = []
-
-    for m in mask:
-        m_np = m.cpu().numpy()
-        if amount < 0:
-            # Erosion (shrink mask)
-            m_np = scipy.ndimage.grey_erosion(m_np, size=(-amount, -amount))
-        else:
-            # Dilation (expand mask)
-            m_np = scipy.ndimage.grey_dilation(m_np, size=(amount, amount))
-        results.append(torch.from_numpy(m_np).to(device))
-
-    return torch.stack(results, dim=0)
-
-
-def mask_fill_holes(mask, size):
-    """
-    Fill holes in mask using grey closing (dilation followed by erosion).
-    Better than binary fill for soft/gradient masks.
-    """
-    if size == 0:
-        return mask
-
-    device = mask.device
-    results = []
-
-    for m in mask:
-        m_np = m.cpu().numpy()
-        m_np = scipy.ndimage.grey_closing(m_np, size=(size, size))
-        results.append(torch.from_numpy(m_np).to(device))
-
-    return torch.stack(results, dim=0)
-
-
-def mask_remove_noise(mask, size):
-    """
-    Remove isolated pixels/noise using grey opening (erosion followed by dilation).
-    Eliminates small specks while preserving larger regions.
-    """
-    if size == 0:
-        return mask
-
-    device = mask.device
-    results = []
-
-    for m in mask:
-        m_np = m.cpu().numpy()
-        m_np = scipy.ndimage.grey_opening(m_np, size=(size, size))
-        results.append(torch.from_numpy(m_np).to(device))
-
-    return torch.stack(results, dim=0)
-
-
-def mask_smooth(mask, amount):
-    """
-    Smooth mask edges by binarizing then blurring.
-    Creates cleaner, crisper edges than direct blur.
-    """
-    if amount == 0:
-        return mask
-
-    if amount % 2 == 0:
-        amount += 1
-
-    # Ensure at least 3D for gaussian_blur
-    if mask.dim() == 2:
-        mask = mask.unsqueeze(0)
-
-    # Binarize first (threshold at 0.5)
-    binary = mask > 0.5
-
-    # Then blur
-    smoothed = T.functional.gaussian_blur(binary.unsqueeze(1).float(), amount).squeeze(1)
-
-    return smoothed
-
-
-def mask_blur(mask, amount):
-    """
-    Direct Gaussian blur on mask (preserves gradients).
-    Used for blend feathering.
-    """
-    if amount == 0:
-        return mask
-
-    if amount % 2 == 0:
-        amount += 1
-
-    if mask.dim() == 2:
-        mask = mask.unsqueeze(0)
-
-    blurred = T.functional.gaussian_blur(mask.unsqueeze(1), amount).squeeze(1)
-
-    return blurred
-
-
-def detect_bbox_anomalies(bboxes, threshold, info_lines):
-    """Detect and reject anomalous bounding boxes (occlusion, tracking loss).
-
-    Computes per-frame area and center-displacement relative to stable statistics.
-    Anomalous frames are set to None and forward/backward filled from neighbors,
-    so downstream smoothing never sees the bad data.
-
-    Metrics:
-        area_delta  = |area[t] - median_area| / median_area
-        center_jump = euclidean(center[t], center[t-1]) / sqrt(median_area)
-    A frame is flagged if max(area_delta, center_jump) > threshold.
-
-    Args:
-        bboxes: List of (x, y, w, h) tuples or None per frame.
-        threshold: Sensitivity (lower = stricter). 0.0 disables detection.
-        info_lines: Diagnostic output accumulator.
-
-    Returns:
-        New list of (x, y, w, h) tuples with anomalous frames filled from neighbors.
-    """
-    if threshold <= 0.0:
-        return bboxes
-
-    valid = [(i, b) for i, b in enumerate(bboxes) if b is not None]
-
-    if len(valid) < 3:
-        return bboxes
-
-    # Compute per-frame area and center
-    areas = []
-    centers = []
-    for _, (x, y, w, h) in valid:
-        areas.append(max(float(w * h), 1.0))
-        centers.append((x + w / 2.0, y + h / 2.0))
-
-    # Stable reference: median area
-    sorted_areas = sorted(areas)
-    median_area = sorted_areas[len(sorted_areas) // 2]
-
-    if median_area < 1.0:
-        return bboxes
-
-    # Score each frame
-    flagged = []
-    scores = {}  # frame_idx -> (area_delta, center_jump, score)
-
-    for idx in range(len(valid)):
-        frame_idx = valid[idx][0]
-        area = areas[idx]
-
-        area_delta = abs(area - median_area) / median_area
-
-        if idx > 0:
-            dx = centers[idx][0] - centers[idx - 1][0]
-            dy = centers[idx][1] - centers[idx - 1][1]
-            center_jump = math.sqrt(dx * dx + dy * dy) / math.sqrt(median_area)
-        else:
-            center_jump = 0.0
-
-        score = max(area_delta, center_jump)
-        scores[frame_idx] = (area_delta, center_jump, score)
-
-        if score > threshold:
-            flagged.append(frame_idx)
-
-    if not flagged:
-        info_lines.append(f"Anomaly detection: clean (threshold={threshold:.2f})")
-        return bboxes
-
-    # Report
-    info_lines.append(
-        f"Anomaly detection: {len(flagged)} frame(s) rejected "
-        f"(threshold={threshold:.2f})"
-    )
-
-    # Compact run reporting
-    runs = []
-    run_start = flagged[0]
-    run_end = flagged[0]
-    for f in flagged[1:]:
-        if f == run_end + 1:
-            run_end = f
-        else:
-            runs.append((run_start, run_end))
-            run_start = f
-            run_end = f
-    runs.append((run_start, run_end))
-
-    for start, end in runs:
-        if start == end:
-            ad, cj, sc = scores[start]
-            info_lines.append(
-                f"  frame {start}: area_delta={ad:.2f}, "
-                f"center_jump={cj:.2f}, score={sc:.2f}"
-            )
-        else:
-            info_lines.append(f"  frames {start}-{end} ({end - start + 1} frames)")
-
-    # Reject: set flagged frames to None
-    result = list(bboxes)
-    for f in flagged:
-        result[f] = None
-
-    # Forward/backward fill None entries from nearest valid neighbor
-    B = len(result)
-    last_valid = None
-    for i in range(B):
-        if result[i] is not None:
-            last_valid = result[i]
-        elif last_valid is not None:
-            result[i] = last_valid
-    last_valid = None
-    for i in range(B - 1, -1, -1):
-        if result[i] is not None:
-            last_valid = result[i]
-        elif last_valid is not None:
-            result[i] = last_valid
-
-    remaining = sum(1 for b in result if b is not None)
-    info_lines.append(
-        f"  {remaining}/{B} frames remain after rejection + fill"
-    )
-
-    return result
-
-
-def find_bbox(mask):
-    """Find bounding box of non-zero mask region. Returns (x, y, w, h) or None if empty."""
-    if mask.dim() == 3:
-        mask_2d = mask[0]
-    else:
-        mask_2d = mask
-
-    non_zero = torch.nonzero(mask_2d > 0.01)
-
-    if non_zero.numel() == 0:
-        return None
-
-    y_min = non_zero[:, 0].min().item()
-    y_max = non_zero[:, 0].max().item()
-    x_min = non_zero[:, 1].min().item()
-    x_max = non_zero[:, 1].max().item()
-
-    return (x_min, y_min, x_max - x_min + 1, y_max - y_min + 1)
-
 
 def pad_to_multiple(value, multiple):
     """Round up value to nearest multiple."""
@@ -996,44 +294,12 @@ class NV_InpaintCrop:
                                "Use to ensure specific areas are included even if main mask is smaller. "
                                "Main mask must be fully contained within this bounding box mask."
                 }),
-
-                # Video stabilization
-                "stabilize_crop": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Enable temporal stabilization for video batches. Smooths crop position/size across frames to reduce jitter."
-                }),
-                "stabilization_mode": (["smooth", "lock_first", "lock_largest", "median"], {
-                    "default": "smooth",
-                    "tooltip": "smooth: Gaussian filter on bbox coords (gentle motion). lock_first: Use first frame's size for all. "
-                               "lock_largest: Use largest bbox size for all (prevents clipping). median: Median filter (removes outliers)."
-                }),
-                "smooth_window": ("INT", {
-                    "default": 5, "min": 3, "max": 21, "step": 2,
-                    "tooltip": "Window size for temporal smoothing. Larger = more stable but less responsive. "
-                               "3-5: subtle stabilization, 7-11: moderate smoothing, 13-21: heavy stabilization."
-                }),
                 "anomaly_threshold": ("FLOAT", {
                     "default": 1.5, "min": 0.0, "max": 10.0, "step": 0.1,
                     "tooltip": "Reject frames where bbox jumps exceed this threshold "
                                "(occlusion, tracking loss, someone walking in front). "
-                               "Rejected frames are filled from neighbors before stabilization. "
-                               "Ensures a smooth, non-jarring crop canvas for inpaint workflows. "
+                               "Rejected frames are filled from neighbors. "
                                "0.0 = disabled. 1.0 = strict. 1.5 = moderate (recommended). 3.0 = lenient."
-                }),
-                "content_stabilize": (["off", "centroid", "optical_flow"], {
-                    "default": "off",
-                    "tooltip": "Stabilize content WITHIN the crop to pixel-lock the subject for denoise. "
-                               "off: no content warp. "
-                               "centroid: translate to lock mask centroid (fast, translation only). "
-                               "optical_flow: RAFT-based alignment (slower, handles rotation + deformation)."
-                }),
-                "stabilize_strength": ("FLOAT", {
-                    "default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
-                    "tooltip": "Content stabilization strength (centroid mode). "
-                               "0.0 = no correction. "
-                               "0.5 = conservative (smoothed centroids only, less jitter in corrections). "
-                               "1.0 = full lock (raw centroids, maximum stabilization). "
-                               "1.0-2.0 = overcorrect (can compensate for systematic centroid bias)."
                 }),
             }
         }
@@ -1045,11 +311,9 @@ class NV_InpaintCrop:
     DESCRIPTION = "Crops image for inpainting. Outputs both original mask (for stitching) and processed mask (for diffusion). stitch_source selects which mask drives the blend: tight (original), processed, or bbox (full region). Auto mode computes optimal resolution from bbox."
 
     def crop(self, image, mask, target_mode, target_width, target_height, auto_preset,
-             padding_multiple, mask_erode_dilate, mask_fill_holes, mask_remove_noise,
-             mask_smooth, stitch_source, mask_blend_pixels, resize_algorithm,
-             mask_config=None, bounding_box_mask=None, stabilize_crop=False,
-             stabilization_mode="smooth", smooth_window=5, anomaly_threshold=1.5,
-             content_stabilize="off", stabilize_strength=1.0):
+             padding_multiple, mask_erode_dilate=0, mask_fill_holes=0, mask_remove_noise=0,
+             mask_smooth=0, stitch_source="tight", mask_blend_pixels=16, resize_algorithm="bicubic",
+             mask_config=None, bounding_box_mask=None, anomaly_threshold=1.5):
 
         # Apply shared config override if connected
         from .mask_processing_config import apply_mask_config
@@ -1060,11 +324,12 @@ class NV_InpaintCrop:
             mask_smooth=mask_smooth,
             mask_blend_pixels=mask_blend_pixels,
         )
-        mask_erode_dilate = vals["mask_erode_dilate"]
-        mask_fill_holes = vals["mask_fill_holes"]
-        mask_remove_noise = vals["mask_remove_noise"]
-        mask_smooth = vals["mask_smooth"]
-        mask_blend_pixels = vals["mask_blend_pixels"]
+        # Use _v suffix locals to avoid shadowing imported functions
+        erode_dilate_v = vals["mask_erode_dilate"]
+        fill_holes_v = vals["mask_fill_holes"]
+        remove_noise_v = vals["mask_remove_noise"]
+        smooth_v = vals["mask_smooth"]
+        blend_pixels_v = vals["mask_blend_pixels"]
 
         padding_multiple = int(padding_multiple)
         device = comfy.model_management.get_torch_device()
@@ -1112,7 +377,7 @@ class NV_InpaintCrop:
         # Initialize stitcher
         stitcher = {
             'resize_algorithm': resize_algorithm,
-            'blend_pixels': mask_blend_pixels,
+            'blend_pixels': blend_pixels_v,
             'crop_target_w': target_width,
             'crop_target_h': target_height,
             'canvas_to_orig_x': [],
@@ -1134,8 +399,8 @@ class NV_InpaintCrop:
         result_masks_original = []
         result_masks_processed = []
 
-        # First pass: collect bounding boxes for anomaly detection / stabilization
-        needs_bbox_pass = batch_size > 1 and (stabilize_crop or anomaly_threshold > 0.0)
+        # First pass: collect bounding boxes for anomaly detection
+        needs_bbox_pass = batch_size > 1 and anomaly_threshold > 0.0
         if needs_bbox_pass:
             raw_bboxes = []
             for b in range(batch_size):
@@ -1143,13 +408,9 @@ class NV_InpaintCrop:
                 bbox = find_bbox(bbox_source)
                 raw_bboxes.append(bbox)
 
-            # Anomaly detection: reject occlusion/tracking-loss frames before smoothing
+            # Anomaly detection: reject occlusion/tracking-loss frames before cropping
             if anomaly_threshold > 0.0:
                 raw_bboxes = detect_bbox_anomalies(raw_bboxes, anomaly_threshold, info_lines)
-
-            # Temporal stabilization
-            if stabilize_crop:
-                raw_bboxes = self._stabilize_bboxes(raw_bboxes, stabilization_mode, smooth_window)
         else:
             raw_bboxes = None
 
@@ -1172,14 +433,14 @@ class NV_InpaintCrop:
             # Process mask for diffusion (apply all operations)
             processed_mask = one_mask.clone()
 
-            if mask_fill_holes > 0:
-                processed_mask = mask_fill_holes_fn(processed_mask, mask_fill_holes)
-            if mask_remove_noise > 0:
-                processed_mask = mask_remove_noise_fn(processed_mask, mask_remove_noise)
-            if mask_erode_dilate != 0:
-                processed_mask = mask_erode_dilate_fn(processed_mask, mask_erode_dilate)
-            if mask_smooth > 0:
-                processed_mask = mask_smooth_fn(processed_mask, mask_smooth)
+            if fill_holes_v > 0:
+                processed_mask = mask_fill_holes(processed_mask, fill_holes_v)
+            if remove_noise_v > 0:
+                processed_mask = mask_remove_noise(processed_mask, remove_noise_v)
+            if erode_dilate_v != 0:
+                processed_mask = mask_erode_dilate(processed_mask, erode_dilate_v)
+            if smooth_v > 0:
+                processed_mask = mask_smooth(processed_mask, smooth_v)
 
             # Determine crop bounding box
             if raw_bboxes is not None and raw_bboxes[b] is not None:
@@ -1219,14 +480,14 @@ class NV_InpaintCrop:
                 # "tight" — original unprocessed mask (default)
                 blend_mask = cropped_mask_orig.clone()
 
-            if mask_blend_pixels > 0:
+            if blend_pixels_v > 0:
                 if stitch_source == "bbox":
                     # Bbox is all-ones — erode INWARD from edges to create a border, then blur
-                    blend_mask = mask_erode_dilate_fn(blend_mask, -mask_blend_pixels)
+                    blend_mask = mask_erode_dilate(blend_mask, -blend_pixels_v)
                 else:
                     # Tight/processed — dilate OUTWARD to extend blend beyond mask edge
-                    blend_mask = mask_erode_dilate_fn(blend_mask, mask_blend_pixels)
-                blend_mask = mask_blur(blend_mask, mask_blend_pixels)
+                    blend_mask = mask_erode_dilate(blend_mask, blend_pixels_v)
+                blend_mask = mask_blur(blend_mask, blend_pixels_v)
 
             # Store in stitcher
             intermediate = comfy.model_management.intermediate_device()
@@ -1261,21 +522,6 @@ class NV_InpaintCrop:
         result_masks_original = torch.stack(result_masks_original, dim=0)
         result_masks_processed = torch.stack(result_masks_processed, dim=0)
 
-        # Content stabilization: warp pixels within crop to lock subject
-        if content_stabilize != "off" and result_images.shape[0] > 1:
-            if content_stabilize == "centroid":
-                result_images, result_masks_original, result_masks_processed, warp_data = \
-                    _stabilize_content_centroid(result_images, result_masks_original, result_masks_processed,
-                                               stitcher=stitcher, target_w=target_width, target_h=target_height,
-                                               resize_algorithm=resize_algorithm,
-                                               strength=stabilize_strength)
-            else:
-                result_images, result_masks_original, result_masks_processed, warp_data = \
-                    _stabilize_content_flow(result_images, result_masks_original, result_masks_processed)
-            stitcher['content_warp_mode'] = content_stabilize
-            stitcher['content_warp_data'] = warp_data
-            info_lines.append(f"Content stabilization: {content_stabilize} ({len(warp_data)} frames)")
-
         out_h, out_w = result_images.shape[1], result_images.shape[2]
         info_lines.append(f"Output: {result_images.shape[0]} frames @ {out_w}x{out_h}")
         print(f"[NV_InpaintCrop] Output: {result_images.shape[0]} frames, {out_w}x{out_h}")
@@ -1309,69 +555,6 @@ class NV_InpaintCrop:
 
         return (int(union_x_min), int(union_y_min),
                 int(union_x_max - union_x_min), int(union_y_max - union_y_min))
-
-    def _stabilize_bboxes(self, bboxes, mode, window_size):
-        """Apply temporal stabilization to bounding box sequence.
-
-        Smooths bbox CENTER and dimensions independently, then derives
-        corner positions from the smoothed center.  This prevents the
-        ±1px A-B-A-B oscillation caused by integer-division centering
-        when x/y/w/h are smoothed and rounded separately.
-        """
-        valid_indices = [i for i, b in enumerate(bboxes) if b is not None]
-
-        if len(valid_indices) <= 1:
-            return bboxes
-
-        xs = [bboxes[i][0] for i in valid_indices]
-        ys = [bboxes[i][1] for i in valid_indices]
-        ws = [bboxes[i][2] for i in valid_indices]
-        hs = [bboxes[i][3] for i in valid_indices]
-
-        # Convert corner+size → center+size (float)
-        cxs = [x + w / 2.0 for x, w in zip(xs, ws)]
-        cys = [y + h / 2.0 for y, h in zip(ys, hs)]
-
-        if mode == "smooth":
-            cxs = list(gaussian_smooth_1d(cxs, window_size))
-            cys = list(gaussian_smooth_1d(cys, window_size))
-            ws = [int(round(v)) for v in gaussian_smooth_1d(ws, window_size)]
-            hs = [int(round(v)) for v in gaussian_smooth_1d(hs, window_size)]
-
-        elif mode == "lock_first":
-            ref_w, ref_h = ws[0], hs[0]
-            # Centers already computed above; just lock dimensions
-            ws = [ref_w] * len(valid_indices)
-            hs = [ref_h] * len(valid_indices)
-
-        elif mode == "lock_largest":
-            max_w = max(ws)
-            max_h = max(hs)
-            ws = [max_w] * len(valid_indices)
-            hs = [max_h] * len(valid_indices)
-
-        elif mode == "median":
-            cxs = list(median_filter_1d(cxs, window_size))
-            cys = list(median_filter_1d(cys, window_size))
-            ws = [int(round(v)) for v in median_filter_1d(ws, window_size)]
-            hs = [int(round(v)) for v in median_filter_1d(hs, window_size)]
-
-        # Derive corner from smoothed center — round position LAST
-        xs = [int(round(cx - w / 2.0)) for cx, w in zip(cxs, ws)]
-        ys = [int(round(cy - h / 2.0)) for cy, h in zip(cys, hs)]
-
-        result = list(bboxes)
-        for idx, i in enumerate(valid_indices):
-            result[i] = (xs[idx], ys[idx], ws[idx], hs[idx])
-
-        return result
-
-
-# Alias functions to avoid name collision with parameters
-mask_erode_dilate_fn = mask_erode_dilate
-mask_fill_holes_fn = mask_fill_holes
-mask_remove_noise_fn = mask_remove_noise
-mask_smooth_fn = mask_smooth
 
 
 # =============================================================================

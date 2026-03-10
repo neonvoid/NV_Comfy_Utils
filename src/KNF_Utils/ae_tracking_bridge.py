@@ -23,7 +23,7 @@ import torch
 import torch.nn.functional as TF
 import comfy.model_management
 
-from .inpaint_crop import rescale_image
+from .mask_ops import rescale_image
 
 
 # =============================================================================
