@@ -19,6 +19,7 @@ import comfy.model_management
 
 from .mask_ops import rescale_image, rescale_mask
 from .multiband_blend_stitch import multiband_blend
+from .guided_filter import refine_mask
 
 
 # =============================================================================
@@ -94,7 +95,9 @@ def stitch_single_frame(canvas_image, inpainted_image, mask,
                         cto_x, cto_y, cto_w, cto_h,
                         resize_algorithm,
                         warp_mode=None, warp_entry=None,
-                        blend_mode="alpha", multiband_levels=5):
+                        blend_mode="multiband", multiband_levels=5,
+                        guided_refine=False, guided_radius=8, guided_eps=0.001,
+                        guided_strength=0.7):
     """Blend one inpainted crop back into its canvas and extract the original region.
 
     Args:
@@ -108,9 +111,12 @@ def stitch_single_frame(canvas_image, inpainted_image, mask,
         warp_entry: Optional per-frame warp data dict.
         blend_mode: 'alpha' (standard), 'multiband' (Laplacian pyramid), or 'hard' (no blend).
         multiband_levels: Pyramid levels for multiband mode (default 5).
+        guided_strength: Lerp strength for guided filter (0.0=original, 1.0=fully refined).
 
     Returns:
-        [1, cto_h, cto_w, C] output image (original image region with inpainted area blended in).
+        Tuple of:
+          [1, cto_h, cto_w, C] output image (original image region with inpainted area blended in).
+          [1, ctc_h, ctc_w] final blend mask used for compositing (after guided refinement if enabled).
     """
     device = canvas_image.device
 
@@ -144,11 +150,21 @@ def stitch_single_frame(canvas_image, inpainted_image, mask,
         resized_image = inpainted_image
         resized_mask = mask
 
-    # Clamp mask and expand to match image channels
-    resized_mask = resized_mask.clamp(0, 1).unsqueeze(-1)  # [1, H, W, 1]
+    # Clamp mask
+    resized_mask = resized_mask.clamp(0, 1)
 
-    # Extract canvas region, blend, paste back
+    # Extract canvas region
     canvas_crop = canvas_image[:, ctc_y:ctc_y + ctc_h, ctc_x:ctc_x + ctc_w, :]
+
+    # Guided filter: refine blend mask using canvas crop edges (applied before blend)
+    if guided_refine:
+        resized_mask = refine_mask(
+            mask=resized_mask, guide_image=canvas_crop,
+            radius=guided_radius, eps=guided_eps, strength=guided_strength, mode="color",
+        )
+
+    # Expand mask to match image channels
+    resized_mask = resized_mask.unsqueeze(-1)  # [1, H, W, 1]
 
     if blend_mode == "multiband":
         # Laplacian pyramid: blend each frequency band at appropriate spatial scale.
@@ -171,7 +187,11 @@ def stitch_single_frame(canvas_image, inpainted_image, mask,
     # Extract the original image area from canvas
     output_image = canvas_image[:, cto_y:cto_y + cto_h, cto_x:cto_x + cto_w, :]
 
-    return output_image
+    # Return the final blend mask (after guided refinement) for consistent stitch_mask output
+    # resized_mask is [1, H, W, 1] at this point — squeeze channel dim
+    final_mask = resized_mask.squeeze(-1)  # [1, H, W]
+
+    return output_image, final_mask
 
 
 def _build_stitch_mask(blend_mask, ctc_x, ctc_y, ctc_w, ctc_h,
@@ -240,6 +260,28 @@ class NV_InpaintStitch:
                     "tooltip": "Pyramid levels for multiband mode. 5 = good for 720p-1080p. "
                                "More levels = broader low-frequency blending."
                 }),
+                "guided_refine": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Refine the blend mask using guided filter before compositing. "
+                               "Snaps mask edges to actual image boundaries — reduces ghosting at "
+                               "hair/clothing edges. Uses canvas crop as guide (stable source)."
+                }),
+                "guided_radius": ("INT", {
+                    "default": 8, "min": 1, "max": 64, "step": 1,
+                    "tooltip": "Guided filter window radius. 8 = good for 512px crops, "
+                               "12-16 for 720p+. Larger = broader smoothing."
+                }),
+                "guided_eps": ("FLOAT", {
+                    "default": 0.001, "min": 0.0001, "max": 0.1, "step": 0.0001,
+                    "tooltip": "Guided filter edge sensitivity. Lower = sharper snap to edges. "
+                               "0.001 = default, 0.01 = smoother (less aggressive edge tracking)."
+                }),
+                "guided_strength": ("FLOAT", {
+                    "default": 0.7, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Lerp between original mask (0.0) and guided-refined mask (1.0). "
+                               "0.7 = safe default that prevents mask erosion from misleading gradients. "
+                               "1.0 = fully trust the guided filter. 0.0 = no refinement."
+                }),
             },
         }
 
@@ -253,7 +295,8 @@ class NV_InpaintStitch:
         "Supports alpha, multiband (Laplacian pyramid), or hard blend modes."
     )
 
-    def stitch(self, stitcher, inpainted_image, blend_mode="multiband", multiband_levels=5):
+    def stitch(self, stitcher, inpainted_image, blend_mode="multiband", multiband_levels=5,
+               guided_refine=False, guided_radius=8, guided_eps=0.001, guided_strength=0.7):
         device = comfy.model_management.get_torch_device()
         intermediate = comfy.model_management.intermediate_device()
         resize_algorithm = _get_resize_algorithm(stitcher)
@@ -278,8 +321,11 @@ class NV_InpaintStitch:
             for b in range(batch_size):
                 idx = 0 if single_stitcher else b
                 warp_entry = content_warp_data[idx] if (content_warp_data and not single_stitcher) else None
-                out = stitch_single_frame(
-                    stitcher['canvas_image'][idx].to(device),
+                # Clone canvas to prevent in-place mutation from accumulating across frames
+                # (single_stitcher reuses idx=0 for every frame)
+                canvas = stitcher['canvas_image'][idx].to(device).clone()
+                out, final_mask = stitch_single_frame(
+                    canvas,
                     inpainted_image[b:b+1].to(device),
                     stitcher['cropped_mask_for_blend'][idx].to(device),
                     stitcher['cropped_to_canvas_x'][idx],
@@ -295,10 +341,14 @@ class NV_InpaintStitch:
                     warp_entry=warp_entry,
                     blend_mode=blend_mode,
                     multiband_levels=multiband_levels,
+                    guided_refine=guided_refine,
+                    guided_radius=guided_radius,
+                    guided_eps=guided_eps,
+                    guided_strength=guided_strength,
                 )
                 results.append(out.squeeze(0).to(intermediate))
                 sm = _build_stitch_mask(
-                    stitcher['cropped_mask_for_blend'][idx],
+                    final_mask,
                     stitcher['cropped_to_canvas_x'][idx], stitcher['cropped_to_canvas_y'][idx],
                     stitcher['cropped_to_canvas_w'][idx], stitcher['cropped_to_canvas_h'][idx],
                     stitcher['canvas_to_orig_x'][idx], stitcher['canvas_to_orig_y'][idx],
@@ -319,7 +369,7 @@ class NV_InpaintStitch:
                     original_idx += 1
                 else:
                     warp_entry = content_warp_data[inpainted_idx] if content_warp_data else None
-                    out = stitch_single_frame(
+                    out, final_mask = stitch_single_frame(
                         stitcher['canvas_image'][inpainted_idx].to(device),
                         inpainted_image[inpainted_idx:inpainted_idx+1].to(device),
                         stitcher['cropped_mask_for_blend'][inpainted_idx].to(device),
@@ -336,10 +386,14 @@ class NV_InpaintStitch:
                         warp_entry=warp_entry,
                         blend_mode=blend_mode,
                         multiband_levels=multiband_levels,
+                        guided_refine=guided_refine,
+                        guided_radius=guided_radius,
+                        guided_eps=guided_eps,
+                        guided_strength=guided_strength,
                     )
                     results.append(out.squeeze(0).to(intermediate))
                     sm = _build_stitch_mask(
-                        stitcher['cropped_mask_for_blend'][inpainted_idx],
+                        final_mask,
                         stitcher['cropped_to_canvas_x'][inpainted_idx], stitcher['cropped_to_canvas_y'][inpainted_idx],
                         stitcher['cropped_to_canvas_w'][inpainted_idx], stitcher['cropped_to_canvas_h'][inpainted_idx],
                         stitcher['canvas_to_orig_x'][inpainted_idx], stitcher['canvas_to_orig_y'][inpainted_idx],
