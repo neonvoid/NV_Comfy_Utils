@@ -10,6 +10,12 @@ V2 multipass pipeline:
   Step 2: Boundary-local residual correction (distance-weighted, guided-filter regularized)
   Step 3: Frequency-aware composite (multiband Laplacian pyramid OR Gaussian alpha)
 
+Motion-adaptive features (Phase 1B + Phase 2):
+  - Per-frame velocity estimation via mask centroid displacement
+  - Velocity-scaled blend width (wider on fast-motion frames)
+  - Temporal EMA of blend weight maps with centroid-based crop-space alignment
+  - Hard boundary lock to prevent correction bleeding into untouched pixels
+
 Place between VAE Decode and InpaintStitch2:
   InpaintCrop2 → VAE Encode → KSampler → VAE Decode
       → [NV_CropColorFix] → InpaintStitch2
@@ -43,6 +49,10 @@ def _gaussian_blur_reflect(tensor, sigma):
     if sigma <= 0:
         return tensor
     k = int(sigma * 3) * 2 + 1
+    # Clamp kernel so padding < spatial dim (reflect padding requirement)
+    max_k = min(tensor.shape[2], tensor.shape[3]) * 2 - 1
+    if k > max_k:
+        k = max(max_k // 2 * 2 + 1, 1)  # keep odd
     x = torch.arange(k, dtype=torch.float32, device=tensor.device) - (k - 1) / 2
     gauss_1d = torch.exp(-0.5 * (x / max(sigma, 1e-6)) ** 2)
     gauss_1d = gauss_1d / gauss_1d.sum()
@@ -57,10 +67,65 @@ def _gaussian_blur_reflect(tensor, sigma):
     return F.conv2d(padded, kv, groups=C)
 
 
+def _compute_mask_centroids_and_velocity(mask):
+    """Compute per-frame mask centroids and inter-frame velocity.
+
+    Args:
+        mask: [B, H, W] float tensor (1.0 = generated region).
+
+    Returns:
+        centroids: [B, 2] tensor of (y, x) centroids per frame.
+        velocity: [B] tensor of L2 centroid displacement (0 for frame 0).
+        has_mask: [B] bool tensor — True where frame had real mask pixels.
+    """
+    B, H, W = mask.shape
+    device = mask.device
+    default_centroid = torch.tensor([H / 2.0, W / 2.0], device=device)
+    centroids = torch.zeros(B, 2, device=device)
+    has_mask = torch.zeros(B, dtype=torch.bool, device=device)
+
+    for b in range(B):
+        indices = torch.nonzero(mask[b] > 0.5, as_tuple=False)  # [N, 2] — (y, x)
+        if indices.numel() == 0:
+            # No mask pixels: use previous centroid or default
+            centroids[b] = centroids[b - 1] if b > 0 else default_centroid
+        else:
+            centroids[b] = indices.float().mean(dim=0)
+            has_mask[b] = True
+
+    velocity = torch.zeros(B, device=device)
+    for b in range(1, B):
+        # Only compute velocity when both frames have real masks
+        # (avoids spike from default center → real mask position)
+        if has_mask[b] and has_mask[b - 1]:
+            velocity[b] = torch.norm(centroids[b] - centroids[b - 1], p=2)
+
+    return centroids, velocity, has_mask
+
+
+def _translate_mask_2d(mask_2d, dx, dy):
+    """Translate a [H, W] mask by (dx, dy) pixels using affine_grid + grid_sample.
+
+    Used for crop-space alignment of temporal EMA blend weights.
+    """
+    inp = mask_2d.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+    _, _, H, W = inp.shape
+
+    # Normalized translation for grid_sample (align_corners=True)
+    tx = 0.0 if W <= 1 else (-2.0 * dx / (W - 1))
+    ty = 0.0 if H <= 1 else (-2.0 * dy / (H - 1))
+
+    theta = inp.new_tensor([[[1.0, 0.0, tx], [0.0, 1.0, ty]]])  # [1, 2, 3]
+    grid = F.affine_grid(theta, inp.size(), align_corners=True)
+    out = F.grid_sample(inp, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
+    return out[0, 0]  # [H, W]
+
+
 class NV_CropColorFix:
     """Multipass color correction and composite for generated crops before stitching.
 
     V2 pipeline: LF Lab correction → boundary-local residual → frequency-aware composite.
+    Motion-adaptive: velocity-scaled blend width + temporal weight EMA + boundary lock.
     """
 
     @classmethod
@@ -129,13 +194,14 @@ class NV_CropColorFix:
                 }),
                 "boundary_decay": ("FLOAT", {
                     "default": 0.15, "min": 0.01, "max": 0.5, "step": 0.01,
-                    "tooltip": "Exponential decay rate for boundary correction propagation inward. "
-                               "Smaller = correction reaches further. 0.15 = ~10px effective radius."
+                    "tooltip": "Controls how far boundary correction propagates inward (scales blur sigma). "
+                               "Larger = correction reaches further. 0.15 = ~10px effective radius."
                 }),
                 "temporal_smooth": ("FLOAT", {
                     "default": 0.0, "min": 0.0, "max": 0.95, "step": 0.05,
-                    "tooltip": "EMA smoothing for correction values across frames (0=off, 0.3=moderate, 0.8=heavy). "
-                               "Prevents frame-to-frame jitter in the color correction."
+                    "tooltip": "EMA smoothing for blend weight maps across frames (0=off, 0.3=moderate, 0.8=heavy). "
+                               "Uses centroid-aligned crop-space translation for temporal coherence. "
+                               "Also smooths color correction values when > 0."
                 }),
                 "multiband_levels": ("INT", {
                     "default": 4, "min": 2, "max": 6, "step": 1,
@@ -146,6 +212,17 @@ class NV_CropColorFix:
                     "tooltip": "Minimum non-masked pixels required for reliable statistics. "
                                "If fewer, falls back to mean_only or skips correction."
                 }),
+                "motion_sensitivity": ("FLOAT", {
+                    "default": 1.5, "min": 0.0, "max": 5.0, "step": 0.1,
+                    "tooltip": "Scale factor for velocity-adaptive blend width. 0=off (static width), "
+                               "1.5=default, higher=wider blend on fast-motion frames. "
+                               "Blend width = blend_pixels + K * velocity, clamped to 3x max."
+                }),
+                "boundary_lock": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Force pristine source pixels outside the blend zone after compositing. "
+                               "Fixes color correction bleeding into untouched areas (0.9/255 leak)."
+                }),
             },
         }
 
@@ -154,9 +231,11 @@ class NV_CropColorFix:
     FUNCTION = "execute"
     CATEGORY = "NV_Utils/Inpaint"
     DESCRIPTION = (
-        "V2 multipass diffusion drift fix. Step 1: Lab-space low-frequency color correction "
-        "(preserves texture detail). Step 2: Boundary-local residual correction. "
-        "Step 3: Frequency-aware composite (multiband Laplacian pyramid). "
+        "V2 multipass diffusion drift fix with motion-adaptive blending. "
+        "Step 1: Lab-space low-frequency color correction (preserves texture detail). "
+        "Step 2: Boundary-local residual correction. "
+        "Step 3: Frequency-aware composite (multiband Laplacian pyramid) with "
+        "velocity-adaptive blend width and temporal weight smoothing. "
         "Place between VAE Decode and InpaintStitch2."
     )
 
@@ -164,7 +243,8 @@ class NV_CropColorFix:
                 composite_mode, blend_pixels, blend_expansion=0,
                 ref_threshold=0.01, ref_erosion=8, lf_sigma=10.0,
                 boundary_correction=True, boundary_ring=12, boundary_decay=0.15,
-                temporal_smooth=0.0, multiband_levels=4, min_ref_pixels=100):
+                temporal_smooth=0.0, multiband_levels=4, min_ref_pixels=100,
+                motion_sensitivity=1.5, boundary_lock=True):
         device = original_crop.device
 
         # --- Batch / spatial alignment ---
@@ -181,19 +261,35 @@ class NV_CropColorFix:
             gen = gen.permute(0, 2, 3, 1)
 
         # Prepare mask [B, H, W]
-        m = mask.float()
+        m = mask.float().to(device)
         if m.dim() == 2:
             m = m.unsqueeze(0)
         if m.shape[1:] != (H, W):
             m = F.interpolate(m.unsqueeze(1), size=(H, W), mode="bilinear", align_corners=False).squeeze(1)
         if m.shape[0] > B:
             m = m[:B]
-        elif m.shape[0] == 1 and B > 1:
-            m = m.expand(B, -1, -1)
+        elif m.shape[0] < B:
+            # Repeat last mask frame to fill batch (handles both 1→B and partial batches)
+            pad = m[-1:].expand(B - m.shape[0], -1, -1)
+            m = torch.cat([m, pad], dim=0)
 
         info_lines = [f"NV_CropColorFix V2: {B} frames, {H}x{W}, correction={color_correction}, composite={composite_mode}"]
         if B_orig != B_gen:
             info_lines.append(f"  Batch mismatch: original={B_orig}, generated={B_gen}, using {B}")
+
+        # =================================================================
+        # Motion analysis (Phase 1B + Phase 2)
+        # =================================================================
+        centroids, velocity, has_mask = _compute_mask_centroids_and_velocity(m)
+        if B > 1:
+            fast_count = (velocity > 5.0).sum().item()
+            info_lines.append(
+                f"  Motion: velocity min={velocity.min().item():.1f}, "
+                f"mean={velocity.mean().item():.1f}, max={velocity.max().item():.1f} px/frame "
+                f"({int(fast_count)} fast frames >5px)"
+            )
+        else:
+            info_lines.append("  Motion: single frame (velocity=0)")
 
         # =====================================================================
         # STEP 1: Color correction
@@ -278,8 +374,8 @@ class NV_CropColorFix:
                         ema_shift[c] = shift
                         ema_scale[c] = scale
 
-                    # Apply Reinhard correction to entire frame
-                    corrected_work[b, c] = (work_src[b, c] - mu_src) * scale + mu_tgt
+                    # Apply Reinhard correction using (potentially EMA-smoothed) shift and scale
+                    corrected_work[b, c] = (work_src[b, c] - mu_src) * scale + (mu_src + shift)
 
                     total_shift[c] += shift.abs()
 
@@ -327,7 +423,6 @@ class NV_CropColorFix:
             outer_ring = outer_ring.clamp(0, 1)
 
             # Build distance-based decay field from mask edge into interior
-            # Use dilated-eroded difference as boundary proximity
             inner_band = mask_binary - _erode_mask_2d(mask_binary, boundary_ring)
             inner_band = inner_band.clamp(0, 1)
 
@@ -347,7 +442,6 @@ class NV_CropColorFix:
                     ring_residual_sum[b, c] = (orig_ring - corr_ring).mean()
 
             # Propagate correction into interior with distance decay
-            # Use the inner_band as a spatial weight (1 at boundary, fading inward)
             if ring_pixel_count.sum() > 0:
                 # Smooth the inner band to create gradient falloff
                 inner_weight = _gaussian_blur_reflect(
@@ -380,39 +474,133 @@ class NV_CropColorFix:
         if blend_expansion > 0:
             comp_mask = _dilate_mask_2d(comp_mask, blend_expansion)
 
+        # --- Phase 2: Temporal EMA on blend weight map (centroid-aligned) ---
+        if temporal_smooth > 0 and B > 1:
+            for b in range(1, B):
+                # Skip EMA on mask appearance/disappearance transitions to avoid ghosting
+                if not (has_mask[b] and has_mask[b - 1]):
+                    continue
+
+                dy = (centroids[b, 0] - centroids[b - 1, 0]).item()
+                dx = (centroids[b, 1] - centroids[b - 1, 1]).item()
+
+                # Translate previous weight map to align with current frame's crop-space
+                # dx/dy = how centroid moved; shift prev mask in same direction to align
+                prev_aligned = _translate_mask_2d(comp_mask[b - 1], dx, dy).clamp(0, 1)
+
+                # Base alpha derived from temporal_smooth slider (higher slider = more smoothing = lower alpha)
+                # Motion-adaptive: fast motion → less smoothing (alpha pushed toward 1.0)
+                base_alpha = 1.0 - temporal_smooth  # slider 0.3 → alpha 0.7, slider 0.8 → alpha 0.2
+                motion_boost = 0.2 * min(velocity[b].item() / 20.0, 1.0)
+                ema_alpha = min(base_alpha + motion_boost, 1.0)
+                comp_mask[b] = (ema_alpha * comp_mask[b] + (1.0 - ema_alpha) * prev_aligned).clamp(0, 1)
+
+            info_lines.append(
+                f"  Phase 2: temporal EMA on blend weights (centroid-aligned, decay adaptive)"
+            )
+
+        # --- Phase 1B: Velocity-adaptive blend width ---
+        use_per_frame = motion_sensitivity > 0 and B > 1
+        blend_base = float(blend_pixels)
+        # Ensure adaptive mode has a nonzero floor so velocity can actually widen the blend
+        blend_min = max(blend_base, 3.0) if use_per_frame else blend_base
+        blend_max = max(blend_base * 3.0, 9.0) if use_per_frame else blend_base * 3.0
+
+        if use_per_frame:
+            effective_blend = (blend_base + motion_sensitivity * velocity).clamp(blend_min, blend_max)
+            info_lines.append(
+                f"  Phase 1B: adaptive blend min={effective_blend.min().item():.1f}, "
+                f"mean={effective_blend.mean().item():.1f}, max={effective_blend.max().item():.1f} "
+                f"(K={motion_sensitivity:.1f})"
+            )
+        else:
+            effective_blend = torch.full((B,), blend_base, device=device)
+            if motion_sensitivity == 0:
+                info_lines.append("  Phase 1B: disabled (motion_sensitivity=0)")
+
+        # --- Composite ---
         if composite_mode == "multiband":
-            # Laplacian pyramid blend — wide LF transition, tight HF transition
-            # Convert to NCHW for multiband_blend
             corr_nchw = corrected.permute(0, 3, 1, 2)  # [B, C, H, W]
             orig_nchw = orig.permute(0, 3, 1, 2)        # [B, C, H, W]
-            mask_nchw = comp_mask.unsqueeze(1)            # [B, 1, H, W]
 
-            # Soften mask edges before pyramid (avoid hard transitions in HF bands)
-            if blend_pixels > 0:
-                mask_nchw = _gaussian_blur_reflect(mask_nchw, blend_pixels / 3.0)
-
-            blended_nchw = multiband_blend(corr_nchw, orig_nchw, mask_nchw, num_levels=multiband_levels)
-            output = blended_nchw.clamp(0, 1).permute(0, 2, 3, 1)  # [B, H, W, C]
-            info_lines.append(f"  Step 3 (multiband): {multiband_levels} levels, expansion={blend_expansion}")
+            if use_per_frame:
+                # Per-frame composite: each frame gets velocity-adapted blend width
+                out_frames = []
+                for b in range(B):
+                    mask_b = comp_mask[b:b + 1].unsqueeze(1)  # [1, 1, H, W]
+                    sigma_b = effective_blend[b].item() / 3.0
+                    if sigma_b > 0:
+                        mask_b = _gaussian_blur_reflect(mask_b, sigma_b).clamp(0, 1)
+                    blended_b = multiband_blend(
+                        corr_nchw[b:b + 1], orig_nchw[b:b + 1], mask_b, num_levels=multiband_levels
+                    )
+                    out_frames.append(blended_b)
+                blended_nchw = torch.cat(out_frames, dim=0)
+                output = blended_nchw.clamp(0, 1).permute(0, 2, 3, 1)
+                info_lines.append(
+                    f"  Step 3 (multiband): {multiband_levels} levels, adaptive width, expansion={blend_expansion}"
+                )
+            else:
+                # Batch mode: all frames use same blend width (fast path)
+                mask_nchw = comp_mask.unsqueeze(1)  # [B, 1, H, W]
+                if blend_pixels > 0:
+                    mask_nchw = _gaussian_blur_reflect(mask_nchw, blend_pixels / 3.0)
+                blended_nchw = multiband_blend(corr_nchw, orig_nchw, mask_nchw, num_levels=multiband_levels)
+                output = blended_nchw.clamp(0, 1).permute(0, 2, 3, 1)  # [B, H, W, C]
+                info_lines.append(f"  Step 3 (multiband): {multiband_levels} levels, expansion={blend_expansion}")
 
         elif composite_mode == "gaussian":
-            # V1 Gaussian alpha blend with reflect padding
-            feathered = comp_mask
-            if blend_pixels > 0:
-                feathered = _gaussian_blur_reflect(
-                    feathered.unsqueeze(1), blend_pixels / 3.0
-                ).squeeze(1).clamp(0, 1)
-
-            alpha = feathered.unsqueeze(-1)  # [B, H, W, 1]
-            output = orig * (1.0 - alpha) + corrected * alpha
-            output = output.clamp(0, 1)
-            info_lines.append(f"  Step 3 (gaussian): sigma={blend_pixels / 3.0:.1f}, expansion={blend_expansion}")
+            if use_per_frame:
+                # Per-frame Gaussian feathering with adaptive sigma
+                feathered = torch.zeros_like(comp_mask)
+                for b in range(B):
+                    sigma_b = effective_blend[b].item() / 3.0
+                    if sigma_b > 0:
+                        feathered[b:b + 1] = _gaussian_blur_reflect(
+                            comp_mask[b:b + 1].unsqueeze(1), sigma_b
+                        ).squeeze(1).clamp(0, 1)
+                    else:
+                        feathered[b] = comp_mask[b]
+                alpha = feathered.unsqueeze(-1)  # [B, H, W, 1]
+                output = orig * (1.0 - alpha) + corrected * alpha
+                output = output.clamp(0, 1)
+                info_lines.append(f"  Step 3 (gaussian): adaptive sigma, expansion={blend_expansion}")
+            else:
+                # Batch mode
+                feathered = comp_mask
+                if blend_pixels > 0:
+                    feathered = _gaussian_blur_reflect(
+                        feathered.unsqueeze(1), blend_pixels / 3.0
+                    ).squeeze(1).clamp(0, 1)
+                alpha = feathered.unsqueeze(-1)  # [B, H, W, 1]
+                output = orig * (1.0 - alpha) + corrected * alpha
+                output = output.clamp(0, 1)
+                info_lines.append(f"  Step 3 (gaussian): sigma={blend_pixels / 3.0:.1f}, expansion={blend_expansion}")
 
         elif composite_mode == "hard":
             hard_mask = (comp_mask > 0.5).float().unsqueeze(-1)
             output = orig * (1.0 - hard_mask) + corrected * hard_mask
             output = output.clamp(0, 1)
             info_lines.append(f"  Step 3 (hard): expansion={blend_expansion}")
+
+        # =====================================================================
+        # Phase 1A: Hard boundary lock — force pristine source outside blend zone
+        # =====================================================================
+        if boundary_lock:
+            # Erode the inverse mask inward by blend transition width + safety margin
+            # so the lock doesn't truncate the blending transition zone
+            # In adaptive mode, use max effective_blend to cover widest frame's transition
+            if use_per_frame:
+                lock_margin = max(int(effective_blend.max().item()) + blend_expansion, 2)
+            else:
+                lock_margin = max(blend_pixels + blend_expansion, 2)
+            inv_mask = (1.0 - comp_mask).clamp(0, 1)
+            eroded_inv = _erode_mask_2d(inv_mask, lock_margin)
+            lock_zone = (eroded_inv > 0.5).unsqueeze(-1)  # [B, H, W, 1]
+            output = torch.where(lock_zone, orig, output)
+            info_lines.append(f"  Phase 1A: boundary lock applied ({lock_margin}px eroded keep zone)")
+
+        output = output.clamp(0, 1)
 
         # --- Final residual measurement ---
         ref_zone = m < ref_threshold
