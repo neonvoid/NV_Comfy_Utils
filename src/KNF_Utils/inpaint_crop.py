@@ -17,7 +17,11 @@ import comfy.utils
 import nodes
 
 from .mask_ops import (
-    mask_erode_dilate, mask_fill_holes, mask_remove_noise, mask_smooth, mask_blur,
+    mask_erode_dilate as _op_erode_dilate,
+    mask_fill_holes as _op_fill_holes,
+    mask_remove_noise as _op_remove_noise,
+    mask_smooth as _op_smooth,
+    mask_blur,
     rescale_image, rescale_mask,
 )
 from .bbox_ops import find_bbox, detect_bbox_anomalies
@@ -434,13 +438,13 @@ class NV_InpaintCrop:
             processed_mask = one_mask.clone()
 
             if fill_holes_v > 0:
-                processed_mask = mask_fill_holes(processed_mask, fill_holes_v)
+                processed_mask = _op_fill_holes(processed_mask, fill_holes_v)
             if remove_noise_v > 0:
-                processed_mask = mask_remove_noise(processed_mask, remove_noise_v)
+                processed_mask = _op_remove_noise(processed_mask, remove_noise_v)
             if erode_dilate_v != 0:
-                processed_mask = mask_erode_dilate(processed_mask, erode_dilate_v)
+                processed_mask = _op_erode_dilate(processed_mask, erode_dilate_v)
             if smooth_v > 0:
-                processed_mask = mask_smooth(processed_mask, smooth_v)
+                processed_mask = _op_smooth(processed_mask, smooth_v)
 
             # Determine crop bounding box
             if raw_bboxes is not None and raw_bboxes[b] is not None:
@@ -483,10 +487,10 @@ class NV_InpaintCrop:
             if blend_pixels_v > 0:
                 if stitch_source == "bbox":
                     # Bbox is all-ones — erode INWARD from edges to create a border, then blur
-                    blend_mask = mask_erode_dilate(blend_mask, -blend_pixels_v)
+                    blend_mask = _op_erode_dilate(blend_mask, -blend_pixels_v)
                 else:
                     # Tight/processed — dilate OUTWARD to extend blend beyond mask edge
-                    blend_mask = mask_erode_dilate(blend_mask, blend_pixels_v)
+                    blend_mask = _op_erode_dilate(blend_mask, blend_pixels_v)
                 blend_mask = mask_blur(blend_mask, blend_pixels_v)
 
             # Store in stitcher
