@@ -408,7 +408,11 @@ from .boundary_color_match import (
     NODE_CLASS_MAPPINGS as BOUNDARY_COLOR_MATCH_CLASS_MAPPINGS,
     NODE_DISPLAY_NAME_MAPPINGS as BOUNDARY_COLOR_MATCH_DISPLAY_NAME_MAPPINGS
 )
-# Import guided filter mask (edge-aware mask refinement for SAM3 cleanup & stitch blending)from .guided_filter_mask import (    NODE_CLASS_MAPPINGS as GUIDED_FILTER_MASK_CLASS_MAPPINGS,    NODE_DISPLAY_NAME_MAPPINGS as GUIDED_FILTER_MASK_DISPLAY_NAME_MAPPINGS)
+# Import guided filter mask (edge-aware mask refinement for SAM3 cleanup & stitch blending)
+from .guided_filter_mask import (
+    NODE_CLASS_MAPPINGS as GUIDED_FILTER_MASK_CLASS_MAPPINGS,
+    NODE_DISPLAY_NAME_MAPPINGS as GUIDED_FILTER_MASK_DISPLAY_NAME_MAPPINGS
+)
 
 
 # Merge all node mappings
