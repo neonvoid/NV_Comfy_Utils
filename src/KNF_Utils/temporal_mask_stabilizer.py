@@ -1,155 +1,324 @@
 """
-NV Temporal Mask Stabilizer — Temporal mask cleaning for video sequences.
+NV Temporal Mask Stabilizer — motion-aware temporal mask cleanup for video sequences.
 
-Fixes mask "pops" (sudden shape changes between frames) using a 2-stage pipeline:
+Core path (when guide_image connected):
+  1. Joint bilateral temporal filtering gated by source-frame color similarity
+  2. Pop detection against an EMA prior, with geodesic reconstruction repair
 
-  Stage 1: Temporal Consensus — temporal median of neighboring frames
-  Stage 2: SDF Temporal Smoothing — signed distance field smoothing (continuous boundary)
+Fallback path (no guide_image):
+  - Temporal median consensus with reduced window
 
-Optional bbox_mask input crops to the mask region before processing (faster + higher detail).
-Optional MASK_PROCESSING_CONFIG applies spatial cleanup (erode/dilate, fill_holes, etc.) after stabilization.
+Optional bbox_mask crops to the region of interest before processing.
+Optional MASK_PROCESSING_CONFIG applies spatial cleanup after stabilization.
+Optional SDF smoothing is retained as a legacy stage and is disabled by default.
 
-Input:  MASK [B, H, W] — per-frame segmentation masks (e.g. from SAM3)
-Output: MASK [B, H, W] — temporally stabilized masks
+Input:
+  - MASK [B, H, W] : per-frame masks (e.g. from SAM3)
+  - IMAGE [B, H, W, C] : source video frames for motion-aware temporal gating
+Output:
+  - MASK [B, H, W] : temporally stabilized masks
 """
 
-import torch
+import math
+
 import numpy as np
+import torch
+import torch.nn.functional as F
 from scipy.ndimage import distance_transform_edt, gaussian_filter, gaussian_filter1d
 
 from .bbox_ops import compute_union_bbox
-from .mask_ops import mask_erode_dilate, mask_fill_holes, mask_remove_noise, mask_smooth
+from .mask_ops import mask_erode_dilate, mask_fill_holes, mask_remove_noise, mask_smooth, mask_connected_components_gate
+
+LOG_PREFIX = "[NV_TemporalMaskStabilizer]"
 
 
 # =============================================================================
-# Stage 1: Temporal Consensus (no-flow median)
+# Logit-space helpers
 # =============================================================================
 
-def compute_temporal_consensus(masks, window_size=5):
-    """Temporal median consensus — simple and effective temporal smoothing.
+def mask_to_logits(mask, eps=1e-4):
+    """Convert probabilities in [0, 1] to logits safely."""
+    eps = float(max(1e-8, min(1e-2, eps)))
+    return torch.logit(mask.clamp(eps, 1.0 - eps))
 
-    For each frame, takes the median across a temporal window of neighboring frames.
-    This eliminates outlier frames ("pops") without requiring optical flow.
 
-    Args:
-        masks: [B, H, W] float tensor
-        window_size: radius of temporal window
+def logits_to_mask(logits):
+    """Convert logits back to probabilities."""
+    return torch.sigmoid(logits)
 
-    Returns:
-        consensus: [B, H, W] float tensor
+
+def _mask_lerp(a, b, weight, use_logit_space=False, logit_eps=1e-4):
+    """Interpolate masks either in probability space or logit space."""
+    weight = float(min(max(weight, 0.0), 1.0))
+    if not use_logit_space:
+        return torch.lerp(a, b, weight)
+    a_l = mask_to_logits(a, eps=logit_eps)
+    b_l = mask_to_logits(b, eps=logit_eps)
+    return logits_to_mask(torch.lerp(a_l, b_l, weight))
+
+
+# =============================================================================
+# Stage 1a: Joint Bilateral Temporal Filter (GPU, motion-aware)
+# =============================================================================
+
+def _temporal_validity(frames, dt, device, dtype):
+    """Validity mask for torch.roll-based temporal shifts (prevents wraparound)."""
+    valid = torch.ones(frames, device=device, dtype=dtype)
+    if dt > 0:
+        valid[:dt] = 0
+    elif dt < 0:
+        valid[frames + dt:] = 0
+    return valid.view(frames, 1, 1)
+
+
+def joint_bilateral_temporal_filter(masks, guide_image, radius=3, sigma_color=0.1, sigma_time=1.5,
+                                    use_logit_space=False, logit_eps=1e-4):
+    """Motion-aware temporal smoothing using image color similarity as a gate.
+
+    For each temporal offset dt:
+      weight = exp(-dt^2 / (2*sigma_time^2)) * exp(-color_diff_sq / (2*sigma_color^2))
+
+    Neighbor frames with large RGB change at a pixel contribute very little, which
+    prevents moving-object shrinkage compared with naive temporal median / averaging.
     """
-    B, H, W = masks.shape
-    if B <= 1:
+    if masks.dim() != 3:
+        raise ValueError(f"masks must be [B, H, W], got shape {list(masks.shape)}")
+    if guide_image.dim() != 4:
+        raise ValueError(f"guide_image must be [B, H, W, C], got shape {list(guide_image.shape)}")
+    if masks.shape[0] != guide_image.shape[0]:
+        raise ValueError(f"Batch mismatch: mask batch={masks.shape[0]}, guide batch={guide_image.shape[0]}")
+    if masks.shape[1] != guide_image.shape[1] or masks.shape[2] != guide_image.shape[2]:
+        raise ValueError(f"Spatial mismatch: mask={list(masks.shape[1:])}, guide={list(guide_image.shape[1:3])}")
+
+    frames = masks.shape[0]
+    if frames <= 1 or radius <= 0:
         return masks.clone()
 
-    masks_np = masks.cpu().numpy()
-    consensus = np.zeros_like(masks_np)
+    sigma_color = max(float(sigma_color), 1e-6)
+    sigma_time = max(float(sigma_time), 1e-6)
 
-    for t in range(B):
-        lo = max(0, t - window_size)
-        hi = min(B, t + window_size + 1)
-        consensus[t] = np.median(masks_np[lo:hi], axis=0)
+    guide = guide_image[..., :3].to(device=masks.device, dtype=torch.float32).contiguous()
+    src_prob = masks.to(dtype=torch.float32).clamp(0.0, 1.0)
+    src = mask_to_logits(src_prob, eps=logit_eps) if use_logit_space else src_prob
 
-    return torch.from_numpy(consensus).to(masks.device)
+    numerator = src.clone()
+    denominator = torch.ones_like(src)
+
+    for dt in range(-radius, radius + 1):
+        if dt == 0:
+            continue
+
+        shifted_mask = torch.roll(src, shifts=dt, dims=0)
+        shifted_guide = torch.roll(guide, shifts=dt, dims=0)
+
+        valid = _temporal_validity(frames, dt, src.device, src.dtype)
+        color_diff_sq = torch.sum((guide - shifted_guide) ** 2, dim=-1)
+
+        color_weight = torch.exp(-color_diff_sq / (2.0 * sigma_color * sigma_color))
+        time_weight = math.exp(-(dt * dt) / (2.0 * sigma_time * sigma_time))
+        weight = color_weight * valid * time_weight
+
+        numerator = numerator + weight * shifted_mask
+        denominator = denominator + weight
+
+    filtered = numerator / denominator.clamp_min(1e-6)
+    if use_logit_space:
+        return logits_to_mask(filtered)
+    return filtered.clamp(0.0, 1.0)
 
 
 # =============================================================================
-# Stage 2: SDF Temporal Smoothing
+# Stage 1b: Fallback Temporal Median (no guide image)
+# =============================================================================
+
+def compute_temporal_consensus(masks, window_radius=3):
+    """Fallback temporal median consensus when no guide image is available."""
+    if masks.dim() != 3:
+        raise ValueError(f"masks must be [B, H, W], got shape {list(masks.shape)}")
+
+    frames = masks.shape[0]
+    if frames <= 1 or window_radius <= 0:
+        return masks.clone()
+
+    result = []
+    for t in range(frames):
+        lo = max(0, t - window_radius)
+        hi = min(frames, t + window_radius + 1)
+        result.append(torch.median(masks[lo:hi], dim=0).values)
+    return torch.stack(result, dim=0)
+
+
+# =============================================================================
+# Stage 2: Pop Detection + Geodesic Reconstruction
+# =============================================================================
+
+def _mask_iou(a, b, threshold=0.5):
+    """Binary IoU for two single-frame masks [H, W]."""
+    a_bin = a > threshold
+    b_bin = b > threshold
+    inter = torch.logical_and(a_bin, b_bin).sum().float()
+    union = torch.logical_or(a_bin, b_bin).sum().float()
+    if union.item() == 0:
+        return 1.0
+    return float((inter / union).item())
+
+
+def _area_ratio_change(current, prior, threshold=0.5):
+    """Relative area change between two single-frame masks [H, W]."""
+    current_area = (current > threshold).float().mean()
+    prior_area = (prior > threshold).float().mean()
+    denom = prior_area.clamp_min(1e-6)
+    return float((current_area - prior_area).abs().div(denom).item())
+
+
+def geodesic_reconstruct(seed, support, iterations=10):
+    """Geodesic reconstruction by iterative dilation clipped to the support mask.
+
+    Uses F.max_pool2d for GPU-native dilation — no scipy/numpy.
+    """
+    seed_bin = seed.bool()
+    support_bin = support.bool()
+
+    if not torch.any(seed_bin) or not torch.any(support_bin):
+        return seed_bin & support_bin
+
+    current = seed_bin.unsqueeze(0).unsqueeze(0).float()
+    support_4d = support_bin.unsqueeze(0).unsqueeze(0)
+
+    for _ in range(max(1, int(iterations))):
+        dilated = F.max_pool2d(current, kernel_size=3, stride=1, padding=1) > 0.5
+        updated = torch.logical_and(dilated, support_4d)
+        if torch.equal(updated, current > 0.5):
+            break
+        current = updated.float()
+
+    return (current > 0.5).squeeze(0).squeeze(0)
+
+
+def repair_pop_frame(current, prior, iterations=10, use_logit_space=False, logit_eps=1e-4):
+    """Repair a popped frame by blending toward the prior and reconstructing support."""
+    current = current.clamp(0.0, 1.0)
+    prior = prior.clamp(0.0, 1.0)
+
+    if use_logit_space:
+        cur_l = mask_to_logits(current, eps=logit_eps)
+        pri_l = mask_to_logits(prior, eps=logit_eps)
+        blended = logits_to_mask(0.7 * pri_l + 0.3 * cur_l)
+    else:
+        blended = 0.7 * prior + 0.3 * current
+    del current  # use blended from here
+    support = blended > 0.30
+    prior_bin = prior > 0.50
+
+    overlap_seed = torch.logical_and(support, prior_bin)
+    if torch.any(overlap_seed):
+        connected_support = geodesic_reconstruct(overlap_seed, support, iterations=iterations)
+    else:
+        connected_support = support
+
+    seed_source = torch.maximum(blended, prior)
+    high_conf_seed = torch.logical_and(seed_source > 0.75, connected_support)
+
+    if torch.any(high_conf_seed):
+        reconstructed = geodesic_reconstruct(high_conf_seed, connected_support, iterations=iterations)
+    else:
+        reconstructed = connected_support
+
+    repaired = blended * reconstructed.float()
+    return repaired.clamp(0.0, 1.0)
+
+
+def apply_pop_detection_and_repair(masks, enabled=True, area_thresh=0.20, iou_thresh=0.65, ema_alpha=0.25,
+                                   info_lines=None, use_logit_space=False, logit_eps=1e-4):
+    """Detect temporal pops against an EMA prior and repair them via geodesic reconstruction."""
+    if info_lines is None:
+        info_lines = []
+
+    if not enabled or masks.shape[0] <= 1:
+        if not enabled:
+            info_lines.append("[Pop] Pop detection disabled.")
+        return masks.clone(), 0
+
+    result = masks.clone()
+    prior = result[0].clone()
+    repaired_count = 0
+
+    stable_alpha = float(min(max(ema_alpha, 0.01), 0.99))
+    pop_alpha = 0.10
+
+    for t in range(result.shape[0]):
+        current = result[t]
+        area_change = _area_ratio_change(current, prior)
+        iou = _mask_iou(current, prior)
+
+        is_pop = area_change > float(area_thresh) or iou < float(iou_thresh)
+        if is_pop:
+            repaired = repair_pop_frame(current, prior, iterations=10,
+                                       use_logit_space=use_logit_space, logit_eps=logit_eps)
+            result[t] = repaired
+            prior = _mask_lerp(prior, repaired, pop_alpha, use_logit_space=use_logit_space, logit_eps=logit_eps)
+            repaired_count += 1
+            info_lines.append(f"[Pop] Frame {t}: repaired (area_change={area_change:.3f}, iou={iou:.3f})")
+        else:
+            prior = _mask_lerp(prior, current, stable_alpha, use_logit_space=use_logit_space, logit_eps=logit_eps)
+
+    if repaired_count == 0:
+        info_lines.append("[Pop] No pops detected.")
+    else:
+        info_lines.append(f"[Pop] Repaired {repaired_count} frame(s).")
+
+    return result, repaired_count
+
+
+# =============================================================================
+# Legacy SDF Smoothing (disabled by default)
 # =============================================================================
 
 def mask_to_sdf(mask_np, narrow_band=0):
-    """Convert a binary mask to a signed distance function.
-
-    Positive outside, negative inside. The zero-crossing is the mask boundary.
-
-    Args:
-        mask_np: [H, W] numpy array, values in [0, 1]
-        narrow_band: if >0, clamp SDF to [-band, +band] for efficiency
-
-    Returns:
-        sdf: [H, W] numpy float32 array
-    """
+    """Convert a binary-ish mask to a signed distance field."""
     binary = (mask_np > 0.5).astype(np.float64)
-
-    # Distance from outside to boundary
     dist_outside = distance_transform_edt(1.0 - binary)
-    # Distance from inside to boundary
     dist_inside = distance_transform_edt(binary)
-
-    sdf = dist_outside - dist_inside  # positive outside, negative inside
-
+    sdf = dist_outside - dist_inside
     if narrow_band > 0:
         sdf = np.clip(sdf, -narrow_band, narrow_band)
-
     return sdf.astype(np.float32)
 
 
 def sdf_to_mask(sdf):
-    """Convert SDF back to mask. Zero-crossing becomes the boundary.
-
-    Uses a steep sigmoid so the output is near-binary (solid white inside,
-    solid black outside) with only a ~1px transition at the boundary.
-    The steepness (scale=5.0) means pixels >1px inside are already >0.99.
-    """
-    # Steep sigmoid: scale=5.0 means 1px from boundary -> 0.993 or 0.007
-    # This prevents the soft gradient artifacts that a gentle sigmoid creates
+    """Convert SDF back to a near-binary soft mask."""
     return 1.0 / (1.0 + np.exp(sdf * 5.0))
 
 
-def temporal_sdf_smooth(masks, sigma_temporal=2.0, sigma_spatial=1.0, narrow_band=64):
-    """Smooth masks via SDF representation — the core quality stage.
+def temporal_sdf_smooth(masks, sigma_temporal=1.0, sigma_spatial=0.5, narrow_band=64):
+    """Legacy SDF temporal smoothing stage (CPU, scipy)."""
+    frames, height, width = masks.shape
+    masks_np = masks.detach().cpu().numpy()
 
-    1. Convert each frame's mask to a signed distance function
-    2. Apply Gaussian smoothing along temporal axis in SDF space
-    3. Optional light spatial smoothing to clean SDF noise
-    4. Convert back to masks via sigmoid at zero-crossing
-
-    Smoothing in SDF space is mathematically superior to smoothing binary masks:
-    - SDFs are continuous and smooth by nature
-    - Temporal filtering interpolates boundary positions, not binary values
-    - Topology changes (splits, merges) are handled gracefully
-    - No sampling artifacts from contour extraction
-
-    Args:
-        masks: [B, H, W] float tensor
-        sigma_temporal: Gaussian sigma along time axis (frames). Higher = more smoothing.
-        sigma_spatial: Gaussian sigma for per-frame SDF cleanup. 0 = skip.
-        narrow_band: SDF clamping distance (pixels). Limits computation to boundary region.
-
-    Returns:
-        smoothed: [B, H, W] float tensor
-    """
-    B, H, W = masks.shape
-    masks_np = masks.cpu().numpy()
-
-    # Step 1: Convert all frames to SDF
-    sdf_volume = np.zeros((B, H, W), dtype=np.float32)
-    for t in range(B):
+    sdf_volume = np.zeros((frames, height, width), dtype=np.float32)
+    for t in range(frames):
         sdf_volume[t] = mask_to_sdf(masks_np[t], narrow_band=narrow_band)
 
-    # Step 2: Temporal Gaussian smoothing in SDF space
-    if sigma_temporal > 0 and B > 1:
+    if sigma_temporal > 0 and frames > 1:
         sdf_volume = gaussian_filter1d(sdf_volume, sigma=sigma_temporal, axis=0, mode="nearest")
 
-    # Step 3: Optional light spatial smoothing
     if sigma_spatial > 0:
-        for t in range(B):
+        for t in range(frames):
             sdf_volume[t] = gaussian_filter(sdf_volume[t], sigma=sigma_spatial, mode="nearest")
 
-    # Step 4: Convert back to masks via sigmoid at zero-crossing
-    result = np.zeros((B, H, W), dtype=np.float32)
-    for t in range(B):
+    result = np.zeros((frames, height, width), dtype=np.float32)
+    for t in range(frames):
         result[t] = sdf_to_mask(sdf_volume[t])
 
-    return torch.from_numpy(result).to(masks.device)
+    return torch.from_numpy(result).to(device=masks.device, dtype=torch.float32)
 
 
 # =============================================================================
-# Bbox Crop/Paste Helpers
+# Crop Helpers
 # =============================================================================
 
 def crop_tensors(masks, images, bbox):
-    """Crop mask and image tensors to a bounding box region."""
+    """Crop masks [B,H,W] and images [B,H,W,C] to a bbox."""
     x, y, w, h = bbox
     cropped_masks = masks[:, y:y + h, x:x + w].clone()
     cropped_images = None
@@ -159,19 +328,18 @@ def crop_tensors(masks, images, bbox):
 
 
 def paste_masks(result_full, cropped_result, bbox):
-    """Paste cropped stabilized masks back into full-frame masks."""
+    """Paste cropped masks back into a full-frame tensor."""
     x, y, w, h = bbox
     result_full[:, y:y + h, x:x + w] = cropped_result
     return result_full
 
 
 # =============================================================================
-# Post-Stabilization Spatial Cleanup (from mask config)
+# Spatial Cleanup
 # =============================================================================
 
-def apply_spatial_cleanup(masks, erode_dilate=0, fill_holes=0,
-                          remove_noise=0, smooth=0):
-    """Apply per-frame spatial mask operations after temporal stabilization."""
+def apply_spatial_cleanup(masks, erode_dilate=0, fill_holes=0, remove_noise=0, smooth=0):
+    """Apply per-frame spatial cleanup after temporal stabilization."""
     result = masks
     if fill_holes > 0:
         result = mask_fill_holes(result, fill_holes)
@@ -188,66 +356,65 @@ def apply_spatial_cleanup(masks, erode_dilate=0, fill_holes=0,
 # Full Pipeline
 # =============================================================================
 
-def run_stabilization_pipeline(masks,
-                               consensus_window=5, sdf_sigma_temporal=2.0,
-                               sdf_sigma_spatial=1.0, sdf_narrow_band=64,
-                               enable_sdf=True,
-                               output_mode="binary",
-                               info_lines=None):
-    """Run the temporal mask stabilization pipeline.
-
-    Args:
-        masks: [B, H, W] float tensor — input masks
-        consensus_window: frames on each side for temporal consensus
-        sdf_sigma_temporal: temporal smoothing in SDF space
-        sdf_sigma_spatial: spatial SDF cleanup
-        sdf_narrow_band: SDF clamping distance in pixels
-        enable_sdf: run SDF smoothing stage
-        output_mode: "binary" (threshold at 0.5) or "soft" (keep gradients)
-        info_lines: list to append diagnostic strings to
-
-    Returns:
-        result: [B, H, W] float tensor — stabilized masks
-    """
+def run_stabilization_pipeline(masks, guide_image=None, consensus_window=3, sigma_color=0.1, sigma_time=1.5,
+                               pop_detection=True, pop_area_thresh=0.20, pop_iou_thresh=0.65,
+                               enable_sdf=False, sdf_sigma_temporal=1.0, sdf_sigma_spatial=0.5, sdf_narrow_band=64,
+                               output_mode="binary", info_lines=None,
+                               use_logit_space=False, logit_eps=1e-4,
+                               cc_gate_enable=False, cc_gate_min_area=300, cc_gate_dilate=15, cc_gate_blur=5):
+    """Run the full temporal mask stabilization pipeline."""
     if info_lines is None:
         info_lines = []
 
-    B, H, W = masks.shape
-    info_lines.append(f"[TemporalStabilizer] Input: {B} frames, {H}x{W}")
+    if masks.dim() != 3:
+        raise ValueError(f"mask must be [B, H, W], got shape {list(masks.shape)}")
 
-    # --- Stage 1: Temporal Consensus ---
-    if B > 1:
-        print(f"[TemporalStabilizer] Stage 1: Temporal median consensus (window={consensus_window})...")
-        info_lines.append(f"[Stage 1] Temporal median consensus (window={consensus_window})...")
-        consensus = compute_temporal_consensus(masks, window_size=consensus_window)
+    frames, height, width = masks.shape
+    info_lines.append(f"[Input] {frames} frames at {height}x{width}")
+    work = masks.to(dtype=torch.float32).clamp(0.0, 1.0)
+
+    if frames > 1:
+        if guide_image is not None:
+            info_lines.append(f"[Stage 1] Joint bilateral temporal filter (radius={consensus_window}, "
+                              f"sigma_color={sigma_color:.3f}, sigma_time={sigma_time:.3f})")
+            print(f"{LOG_PREFIX} Stage 1: joint bilateral temporal filter "
+                  f"(radius={consensus_window}, sigma_color={sigma_color}, sigma_time={sigma_time})")
+            work = joint_bilateral_temporal_filter(work, guide_image, radius=consensus_window,
+                                                   sigma_color=sigma_color, sigma_time=sigma_time,
+                                                   use_logit_space=use_logit_space, logit_eps=logit_eps)
+        else:
+            info_lines.append(f"[Stage 1] Fallback temporal median (radius={consensus_window})")
+            print(f"{LOG_PREFIX} Stage 1: fallback temporal median (radius={consensus_window})")
+            work = compute_temporal_consensus(work, window_radius=consensus_window)
     else:
-        info_lines.append("[Stage 1] Single frame, skipping temporal consensus.")
-        consensus = masks.clone()
+        info_lines.append("[Stage 1] Single frame, temporal filtering skipped.")
 
-    # --- Stage 2: SDF Temporal Smoothing ---
-    if enable_sdf and B > 1:
-        print(f"[TemporalStabilizer] Stage 2: SDF temporal smoothing (sigma_t={sdf_sigma_temporal}, sigma_s={sdf_sigma_spatial})...")
-        info_lines.append(f"[Stage 2] SDF temporal smoothing (sigma_t={sdf_sigma_temporal}, sigma_s={sdf_sigma_spatial})...")
-        result = temporal_sdf_smooth(consensus, sigma_temporal=sdf_sigma_temporal,
-                                     sigma_spatial=sdf_sigma_spatial, narrow_band=sdf_narrow_band)
-    elif enable_sdf:
-        # Single frame — only spatial SDF smoothing
-        info_lines.append("[Stage 2] SDF spatial smoothing (single frame)...")
-        result = temporal_sdf_smooth(consensus, sigma_temporal=0, sigma_spatial=sdf_sigma_spatial,
-                                     narrow_band=sdf_narrow_band)
-    else:
-        result = consensus
+    work, _ = apply_pop_detection_and_repair(work, enabled=pop_detection, area_thresh=pop_area_thresh,
+                                             iou_thresh=pop_iou_thresh, info_lines=info_lines,
+                                             use_logit_space=use_logit_space, logit_eps=logit_eps)
 
-    # --- Final Output ---
+    if enable_sdf:
+        info_lines.append(f"[Stage 3] Legacy SDF smoothing (sigma_t={sdf_sigma_temporal:.2f}, "
+                          f"sigma_s={sdf_sigma_spatial:.2f})")
+        print(f"{LOG_PREFIX} Stage 3: legacy SDF smoothing (sigma_t={sdf_sigma_temporal}, sigma_s={sdf_sigma_spatial})")
+        work = temporal_sdf_smooth(work, sigma_temporal=sdf_sigma_temporal,
+                                   sigma_spatial=sdf_sigma_spatial, narrow_band=sdf_narrow_band)
+
+    # --- Stage 4: Connected components gating ---
+    if cc_gate_enable:
+        info_lines.append(f"[Stage 4] CC gating (min_area={cc_gate_min_area}, dilate={cc_gate_dilate}, blur={cc_gate_blur})")
+        print(f"{LOG_PREFIX} Stage 4: CC gating (min_area={cc_gate_min_area}, dilate={cc_gate_dilate})")
+        work = mask_connected_components_gate(work, min_area=cc_gate_min_area,
+                                              dilate_radius=cc_gate_dilate, blur_kernel=cc_gate_blur)
+
     if output_mode == "binary":
-        result = (result > 0.5).float()
-        info_lines.append("[Output] Binarized at 0.5 threshold (clean binary masks).")
+        work = (work > 0.5).float()
+        info_lines.append("[Output] Binary mask at threshold 0.5.")
     else:
-        result = result.clamp(0, 1)
-        info_lines.append("[Output] Soft output (gradients preserved).")
+        work = work.clamp(0.0, 1.0)
+        info_lines.append("[Output] Soft mask preserved.")
 
-    info_lines.append(f"[TemporalStabilizer] Done. {len(info_lines)} diagnostic lines.")
-    return result
+    return work
 
 
 # =============================================================================
@@ -255,74 +422,102 @@ def run_stabilization_pipeline(masks,
 # =============================================================================
 
 class NV_TemporalMaskStabilizer:
-    """Temporal mask stabilization for video sequences.
-
-    Eliminates mask "pops" (sudden shape changes) using temporal median consensus
-    and signed distance field smoothing.
-
-    Optional bbox_mask crops to the region of interest before processing — faster and
-    higher quality since SDF operates on a smaller, more detailed region.
-
-    Optional MASK_PROCESSING_CONFIG applies spatial cleanup after stabilization using
-    the same shared settings as InpaintCrop, LatentInpaintCrop, etc.
-    """
+    """Motion-aware temporal stabilization for video masks."""
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
                 "mask": ("MASK", {
-                    "tooltip": "Per-frame segmentation masks [B, H, W]. Connect SAM3 or other segmentation output."
+                    "tooltip": "Per-frame masks [B, H, W]. Connect SAM3 or any mask sequence."
                 }),
                 "consensus_window": ("INT", {
-                    "default": 5, "min": 1, "max": 20, "step": 1,
-                    "tooltip": "Temporal consensus window radius (frames on each side). Larger = more temporal context but slower."
-                }),
-                "sdf_sigma_temporal": ("FLOAT", {
-                    "default": 1.5, "min": 0.0, "max": 10.0, "step": 0.1,
-                    "tooltip": "SDF temporal smoothing strength (Gaussian sigma in frames). Higher = smoother boundaries over time but more shape loss. 0 = skip."
-                }),
-                "sdf_sigma_spatial": ("FLOAT", {
-                    "default": 0.5, "min": 0.0, "max": 5.0, "step": 0.1,
-                    "tooltip": "SDF spatial cleanup (Gaussian sigma in pixels). Removes boundary noise. 0 = skip. Keep low to preserve shape."
+                    "default": 3, "min": 1, "max": 10, "step": 1,
+                    "tooltip": "Temporal window radius in frames. 3 = recommended (7-frame window). "
+                               "Larger windows increase smoothing but can hurt motion tracking."
                 }),
                 "output_mode": (["binary", "soft"], {
                     "default": "binary",
-                    "tooltip": "binary = clean solid masks (threshold at 0.5). soft = preserve gradients (for blend masks)."
-                }),
-                "crop_padding": ("FLOAT", {
-                    "default": 0.15, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "Padding around crop region as fraction of bbox size. Only used when bbox_mask is connected."
+                    "tooltip": "binary: threshold to clean solid masks. soft: keep soft probabilities."
                 }),
             },
             "optional": {
+                "guide_image": ("IMAGE", {
+                    "tooltip": "Source video frames [B, H, W, C] for motion-aware temporal filtering. "
+                               "STRONGLY RECOMMENDED — without this, falls back to temporal median "
+                               "which shrinks masks on moving objects."
+                }),
                 "bbox_mask": ("MASK", {
-                    "tooltip": "Bounding box mask from MaskTrackingBBox. When connected, stabilization runs only on the "
-                              "cropped region (faster, higher detail). Result is pasted back to full frame."
+                    "tooltip": "Optional bbox/ROI mask. Stabilization runs only inside union crop."
                 }),
                 "mask_config": ("MASK_PROCESSING_CONFIG", {
-                    "tooltip": "Shared mask processing config from NV_MaskProcessingConfig. Applies spatial cleanup "
-                              "(erode/dilate, fill_holes, remove_noise, smooth) after temporal stabilization."
+                    "tooltip": "Shared mask-processing config bus. Overrides local cleanup widgets."
+                }),
+                "sigma_color": ("FLOAT", {
+                    "default": 0.1, "min": 0.01, "max": 1.0, "step": 0.01,
+                    "tooltip": "Color-similarity sigma for bilateral filter. Lower = stricter motion rejection."
+                }),
+                "sigma_time": ("FLOAT", {
+                    "default": 1.5, "min": 0.1, "max": 5.0, "step": 0.1,
+                    "tooltip": "Temporal decay sigma in frames. Lower = prioritize nearby frames."
+                }),
+                "pop_detection": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Detect sudden mask pops and repair with geodesic reconstruction."
+                }),
+                "pop_area_thresh": ("FLOAT", {
+                    "default": 0.20, "min": 0.05, "max": 0.5, "step": 0.01,
+                    "tooltip": "Pop trigger: relative area change threshold."
+                }),
+                "pop_iou_thresh": ("FLOAT", {
+                    "default": 0.65, "min": 0.3, "max": 0.95, "step": 0.01,
+                    "tooltip": "Pop trigger: IoU with EMA prior below which to repair."
+                }),
+                "use_logit_space": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Operate in logit space instead of probability space. Prevents saturation blocking "
+                               "near 0/1 values. Experimental — may need threshold retuning."
+                }),
+                "cc_gate_enable": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Enable connected-components gating after stabilization. Kills isolated noise specks "
+                               "while preserving soft edges in valid regions. (CorridorKey-style clean_matte)"
+                }),
+                "cc_gate_min_area": ("INT", {
+                    "default": 300, "min": 10, "max": 10000, "step": 10,
+                    "tooltip": "Minimum component area in pixels to keep. Smaller components are killed."
                 }),
                 "mask_erode_dilate": ("INT", {
                     "default": 0, "min": -128, "max": 128, "step": 1,
-                    "tooltip": "Post-stabilization erosion (<0) or dilation (>0). Overridden by mask_config if connected."
+                    "tooltip": "Post-stabilization erosion (<0) or dilation (>0). Overridden by mask_config."
                 }),
                 "mask_fill_holes": ("INT", {
                     "default": 0, "min": 0, "max": 128, "step": 1,
-                    "tooltip": "Post-stabilization hole filling (grey closing). Overridden by mask_config if connected."
+                    "tooltip": "Post-stabilization hole filling. Overridden by mask_config."
                 }),
                 "mask_remove_noise": ("INT", {
                     "default": 0, "min": 0, "max": 32, "step": 1,
-                    "tooltip": "Post-stabilization noise removal (grey opening). Overridden by mask_config if connected."
+                    "tooltip": "Post-stabilization noise removal. Overridden by mask_config."
                 }),
                 "mask_smooth": ("INT", {
                     "default": 0, "min": 0, "max": 127, "step": 1,
-                    "tooltip": "Post-stabilization edge smoothing (binarize + blur). Overridden by mask_config if connected."
+                    "tooltip": "Post-stabilization edge smoothing. Overridden by mask_config."
                 }),
                 "enable_sdf": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "Enable SDF temporal smoothing. This is the core quality stage — smooths boundaries in continuous distance space."
+                    "default": False,
+                    "tooltip": "Enable legacy SDF smoothing after bilateral + pop pipeline. Off by default."
+                }),
+                "sdf_sigma_temporal": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 10.0, "step": 0.1,
+                    "tooltip": "Legacy SDF temporal sigma. Only used when enable_sdf is on."
+                }),
+                "sdf_sigma_spatial": ("FLOAT", {
+                    "default": 0.5, "min": 0.0, "max": 5.0, "step": 0.1,
+                    "tooltip": "Legacy SDF spatial sigma. Only used when enable_sdf is on."
+                }),
+                "crop_padding": ("FLOAT", {
+                    "default": 0.15, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Padding around bbox crop. Only used when bbox_mask is connected."
                 }),
             },
         }
@@ -332,78 +527,82 @@ class NV_TemporalMaskStabilizer:
     FUNCTION = "execute"
     CATEGORY = "NV_Utils/Mask"
     DESCRIPTION = (
-        "Temporal mask stabilization. Fixes mask pops using temporal median consensus "
-        "and SDF boundary smoothing. "
-        "Connect bbox_mask to crop first (faster). Connect mask_config for shared spatial cleanup."
+        "Motion-aware temporal mask stabilization. Uses joint bilateral temporal filtering "
+        "with source video frames to prevent mask shrinkage on moving objects, then repairs "
+        "sudden pops using an EMA prior and geodesic reconstruction. "
+        "Falls back to temporal median if guide_image is not connected."
     )
 
-    def execute(self, mask, consensus_window, sdf_sigma_temporal, sdf_sigma_spatial,
-                output_mode="binary", crop_padding=0.15,
-                bbox_mask=None, mask_config=None,
+    def execute(self, mask, consensus_window, output_mode,
+                guide_image=None, bbox_mask=None, mask_config=None,
+                sigma_color=0.1, sigma_time=1.5,
+                pop_detection=True, pop_area_thresh=0.20, pop_iou_thresh=0.65,
+                use_logit_space=False, cc_gate_enable=False, cc_gate_min_area=300,
                 mask_erode_dilate=0, mask_fill_holes=0, mask_remove_noise=0, mask_smooth=0,
-                enable_sdf=True):
+                enable_sdf=False, sdf_sigma_temporal=1.0, sdf_sigma_spatial=0.5, crop_padding=0.15):
+
+        if mask.dim() != 3:
+            raise ValueError(f"mask must be [B, H, W], got shape {list(mask.shape)}")
 
         info_lines = []
-        B = mask.shape[0]
-        print(f"[NV_TemporalMaskStabilizer] Starting: {B} frames, {mask.shape[1]}x{mask.shape[2]}")
+        frames, height, width = mask.shape
+        print(f"{LOG_PREFIX} Starting: {frames} frames, {height}x{width}")
 
-        # --- Resolve mask config (config bus overrides local widgets) ---
+        if guide_image is not None:
+            if guide_image.dim() != 4:
+                raise ValueError(f"guide_image must be [B, H, W, C], got shape {list(guide_image.shape)}")
+            if guide_image.shape[0] != frames:
+                raise ValueError(f"guide_image batch must match mask: guide={guide_image.shape[0]}, mask={frames}")
+            if guide_image.shape[1] != height or guide_image.shape[2] != width:
+                raise ValueError(f"guide_image spatial must match mask: guide={list(guide_image.shape[1:3])}, "
+                                 f"mask={[height, width]}")
+            guide_image = guide_image.to(device=mask.device, dtype=torch.float32).clamp(0.0, 1.0)
+
+        mask = mask.to(dtype=torch.float32).clamp(0.0, 1.0)
+
         from .mask_processing_config import apply_mask_config
-        vals = apply_mask_config(mask_config,
-            mask_erode_dilate=mask_erode_dilate,
-            mask_fill_holes=mask_fill_holes,
-            mask_remove_noise=mask_remove_noise,
-            mask_smooth=mask_smooth,
-        )
+        vals = apply_mask_config(mask_config, mask_erode_dilate=mask_erode_dilate, mask_fill_holes=mask_fill_holes,
+                                 mask_remove_noise=mask_remove_noise, mask_smooth=mask_smooth)
         post_erode_dilate = vals["mask_erode_dilate"]
         post_fill_holes = vals["mask_fill_holes"]
         post_remove_noise = vals["mask_remove_noise"]
         post_smooth = vals["mask_smooth"]
-
         has_spatial_cleanup = (post_erode_dilate != 0 or post_fill_holes > 0
                                or post_remove_noise > 0 or post_smooth > 0)
 
-        # --- Bbox crop mode ---
         use_crop = bbox_mask is not None
         crop_bbox = None
+        work_masks = mask
+        work_images = guide_image
 
         if use_crop:
             crop_bbox = compute_union_bbox(bbox_mask, padding_frac=crop_padding)
             if crop_bbox is not None:
                 x, y, w, h = crop_bbox
-                info_lines.append(f"[Crop] Cropping to bbox region: ({x},{y}) {w}x{h} (padding={crop_padding:.0%})")
-                work_masks, _ = crop_tensors(mask, None, crop_bbox)
+                info_lines.append(f"[Crop] Using bbox crop ({x},{y}) {w}x{h} with padding={crop_padding:.0%}.")
+                work_masks, work_images = crop_tensors(mask, guide_image, crop_bbox)
             else:
-                info_lines.append("[Crop] bbox_mask is empty — processing full frame.")
+                info_lines.append("[Crop] bbox_mask is empty. Processing full frame.")
                 use_crop = False
-                work_masks = mask
-        else:
-            work_masks = mask
 
-        # --- Run temporal stabilization pipeline on work region ---
         stabilized = run_stabilization_pipeline(
-            masks=work_masks,
-            consensus_window=consensus_window,
-            sdf_sigma_temporal=sdf_sigma_temporal,
-            sdf_sigma_spatial=sdf_sigma_spatial,
-            sdf_narrow_band=64,
-            enable_sdf=enable_sdf,
-            output_mode=output_mode,
-            info_lines=info_lines,
+            masks=work_masks, guide_image=work_images, consensus_window=consensus_window,
+            sigma_color=sigma_color, sigma_time=sigma_time,
+            pop_detection=pop_detection, pop_area_thresh=pop_area_thresh, pop_iou_thresh=pop_iou_thresh,
+            enable_sdf=enable_sdf, sdf_sigma_temporal=sdf_sigma_temporal, sdf_sigma_spatial=sdf_sigma_spatial,
+            sdf_narrow_band=64, output_mode=output_mode, info_lines=info_lines,
+            use_logit_space=use_logit_space, logit_eps=1e-4,
+            cc_gate_enable=cc_gate_enable, cc_gate_min_area=cc_gate_min_area,
         )
 
-        # --- Paste back if cropped ---
         if use_crop and crop_bbox is not None:
-            # Start with zeros (black outside crop region)
             result = torch.zeros_like(mask)
             result = paste_masks(result, stabilized, crop_bbox)
-            info_lines.append(f"[Crop] Pasted stabilized region back to full {mask.shape[1]}x{mask.shape[2]} frame.")
+            info_lines.append("[Crop] Pasted stabilized crop back into full-frame mask.")
         else:
             result = stabilized
 
-        # --- Post-stabilization spatial cleanup ---
         if has_spatial_cleanup:
-            print(f"[NV_TemporalMaskStabilizer] Applying spatial cleanup...")
             cleanup_parts = []
             if post_fill_holes > 0:
                 cleanup_parts.append(f"fill_holes={post_fill_holes}")
@@ -413,23 +612,16 @@ class NV_TemporalMaskStabilizer:
                 cleanup_parts.append(f"erode_dilate={post_erode_dilate}")
             if post_smooth > 0:
                 cleanup_parts.append(f"smooth={post_smooth}")
-            info_lines.append(f"[Spatial] Applying post-stabilization cleanup: {', '.join(cleanup_parts)}")
-
-            result = apply_spatial_cleanup(result,
-                erode_dilate=post_erode_dilate,
-                fill_holes=post_fill_holes,
-                remove_noise=post_remove_noise,
-                smooth=post_smooth,
-            )
-
-            # Re-binarize after spatial cleanup if binary mode
+            info_lines.append(f"[Spatial] Post-cleanup: {', '.join(cleanup_parts)}")
+            print(f"{LOG_PREFIX} Applying spatial cleanup: {', '.join(cleanup_parts)}")
+            result = apply_spatial_cleanup(result, erode_dilate=post_erode_dilate, fill_holes=post_fill_holes,
+                                           remove_noise=post_remove_noise, smooth=post_smooth)
             if output_mode == "binary":
                 result = (result > 0.5).float()
 
         info = "\n".join(info_lines)
-        print(f"[NV_TemporalMaskStabilizer] Done. {B} frames processed.")
-
-        return (result, info)
+        print(f"{LOG_PREFIX} Done. {frames} frames processed.")
+        return (result.clamp(0.0, 1.0), info)
 
 
 NODE_CLASS_MAPPINGS = {
