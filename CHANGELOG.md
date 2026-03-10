@@ -16,6 +16,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- NV_CropColorFix V2 — multipass diffusion drift correction before stitching. 3-step pipeline: (1) Lab-space low-frequency color correction with eroded reference mask (preserves texture), (2) boundary-local residual correction with distance-weighted propagation, (3) Laplacian pyramid multiband composite. Reuses `_rgb_to_lab`/`_lab_to_rgb` from BoundaryColorMatch and `multiband_blend` from MultiBandBlendStitch. All V1 modes retained as fallbacks (`reinhard`, `mean_only`, `gaussian` composite).
+- NV_ImageDiffAnalyzer — crop-space diagnostic for measuring pixel differences between original and generated crops. Zone breakdown (untouched/blend/generated/boundary/interior), per-frame PSNR table, signed shift analysis. Accepts STITCHER for full-frame mode.
 - NV_VacePrePassReference: optional `identity_anchor` input for cross-chunk identity lock. Wire chunk 0's Kling output to anchor identity across all chunks. Prepended at t=0 (WAN 2.2 training prior), with sharpness quality floor. Original `reference_frames` input unchanged (current chunk's Kling output). IFS adaptive sampling available for both pools.
 - Variables Pool system — each variable can have multiple candidate source connections. Switch between candidates via pool chips in the Variables Panel. Right-click any node output → "Add to Variable Pool" to register candidates.
 - `healPool()` migration — automatically repairs orphaned pool entries and stale metadata from older variable system versions on workflow load.
