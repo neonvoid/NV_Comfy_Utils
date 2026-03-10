@@ -39,6 +39,14 @@ class NV_ImageDiffAnalyzer:
                                "Stats are computed only on UNMASKED pixels (mask=0 = kept region). "
                                "The heatmap still shows all pixels but stats focus on the kept area."
                 }),
+                "stitcher": ("STITCHER", {
+                    "tooltip": "Connect the STITCHER from InpaintCrop2. Extracts the blend mask, crop coords, "
+                               "and stitch parameters for analysis. Overrides the 'mask' input if both connected."
+                }),
+                "mask_config": ("MASK_PROCESSING_CONFIG", {
+                    "tooltip": "Connect NV_MaskProcessingConfig to log the mask processing settings "
+                               "used in the pipeline (erode/dilate, blend pixels, etc.)."
+                }),
                 "mask_threshold": ("FLOAT", {
                     "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01,
                     "tooltip": "Pixels with mask value below this are considered 'kept' (measured)."
@@ -57,7 +65,8 @@ class NV_ImageDiffAnalyzer:
     CATEGORY = "NV_Utils/Debug"
     DESCRIPTION = "Pixel-by-pixel comparison of two images. Outputs amplified diff heatmap and per-channel statistics."
 
-    def execute(self, image_a, image_b, amplify, mode, mask=None, mask_threshold=0.5, boundary_width=16):
+    def execute(self, image_a, image_b, amplify, mode, mask=None, stitcher=None,
+                mask_config=None, mask_threshold=0.5, boundary_width=16):
         # Ensure same shape — resize B to match A if needed
         if image_a.shape != image_b.shape:
             b_resized = image_b.permute(0, 3, 1, 2)
@@ -66,6 +75,11 @@ class NV_ImageDiffAnalyzer:
 
         diff = image_b.float() - image_a.float()
         abs_diff = diff.abs()
+
+        # Extract mask from stitcher if provided (overrides manual mask)
+        stitcher_info = None
+        if stitcher is not None:
+            mask, stitcher_info = self._extract_stitcher_mask(stitcher, image_a.shape)
 
         # Build visualization based on mode
         if mode == "absolute_diff":
@@ -102,9 +116,94 @@ class NV_ImageDiffAnalyzer:
             masked_vis = vis
 
         # Compute statistics
-        stats = self._compute_stats(image_a, image_b, abs_diff, diff, m_resized, mask_threshold, boundary_width)
+        stats = self._compute_stats(
+            image_a, image_b, abs_diff, diff, m_resized, mask_threshold, boundary_width,
+            stitcher_info=stitcher_info, mask_config=mask_config,
+        )
 
         return (vis, masked_vis, stats,)
+
+    def _extract_stitcher_mask(self, stitcher, image_shape):
+        """Extract blend mask from STITCHER dict and build a full-frame mask.
+
+        The stitcher carries per-frame blend masks at crop resolution + coordinates.
+        We reconstruct the full-frame mask showing where blending occurs.
+
+        Returns: (mask [B, H, W], stitcher_info dict for stats)
+        """
+        B, H, W, C = image_shape
+        device = "cpu"
+
+        blend_masks = stitcher.get("cropped_mask_for_blend", [])
+        skipped = set(stitcher.get("skipped_indices", []))
+        total_frames = stitcher.get("total_frames", B)
+        single_stitcher = len(stitcher.get("cropped_to_canvas_x", [])) == 1 and B > 1
+
+        # Collect stitcher metadata for the report
+        info = {
+            "total_frames": total_frames,
+            "skipped_frames": len(skipped),
+            "stitch_source": stitcher.get("stitch_source", "unknown"),
+            "resize_algorithm": stitcher.get("resize_algorithm", stitcher.get("upscale_algorithm", "unknown")),
+            "num_blend_masks": len(blend_masks),
+            "single_stitcher": single_stitcher,
+        }
+
+        # Sample crop coords for the report
+        if stitcher.get("cropped_to_canvas_w"):
+            info["crop_w"] = stitcher["cropped_to_canvas_w"][0]
+            info["crop_h"] = stitcher["cropped_to_canvas_h"][0]
+        if stitcher.get("canvas_to_orig_w"):
+            info["orig_w"] = stitcher["canvas_to_orig_w"][0]
+            info["orig_h"] = stitcher["canvas_to_orig_h"][0]
+
+        # Build full-frame mask: 0 = untouched, blend_value = blended, 1 = fully generated
+        full_mask = torch.zeros(B, H, W, device=device)
+
+        inpaint_idx = 0
+        for frame in range(min(B, total_frames)):
+            if frame in skipped:
+                continue
+
+            idx = 0 if single_stitcher else inpaint_idx
+
+            if idx >= len(blend_masks):
+                inpaint_idx += 1
+                continue
+
+            bm = blend_masks[idx].float()  # [crop_H, crop_W] or [1, crop_H, crop_W]
+            if bm.dim() == 3:
+                bm = bm.squeeze(0)
+
+            # Get coordinates to place in full frame
+            cto_x = stitcher["canvas_to_orig_x"][idx]
+            cto_y = stitcher["canvas_to_orig_y"][idx]
+            cto_w = stitcher["canvas_to_orig_w"][idx]
+            cto_h = stitcher["canvas_to_orig_h"][idx]
+
+            # Resize blend mask from crop space to original bbox space
+            if bm.shape[0] != cto_h or bm.shape[1] != cto_w:
+                bm_resized = F.interpolate(
+                    bm.unsqueeze(0).unsqueeze(0), size=(cto_h, cto_w), mode="bilinear", align_corners=False
+                ).squeeze(0).squeeze(0)
+            else:
+                bm_resized = bm
+
+            # Clip to frame bounds
+            src_y_start = max(0, -cto_y)
+            src_x_start = max(0, -cto_x)
+            dst_y_start = max(0, cto_y)
+            dst_x_start = max(0, cto_x)
+            copy_h = min(cto_h - src_y_start, H - dst_y_start)
+            copy_w = min(cto_w - src_x_start, W - dst_x_start)
+
+            if copy_h > 0 and copy_w > 0:
+                full_mask[frame, dst_y_start:dst_y_start + copy_h, dst_x_start:dst_x_start + copy_w] = \
+                    bm_resized[src_y_start:src_y_start + copy_h, src_x_start:src_x_start + copy_w]
+
+            inpaint_idx += 1
+
+        return full_mask, info
 
     def _apply_heatmap(self, magnitude):
         """Convert [B, H, W] magnitude (0-1) to [B, H, W, 3] RGB heatmap."""
@@ -197,7 +296,8 @@ class NV_ImageDiffAnalyzer:
 
         return lines, count
 
-    def _compute_stats(self, image_a, image_b, abs_diff, signed_diff, mask, mask_threshold, boundary_width):
+    def _compute_stats(self, image_a, image_b, abs_diff, signed_diff, mask, mask_threshold, boundary_width,
+                        stitcher_info=None, mask_config=None):
         """Compute verbose per-channel, per-zone, and per-frame statistics."""
         lines = []
         B, H, W, C = image_a.shape
@@ -213,7 +313,34 @@ class NV_ImageDiffAnalyzer:
         lines.append(f"Frames (batch): {B}")
         lines.append("")
 
+        # --- Stitcher info ---
+        if stitcher_info is not None:
+            lines.append("STITCHER CONFIG:")
+            lines.append(f"  Stitch source:     {stitcher_info.get('stitch_source', '?')}")
+            lines.append(f"  Resize algorithm:  {stitcher_info.get('resize_algorithm', '?')}")
+            lines.append(f"  Total frames:      {stitcher_info.get('total_frames', '?')}")
+            lines.append(f"  Skipped frames:    {stitcher_info.get('skipped_frames', '?')}")
+            lines.append(f"  Single stitcher:   {stitcher_info.get('single_stitcher', '?')}")
+            if "crop_w" in stitcher_info:
+                lines.append(f"  Crop size:         {stitcher_info['crop_w']}x{stitcher_info['crop_h']} (cropped_to_canvas)")
+            if "orig_w" in stitcher_info:
+                lines.append(f"  Original bbox:     {stitcher_info['orig_w']}x{stitcher_info['orig_h']} (canvas_to_orig)")
+                if "crop_w" in stitcher_info:
+                    scale_x = stitcher_info["orig_w"] / max(stitcher_info["crop_w"], 1)
+                    scale_y = stitcher_info["orig_h"] / max(stitcher_info["crop_h"], 1)
+                    lines.append(f"  Resize factor:     {scale_x:.2f}x × {scale_y:.2f}x (crop→orig)")
+            lines.append(f"  Mask source:       STITCHER blend_mask (continuous 0-1, not binary)")
+            lines.append("")
+
+        # --- Mask config info ---
+        if mask_config is not None:
+            lines.append("MASK PROCESSING CONFIG:")
+            for key, val in sorted(mask_config.items()):
+                lines.append(f"  {key}: {val}")
+            lines.append("")
+
         # --- Mask info ---
+        blend_zone = None
         if mask is not None:
             gen_mask = mask >= mask_threshold  # [B, H, W] bool — True = generated
             keep_mask = ~gen_mask  # True = kept
@@ -221,18 +348,40 @@ class NV_ImageDiffAnalyzer:
             kept_px = keep_mask.sum().item()
             gen_px = gen_mask.sum().item()
 
-            lines.append(f"Mask: provided (threshold={mask_threshold})")
-            lines.append(f"  Total pixels:     {total_px:>10,}")
-            lines.append(f"  Kept pixels:      {int(kept_px):>10,}  ({100*kept_px/total_px:.1f}%)")
-            lines.append(f"  Generated pixels: {int(gen_px):>10,}  ({100*gen_px/total_px:.1f}%)")
+            # For continuous masks (from stitcher), also compute blend transition zone
+            # Blend zone: pixels that are partially blended (0 < mask < threshold)
+            is_continuous = (mask > 0).sum().item() != (mask >= mask_threshold).sum().item()
+            if is_continuous:
+                blend_zone = (mask > 0.01) & (mask < mask_threshold)  # partially blended kept pixels
+                untouched_zone = mask <= 0.01  # truly untouched pixels
+                blend_px = blend_zone.sum().item()
+                untouched_px = untouched_zone.sum().item()
 
-            # Compute boundary zone
+                lines.append(f"Mask: continuous (from stitcher blend mask, threshold={mask_threshold})")
+                lines.append(f"  Total pixels:     {total_px:>10,}")
+                lines.append(f"  Untouched (=0):   {int(untouched_px):>10,}  ({100*untouched_px/total_px:.1f}%)  [mask ≤ 0.01]")
+                lines.append(f"  Blend zone:       {int(blend_px):>10,}  ({100*blend_px/total_px:.1f}%)  [0.01 < mask < {mask_threshold}]")
+                lines.append(f"  Generated:        {int(gen_px):>10,}  ({100*gen_px/total_px:.1f}%)  [mask ≥ {mask_threshold}]")
+                lines.append(f"  Kept (measured):  {int(kept_px):>10,}  ({100*kept_px/total_px:.1f}%)  [untouched + blend]")
+
+                # Mask value distribution in blend zone
+                if blend_px > 0:
+                    bz_vals = mask[blend_zone]
+                    lines.append(f"  Blend mask range: {bz_vals.min().item():.3f} — {bz_vals.max().item():.3f}")
+                    lines.append(f"  Blend mask mean:  {bz_vals.mean().item():.3f}")
+            else:
+                lines.append(f"Mask: binary (threshold={mask_threshold})")
+                lines.append(f"  Total pixels:     {total_px:>10,}")
+                lines.append(f"  Kept pixels:      {int(kept_px):>10,}  ({100*kept_px/total_px:.1f}%)")
+                lines.append(f"  Generated pixels: {int(gen_px):>10,}  ({100*gen_px/total_px:.1f}%)")
+
+            # Compute boundary zone (based on binary gen_mask edge)
             boundary_zone = self._compute_boundary_mask(gen_mask, boundary_width)
             interior_zone = keep_mask & (~boundary_zone)
             bnd_px = boundary_zone.sum().item()
             int_px = interior_zone.sum().item()
 
-            lines.append(f"  Boundary zone:    {int(bnd_px):>10,}  ({100*bnd_px/max(kept_px,1):.1f}% of kept)  [width={boundary_width}px from mask edge]")
+            lines.append(f"  Boundary zone:    {int(bnd_px):>10,}  ({100*bnd_px/max(kept_px,1):.1f}% of kept)  [within {boundary_width}px of mask edge]")
             lines.append(f"  Interior zone:    {int(int_px):>10,}  ({100*int_px/max(kept_px,1):.1f}% of kept)  [farther than {boundary_width}px from edge]")
         else:
             keep_mask = None
@@ -305,6 +454,44 @@ class NV_ImageDiffAnalyzer:
                 int_mse = (int_lum ** 2).mean().item()
                 int_psnr = 10 * torch.log10(torch.tensor(1.0 / max(int_mse, 1e-10))).item()
                 lines.append(f"  Luminance PSNR: {int_psnr:.1f} dB")
+
+        # --- Blend transition zone (for continuous masks from stitcher) ---
+        if blend_zone is not None and blend_zone.sum().item() > 0:
+            lines.append("")
+            lines.append("-" * 70)
+            lines.append("BLEND TRANSITION ZONE (kept pixels with 0 < mask < threshold)")
+            lines.append("-" * 70)
+            blz_lines, blz_count = self._zone_stats(abs_diff, signed_diff, blend_zone)
+            lines.extend(blz_lines)
+            if blz_count > 0:
+                blz_lum = lum_diff[blend_zone]
+                blz_mse = (blz_lum ** 2).mean().item()
+                blz_psnr = 10 * torch.log10(torch.tensor(1.0 / max(blz_mse, 1e-10))).item()
+                lines.append(f"  Luminance PSNR: {blz_psnr:.1f} dB")
+
+            # Also show untouched-only stats
+            untouched = mask <= 0.01
+            if untouched.sum().item() > 0:
+                lines.append("")
+                lines.append("-" * 70)
+                lines.append("UNTOUCHED ZONE (mask ≤ 0.01, should be identical to source)")
+                lines.append("-" * 70)
+                ut_lines, ut_count = self._zone_stats(abs_diff, signed_diff, untouched)
+                lines.extend(ut_lines)
+                if ut_count > 0:
+                    ut_lum = lum_diff[untouched]
+                    ut_mse = (ut_lum ** 2).mean().item()
+                    ut_psnr = 10 * torch.log10(torch.tensor(1.0 / max(ut_mse, 1e-10))).item()
+                    lines.append(f"  Luminance PSNR: {ut_psnr:.1f} dB")
+                    if ut_mse < 1e-8:
+                        lines.append(f"  => PERFECT MATCH — untouched pixels are bit-identical")
+                    elif ut_psnr > 60:
+                        lines.append(f"  => NEAR-PERFECT — untouched pixels have negligible difference (rounding)")
+                    elif ut_psnr > 40:
+                        lines.append(f"  => VERY GOOD — untouched pixels barely changed")
+                    else:
+                        lines.append(f"  => WARNING — untouched pixels should be identical but show {ut_lum.abs().mean().item()*255:.1f}/255 mean diff")
+                        lines.append(f"     This suggests the stitch is modifying pixels outside the blend zone!")
 
         # --- Per-frame stats (if batch > 1) ---
         if B > 1:
