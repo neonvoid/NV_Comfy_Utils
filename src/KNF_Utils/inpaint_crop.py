@@ -270,17 +270,32 @@ class NV_InpaintCrop:
                 }),
 
                 # Blend settings (for stitching)
-                "stitch_source": (["tight", "processed", "bbox"], {
+                "stitch_source": (["tight", "processed", "hybrid", "bbox"], {
                     "default": "tight",
                     "tooltip": "Which mask to use as the base for stitch blending. "
                                "tight: original unprocessed mask (minimal changes to image). "
                                "processed: mask after erode/dilate/fill/smooth (matches diffusion mask). "
-                               "bbox: full crop region (blends in the entire re-generated area)."
+                               "hybrid: processed mask core with wide soft falloff into surrounding diffused area "
+                               "(best of both — tight subject, smooth transition, no background stretching). "
+                               "bbox: full crop region (blends in the entire re-generated area — can cause stretching)."
                 }),
                 "mask_blend_pixels": ("INT", {
                     "default": 16, "min": 0, "max": 64, "step": 1,
                     "tooltip": "Feather the stitch mask edges for seamless stitching (dilate + blur). "
                                "Recommended: 8-16 for subtle blending, 24-32 for visible seam hiding, 48-64 for aggressive blending."
+                }),
+
+                "hybrid_falloff": ("INT", {
+                    "default": 48, "min": 8, "max": 128, "step": 4,
+                    "tooltip": "Hybrid mode: width of the soft transition zone beyond the processed mask (blur sigma in pixels). "
+                               "Higher = wider/smoother transition borrowing more diffused context. "
+                               "48 = good default for 512x512 crops. Only used when stitch_source=hybrid."
+                }),
+                "hybrid_curve": ("FLOAT", {
+                    "default": 0.6, "min": 0.1, "max": 2.0, "step": 0.05,
+                    "tooltip": "Hybrid mode: falloff curve shape (power exponent). "
+                               "Lower = wider/gentler transition. Higher = tighter/steeper. "
+                               "0.6 = recommended. 0.3 = very wide. 1.0 = linear. Only used when stitch_source=hybrid."
                 }),
 
                 "resize_algorithm": (["bicubic", "bilinear", "nearest", "area"], {
@@ -314,11 +329,12 @@ class NV_InpaintCrop:
     RETURN_NAMES = ("stitcher", "cropped_image", "cropped_mask", "cropped_mask_processed", "info")
     FUNCTION = "crop"
     CATEGORY = "NV_Utils/Inpaint"
-    DESCRIPTION = "Crops image for inpainting. Outputs both original mask (for stitching) and processed mask (for diffusion). stitch_source selects which mask drives the blend: tight (original), processed, or bbox (full region). Auto mode computes optimal resolution from bbox."
+    DESCRIPTION = "Crops image for inpainting. Outputs both original mask (for stitching) and processed mask (for diffusion). stitch_source selects which mask drives the blend: tight, processed, hybrid (wide soft falloff), or bbox (full region). Auto mode computes optimal resolution from bbox."
 
     def crop(self, image, mask, target_mode, target_width, target_height, auto_preset,
              padding_multiple, mask_erode_dilate=0, mask_fill_holes=0, mask_remove_noise=0,
-             mask_smooth=0, stitch_source="tight", mask_blend_pixels=16, resize_algorithm="bicubic",
+             mask_smooth=0, stitch_source="tight", mask_blend_pixels=16,
+             hybrid_falloff=48, hybrid_curve=0.6, resize_algorithm="bicubic",
              mask_config=None, bounding_box_mask=None, anomaly_threshold=1.5):
 
         # Apply shared config override if connected
@@ -480,6 +496,14 @@ class NV_InpaintCrop:
             if stitch_source == "bbox":
                 # Full crop region — blend in everything
                 blend_mask = torch.ones_like(cropped_mask_orig)
+            elif stitch_source == "hybrid":
+                # Hybrid: processed mask core + wide soft falloff into surrounding diffused area.
+                # Heavy blur of processed mask simulates a distance field; pow() shapes the curve.
+                # torch.maximum preserves full opacity inside the subject.
+                proc = cropped_mask_proc.clamp(0, 1)
+                falloff = mask_blur(proc, hybrid_falloff).clamp(0, 1)
+                falloff = falloff.pow(hybrid_curve)
+                blend_mask = torch.maximum(proc, falloff)
             elif stitch_source == "processed":
                 blend_mask = cropped_mask_proc.clone()
             else:
@@ -490,10 +514,14 @@ class NV_InpaintCrop:
                 if stitch_source == "bbox":
                     # Bbox is all-ones — erode INWARD from edges to create a border, then blur
                     blend_mask = _op_erode_dilate(blend_mask, -blend_pixels_v)
+                    blend_mask = mask_blur(blend_mask, blend_pixels_v)
+                elif stitch_source == "hybrid":
+                    # Hybrid already has a wide falloff — just apply a light final blur for polish
+                    blend_mask = mask_blur(blend_mask, blend_pixels_v)
                 else:
                     # Tight/processed — dilate OUTWARD to extend blend beyond mask edge
                     blend_mask = _op_erode_dilate(blend_mask, blend_pixels_v)
-                blend_mask = mask_blur(blend_mask, blend_pixels_v)
+                    blend_mask = mask_blur(blend_mask, blend_pixels_v)
 
             # Store in stitcher
             intermediate = comfy.model_management.intermediate_device()
