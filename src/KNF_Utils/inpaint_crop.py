@@ -12,6 +12,7 @@ Key features:
 
 import math
 import torch
+import torchvision.transforms.v2.functional as TVF
 import comfy.model_management
 import comfy.utils
 import nodes
@@ -286,10 +287,10 @@ class NV_InpaintCrop:
                 }),
 
                 "hybrid_falloff": ("INT", {
-                    "default": 48, "min": 8, "max": 128, "step": 4,
-                    "tooltip": "Hybrid mode: width of the soft transition zone beyond the processed mask (blur sigma in pixels). "
-                               "Higher = wider/smoother transition borrowing more diffused context. "
-                               "48 = good default for 512x512 crops. Only used when stitch_source=hybrid."
+                    "default": 48, "min": 8, "max": 192, "step": 4,
+                    "tooltip": "Hybrid mode: radius of the soft transition zone beyond the processed mask (pixels). "
+                               "The blend fades to zero at roughly this distance from the mask edge. "
+                               "48 = good default for 512x512 crops. 80-128 for wider blends. Only used when stitch_source=hybrid."
                 }),
                 "hybrid_curve": ("FLOAT", {
                     "default": 0.6, "min": 0.1, "max": 2.0, "step": 0.05,
@@ -498,12 +499,15 @@ class NV_InpaintCrop:
                 blend_mask = torch.ones_like(cropped_mask_orig)
             elif stitch_source == "hybrid":
                 # Hybrid: processed mask core + wide soft falloff into surrounding diffused area.
-                # Heavy blur of processed mask simulates a distance field; pow() shapes the curve.
-                # torch.maximum preserves full opacity inside the subject.
+                # Uses explicit sigma (not kernel_size) for controllable transition width.
+                # Screen blend avoids the 0.5 discontinuity at mask edges that torch.maximum creates.
                 proc = cropped_mask_proc.clamp(0, 1)
-                falloff = mask_blur(proc, hybrid_falloff).clamp(0, 1)
-                falloff = falloff.pow(hybrid_curve)
-                blend_mask = torch.maximum(proc, falloff)
+                sigma = float(hybrid_falloff) / 3.0  # falloff radius ≈ 3*sigma
+                kernel_size = max(3, int(sigma * 6) | 1)  # ensure odd, >= 3
+                falloff = TVF.gaussian_blur(proc.unsqueeze(1), kernel_size, sigma).squeeze(1)
+                falloff = falloff.clamp(0, 1).pow(hybrid_curve)
+                # Screen blend: smooth union that avoids hard 1.0→0.5 step at mask edge
+                blend_mask = 1.0 - (1.0 - proc) * (1.0 - falloff)
             elif stitch_source == "processed":
                 blend_mask = cropped_mask_proc.clone()
             else:
