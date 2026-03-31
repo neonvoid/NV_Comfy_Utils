@@ -134,7 +134,8 @@ def crop_for_inpaint(image, original_mask, processed_mask, bbox_x, bbox_y, bbox_
     new_x = int(round(bbox_cx - new_w / 2.0))
     new_y = int(round(bbox_cy - new_h / 2.0))
 
-    # Try to keep within image bounds by shifting
+    # Keep crop within image bounds: shift first, then clamp.
+    # No canvas extension beyond the frame — all context is real pixels.
     if new_x < 0 and new_x + new_w <= img_w:
         new_x = 0
     elif new_x + new_w > img_w and new_x >= 0:
@@ -145,48 +146,30 @@ def crop_for_inpaint(image, original_mask, processed_mask, bbox_x, bbox_y, bbox_
     elif new_y + new_h > img_h and new_y >= 0:
         new_y = img_h - new_h
 
-    # Calculate padding needed if bbox still exceeds image
-    pad_left = max(0, -new_x)
-    pad_right = max(0, new_x + new_w - img_w)
-    pad_top = max(0, -new_y)
-    pad_bottom = max(0, new_y + new_h - img_h)
+    # Hard clamp to frame bounds — no out-of-frame extension
+    new_x = max(0, new_x)
+    new_y = max(0, new_y)
+    new_w = min(new_w, img_w - new_x)
+    new_h = min(new_h, img_h - new_y)
 
-    # Create canvas (expanded image)
-    canvas_w = img_w + pad_left + pad_right
-    canvas_h = img_h + pad_top + pad_bottom
+    # Canvas IS the original image (no padding, no fake pixels)
+    canvas_image = image
+    canvas_mask_orig = original_mask
+    canvas_mask_proc = processed_mask
 
-    canvas_image = torch.zeros((B, canvas_h, canvas_w, C), device=device, dtype=image.dtype)
-    canvas_mask_orig = torch.zeros((B, canvas_h, canvas_w), device=device, dtype=original_mask.dtype)
-    canvas_mask_proc = torch.zeros((B, canvas_h, canvas_w), device=device, dtype=processed_mask.dtype)
-
-    # Place original image and masks in canvas
-    canvas_image[:, pad_top:pad_top+img_h, pad_left:pad_left+img_w, :] = image
-    canvas_mask_orig[:, pad_top:pad_top+img_h, pad_left:pad_left+img_w] = original_mask
-    canvas_mask_proc[:, pad_top:pad_top+img_h, pad_left:pad_left+img_w] = processed_mask
-
-    # Fill edges by replicating border pixels
-    if pad_top > 0:
-        canvas_image[:, :pad_top, pad_left:pad_left+img_w, :] = image[:, 0:1, :, :].expand(-1, pad_top, -1, -1)
-    if pad_bottom > 0:
-        canvas_image[:, -pad_bottom:, pad_left:pad_left+img_w, :] = image[:, -1:, :, :].expand(-1, pad_bottom, -1, -1)
-    if pad_left > 0:
-        canvas_image[:, :, :pad_left, :] = canvas_image[:, :, pad_left:pad_left+1, :].expand(-1, -1, pad_left, -1)
-    if pad_right > 0:
-        canvas_image[:, :, -pad_right:, :] = canvas_image[:, :, -pad_right-1:-pad_right, :].expand(-1, -1, pad_right, -1)
-
-    # Canvas-to-original coordinates
-    cto_x, cto_y = pad_left, pad_top
+    # Canvas-to-original coordinates (identity — no padding offset)
+    cto_x, cto_y = 0, 0
     cto_w, cto_h = img_w, img_h
 
-    # Crop coordinates in canvas space
-    ctc_x = new_x + pad_left
-    ctc_y = new_y + pad_top
+    # Crop coordinates in canvas space (same as image space now)
+    ctc_x = new_x
+    ctc_y = new_y
     ctc_w, ctc_h = new_w, new_h
 
-    # Crop from canvas
-    cropped_image = canvas_image[:, ctc_y:ctc_y+ctc_h, ctc_x:ctc_x+ctc_w, :]
-    cropped_mask_orig = canvas_mask_orig[:, ctc_y:ctc_y+ctc_h, ctc_x:ctc_x+ctc_w]
-    cropped_mask_proc = canvas_mask_proc[:, ctc_y:ctc_y+ctc_h, ctc_x:ctc_x+ctc_w]
+    # Crop directly from image
+    cropped_image = image[:, ctc_y:ctc_y+ctc_h, ctc_x:ctc_x+ctc_w, :]
+    cropped_mask_orig = original_mask[:, ctc_y:ctc_y+ctc_h, ctc_x:ctc_x+ctc_w]
+    cropped_mask_proc = processed_mask[:, ctc_y:ctc_y+ctc_h, ctc_x:ctc_x+ctc_w]
 
     # Resize to target dimensions
     if target_w != ctc_w or target_h != ctc_h:

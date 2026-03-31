@@ -651,6 +651,12 @@ class FloatingPanel {
     refreshGroups() {
         if (!app.graph || this.isDraggingGroup) return;
 
+        // Detect graph object swap (tab switch, workflow load, etc.)
+        if (this._lastGraph !== app.graph) {
+            this._lastGraph = app.graph;
+            this._lastStateHash = "";
+        }
+
         const groups = app.graph._groups || [];
 
         // Recompute nodes for all groups
@@ -1628,6 +1634,19 @@ app.registerExtension({
             console.error("[FloatingPanel] Failed to create panel:", e);
             return;
         }
+
+        // Hook workflow/tab switching — app.graph is replaced on load,
+        // so we invalidate the dirty-check hash and force a refresh.
+        const origLoadGraphData = app.loadGraphData;
+        app.loadGraphData = async function() {
+            const result = await origLoadGraphData.apply(this, arguments);
+            if (floatingPanelInstance) {
+                floatingPanelInstance._lastStateHash = "";
+                floatingPanelInstance.refreshGroups();
+                floatingPanelInstance.refreshPatterns();
+            }
+            return result;
+        };
 
         // Add keyboard shortcut (Ctrl+Shift+P to toggle)
         document.addEventListener("keydown", (e) => {

@@ -21,6 +21,8 @@ Place between VAE Decode and InpaintStitch2:
       → [NV_CropColorFix] → InpaintStitch2
 """
 
+import gc
+
 import torch
 import torch.nn.functional as F
 
@@ -546,8 +548,12 @@ class NV_CropColorFix:
                         corr_nchw[b:b + 1], orig_nchw[b:b + 1], mask_b, num_levels=multiband_levels
                     )
                     out_frames.append(blended_b)
+                # Free NCHW intermediates before cat to reduce peak memory
+                del corr_nchw, orig_nchw
                 blended_nchw = torch.cat(out_frames, dim=0)
+                del out_frames
                 output = blended_nchw.clamp(0, 1).permute(0, 2, 3, 1)
+                del blended_nchw
                 info_lines.append(
                     f"  Step 3 (multiband): {multiband_levels} levels, adaptive width, expansion={blend_expansion}"
                 )
@@ -557,7 +563,9 @@ class NV_CropColorFix:
                 if blend_pixels > 0:
                     mask_nchw = _gaussian_blur_reflect(mask_nchw, blend_pixels / 3.0)
                 blended_nchw = multiband_blend(corr_nchw, orig_nchw, mask_nchw, num_levels=multiband_levels)
+                del corr_nchw, orig_nchw
                 output = blended_nchw.clamp(0, 1).permute(0, 2, 3, 1)  # [B, H, W, C]
+                del blended_nchw
                 info_lines.append(f"  Step 3 (multiband): {multiband_levels} levels, expansion={blend_expansion}")
 
         elif composite_mode == "gaussian":
@@ -622,6 +630,11 @@ class NV_CropColorFix:
             info_lines.append(f"  Final residual in ref zone: {ref_residual * 255:.2f}/255")
         else:
             info_lines.append("  No reference zone pixels to measure residual")
+
+        # Free large intermediates before returning
+        del corrected, comp_mask
+        gc.collect()
+        torch.cuda.empty_cache()
 
         info_text = "\n".join(info_lines)
         print(f"{TAG} Done. {B} frames processed.")

@@ -13,6 +13,8 @@ Frame skipping: if the crop node skipped frames (empty mask), the stitch node
 reinserts the original frames at their correct positions in the output batch.
 """
 
+import gc
+
 import torch
 import torch.nn.functional as TF
 import comfy.model_management
@@ -356,6 +358,10 @@ class NV_InpaintStitch:
                     resize_algorithm,
                 )
                 mask_results.append(sm.to(intermediate))
+
+                # Periodic GPU cleanup to prevent VRAM fragmentation on long sequences
+                if (b + 1) % 32 == 0:
+                    torch.cuda.empty_cache()
         else:
             # Reconstruct full batch with skipped frames reinserted
             inpainted_idx = 0
@@ -405,6 +411,12 @@ class NV_InpaintStitch:
 
         result_batch = torch.stack(results, dim=0)
         stitch_mask_batch = torch.stack(mask_results, dim=0)
+
+        # Free intermediate lists + reclaim GPU memory before returning
+        del results, mask_results
+        gc.collect()
+        torch.cuda.empty_cache()
+
         print(f"[NV_InpaintStitch] Stitched {result_batch.shape[0]} frames "
               f"({len(skipped_indices)} skipped, {inpainted_image.shape[0]} inpainted, "
               f"blend={blend_mode})")
