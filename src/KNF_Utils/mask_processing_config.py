@@ -54,15 +54,7 @@ def apply_vace_mask_config(mask_config, **local_values):
 
     vace_input_grow_px is now included (promoted from local-only to config bus).
     """
-    print(f"[apply_vace_mask_config] ENTER: mask_config is None={mask_config is None}")
-    print(f"[apply_vace_mask_config] local_values keys: {list(local_values.keys())}")
-    print(f"[apply_vace_mask_config] local_values: {local_values}")
-    if mask_config is not None:
-        print(f"[apply_vace_mask_config] config dict keys: {list(mask_config.keys())}")
-        print(f"[apply_vace_mask_config] config dict: {mask_config}")
-
     if mask_config is None:
-        print(f"[apply_vace_mask_config] EXIT EARLY: config is None, returning local_values")
         return local_values
     result = dict(local_values)
 
@@ -76,7 +68,6 @@ def apply_vace_mask_config(mask_config, **local_values):
         if local_key in cleanup_keys:
             for config_key in cleanup_keys[local_key]:
                 if config_key in mask_config:
-                    print(f"[apply_vace_mask_config] CLEANUP MATCH: {local_key} <- config[{config_key}] = {mask_config[config_key]}")
                     result[local_key] = mask_config[config_key]
                     break
 
@@ -96,15 +87,9 @@ def apply_vace_mask_config(mask_config, **local_values):
                 config_keys = [config_keys]
             for config_key in config_keys:
                 if config_key in mask_config:
-                    print(f"[apply_vace_mask_config] REMAP MATCH: {local_key} <- config[{config_key}] = {mask_config[config_key]}")
                     result[local_key] = mask_config[config_key]
                     break
-            else:
-                print(f"[apply_vace_mask_config] REMAP MISS: {local_key} -> tried {config_keys}, none found in config")
-        else:
-            print(f"[apply_vace_mask_config] NOT IN REMAP: {local_key} (value stays {result[local_key]})")
 
-    print(f"[apply_vace_mask_config] FINAL result: {result}")
     return result
 
 
@@ -224,7 +209,6 @@ class NV_MaskProcessingConfig:
             "vace_stitch_erosion_px": vace_stitch_erosion_px,
             "vace_stitch_feather_px": vace_stitch_feather_px,
         }
-        print(f"[NV_MaskProcessingConfig] EMITTING config: {config}")
         return (config,)
 
 
