@@ -380,7 +380,7 @@ class NV_CoTrackerBridge:
                 grid = _build_translation_grid(dx, dy, expanded_h_b, expanded_w_b, device)
 
                 wi = TF.grid_sample(img_nchw, grid, mode='bilinear',
-                                    padding_mode='border', align_corners=False)
+                                    padding_mode='reflection', align_corners=False)
                 wi = wi[:, :, trim_top:trim_top + H, trim_left:trim_left + W]
 
                 # Warp masks if provided

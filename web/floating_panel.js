@@ -26,53 +26,125 @@ const STATE_VERSION = 1;
 
 // ─── MacroManager ─────────────────────────────────────────────────────────────
 // Handles CRUD, state computation, and serialization for macro groups.
+// Macros are stored per-workflow in app.graph.extra.nv_floating_panel so they
+// automatically switch when the user changes workflow tabs.
 // Never touches DOM or ComfyUI globals directly — the panel mediates.
+
+const GRAPH_EXTRA_KEY = "nv_floating_panel";
 
 class MacroManager {
     constructor() {
         this.macros = [];
         this.macroOrder = [];
-        this._load();
+        this._lastSyncGraph = null; // Track which graph we last synced from
     }
 
-    _load() {
+    /**
+     * Sync in-memory state from the current graph's extra data.
+     * Called by refreshGroups() on every render cycle — only re-reads when
+     * the graph object changes (tab switch) to avoid unnecessary churn.
+     */
+    syncFromGraph(graph) {
+        if (!graph) { this.macros = []; this.macroOrder = []; this._lastSyncGraph = null; return; }
+        // Skip re-read if we already synced from this exact graph object
+        if (graph === this._lastSyncGraph) return;
+        this._lastSyncGraph = graph;
         try {
-            const saved = localStorage.getItem(MACRO_STORAGE_KEY);
-            if (saved) {
-                const data = JSON.parse(saved);
-                this.macros = Array.isArray(data.macros) ? data.macros : [];
-                this.macroOrder = Array.isArray(data.macroOrder) ? data.macroOrder : [];
-                // Migration: ensure all macros have required fields
-                for (const m of this.macros) {
-                    if (!m.id) m.id = "m_" + Date.now() + "_" + Math.random().toString(36).slice(2, 6);
-                    if (!Array.isArray(m.groupTitles)) m.groupTitles = [];
-                    if (typeof m.collapsed !== "boolean") m.collapsed = false;
-                    if (typeof m.name !== "string") m.name = "Untitled Macro";
+            const data = graph.extra?.[GRAPH_EXTRA_KEY];
+            if (data) {
+                // Deep-clone to detach from graph.extra references
+                this.macros = JSON.parse(JSON.stringify(Array.isArray(data.macros) ? data.macros : []));
+                this.macroOrder = JSON.parse(JSON.stringify(Array.isArray(data.macroOrder) ? data.macroOrder : []));
+                if (this._sanitize()) {
+                    // Sanitizer repaired something — persist the fix
+                    this._saveToGraph(graph);
                 }
-                // Prune macroOrder to only valid IDs
-                const idSet = new Set(this.macros.map(m => m.id));
-                this.macroOrder = this.macroOrder.filter(id => idSet.has(id));
-                // Add any macros not in order
-                for (const m of this.macros) {
-                    if (!this.macroOrder.includes(m.id)) this.macroOrder.push(m.id);
-                }
+            } else {
+                this.macros = [];
+                this.macroOrder = [];
             }
         } catch (e) {
-            console.warn("[MacroManager] Failed to load macros, resetting:", e);
+            console.warn("[MacroManager] Failed to read graph.extra macros:", e);
             this.macros = [];
             this.macroOrder = [];
         }
     }
 
-    _save() {
+    /** Force re-sync on next refreshGroups() (e.g., after explicit macro mutation). */
+    invalidateSync() {
+        this._lastSyncGraph = null;
+    }
+
+    /**
+     * Ensure all macros have required fields and prune stale order entries.
+     * Returns true if any repairs were made.
+     */
+    _sanitize() {
+        let repaired = false;
+        for (const m of this.macros) {
+            if (!m.id) { m.id = "m_" + Date.now() + "_" + Math.random().toString(36).slice(2, 6); repaired = true; }
+            if (!Array.isArray(m.groupTitles)) { m.groupTitles = []; repaired = true; }
+            if (typeof m.collapsed !== "boolean") { m.collapsed = false; repaired = true; }
+            if (typeof m.name !== "string") { m.name = "Untitled Macro"; repaired = true; }
+        }
+        const idSet = new Set(this.macros.map(m => m.id));
+        const prunedOrder = this.macroOrder.filter(id => idSet.has(id));
+        if (prunedOrder.length !== this.macroOrder.length) repaired = true;
+        this.macroOrder = prunedOrder;
+        const orderSet = new Set(this.macroOrder);
+        for (const m of this.macros) {
+            if (!orderSet.has(m.id)) { this.macroOrder.push(m.id); orderSet.add(m.id); repaired = true; }
+        }
+        return repaired;
+    }
+
+    /** Persist current macro state into the graph's extra data. Returns true on success. */
+    _saveToGraph(graph) {
+        if (!graph) return false;
         try {
-            localStorage.setItem(MACRO_STORAGE_KEY, JSON.stringify({
-                version: STATE_VERSION,
+            if (!graph.extra) graph.extra = {};
+            graph.extra[GRAPH_EXTRA_KEY] = {
                 macros: this.macros,
                 macroOrder: this.macroOrder,
-            }));
+            };
+            // Update sync tracker so we don't re-read what we just wrote
+            this._lastSyncGraph = graph;
+            return true;
         } catch (e) {
-            console.warn("[MacroManager] Failed to save macros:", e);
+            console.warn("[MacroManager] Failed to write graph.extra macros:", e);
+            return false;
+        }
+    }
+
+    /**
+     * One-time migration: if graph has no macros but old localStorage data exists,
+     * import them into the current graph and tombstone the old storage.
+     * Returns true if macros were migrated.
+     */
+    migrateFromLocalStorage(graph) {
+        if (!graph) return false;
+        // Skip if graph already has macros
+        if (graph.extra?.[GRAPH_EXTRA_KEY]?.macros?.length > 0) return false;
+        try {
+            const saved = localStorage.getItem(MACRO_STORAGE_KEY);
+            if (!saved) return false;
+            const data = JSON.parse(saved);
+            // Already migrated in a previous session
+            if (data.migrated) return false;
+            const oldMacros = Array.isArray(data.macros) ? data.macros : [];
+            if (oldMacros.length === 0) return false;
+            // Deep-clone old macros into this graph
+            this.macros = JSON.parse(JSON.stringify(oldMacros));
+            this.macroOrder = JSON.parse(JSON.stringify(Array.isArray(data.macroOrder) ? data.macroOrder : []));
+            this._sanitize();
+            if (!this._saveToGraph(graph)) return false;
+            // Tombstone the old localStorage key only after successful save
+            localStorage.setItem(MACRO_STORAGE_KEY, JSON.stringify({ migrated: true, migratedAt: Date.now() }));
+            console.log("[MacroManager] Migrated", oldMacros.length, "macros from localStorage to graph.extra");
+            return true;
+        } catch (e) {
+            console.warn("[MacroManager] Migration failed:", e);
+            return false;
         }
     }
 
@@ -91,7 +163,7 @@ class MacroManager {
         };
         this.macros.push(macro);
         this.macroOrder.push(macro.id);
-        this._save();
+        this._saveToGraph(app.graph);
         return macro;
     }
 
@@ -101,19 +173,19 @@ class MacroManager {
         if (changes.name !== undefined) macro.name = changes.name;
         if (changes.groupTitles !== undefined) macro.groupTitles = [...changes.groupTitles];
         if (changes.collapsed !== undefined) macro.collapsed = changes.collapsed;
-        this._save();
+        this._saveToGraph(app.graph);
         return macro;
     }
 
     deleteMacro(id) {
         this.macros = this.macros.filter(m => m.id !== id);
         this.macroOrder = this.macroOrder.filter(i => i !== id);
-        this._save();
+        this._saveToGraph(app.graph);
     }
 
     reorderMacros(newOrder) {
         this.macroOrder = newOrder;
-        this._save();
+        this._saveToGraph(app.graph);
     }
 
     /**
@@ -655,6 +727,11 @@ class FloatingPanel {
         if (this._lastGraph !== app.graph) {
             this._lastGraph = app.graph;
             this._lastStateHash = "";
+        }
+
+        // Sync macros from current graph's extra data (per-workflow storage)
+        if (this.macroManager) {
+            this.macroManager.syncFromGraph(app.graph);
         }
 
         const groups = app.graph._groups || [];
@@ -1637,11 +1714,21 @@ app.registerExtension({
 
         // Hook workflow/tab switching — app.graph is replaced on load,
         // so we invalidate the dirty-check hash and force a refresh.
+        // Macros are now per-workflow (stored in graph.extra), so the
+        // syncFromGraph() call inside refreshGroups() handles the swap.
         const origLoadGraphData = app.loadGraphData;
         app.loadGraphData = async function() {
             const result = await origLoadGraphData.apply(this, arguments);
             if (floatingPanelInstance) {
                 floatingPanelInstance._lastStateHash = "";
+                // Force macro re-sync from the newly loaded graph
+                if (floatingPanelInstance.macroManager) {
+                    floatingPanelInstance.macroManager.invalidateSync();
+                    // Attempt one-time migration from old global localStorage macros
+                    if (app.graph) {
+                        floatingPanelInstance.macroManager.migrateFromLocalStorage(app.graph);
+                    }
+                }
                 floatingPanelInstance.refreshGroups();
                 floatingPanelInstance.refreshPatterns();
             }

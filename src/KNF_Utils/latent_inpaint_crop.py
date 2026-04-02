@@ -166,29 +166,29 @@ class NV_LatentInpaintCrop:
                 }),
 
                 # Mask processing (applied to processed mask only)
-                "mask_erode_dilate": ("INT", {
+                "crop_expand_px": ("INT", {
                     "default": 0, "min": -128, "max": 128, "step": 1,
                     "tooltip": "Shrink (negative) or expand (positive) the subject mask using grey morphology. "
                                "Applied to the processed mask output only; original mask stays untouched for stitching."
                 }),
-                "mask_fill_holes": ("INT", {
+                "cleanup_fill_holes": ("INT", {
                     "default": 0, "min": 0, "max": 128, "step": 1,
                     "tooltip": "Fill gaps/holes in mask using morphological closing (dilate then erode). "
                                "Useful for masks with unwanted holes from segmentation."
                 }),
-                "mask_remove_noise": ("INT", {
+                "cleanup_remove_noise": ("INT", {
                     "default": 0, "min": 0, "max": 32, "step": 1,
                     "tooltip": "Remove isolated pixels/specks using morphological opening (erode then dilate). "
                                "Keeps main mask regions intact while eliminating stray pixels."
                 }),
-                "mask_smooth": ("INT", {
+                "cleanup_smooth": ("INT", {
                     "default": 0, "min": 0, "max": 127, "step": 1,
                     "tooltip": "Smooth jagged mask edges by binarizing (threshold 0.5) then Gaussian blurring. "
                                "Creates cleaner edges than direct blur. Value must be odd (auto-adjusted if even)."
                 }),
 
                 # Blend settings (for stitching)
-                "mask_blend_pixels": ("INT", {
+                "crop_blend_feather_px": ("INT", {
                     "default": 16, "min": 0, "max": 64, "step": 1,
                     "tooltip": "Feather the original mask edges for seamless stitching (dilate + blur). "
                                "Stored in stitcher for automatic use by NV_LatentInpaintStitch. "
@@ -199,7 +199,7 @@ class NV_LatentInpaintCrop:
                 "mask_config": ("MASK_PROCESSING_CONFIG", {
                     "tooltip": "Optional shared config from NV_MaskProcessingConfig. "
                                "When connected, overrides this node's local mask processing widgets "
-                               "(erode_dilate, fill_holes, remove_noise, smooth, blend_pixels)."
+                               "(crop_expand_px, cleanup_fill_holes, cleanup_remove_noise, cleanup_smooth, crop_blend_feather_px)."
                 }),
                 "bbox_mask": ("MASK", {
                     "tooltip": "Bounding box mask [B,H,W] from MaskTrackingBBox. "
@@ -219,6 +219,27 @@ class NV_LatentInpaintCrop:
                            "tooltip": "Manual crop width in pixels. Ignored when bbox_mask is connected."}),
                 "height": ("INT", {"default": 512, "min": 8, "max": 8192, "step": 8,
                             "tooltip": "Manual crop height in pixels. Ignored when bbox_mask is connected."}),
+                # Deprecated names (backward compat for old workflows)
+                "mask_erode_dilate": ("INT", {
+                    "default": 0, "min": -128, "max": 128, "step": 1,
+                    "tooltip": "DEPRECATED — use crop_expand_px"
+                }),
+                "mask_fill_holes": ("INT", {
+                    "default": 0, "min": 0, "max": 128, "step": 1,
+                    "tooltip": "DEPRECATED — use cleanup_fill_holes"
+                }),
+                "mask_remove_noise": ("INT", {
+                    "default": 0, "min": 0, "max": 32, "step": 1,
+                    "tooltip": "DEPRECATED — use cleanup_remove_noise"
+                }),
+                "mask_smooth": ("INT", {
+                    "default": 0, "min": 0, "max": 127, "step": 1,
+                    "tooltip": "DEPRECATED — use cleanup_smooth"
+                }),
+                "mask_blend_pixels": ("INT", {
+                    "default": 16, "min": 0, "max": 64, "step": 1,
+                    "tooltip": "DEPRECATED — use crop_blend_feather_px"
+                }),
             }
         }
 
@@ -237,26 +258,37 @@ class NV_LatentInpaintCrop:
                 crop_aspect="off", auto_preset="WAN_480p",
                 target_width=512, target_height=512,
                 target_mode="off", resize_method="bislerp",
+                crop_expand_px=0, cleanup_fill_holes=0,
+                cleanup_remove_noise=0, cleanup_smooth=0,
+                crop_blend_feather_px=16,
+                mask_config=None, bbox_mask=None, subject_mask=None,
+                x=0, y=0, width=512, height=512,
+                # Deprecated names (backward compat)
                 mask_erode_dilate=0, mask_fill_holes=0,
                 mask_remove_noise=0, mask_smooth=0,
-                mask_blend_pixels=16,
-                mask_config=None, bbox_mask=None, subject_mask=None,
-                x=0, y=0, width=512, height=512):
+                mask_blend_pixels=16):
+
+        # Resolve deprecated param names
+        from .mask_processing_config import resolve_deprecated, apply_mask_config
+        crop_expand_px = resolve_deprecated(crop_expand_px, 0, mask_erode_dilate, 0)
+        cleanup_fill_holes = resolve_deprecated(cleanup_fill_holes, 0, mask_fill_holes, 0)
+        cleanup_remove_noise = resolve_deprecated(cleanup_remove_noise, 0, mask_remove_noise, 0)
+        cleanup_smooth = resolve_deprecated(cleanup_smooth, 0, mask_smooth, 0)
+        crop_blend_feather_px = resolve_deprecated(crop_blend_feather_px, 16, mask_blend_pixels, 16)
 
         # Apply shared config override if connected
-        from .mask_processing_config import apply_mask_config
         vals = apply_mask_config(mask_config,
-            mask_erode_dilate=mask_erode_dilate,
-            mask_fill_holes=mask_fill_holes,
-            mask_remove_noise=mask_remove_noise,
-            mask_smooth=mask_smooth,
-            mask_blend_pixels=mask_blend_pixels,
+            crop_expand_px=crop_expand_px,
+            cleanup_fill_holes=cleanup_fill_holes,
+            cleanup_remove_noise=cleanup_remove_noise,
+            cleanup_smooth=cleanup_smooth,
+            crop_blend_feather_px=crop_blend_feather_px,
         )
-        mask_erode_dilate = vals["mask_erode_dilate"]
-        mask_fill_holes = vals["mask_fill_holes"]
-        mask_remove_noise = vals["mask_remove_noise"]
-        mask_smooth = vals["mask_smooth"]
-        mask_blend_pixels = vals["mask_blend_pixels"]
+        crop_expand_px = vals["crop_expand_px"]
+        cleanup_fill_holes = vals["cleanup_fill_holes"]
+        cleanup_remove_noise = vals["cleanup_remove_noise"]
+        cleanup_smooth = vals["cleanup_smooth"]
+        crop_blend_feather_px = vals["crop_blend_feather_px"]
 
         samples = latent["samples"]
         info_lines = []
@@ -454,18 +486,18 @@ class NV_LatentInpaintCrop:
         if subject_mask is not None:
             mask_ops = []
 
-            if mask_fill_holes > 0:
-                cropped_mask_processed = _mask_fill_holes(cropped_mask_processed, mask_fill_holes)
-                mask_ops.append(f"fill_holes={mask_fill_holes}")
-            if mask_remove_noise > 0:
-                cropped_mask_processed = _mask_remove_noise(cropped_mask_processed, mask_remove_noise)
-                mask_ops.append(f"remove_noise={mask_remove_noise}")
-            if mask_erode_dilate != 0:
-                cropped_mask_processed = _mask_erode_dilate(cropped_mask_processed, mask_erode_dilate)
-                mask_ops.append(f"erode_dilate={mask_erode_dilate}")
-            if mask_smooth > 0:
-                cropped_mask_processed = _mask_smooth(cropped_mask_processed, mask_smooth)
-                mask_ops.append(f"smooth={mask_smooth}")
+            if cleanup_fill_holes > 0:
+                cropped_mask_processed = _mask_fill_holes(cropped_mask_processed, cleanup_fill_holes)
+                mask_ops.append(f"fill_holes={cleanup_fill_holes}")
+            if cleanup_remove_noise > 0:
+                cropped_mask_processed = _mask_remove_noise(cropped_mask_processed, cleanup_remove_noise)
+                mask_ops.append(f"remove_noise={cleanup_remove_noise}")
+            if crop_expand_px != 0:
+                cropped_mask_processed = _mask_erode_dilate(cropped_mask_processed, crop_expand_px)
+                mask_ops.append(f"erode_dilate={crop_expand_px}")
+            if cleanup_smooth > 0:
+                cropped_mask_processed = _mask_smooth(cropped_mask_processed, cleanup_smooth)
+                mask_ops.append(f"smooth={cleanup_smooth}")
 
             if mask_ops:
                 info_lines.append(f"Mask processing: {', '.join(mask_ops)}")
@@ -474,11 +506,11 @@ class NV_LatentInpaintCrop:
         # MUST happen BEFORE mask resize: blend mask stays at original crop pixel
         # resolution because the stitch pastes at original crop coordinates.
         blend_mask_for_stitch = None
-        if mask_blend_pixels > 0 and subject_mask is not None:
+        if crop_blend_feather_px > 0 and subject_mask is not None:
             blend_mask_for_stitch = cropped_mask.max(dim=0, keepdim=True).values
-            blend_mask_for_stitch = _mask_erode_dilate(blend_mask_for_stitch, mask_blend_pixels)
-            blend_mask_for_stitch = _mask_blur(blend_mask_for_stitch, mask_blend_pixels)
-            info_lines.append(f"Blend mask: union + dilate+blur {mask_blend_pixels}px")
+            blend_mask_for_stitch = _mask_erode_dilate(blend_mask_for_stitch, crop_blend_feather_px)
+            blend_mask_for_stitch = _mask_blur(blend_mask_for_stitch, crop_blend_feather_px)
+            info_lines.append(f"Blend mask: union + dilate+blur {crop_blend_feather_px}px")
 
         # --- Resize output masks to target pixel dimensions ---
         # After blend mask (which needs original crop res), resize masks to match

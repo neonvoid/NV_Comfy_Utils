@@ -96,17 +96,23 @@ def crop_for_inpaint(image, original_mask, processed_mask, bbox_x, bbox_y, bbox_
                      target_w, target_h, padding_multiple, resize_algorithm):
     """
     Crop image and masks around bounding box, adjusting for target aspect ratio.
+    Crop is clamped to frame bounds — no canvas extension, no fake pixels.
 
     Returns:
-        canvas_image: Expanded image (may be larger than original if bbox doesn't fit)
-        cto_x, cto_y, cto_w, cto_h: Where original image sits in canvas
+        canvas_image: The original image (no padding — canvas == image)
+        cto_x, cto_y, cto_w, cto_h: Where original image sits in canvas (always 0,0,W,H)
         cropped_image: The cropped and resized region
         cropped_mask_original: Original mask cropped and resized (for tight stitching)
         cropped_mask_processed: Processed mask cropped and resized (for diffusion)
         ctc_x, ctc_y, ctc_w, ctc_h: Where crop region sits in canvas
     """
     B, img_h, img_w, C = image.shape
-    device = image.device
+
+    # Validate inputs to prevent division by zero
+    if bbox_w <= 0 or bbox_h <= 0:
+        raise ValueError(f"[NV_InpaintCrop] Invalid bbox dimensions: {bbox_w}x{bbox_h}")
+    if target_w <= 0 or target_h <= 0:
+        raise ValueError(f"[NV_InpaintCrop] Invalid target dimensions: {target_w}x{target_h}")
 
     # Ensure target dimensions are multiples of padding
     if padding_multiple > 0:
@@ -134,7 +140,7 @@ def crop_for_inpaint(image, original_mask, processed_mask, bbox_x, bbox_y, bbox_
     new_x = int(round(bbox_cx - new_w / 2.0))
     new_y = int(round(bbox_cy - new_h / 2.0))
 
-    # Keep crop within image bounds: shift first, then clamp.
+    # Keep crop within image bounds: shift first, then isotropic shrink.
     # No canvas extension beyond the frame — all context is real pixels.
     if new_x < 0 and new_x + new_w <= img_w:
         new_x = 0
@@ -146,16 +152,32 @@ def crop_for_inpaint(image, original_mask, processed_mask, bbox_x, bbox_y, bbox_
     elif new_y + new_h > img_h and new_y >= 0:
         new_y = img_h - new_h
 
-    # Hard clamp to frame bounds — no out-of-frame extension
+    # Clamp origin to frame bounds
     new_x = max(0, new_x)
     new_y = max(0, new_y)
-    new_w = min(new_w, img_w - new_x)
-    new_h = min(new_h, img_h - new_y)
+
+    # Isotropic shrink: if crop exceeds frame, shrink BOTH axes proportionally
+    # to preserve target aspect ratio (avoids anisotropic distortion on resize).
+    avail_w = img_w - new_x
+    avail_h = img_h - new_y
+    if new_w > avail_w or new_h > avail_h:
+        scale = min(avail_w / new_w, avail_h / new_h)
+        new_w = max(1, int(round(new_w * scale)))
+        new_h = max(1, int(round(new_h * scale)))
+        # Re-center within available space after shrink
+        new_x = min(new_x, img_w - new_w)
+        new_y = min(new_y, img_h - new_h)
+
+    # Guard: reject degenerate crops
+    if new_w <= 0 or new_h <= 0:
+        raise ValueError(
+            f"[NV_InpaintCrop] Crop region collapsed after clamping to frame bounds: "
+            f"new_x={new_x}, new_y={new_y}, new_w={new_w}, new_h={new_h}, "
+            f"frame={img_w}x{img_h}. Check that the mask/bbox is within the image."
+        )
 
     # Canvas IS the original image (no padding, no fake pixels)
     canvas_image = image
-    canvas_mask_orig = original_mask
-    canvas_mask_proc = processed_mask
 
     # Canvas-to-original coordinates (identity — no padding offset)
     cto_x, cto_y = 0, 0
@@ -225,48 +247,36 @@ class NV_InpaintCrop:
                     "tooltip": "Round output dimensions to multiples of this value. Use 8 for most models, 32 for latent-space operations, 64 for maximum compatibility."
                 }),
 
-                # Mask processing (applied to processed mask only)
-                "mask_erode_dilate": ("INT", {
-                    "default": 0, "min": -128, "max": 128, "step": 1,
-                    "tooltip": "Shrink (negative) or expand (positive) the mask using grey morphology. "
-                               "Recommended: 8-12 for character inpainting (keeps blend zone tight, reduces structural mismatch). "
-                               "-8 to -16 for tighter face boundaries, +32 to +64 for large area inpainting. "
-                               "Avoid >24 — excess erosion widens the blend transition zone. "
-                               "Uses scipy grey_erosion/dilation to preserve gradient edges."
-                }),
-                "mask_fill_holes": ("INT", {
+                # Cleanup (applied to processed mask only)
+                "cleanup_fill_holes": ("INT", {
                     "default": 0, "min": 0, "max": 128, "step": 1,
-                    "tooltip": "Fill gaps/holes in mask using morphological closing (dilate then erode). "
-                               "Recommended: 8-16 for small gaps between strokes, 32-64 for medium holes, 64+ for large interior gaps. "
-                               "Useful for masks with unwanted holes from segmentation."
+                    "tooltip": "Fill gaps/holes in mask (morphological closing). (Previously: mask_fill_holes)"
                 }),
-                "mask_remove_noise": ("INT", {
+                "cleanup_remove_noise": ("INT", {
                     "default": 0, "min": 0, "max": 32, "step": 1,
-                    "tooltip": "Remove isolated pixels/specks using morphological opening (erode then dilate). "
-                               "Recommended: 2-4 for tiny specks, 8-16 for larger noise clusters. "
-                               "Keeps main mask regions intact while eliminating stray pixels."
+                    "tooltip": "Remove isolated pixels (morphological opening). (Previously: mask_remove_noise)"
                 }),
-                "mask_smooth": ("INT", {
+                "cleanup_smooth": ("INT", {
                     "default": 0, "min": 0, "max": 127, "step": 1,
-                    "tooltip": "Smooth jagged mask edges by binarizing (threshold 0.5) then Gaussian blurring. "
-                               "Recommended: 3-9 for subtle smoothing, 15-31 for noticeable softening. "
-                               "Creates cleaner edges than direct blur. Value must be odd (auto-adjusted if even)."
+                    "tooltip": "Smooth jagged edges (binarize + blur). (Previously: mask_smooth)"
                 }),
 
-                # Blend settings (for stitching)
-                "stitch_source": (["tight", "processed", "hybrid", "bbox"], {
-                    "default": "tight",
-                    "tooltip": "Which mask to use as the base for stitch blending. "
-                               "tight: original unprocessed mask (minimal changes to image). "
-                               "processed: mask after erode/dilate/fill/smooth (matches diffusion mask). "
-                               "hybrid: processed mask core with wide soft falloff into surrounding diffused area "
-                               "(best of both — tight subject, smooth transition, no background stretching). "
-                               "bbox: full crop region (blends in the entire re-generated area — can cause stretching)."
+                # Crop / Stitch
+                "crop_expand_px": ("INT", {
+                    "default": 0, "min": -128, "max": 128, "step": 1,
+                    "tooltip": "Shrink (negative) or expand (positive) the crop/stitch mask in pixels. "
+                               "Controls what area gets denoised + stitched. (Previously: mask_erode_dilate)"
                 }),
-                "mask_blend_pixels": ("INT", {
+                "crop_stitch_source": (["tight", "processed", "hybrid", "bbox"], {
+                    "default": "tight",
+                    "tooltip": "Which mask drives the stitch blend. "
+                               "tight: original unprocessed mask. processed: after cleanup+expand. "
+                               "hybrid: processed core + soft falloff. bbox: full crop region. "
+                               "(Previously: stitch_source)"
+                }),
+                "crop_blend_feather_px": ("INT", {
                     "default": 16, "min": 0, "max": 64, "step": 1,
-                    "tooltip": "Feather the stitch mask edges for seamless stitching (dilate + blur). "
-                               "Recommended: 8-16 for subtle blending, 24-32 for visible seam hiding, 48-64 for aggressive blending."
+                    "tooltip": "Feather stitch mask edges (dilate + blur). (Previously: mask_blend_pixels)"
                 }),
 
                 "hybrid_falloff": ("INT", {
@@ -291,9 +301,21 @@ class NV_InpaintCrop:
             "optional": {
                 "mask_config": ("MASK_PROCESSING_CONFIG", {
                     "tooltip": "Optional shared config from NV_MaskProcessingConfig. "
-                               "When connected, overrides this node's local mask processing widgets "
-                               "(erode_dilate, fill_holes, remove_noise, smooth, blend_pixels)."
+                               "When connected, overrides cleanup, crop_expand, and blend_feather widgets."
                 }),
+                # Deprecated names (backward compat for old workflows)
+                "mask_erode_dilate": ("INT", {"default": 0, "min": -128, "max": 128, "step": 1,
+                    "tooltip": "DEPRECATED — use crop_expand_px"}),
+                "mask_fill_holes": ("INT", {"default": 0, "min": 0, "max": 128, "step": 1,
+                    "tooltip": "DEPRECATED — use cleanup_fill_holes"}),
+                "mask_remove_noise": ("INT", {"default": 0, "min": 0, "max": 32, "step": 1,
+                    "tooltip": "DEPRECATED — use cleanup_remove_noise"}),
+                "mask_smooth": ("INT", {"default": 0, "min": 0, "max": 127, "step": 1,
+                    "tooltip": "DEPRECATED — use cleanup_smooth"}),
+                "stitch_source": (["tight", "processed", "hybrid", "bbox"], {"default": "tight",
+                    "tooltip": "DEPRECATED — use crop_stitch_source"}),
+                "mask_blend_pixels": ("INT", {"default": 16, "min": 0, "max": 64, "step": 1,
+                    "tooltip": "DEPRECATED — use crop_blend_feather_px"}),
                 "bounding_box_mask": ("MASK", {
                     "tooltip": "Optional mask defining minimum crop area. Crop region will encompass this entire mask. "
                                "Use to ensure specific areas are included even if main mask is smaller. "
@@ -316,26 +338,39 @@ class NV_InpaintCrop:
     DESCRIPTION = "Crops image for inpainting. Outputs both original mask (for stitching) and processed mask (for diffusion). stitch_source selects which mask drives the blend: tight, processed, hybrid (wide soft falloff), or bbox (full region). Auto mode computes optimal resolution from bbox."
 
     def crop(self, image, mask, target_mode, target_width, target_height, auto_preset,
-             padding_multiple, mask_erode_dilate=0, mask_fill_holes=0, mask_remove_noise=0,
-             mask_smooth=0, stitch_source="tight", mask_blend_pixels=16,
+             padding_multiple,
+             # New names
+             cleanup_fill_holes=0, cleanup_remove_noise=0, cleanup_smooth=0,
+             crop_expand_px=0, crop_stitch_source="tight", crop_blend_feather_px=16,
              hybrid_falloff=48, hybrid_curve=0.6, resize_algorithm="bicubic",
-             mask_config=None, bounding_box_mask=None, anomaly_threshold=1.5):
+             mask_config=None, bounding_box_mask=None, anomaly_threshold=1.5,
+             # Deprecated names (backward compat)
+             mask_erode_dilate=0, mask_fill_holes=0, mask_remove_noise=0,
+             mask_smooth=0, stitch_source="tight", mask_blend_pixels=16):
+
+        # Resolve deprecated param names
+        from .mask_processing_config import resolve_deprecated
+        crop_expand_px = resolve_deprecated(crop_expand_px, 0, mask_erode_dilate, 0)
+        cleanup_fill_holes = resolve_deprecated(cleanup_fill_holes, 0, mask_fill_holes, 0)
+        cleanup_remove_noise = resolve_deprecated(cleanup_remove_noise, 0, mask_remove_noise, 0)
+        cleanup_smooth = resolve_deprecated(cleanup_smooth, 0, mask_smooth, 0)
+        crop_stitch_source = resolve_deprecated(crop_stitch_source, "tight", stitch_source, "tight")
+        crop_blend_feather_px = resolve_deprecated(crop_blend_feather_px, 16, mask_blend_pixels, 16)
 
         # Apply shared config override if connected
         from .mask_processing_config import apply_mask_config
         vals = apply_mask_config(mask_config,
-            mask_erode_dilate=mask_erode_dilate,
-            mask_fill_holes=mask_fill_holes,
-            mask_remove_noise=mask_remove_noise,
-            mask_smooth=mask_smooth,
-            mask_blend_pixels=mask_blend_pixels,
+            crop_expand_px=crop_expand_px,
+            cleanup_fill_holes=cleanup_fill_holes,
+            cleanup_remove_noise=cleanup_remove_noise,
+            cleanup_smooth=cleanup_smooth,
+            crop_blend_feather_px=crop_blend_feather_px,
         )
-        # Use _v suffix locals to avoid shadowing imported functions
-        erode_dilate_v = vals["mask_erode_dilate"]
-        fill_holes_v = vals["mask_fill_holes"]
-        remove_noise_v = vals["mask_remove_noise"]
-        smooth_v = vals["mask_smooth"]
-        blend_pixels_v = vals["mask_blend_pixels"]
+        erode_dilate_v = vals["crop_expand_px"]
+        fill_holes_v = vals["cleanup_fill_holes"]
+        remove_noise_v = vals["cleanup_remove_noise"]
+        smooth_v = vals["cleanup_smooth"]
+        blend_pixels_v = vals["crop_blend_feather_px"]
 
         padding_multiple = int(padding_multiple)
         device = comfy.model_management.get_torch_device()
@@ -354,9 +389,12 @@ class NV_InpaintCrop:
         if bounding_box_mask is not None and bounding_box_mask.shape[0] == 1 and batch_size > 1:
             bounding_box_mask = bounding_box_mask.expand(batch_size, -1, -1).clone()
 
-        # Validate dimensions
-        assert image.shape[1] == mask.shape[1] and image.shape[2] == mask.shape[2], \
-            f"Image and mask dimensions must match: image {image.shape}, mask {mask.shape}"
+        # Validate spatial dimensions (use raise, not assert — asserts get stripped in optimized runs)
+        if image.shape[1] != mask.shape[1] or image.shape[2] != mask.shape[2]:
+            raise ValueError(f"[NV_InpaintCrop] Image and mask spatial dims must match: image {image.shape}, mask {mask.shape}")
+        if bounding_box_mask is not None:
+            if image.shape[1] != bounding_box_mask.shape[1] or image.shape[2] != bounding_box_mask.shape[2]:
+                raise ValueError(f"[NV_InpaintCrop] Image and bounding_box_mask spatial dims must match: image {image.shape}, bbox_mask {bounding_box_mask.shape}")
 
         info_lines = []
 
@@ -477,10 +515,10 @@ class NV_InpaintCrop:
             )
 
             # Create blend mask from selected source
-            if stitch_source == "bbox":
+            if crop_stitch_source == "bbox":
                 # Full crop region — blend in everything
                 blend_mask = torch.ones_like(cropped_mask_orig)
-            elif stitch_source == "hybrid":
+            elif crop_stitch_source == "hybrid":
                 # Hybrid: processed mask core + wide soft falloff into surrounding diffused area.
                 # Uses explicit sigma (not kernel_size) for controllable transition width.
                 # Screen blend avoids the 0.5 discontinuity at mask edges that torch.maximum creates.
@@ -491,18 +529,18 @@ class NV_InpaintCrop:
                 falloff = falloff.clamp(0, 1).pow(hybrid_curve)
                 # Screen blend: smooth union that avoids hard 1.0→0.5 step at mask edge
                 blend_mask = 1.0 - (1.0 - proc) * (1.0 - falloff)
-            elif stitch_source == "processed":
+            elif crop_stitch_source == "processed":
                 blend_mask = cropped_mask_proc.clone()
             else:
                 # "tight" — original unprocessed mask (default)
                 blend_mask = cropped_mask_orig.clone()
 
             if blend_pixels_v > 0:
-                if stitch_source == "bbox":
+                if crop_stitch_source == "bbox":
                     # Bbox is all-ones — erode INWARD from edges to create a border, then blur
                     blend_mask = _op_erode_dilate(blend_mask, -blend_pixels_v)
                     blend_mask = mask_blur(blend_mask, blend_pixels_v)
-                elif stitch_source == "hybrid":
+                elif crop_stitch_source == "hybrid":
                     # Hybrid already has a wide falloff — just apply a light final blur for polish
                     blend_mask = mask_blur(blend_mask, blend_pixels_v)
                 else:

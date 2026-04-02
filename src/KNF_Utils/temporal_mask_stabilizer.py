@@ -487,21 +487,38 @@ class NV_TemporalMaskStabilizer:
                     "default": 300, "min": 10, "max": 10000, "step": 10,
                     "tooltip": "Minimum component area in pixels to keep. Smaller components are killed."
                 }),
-                "mask_erode_dilate": ("INT", {
+                "crop_expand_px": ("INT", {
                     "default": 0, "min": -128, "max": 128, "step": 1,
                     "tooltip": "Post-stabilization erosion (<0) or dilation (>0). Overridden by mask_config."
                 }),
-                "mask_fill_holes": ("INT", {
+                "cleanup_fill_holes": ("INT", {
                     "default": 0, "min": 0, "max": 128, "step": 1,
                     "tooltip": "Post-stabilization hole filling. Overridden by mask_config."
                 }),
-                "mask_remove_noise": ("INT", {
+                "cleanup_remove_noise": ("INT", {
                     "default": 0, "min": 0, "max": 32, "step": 1,
                     "tooltip": "Post-stabilization noise removal. Overridden by mask_config."
                 }),
-                "mask_smooth": ("INT", {
+                "cleanup_smooth": ("INT", {
                     "default": 0, "min": 0, "max": 127, "step": 1,
                     "tooltip": "Post-stabilization edge smoothing. Overridden by mask_config."
+                }),
+                # Deprecated names (backward compat for old workflows)
+                "mask_erode_dilate": ("INT", {
+                    "default": 0, "min": -128, "max": 128, "step": 1,
+                    "tooltip": "DEPRECATED — use crop_expand_px"
+                }),
+                "mask_fill_holes": ("INT", {
+                    "default": 0, "min": 0, "max": 128, "step": 1,
+                    "tooltip": "DEPRECATED — use cleanup_fill_holes"
+                }),
+                "mask_remove_noise": ("INT", {
+                    "default": 0, "min": 0, "max": 32, "step": 1,
+                    "tooltip": "DEPRECATED — use cleanup_remove_noise"
+                }),
+                "mask_smooth": ("INT", {
+                    "default": 0, "min": 0, "max": 127, "step": 1,
+                    "tooltip": "DEPRECATED — use cleanup_smooth"
                 }),
                 "enable_sdf": ("BOOLEAN", {
                     "default": False,
@@ -538,8 +555,17 @@ class NV_TemporalMaskStabilizer:
                 sigma_color=0.1, sigma_time=1.5,
                 pop_detection=True, pop_area_thresh=0.20, pop_iou_thresh=0.65,
                 use_logit_space=False, cc_gate_enable=False, cc_gate_min_area=300,
+                crop_expand_px=0, cleanup_fill_holes=0, cleanup_remove_noise=0, cleanup_smooth=0,
+                # Deprecated names (backward compat)
                 mask_erode_dilate=0, mask_fill_holes=0, mask_remove_noise=0, mask_smooth=0,
                 enable_sdf=False, sdf_sigma_temporal=1.0, sdf_sigma_spatial=0.5, crop_padding=0.15):
+
+        # Resolve deprecated param names
+        from .mask_processing_config import resolve_deprecated, apply_mask_config
+        crop_expand_px = resolve_deprecated(crop_expand_px, 0, mask_erode_dilate, 0)
+        cleanup_fill_holes = resolve_deprecated(cleanup_fill_holes, 0, mask_fill_holes, 0)
+        cleanup_remove_noise = resolve_deprecated(cleanup_remove_noise, 0, mask_remove_noise, 0)
+        cleanup_smooth = resolve_deprecated(cleanup_smooth, 0, mask_smooth, 0)
 
         if mask.dim() != 3:
             raise ValueError(f"mask must be [B, H, W], got shape {list(mask.shape)}")
@@ -560,13 +586,12 @@ class NV_TemporalMaskStabilizer:
 
         mask = mask.to(dtype=torch.float32).clamp(0.0, 1.0)
 
-        from .mask_processing_config import apply_mask_config
-        vals = apply_mask_config(mask_config, mask_erode_dilate=mask_erode_dilate, mask_fill_holes=mask_fill_holes,
-                                 mask_remove_noise=mask_remove_noise, mask_smooth=mask_smooth)
-        post_erode_dilate = vals["mask_erode_dilate"]
-        post_fill_holes = vals["mask_fill_holes"]
-        post_remove_noise = vals["mask_remove_noise"]
-        post_smooth = vals["mask_smooth"]
+        vals = apply_mask_config(mask_config, crop_expand_px=crop_expand_px, cleanup_fill_holes=cleanup_fill_holes,
+                                 cleanup_remove_noise=cleanup_remove_noise, cleanup_smooth=cleanup_smooth)
+        post_erode_dilate = vals["crop_expand_px"]
+        post_fill_holes = vals["cleanup_fill_holes"]
+        post_remove_noise = vals["cleanup_remove_noise"]
+        post_smooth = vals["cleanup_smooth"]
         has_spatial_cleanup = (post_erode_dilate != 0 or post_fill_holes > 0
                                or post_remove_noise > 0 or post_smooth > 0)
 

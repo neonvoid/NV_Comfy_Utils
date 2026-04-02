@@ -61,7 +61,7 @@ class NV_MaskTrackingBBox:
                     "tooltip": "Per-frame segmentation masks [B, H, W]. "
                                "Each frame's non-zero region defines the tight subject boundary."
                 }),
-                "padding": ("FLOAT", {
+                "bbox_expand_pct": ("FLOAT", {
                     "default": 0.15, "min": 0.0, "max": 1.0, "step": 0.05,
                     "tooltip": "Expand bbox by this fraction of its dimensions "
                                "(0.15 = 15% on each side). Applied after smoothing. "
@@ -89,6 +89,11 @@ class NV_MaskTrackingBBox:
                 }),
             },
             "optional": {
+                # Deprecated name (backward compat for old workflows)
+                "padding": ("FLOAT", {
+                    "default": 0.15, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "DEPRECATED — use bbox_expand_pct"
+                }),
                 "min_cutoff": ("FLOAT", {
                     "default": 0.05, "min": 0.001, "max": 10.0, "step": 0.01,
                     "tooltip": "One-Euro min_cutoff: minimum cutoff frequency. "
@@ -170,19 +175,26 @@ class NV_MaskTrackingBBox:
         "Anomaly detection (occlusion rejection) is handled by InpaintCrop v2 downstream."
     )
 
-    def execute(self, mask, padding, smooth_mode, smooth_window,
+    def execute(self, mask, bbox_expand_pct, smooth_mode, smooth_window,
+                # Deprecated name (backward compat)
+                padding=0.15,
                 min_cutoff=0.05, beta=0.7,
                 ema_alpha=0.3, smooth_strength=1.0,
                 threshold=False, output_erode=0, output_feather=0,
                 kalman_q_pos=4.0, kalman_q_dim=1.0,
                 kalman_r_pos=9.0, kalman_r_dim=25.0):
+
+        # Resolve deprecated param name
+        from .mask_processing_config import resolve_deprecated
+        bbox_expand_pct = resolve_deprecated(bbox_expand_pct, 0.15, padding, 0.15)
+
         if mask.dim() == 2:
             mask = mask.unsqueeze(0)
 
         B, H, W = mask.shape
         info_lines = [
             f"[NV_MaskTrackingBBox] {B} frames, {W}x{H}px | "
-            f"mode={smooth_mode} | padding={padding:.0%}"
+            f"mode={smooth_mode} | padding={bbox_expand_pct:.0%}"
         ]
 
         # --- Threshold ---
@@ -215,7 +227,7 @@ class NV_MaskTrackingBBox:
         )
 
         # --- Build output bbox masks ---
-        bbox_mask = build_bbox_masks(x1s, y1s, x2s, y2s, padding, H, W, info_lines)
+        bbox_mask = build_bbox_masks(x1s, y1s, x2s, y2s, bbox_expand_pct, H, W, info_lines)
 
         # --- Optional post-processing ---
         if output_erode != 0:

@@ -54,9 +54,12 @@ def _inverse_content_warp(image, mask, warp_mode, warp_entry):
         ], device=device, dtype=torch.float32).unsqueeze(0)
         grid = TF.affine_grid(theta, (1, 1, H, W), align_corners=False)
 
+        # Use zeros for both image and mask — compositing is strictly mask-gated,
+        # so zero-filled edges are invisible in the final output. This avoids both
+        # border-stretching artifacts AND reflection mirror ghosts.
         img_nchw = image.permute(0, 3, 1, 2)
         image = TF.grid_sample(img_nchw, grid, mode='bilinear',
-                               padding_mode='border', align_corners=False).permute(0, 2, 3, 1)
+                               padding_mode='zeros', align_corners=False).permute(0, 2, 3, 1)
 
         mask_nchw = mask.permute(0, 3, 1, 2)
         mask = TF.grid_sample(mask_nchw, grid, mode='bilinear',
@@ -79,7 +82,7 @@ def _inverse_content_warp(image, mask, warp_mode, warp_entry):
 
         img_nchw = image.permute(0, 3, 1, 2)
         image = TF.grid_sample(img_nchw, grid, mode='bilinear',
-                               padding_mode='border', align_corners=True).permute(0, 2, 3, 1)
+                               padding_mode='zeros', align_corners=True).permute(0, 2, 3, 1)
 
         mask_nchw = mask.permute(0, 3, 1, 2)
         mask = TF.grid_sample(mask_nchw, grid, mode='bilinear',

@@ -196,23 +196,23 @@ class NV_MaskPipelineViz:
                     "tooltip": "Mask overlay opacity.",
                 }),
                 # InpaintCrop mask processing params
-                "mask_erode_dilate": ("INT", {
+                "crop_expand_px": ("INT", {
                     "default": 4, "min": -128, "max": 128, "step": 1,
                     "tooltip": "Mirror of InpaintCrop. Negative=shrink, positive=expand.",
                 }),
-                "mask_fill_holes": ("INT", {
+                "cleanup_fill_holes": ("INT", {
                     "default": 0, "min": 0, "max": 128, "step": 1,
                     "tooltip": "Mirror of InpaintCrop. Grey closing to fill gaps.",
                 }),
-                "mask_remove_noise": ("INT", {
+                "cleanup_remove_noise": ("INT", {
                     "default": 0, "min": 0, "max": 32, "step": 1,
                     "tooltip": "Mirror of InpaintCrop. Grey opening to remove specks.",
                 }),
-                "mask_smooth": ("INT", {
+                "cleanup_smooth": ("INT", {
                     "default": 0, "min": 0, "max": 127, "step": 1,
                     "tooltip": "Mirror of InpaintCrop. Binarize + blur edges.",
                 }),
-                "mask_blend_pixels": ("INT", {
+                "crop_blend_feather_px": ("INT", {
                     "default": 16, "min": 0, "max": 64, "step": 1,
                     "tooltip": "Mirror of InpaintCrop. Dilate + blur for stitching.",
                 }),
@@ -229,11 +229,11 @@ class NV_MaskPipelineViz:
                     "default": 8, "min": 4, "max": 32, "step": 4,
                     "tooltip": "VAE spatial stride. 8 for WAN.",
                 }),
-                "stitch_erosion": ("INT", {
+                "vace_stitch_erosion_px": ("INT", {
                     "default": 0, "min": -32, "max": 32, "step": 1,
                     "tooltip": "Mirror of VACE Prep. Erode/dilate stitch mask (pixels).",
                 }),
-                "stitch_feather": ("INT", {
+                "vace_stitch_feather_px": ("INT", {
                     "default": 4, "min": 0, "max": 64, "step": 1,
                     "tooltip": "Mirror of VACE Prep. Feather stitch mask (pixels).",
                 }),
@@ -256,6 +256,35 @@ class NV_MaskPipelineViz:
                                "Used as the original_mask when previewing the cropped view. "
                                "Wire: InpaintCrop.cropped_mask -> here."
                 }),
+                # Deprecated names (backward compat for old workflows)
+                "mask_erode_dilate": ("INT", {
+                    "default": 4, "min": -128, "max": 128, "step": 1,
+                    "tooltip": "DEPRECATED — use crop_expand_px"
+                }),
+                "mask_fill_holes": ("INT", {
+                    "default": 0, "min": 0, "max": 128, "step": 1,
+                    "tooltip": "DEPRECATED — use cleanup_fill_holes"
+                }),
+                "mask_remove_noise": ("INT", {
+                    "default": 0, "min": 0, "max": 32, "step": 1,
+                    "tooltip": "DEPRECATED — use cleanup_remove_noise"
+                }),
+                "mask_smooth": ("INT", {
+                    "default": 0, "min": 0, "max": 127, "step": 1,
+                    "tooltip": "DEPRECATED — use cleanup_smooth"
+                }),
+                "mask_blend_pixels": ("INT", {
+                    "default": 16, "min": 0, "max": 64, "step": 1,
+                    "tooltip": "DEPRECATED — use crop_blend_feather_px"
+                }),
+                "stitch_erosion": ("INT", {
+                    "default": 0, "min": -32, "max": 32, "step": 1,
+                    "tooltip": "DEPRECATED — use vace_stitch_erosion_px"
+                }),
+                "stitch_feather": ("INT", {
+                    "default": 4, "min": 0, "max": 64, "step": 1,
+                    "tooltip": "DEPRECATED — use vace_stitch_feather_px"
+                }),
             },
         }
 
@@ -270,50 +299,63 @@ class NV_MaskPipelineViz:
     )
 
     def execute(self, image, original_mask, mode, frame_index, video_stage, overlay_alpha,
-                mask_erode_dilate, mask_fill_holes, mask_remove_noise,
-                mask_smooth, mask_blend_pixels,
+                crop_expand_px, cleanup_fill_holes, cleanup_remove_noise,
+                cleanup_smooth, crop_blend_feather_px,
                 erosion_blocks, feather_blocks, vae_stride,
-                stitch_erosion, stitch_feather,
+                vace_stitch_erosion_px, vace_stitch_feather_px,
                 mask_config=None, bbox_mask=None,
-                cropped_image=None, cropped_mask=None):
+                cropped_image=None, cropped_mask=None,
+                # Deprecated names (backward compat)
+                mask_erode_dilate=4, mask_fill_holes=0, mask_remove_noise=0,
+                mask_smooth=0, mask_blend_pixels=16,
+                stitch_erosion=0, stitch_feather=4):
+
+        # Resolve deprecated param names
+        from .mask_processing_config import resolve_deprecated, apply_mask_config, apply_vace_mask_config
+        crop_expand_px = resolve_deprecated(crop_expand_px, 4, mask_erode_dilate, 4)
+        cleanup_fill_holes = resolve_deprecated(cleanup_fill_holes, 0, mask_fill_holes, 0)
+        cleanup_remove_noise = resolve_deprecated(cleanup_remove_noise, 0, mask_remove_noise, 0)
+        cleanup_smooth = resolve_deprecated(cleanup_smooth, 0, mask_smooth, 0)
+        crop_blend_feather_px = resolve_deprecated(crop_blend_feather_px, 16, mask_blend_pixels, 16)
+        vace_stitch_erosion_px = resolve_deprecated(vace_stitch_erosion_px, 0, stitch_erosion, 0)
+        vace_stitch_feather_px = resolve_deprecated(vace_stitch_feather_px, 4, stitch_feather, 4)
 
         # Apply shared config override if connected
-        from .mask_processing_config import apply_mask_config, apply_vace_mask_config
         vals = apply_mask_config(mask_config,
-            mask_erode_dilate=mask_erode_dilate,
-            mask_fill_holes=mask_fill_holes,
-            mask_remove_noise=mask_remove_noise,
-            mask_smooth=mask_smooth,
-            mask_blend_pixels=mask_blend_pixels,
+            crop_expand_px=crop_expand_px,
+            cleanup_fill_holes=cleanup_fill_holes,
+            cleanup_remove_noise=cleanup_remove_noise,
+            cleanup_smooth=cleanup_smooth,
+            crop_blend_feather_px=crop_blend_feather_px,
         )
-        mask_erode_dilate = vals["mask_erode_dilate"]
-        mask_fill_holes = vals["mask_fill_holes"]
-        mask_remove_noise = vals["mask_remove_noise"]
-        mask_smooth = vals["mask_smooth"]
-        mask_blend_pixels = vals["mask_blend_pixels"]
+        crop_expand_px = vals["crop_expand_px"]
+        cleanup_fill_holes = vals["cleanup_fill_holes"]
+        cleanup_remove_noise = vals["cleanup_remove_noise"]
+        cleanup_smooth = vals["cleanup_smooth"]
+        crop_blend_feather_px = vals["crop_blend_feather_px"]
         vace_vals = apply_vace_mask_config(mask_config,
             erosion_blocks=erosion_blocks,
             feather_blocks=feather_blocks,
-            stitch_erosion=stitch_erosion,
-            stitch_feather=stitch_feather,
+            vace_stitch_erosion_px=vace_stitch_erosion_px,
+            vace_stitch_feather_px=vace_stitch_feather_px,
         )
         erosion_blocks = vace_vals["erosion_blocks"]
         feather_blocks = vace_vals["feather_blocks"]
-        stitch_erosion = vace_vals["stitch_erosion"]
-        stitch_feather = vace_vals["stitch_feather"]
+        vace_stitch_erosion_px = vace_vals["vace_stitch_erosion_px"]
+        vace_stitch_feather_px = vace_vals["vace_stitch_feather_px"]
 
         # Common mask processing kwargs
         mask_kwargs = dict(
-            mask_erode_dilate=mask_erode_dilate,
-            mask_fill_holes=mask_fill_holes,
-            mask_remove_noise=mask_remove_noise,
-            mask_smooth=mask_smooth,
-            mask_blend_pixels=mask_blend_pixels,
+            mask_erode_dilate=crop_expand_px,
+            mask_fill_holes=cleanup_fill_holes,
+            mask_remove_noise=cleanup_remove_noise,
+            mask_smooth=cleanup_smooth,
+            mask_blend_pixels=crop_blend_feather_px,
             erosion_blocks=erosion_blocks,
             feather_blocks=feather_blocks,
             vae_stride=vae_stride,
-            stitch_erosion=stitch_erosion,
-            stitch_feather=stitch_feather,
+            stitch_erosion=vace_stitch_erosion_px,
+            stitch_feather=vace_stitch_feather_px,
         )
 
         # Resolve image/mask source: use cropped inputs if connected, otherwise full-frame

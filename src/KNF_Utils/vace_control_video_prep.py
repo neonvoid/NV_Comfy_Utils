@@ -136,9 +136,8 @@ class NV_VaceControlVideoPrep:
             "optional": {
                 "mask_config": ("MASK_PROCESSING_CONFIG", {
                     "tooltip": "Optional shared config from NV_MaskProcessingConfig. "
-                               "When connected, overrides VACE erosion/feather, stitch, and "
-                               "mask cleanup widgets (fill_holes, remove_noise, smooth). "
-                               "Note: mask_grow is NOT overridden (different semantics)."
+                               "When connected, overrides VACE erosion/feather, stitch, cleanup, "
+                               "input_grow, and halo widgets."
                 }),
                 "bbox_padding": ("FLOAT", {
                     "default": 0.15, "min": 0.0, "max": 1.0, "step": 0.05,
@@ -148,78 +147,80 @@ class NV_VaceControlVideoPrep:
                 "bbox_smooth_frames": ("INT", {
                     "default": 5, "min": 0, "max": 31, "step": 2,
                     "tooltip": "Temporal smoothing window for bbox coordinates (odd values recommended). "
-                               "Applies median filter then Gaussian smooth to eliminate jitter. "
                                "0 = disabled. Only used when mask_shape='bbox'."
                 }),
                 "fill_value": ("FLOAT", {
                     "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "Fill color for masked area (uniform across RGB). "
-                               "0.5 = true VACE neutral (WanVaceToVideo centers by -0.5). "
+                    "tooltip": "Fill color for masked area. 0.5 = true VACE neutral. "
                                "Only used when fill_mode='soft'."
                 }),
                 "threshold": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "Binarize mask at 0.5 before processing. Enable if mask has "
-                               "intermediate values from resizing that should be hard edges."
+                    "tooltip": "Binarize mask at 0.5 before processing."
                 }),
-                "mask_grow": ("INT", {
+                "vace_input_grow_px": ("INT", {
                     "default": 0, "min": -128, "max": 128, "step": 1,
-                    "tooltip": "Grow (positive) or shrink (negative) the input mask before "
-                               "VACE processing. Applied after threshold, before bbox conversion. "
-                               "Uses grey morphology to preserve gradients."
+                    "tooltip": "Grow (positive) or shrink (negative) the raw input mask before "
+                               "VACE processing. Expands the area VACE regenerates. "
+                               "Use for object insertion where generated content extends beyond mask. "
+                               "0 = mask already covers the right area. (Previously: mask_grow)"
                 }),
-                "mask_fill_holes": ("INT", {
+                "cleanup_fill_holes": ("INT", {
                     "default": 0, "min": 0, "max": 128, "step": 1,
-                    "tooltip": "Fill gaps/holes in the mask using morphological closing "
-                               "(dilate then erode). Bridges small gaps in segmentation masks. "
-                               "Value is the kernel size in pixels."
+                    "tooltip": "Fill gaps/holes in mask (morphological closing). (Previously: mask_fill_holes)"
                 }),
-                "mask_remove_noise": ("INT", {
+                "cleanup_remove_noise": ("INT", {
                     "default": 0, "min": 0, "max": 32, "step": 1,
-                    "tooltip": "Remove isolated pixels/noise using morphological opening "
-                               "(erode then dilate). Eliminates small specks while preserving "
-                               "larger regions. Value is the kernel size in pixels."
+                    "tooltip": "Remove isolated pixels (morphological opening). (Previously: mask_remove_noise)"
                 }),
-                "mask_smooth": ("INT", {
+                "cleanup_smooth": ("INT", {
                     "default": 0, "min": 0, "max": 127, "step": 1,
-                    "tooltip": "Smooth jagged mask edges by binarizing at 0.5 then blurring. "
-                               "Creates cleaner edges without shifting the boundary. "
-                               "Value is the blur kernel size in pixels (odd)."
+                    "tooltip": "Smooth jagged edges (binarize + blur). (Previously: mask_smooth)"
                 }),
                 "vae_stride": ("INT", {
                     "default": 8, "min": 4, "max": 32, "step": 4,
                     "tooltip": "VAE spatial stride in pixels (8 for WAN)."
                 }),
-                "stitch_source": (["tight", "bbox"], {
+                "vace_stitch_source": (["tight", "bbox"], {
                     "default": "tight",
-                    "tooltip": "Source mask for pixel-space stitching. "
-                               "'tight': use original input mask (precise subject boundary, but may "
-                               "cut into VACE content at a boundary VACE wasn't aware of). "
-                               "'bbox': use the VACE bbox mask eroded inward — hides bbox-edge seam "
-                               "artifacts since the blend happens in VACE's clean interior zone. "
-                               "Trade-off: pastes everything VACE generated inside the bbox."
+                    "tooltip": "Source mask for VACE pixel-space stitching. "
+                               "'tight': original input mask (precise boundary). "
+                               "'bbox': VACE bbox mask eroded inward (hides seam artifacts). "
+                               "(Previously: stitch_source)"
                 }),
-                "halo_pixels": ("INT", {
+                "vace_halo_px": ("INT", {
                     "default": 16, "min": 0, "max": 48, "step": 4,
-                    "tooltip": "Seam-Absorbing Control Halo: expand the VACE conditioning mask "
-                               "OUTWARD by this many pixels beyond the stitch boundary. "
-                               "WAN repaints this strip, so the stitch falls inside VACE-repainted content "
-                               "rather than at its edge — eliminating seam memory in downstream stages. "
-                               "16px = recommended default (2 VAE blocks, covers decoder receptive field). "
-                               "8px = subtle (1 VAE block), 24px = aggressive. 0 = disabled."
+                    "tooltip": "Seam-Absorbing Halo: expand VACE conditioning mask OUTWARD. "
+                               "16px = recommended (2 VAE blocks). 0 = disabled. "
+                               "(Previously: halo_pixels)"
                 }),
-                "stitch_erosion": ("INT", {
+                "vace_stitch_erosion_px": ("INT", {
                     "default": 0, "min": -32, "max": 32, "step": 1,
-                    "tooltip": "Erode (negative) or dilate (positive) the stitch mask for "
-                               "pixel-space compositing. Independent of the VACE mask erosion. "
-                               "Controls the pixel blend boundary, not the VACE conditioning zone."
+                    "tooltip": "Erode/dilate VACE pixel-space stitch mask. "
+                               "Independent of VACE conditioning erosion. (Previously: stitch_erosion)"
                 }),
-                "stitch_feather": ("INT", {
+                "vace_stitch_feather_px": ("INT", {
                     "default": 8, "min": 0, "max": 64, "step": 1,
-                    "tooltip": "Feather the stitch mask edges for seamless pixel compositing. "
-                               "This controls the pixel-space blend, not the VACE conditioning transition. "
-                               "8-16px = subtle, 24-32px = visible softening, 0 = hard edge."
+                    "tooltip": "Feather VACE pixel-space stitch mask edges. "
+                               "8-16px = subtle, 0 = hard edge. (Previously: stitch_feather)"
                 }),
+                # ── Deprecated names (backward compat) ──
+                "mask_grow": ("INT", {"default": 0, "min": -128, "max": 128, "step": 1,
+                    "tooltip": "DEPRECATED — use vace_input_grow_px"}),
+                "mask_fill_holes": ("INT", {"default": 0, "min": 0, "max": 128, "step": 1,
+                    "tooltip": "DEPRECATED — use cleanup_fill_holes"}),
+                "mask_remove_noise": ("INT", {"default": 0, "min": 0, "max": 32, "step": 1,
+                    "tooltip": "DEPRECATED — use cleanup_remove_noise"}),
+                "mask_smooth": ("INT", {"default": 0, "min": 0, "max": 127, "step": 1,
+                    "tooltip": "DEPRECATED — use cleanup_smooth"}),
+                "stitch_source": (["tight", "bbox"], {"default": "tight",
+                    "tooltip": "DEPRECATED — use vace_stitch_source"}),
+                "halo_pixels": ("INT", {"default": 16, "min": 0, "max": 48, "step": 4,
+                    "tooltip": "DEPRECATED — use vace_halo_px"}),
+                "stitch_erosion": ("INT", {"default": 0, "min": -32, "max": 32, "step": 1,
+                    "tooltip": "DEPRECATED — use vace_stitch_erosion_px"}),
+                "stitch_feather": ("INT", {"default": 8, "min": 0, "max": 64, "step": 1,
+                    "tooltip": "DEPRECATED — use vace_stitch_feather_px"}),
             },
         }
 
@@ -239,28 +240,48 @@ class NV_VaceControlVideoPrep:
     def execute(self, image, mask, mask_shape, mode, erosion_blocks, feather_blocks, fill_mode,
                 mask_config=None, bbox_padding=0.15, bbox_smooth_frames=5,
                 fill_value=0.5, threshold=False,
+                # New names
+                vace_input_grow_px=0, cleanup_fill_holes=0, cleanup_remove_noise=0,
+                cleanup_smooth=0, vae_stride=8,
+                vace_stitch_source="tight", vace_halo_px=16,
+                vace_stitch_erosion_px=0, vace_stitch_feather_px=8,
+                # Deprecated names (backward compat)
                 mask_grow=0, mask_fill_holes=0, mask_remove_noise=0, mask_smooth=0,
-                vae_stride=8,
                 stitch_source="tight", halo_pixels=16, stitch_erosion=0, stitch_feather=8):
+
+        # Resolve deprecated param names
+        from .mask_processing_config import resolve_deprecated
+        vace_input_grow_px = resolve_deprecated(vace_input_grow_px, 0, mask_grow, 0)
+        cleanup_fill_holes = resolve_deprecated(cleanup_fill_holes, 0, mask_fill_holes, 0)
+        cleanup_remove_noise = resolve_deprecated(cleanup_remove_noise, 0, mask_remove_noise, 0)
+        cleanup_smooth = resolve_deprecated(cleanup_smooth, 0, mask_smooth, 0)
+        vace_stitch_source = resolve_deprecated(vace_stitch_source, "tight", stitch_source, "tight")
+        vace_halo_px = resolve_deprecated(vace_halo_px, 16, halo_pixels, 16)
+        vace_stitch_erosion_px = resolve_deprecated(vace_stitch_erosion_px, 0, stitch_erosion, 0)
+        vace_stitch_feather_px = resolve_deprecated(vace_stitch_feather_px, 8, stitch_feather, 8)
 
         # Apply shared config override if connected
         from .mask_processing_config import apply_vace_mask_config
         vals = apply_vace_mask_config(mask_config,
-            mask_fill_holes=mask_fill_holes,
-            mask_remove_noise=mask_remove_noise,
-            mask_smooth=mask_smooth,
+            cleanup_fill_holes=cleanup_fill_holes,
+            cleanup_remove_noise=cleanup_remove_noise,
+            cleanup_smooth=cleanup_smooth,
             erosion_blocks=erosion_blocks,
             feather_blocks=feather_blocks,
-            stitch_erosion=stitch_erosion,
-            stitch_feather=stitch_feather,
+            vace_stitch_erosion_px=vace_stitch_erosion_px,
+            vace_stitch_feather_px=vace_stitch_feather_px,
+            vace_input_grow_px=vace_input_grow_px,
+            vace_halo_px=vace_halo_px,
         )
-        fill_holes_v = vals["mask_fill_holes"]
-        remove_noise_v = vals["mask_remove_noise"]
-        smooth_v = vals["mask_smooth"]
+        fill_holes_v = vals["cleanup_fill_holes"]
+        remove_noise_v = vals["cleanup_remove_noise"]
+        smooth_v = vals["cleanup_smooth"]
         erosion_blocks = vals["erosion_blocks"]
         feather_blocks = vals["feather_blocks"]
-        stitch_erosion = vals["stitch_erosion"]
-        stitch_feather = vals["stitch_feather"]
+        stitch_erosion = vals["vace_stitch_erosion_px"]
+        stitch_feather = vals["vace_stitch_feather_px"]
+        vace_input_grow_px = vals["vace_input_grow_px"]
+        vace_halo_px = vals["vace_halo_px"]
 
         if mask.dim() == 2:
             mask = mask.unsqueeze(0)
@@ -296,9 +317,9 @@ class NV_VaceControlVideoPrep:
 
         # --- Step 1b: Mask pre-processing (grow/shrink, fill holes, denoise, smooth) ---
         preproc_applied = []
-        if mask_grow != 0:
-            result_mask = mask_erode_dilate(result_mask, mask_grow)
-            preproc_applied.append(f"grow={mask_grow}px")
+        if vace_input_grow_px != 0:
+            result_mask = mask_erode_dilate(result_mask, vace_input_grow_px)
+            preproc_applied.append(f"grow={vace_input_grow_px}px")
         if fill_holes_v > 0:
             result_mask = mask_fill_holes(result_mask, fill_holes_v)
             preproc_applied.append(f"fill_holes={fill_holes_v}px")
@@ -382,11 +403,11 @@ class NV_VaceControlVideoPrep:
         # Expand the BINARY eroded mask outward BEFORE feathering, so the halo gets a
         # clean uniform expansion. Dilating after feather would distort the gradient profile
         # (grey morphology expands high-value contours more than low-value).
-        if halo_pixels > 0:
-            result_mask = mask_erode_dilate(result_mask, halo_pixels)  # positive = dilate outward
+        if vace_halo_px > 0:
+            result_mask = mask_erode_dilate(result_mask, vace_halo_px)  # positive = dilate outward
             info_lines.append(
-                f"  Halo: expanded VACE mask outward by {halo_pixels}px "
-                f"({halo_pixels / vae_stride:.1f} VAE blocks) — applied pre-feather"
+                f"  Halo: expanded VACE mask outward by {vace_halo_px}px "
+                f"({vace_halo_px / vae_stride:.1f} VAE blocks) — applied pre-feather"
             )
 
         # --- Step 6: Blur (feather) ---
@@ -441,8 +462,8 @@ class NV_VaceControlVideoPrep:
             tight_processed = mask_blur(tight_processed, stitch_feather)
         tight_processed = tight_processed.clamp(0.0, 1.0)
 
-        # --- Step 10: Build stitch mask (source depends on stitch_source param) ---
-        if stitch_source == "bbox" and mask_shape == "bbox":
+        # --- Step 10: Build stitch mask (source depends on vace_stitch_source param) ---
+        if vace_stitch_source == "bbox" and mask_shape == "bbox":
             # Derive stitch mask from the bbox (result_mask before erosion/feather for VACE).
             # Re-run bbox computation on the pre-erosion mask to get clean binary boxes,
             # then apply stitch_erosion/feather independently.
@@ -475,7 +496,7 @@ class NV_VaceControlVideoPrep:
         else:
             # Use tight mask (original behavior)
             stitch_mask = tight_processed
-            if stitch_source == "bbox" and mask_shape != "bbox":
+            if vace_stitch_source == "bbox" and mask_shape != "bbox":
                 info_lines.append(
                     "  Stitch source: 'bbox' requested but mask_shape is not 'bbox' "
                     "— falling back to tight mask."
