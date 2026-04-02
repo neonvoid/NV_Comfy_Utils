@@ -303,7 +303,7 @@ class NV_InpaintCrop:
                     "tooltip": "Optional shared config from NV_MaskProcessingConfig. "
                                "When connected, overrides cleanup, crop_expand, and blend_feather widgets."
                 }),
-                # Deprecated names (backward compat for old workflows)
+                # Deprecated (kept for old workflow compat — do not remove)
                 "mask_erode_dilate": ("INT", {"default": 0, "min": -128, "max": 128, "step": 1,
                     "tooltip": "DEPRECATED — use crop_expand_px"}),
                 "mask_fill_holes": ("INT", {"default": 0, "min": 0, "max": 128, "step": 1,

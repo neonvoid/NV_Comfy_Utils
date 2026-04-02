@@ -503,23 +503,15 @@ class NV_TemporalMaskStabilizer:
                     "default": 0, "min": 0, "max": 127, "step": 1,
                     "tooltip": "Post-stabilization edge smoothing. Overridden by mask_config."
                 }),
-                # Deprecated names (backward compat for old workflows)
-                "mask_erode_dilate": ("INT", {
-                    "default": 0, "min": -128, "max": 128, "step": 1,
-                    "tooltip": "DEPRECATED — use crop_expand_px"
-                }),
-                "mask_fill_holes": ("INT", {
-                    "default": 0, "min": 0, "max": 128, "step": 1,
-                    "tooltip": "DEPRECATED — use cleanup_fill_holes"
-                }),
-                "mask_remove_noise": ("INT", {
-                    "default": 0, "min": 0, "max": 32, "step": 1,
-                    "tooltip": "DEPRECATED — use cleanup_remove_noise"
-                }),
-                "mask_smooth": ("INT", {
-                    "default": 0, "min": 0, "max": 127, "step": 1,
-                    "tooltip": "DEPRECATED — use cleanup_smooth"
-                }),
+                # Deprecated (kept for old workflow compat — do not remove)
+                "mask_erode_dilate": ("INT", {"default": 0, "min": -128, "max": 128, "step": 1,
+                    "tooltip": "DEPRECATED — use crop_expand_px"}),
+                "mask_fill_holes": ("INT", {"default": 0, "min": 0, "max": 128, "step": 1,
+                    "tooltip": "DEPRECATED — use cleanup_fill_holes"}),
+                "mask_remove_noise": ("INT", {"default": 0, "min": 0, "max": 32, "step": 1,
+                    "tooltip": "DEPRECATED — use cleanup_remove_noise"}),
+                "mask_smooth": ("INT", {"default": 0, "min": 0, "max": 127, "step": 1,
+                    "tooltip": "DEPRECATED — use cleanup_smooth"}),
                 "enable_sdf": ("BOOLEAN", {
                     "default": False,
                     "tooltip": "Enable legacy SDF smoothing after bilateral + pop pipeline. Off by default."

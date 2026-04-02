@@ -147,24 +147,60 @@ class NV_VaceDebugPreview:
             stitch_mask = _resize_to_match(stitch_mask, H, W)
 
         # Extract crop blend mask from stitcher (if connected)
-        # This is the actual mask InpaintStitch2 uses for compositing
+        # Blend masks are in CROP space — must be placed at crop coordinates on a full-frame canvas
         crop_blend_masks = None
         crop_info = ""
         if stitcher is not None:
             blend_list = stitcher.get("cropped_mask_for_blend", [])
-            stitch_source = stitcher.get("stitch_source", "?")
-            crop_target_w = stitcher.get("crop_target_w", "?")
-            crop_target_h = stitcher.get("crop_target_h", "?")
-            crop_info = f"Crop: {crop_target_w}x{crop_target_h}, stitch_source={stitch_source}"
+            crop_target_w = stitcher.get("crop_target_w", 0)
+            crop_target_h = stitcher.get("crop_target_h", 0)
+            cto_x_list = stitcher.get("canvas_to_orig_x", [])
+            cto_y_list = stitcher.get("canvas_to_orig_y", [])
+            ctc_x_list = stitcher.get("cropped_to_canvas_x", [])
+            ctc_y_list = stitcher.get("cropped_to_canvas_y", [])
+            ctc_w_list = stitcher.get("cropped_to_canvas_w", [])
+            ctc_h_list = stitcher.get("cropped_to_canvas_h", [])
+            skipped = set(stitcher.get("skipped_indices", []))
+            crop_info = f"Crop: {crop_target_w}x{crop_target_h}"
             if blend_list:
-                # Blend masks are in crop space — resize to full frame for overlay
-                # They're [H_crop, W_crop] tensors stored per-frame
                 crop_blend_masks = []
-                for bm in blend_list:
+                blend_idx = 0
+                for b_frame in range(B):
+                    if b_frame in skipped:
+                        crop_blend_masks.append(torch.zeros(H, W))
+                        continue
+                    if blend_idx >= len(blend_list):
+                        crop_blend_masks.append(torch.zeros(H, W))
+                        continue
+                    bm = blend_list[blend_idx].cpu().float()
                     if bm.dim() == 2:
-                        bm = bm.unsqueeze(0)  # [1, H, W]
-                    bm = _resize_to_match(bm, H, W)
-                    crop_blend_masks.append(bm.squeeze(0))
+                        bm = bm.unsqueeze(0)
+                    # Resize from target crop size to actual crop region size in canvas
+                    ctc_w = ctc_w_list[blend_idx] if blend_idx < len(ctc_w_list) else W
+                    ctc_h = ctc_h_list[blend_idx] if blend_idx < len(ctc_h_list) else H
+                    ctc_x = ctc_x_list[blend_idx] if blend_idx < len(ctc_x_list) else 0
+                    ctc_y = ctc_y_list[blend_idx] if blend_idx < len(ctc_y_list) else 0
+                    cto_x = cto_x_list[blend_idx] if blend_idx < len(cto_x_list) else 0
+                    cto_y = cto_y_list[blend_idx] if blend_idx < len(cto_y_list) else 0
+                    # Resize blend mask from crop target to actual crop dimensions
+                    bm_resized = _resize_to_match(bm, ctc_h, ctc_w).squeeze(0)
+                    # Place on full-frame canvas at the correct position
+                    # ctc_x/y are in canvas space, cto_x/y is offset to original image
+                    orig_x = ctc_x - cto_x
+                    orig_y = ctc_y - cto_y
+                    canvas = torch.zeros(H, W)
+                    # Clamp placement to frame bounds
+                    src_y0 = max(0, -orig_y)
+                    src_x0 = max(0, -orig_x)
+                    dst_y0 = max(0, orig_y)
+                    dst_x0 = max(0, orig_x)
+                    copy_h = min(ctc_h - src_y0, H - dst_y0)
+                    copy_w = min(ctc_w - src_x0, W - dst_x0)
+                    if copy_h > 0 and copy_w > 0:
+                        canvas[dst_y0:dst_y0 + copy_h, dst_x0:dst_x0 + copy_w] = \
+                            bm_resized[src_y0:src_y0 + copy_h, src_x0:src_x0 + copy_w]
+                    crop_blend_masks.append(canvas)
+                    blend_idx += 1
 
         # Match batch sizes
         ctrl_B = control_video.shape[0]

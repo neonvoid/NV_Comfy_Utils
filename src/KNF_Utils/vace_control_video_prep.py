@@ -204,7 +204,7 @@ class NV_VaceControlVideoPrep:
                     "tooltip": "Feather VACE pixel-space stitch mask edges. "
                                "8-16px = subtle, 0 = hard edge. (Previously: stitch_feather)"
                 }),
-                # ── Deprecated names (backward compat) ──
+                # Deprecated (kept for old workflow compat — do not remove)
                 "mask_grow": ("INT", {"default": 0, "min": -128, "max": 128, "step": 1,
                     "tooltip": "DEPRECATED — use vace_input_grow_px"}),
                 "mask_fill_holes": ("INT", {"default": 0, "min": 0, "max": 128, "step": 1,

@@ -256,35 +256,21 @@ class NV_MaskPipelineViz:
                                "Used as the original_mask when previewing the cropped view. "
                                "Wire: InpaintCrop.cropped_mask -> here."
                 }),
-                # Deprecated names (backward compat for old workflows)
-                "mask_erode_dilate": ("INT", {
-                    "default": 4, "min": -128, "max": 128, "step": 1,
-                    "tooltip": "DEPRECATED — use crop_expand_px"
-                }),
-                "mask_fill_holes": ("INT", {
-                    "default": 0, "min": 0, "max": 128, "step": 1,
-                    "tooltip": "DEPRECATED — use cleanup_fill_holes"
-                }),
-                "mask_remove_noise": ("INT", {
-                    "default": 0, "min": 0, "max": 32, "step": 1,
-                    "tooltip": "DEPRECATED — use cleanup_remove_noise"
-                }),
-                "mask_smooth": ("INT", {
-                    "default": 0, "min": 0, "max": 127, "step": 1,
-                    "tooltip": "DEPRECATED — use cleanup_smooth"
-                }),
-                "mask_blend_pixels": ("INT", {
-                    "default": 16, "min": 0, "max": 64, "step": 1,
-                    "tooltip": "DEPRECATED — use crop_blend_feather_px"
-                }),
-                "stitch_erosion": ("INT", {
-                    "default": 0, "min": -32, "max": 32, "step": 1,
-                    "tooltip": "DEPRECATED — use vace_stitch_erosion_px"
-                }),
-                "stitch_feather": ("INT", {
-                    "default": 4, "min": 0, "max": 64, "step": 1,
-                    "tooltip": "DEPRECATED — use vace_stitch_feather_px"
-                }),
+                # Deprecated (kept for old workflow compat — do not remove)
+                "mask_erode_dilate": ("INT", {"default": 4, "min": -128, "max": 128, "step": 1,
+                    "tooltip": "DEPRECATED — use crop_expand_px"}),
+                "mask_fill_holes": ("INT", {"default": 0, "min": 0, "max": 128, "step": 1,
+                    "tooltip": "DEPRECATED — use cleanup_fill_holes"}),
+                "mask_remove_noise": ("INT", {"default": 0, "min": 0, "max": 32, "step": 1,
+                    "tooltip": "DEPRECATED — use cleanup_remove_noise"}),
+                "mask_smooth": ("INT", {"default": 0, "min": 0, "max": 127, "step": 1,
+                    "tooltip": "DEPRECATED — use cleanup_smooth"}),
+                "mask_blend_pixels": ("INT", {"default": 16, "min": 0, "max": 64, "step": 1,
+                    "tooltip": "DEPRECATED — use crop_blend_feather_px"}),
+                "stitch_erosion": ("INT", {"default": 0, "min": -32, "max": 32, "step": 1,
+                    "tooltip": "DEPRECATED — use vace_stitch_erosion_px"}),
+                "stitch_feather": ("INT", {"default": 4, "min": 0, "max": 64, "step": 1,
+                    "tooltip": "DEPRECATED — use vace_stitch_feather_px"}),
             },
         }
 

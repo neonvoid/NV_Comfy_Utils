@@ -219,27 +219,17 @@ class NV_LatentInpaintCrop:
                            "tooltip": "Manual crop width in pixels. Ignored when bbox_mask is connected."}),
                 "height": ("INT", {"default": 512, "min": 8, "max": 8192, "step": 8,
                             "tooltip": "Manual crop height in pixels. Ignored when bbox_mask is connected."}),
-                # Deprecated names (backward compat for old workflows)
-                "mask_erode_dilate": ("INT", {
-                    "default": 0, "min": -128, "max": 128, "step": 1,
-                    "tooltip": "DEPRECATED — use crop_expand_px"
-                }),
-                "mask_fill_holes": ("INT", {
-                    "default": 0, "min": 0, "max": 128, "step": 1,
-                    "tooltip": "DEPRECATED — use cleanup_fill_holes"
-                }),
-                "mask_remove_noise": ("INT", {
-                    "default": 0, "min": 0, "max": 32, "step": 1,
-                    "tooltip": "DEPRECATED — use cleanup_remove_noise"
-                }),
-                "mask_smooth": ("INT", {
-                    "default": 0, "min": 0, "max": 127, "step": 1,
-                    "tooltip": "DEPRECATED — use cleanup_smooth"
-                }),
-                "mask_blend_pixels": ("INT", {
-                    "default": 16, "min": 0, "max": 64, "step": 1,
-                    "tooltip": "DEPRECATED — use crop_blend_feather_px"
-                }),
+                # Deprecated (kept for old workflow compat — do not remove)
+                "mask_erode_dilate": ("INT", {"default": 0, "min": -128, "max": 128, "step": 1,
+                    "tooltip": "DEPRECATED — use crop_expand_px"}),
+                "mask_fill_holes": ("INT", {"default": 0, "min": 0, "max": 128, "step": 1,
+                    "tooltip": "DEPRECATED — use cleanup_fill_holes"}),
+                "mask_remove_noise": ("INT", {"default": 0, "min": 0, "max": 32, "step": 1,
+                    "tooltip": "DEPRECATED — use cleanup_remove_noise"}),
+                "mask_smooth": ("INT", {"default": 0, "min": 0, "max": 127, "step": 1,
+                    "tooltip": "DEPRECATED — use cleanup_smooth"}),
+                "mask_blend_pixels": ("INT", {"default": 16, "min": 0, "max": 64, "step": 1,
+                    "tooltip": "DEPRECATED — use crop_blend_feather_px"}),
             }
         }
 
