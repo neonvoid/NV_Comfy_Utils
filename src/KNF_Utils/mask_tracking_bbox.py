@@ -89,11 +89,6 @@ class NV_MaskTrackingBBox:
                 }),
             },
             "optional": {
-                # Deprecated name (backward compat for old workflows)
-                "padding": ("FLOAT", {
-                    "default": 0.15, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "DEPRECATED — use bbox_expand_pct"
-                }),
                 "min_cutoff": ("FLOAT", {
                     "default": 0.05, "min": 0.001, "max": 10.0, "step": 0.01,
                     "tooltip": "One-Euro min_cutoff: minimum cutoff frequency. "
@@ -176,17 +171,11 @@ class NV_MaskTrackingBBox:
     )
 
     def execute(self, mask, bbox_expand_pct, smooth_mode, smooth_window,
-                # Deprecated name (backward compat)
-                padding=0.15,
                 min_cutoff=0.05, beta=0.7,
                 ema_alpha=0.3, smooth_strength=1.0,
                 threshold=False, output_erode=0, output_feather=0,
                 kalman_q_pos=4.0, kalman_q_dim=1.0,
                 kalman_r_pos=9.0, kalman_r_dim=25.0):
-
-        # Resolve deprecated param name
-        from .mask_processing_config import resolve_deprecated
-        bbox_expand_pct = resolve_deprecated(bbox_expand_pct, 0.15, padding, 0.15)
 
         if mask.dim() == 2:
             mask = mask.unsqueeze(0)
