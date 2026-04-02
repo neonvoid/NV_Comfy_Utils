@@ -16,31 +16,6 @@ Parameters are organized by category:
 
 
 # =============================================================================
-# Backward compatibility: old config key → new config key
-# =============================================================================
-
-_OLD_TO_NEW = {
-    "mask_erode_dilate": "crop_expand_px",
-    "mask_fill_holes": "cleanup_fill_holes",
-    "mask_remove_noise": "cleanup_remove_noise",
-    "mask_smooth": "cleanup_smooth",
-    "mask_blend_pixels": "crop_blend_feather_px",
-    "vace_stitch_erosion": "vace_stitch_erosion_px",
-    "vace_stitch_feather": "vace_stitch_feather_px",
-    # vace_erosion_blocks and vace_feather_blocks unchanged
-}
-
-_NEW_TO_OLD = {v: k for k, v in _OLD_TO_NEW.items()}
-
-
-def resolve_deprecated(new_value, new_default, old_value, old_default):
-    """If new param is at default and old param was explicitly set, use old value."""
-    if new_value != new_default or old_value == old_default:
-        return new_value
-    return old_value
-
-
-# =============================================================================
 # Apply functions — merge config over local widget values
 # =============================================================================
 
@@ -66,12 +41,6 @@ def apply_mask_config(mask_config, **local_values):
     for key in local_values:
         if key in mask_config:
             result[key] = mask_config[key]
-        # Check old-name alias in config dict
-        elif key in _NEW_TO_OLD and _NEW_TO_OLD[key] in mask_config:
-            result[key] = mask_config[_NEW_TO_OLD[key]]
-        # Check new-name alias (consumer still uses old name)
-        elif key in _OLD_TO_NEW and _OLD_TO_NEW[key] in mask_config:
-            result[key] = mask_config[_OLD_TO_NEW[key]]
     return result
 
 
@@ -89,15 +58,11 @@ def apply_vace_mask_config(mask_config, **local_values):
         return local_values
     result = dict(local_values)
 
-    # Direct matches (shared cleanup params — accept both old and new names)
+    # Direct matches (shared cleanup params)
     cleanup_keys = {
-        "cleanup_fill_holes": ["cleanup_fill_holes", "mask_fill_holes"],
-        "cleanup_remove_noise": ["cleanup_remove_noise", "mask_remove_noise"],
-        "cleanup_smooth": ["cleanup_smooth", "mask_smooth"],
-        # Legacy names used by consumers not yet updated
-        "mask_fill_holes": ["cleanup_fill_holes", "mask_fill_holes"],
-        "mask_remove_noise": ["cleanup_remove_noise", "mask_remove_noise"],
-        "mask_smooth": ["cleanup_smooth", "mask_smooth"],
+        "cleanup_fill_holes": ["cleanup_fill_holes"],
+        "cleanup_remove_noise": ["cleanup_remove_noise"],
+        "cleanup_smooth": ["cleanup_smooth"],
     }
     for local_key in list(result.keys()):
         if local_key in cleanup_keys:
@@ -110,13 +75,8 @@ def apply_vace_mask_config(mask_config, **local_values):
     remap = {
         "erosion_blocks": "vace_erosion_blocks",
         "feather_blocks": "vace_feather_blocks",
-        "stitch_erosion": ["vace_stitch_erosion_px", "vace_stitch_erosion"],
-        "stitch_feather": ["vace_stitch_feather_px", "vace_stitch_feather"],
-        "input_grow_px": ["vace_input_grow_px"],
-        "halo_px": ["vace_halo_px"],
-        # New-style local names (for updated consumers)
-        "vace_stitch_erosion_px": ["vace_stitch_erosion_px", "vace_stitch_erosion"],
-        "vace_stitch_feather_px": ["vace_stitch_feather_px", "vace_stitch_feather"],
+        "vace_stitch_erosion_px": ["vace_stitch_erosion_px"],
+        "vace_stitch_feather_px": ["vace_stitch_feather_px"],
         "vace_input_grow_px": ["vace_input_grow_px"],
         "vace_halo_px": ["vace_halo_px"],
     }
@@ -216,23 +176,6 @@ class NV_MaskProcessingConfig:
                                "(Previously: vace_stitch_feather)"
                 }),
             },
-            "optional": {
-                # Deprecated (kept for old workflow compat — do not remove)
-                "mask_erode_dilate": ("INT", {"default": 0, "min": -128, "max": 128, "step": 1,
-                    "tooltip": "DEPRECATED — use crop_expand_px"}),
-                "mask_fill_holes": ("INT", {"default": 0, "min": 0, "max": 128, "step": 1,
-                    "tooltip": "DEPRECATED — use cleanup_fill_holes"}),
-                "mask_remove_noise": ("INT", {"default": 0, "min": 0, "max": 32, "step": 1,
-                    "tooltip": "DEPRECATED — use cleanup_remove_noise"}),
-                "mask_smooth": ("INT", {"default": 0, "min": 0, "max": 127, "step": 1,
-                    "tooltip": "DEPRECATED — use cleanup_smooth"}),
-                "mask_blend_pixels": ("INT", {"default": 16, "min": 0, "max": 64, "step": 1,
-                    "tooltip": "DEPRECATED — use crop_blend_feather_px"}),
-                "vace_stitch_erosion": ("INT", {"default": 0, "min": -32, "max": 32, "step": 1,
-                    "tooltip": "DEPRECATED — use vace_stitch_erosion_px"}),
-                "vace_stitch_feather": ("INT", {"default": 8, "min": 0, "max": 64, "step": 1,
-                    "tooltip": "DEPRECATED — use vace_stitch_feather_px"}),
-            },
         }
 
     RETURN_TYPES = ("MASK_PROCESSING_CONFIG",)
@@ -248,27 +191,12 @@ class NV_MaskProcessingConfig:
     )
 
     def execute(self,
-                # New names (required)
                 cleanup_fill_holes, cleanup_remove_noise, cleanup_smooth,
                 crop_expand_px, crop_blend_feather_px,
                 vace_input_grow_px, vace_erosion_blocks, vace_feather_blocks,
-                vace_halo_px, vace_stitch_erosion_px, vace_stitch_feather_px,
-                # Deprecated names (optional, backward compat)
-                mask_erode_dilate=0, mask_fill_holes=0, mask_remove_noise=0,
-                mask_smooth=0, mask_blend_pixels=16,
-                vace_stitch_erosion=0, vace_stitch_feather=8):
-
-        # Resolve deprecated: old workflow values override new defaults
-        crop_expand_px = resolve_deprecated(crop_expand_px, 0, mask_erode_dilate, 0)
-        cleanup_fill_holes = resolve_deprecated(cleanup_fill_holes, 0, mask_fill_holes, 0)
-        cleanup_remove_noise = resolve_deprecated(cleanup_remove_noise, 0, mask_remove_noise, 0)
-        cleanup_smooth = resolve_deprecated(cleanup_smooth, 0, mask_smooth, 0)
-        crop_blend_feather_px = resolve_deprecated(crop_blend_feather_px, 16, mask_blend_pixels, 16)
-        vace_stitch_erosion_px = resolve_deprecated(vace_stitch_erosion_px, 0, vace_stitch_erosion, 0)
-        vace_stitch_feather_px = resolve_deprecated(vace_stitch_feather_px, 8, vace_stitch_feather, 8)
+                vace_halo_px, vace_stitch_erosion_px, vace_stitch_feather_px):
 
         config = {
-            # New keys (primary)
             "cleanup_fill_holes": cleanup_fill_holes,
             "cleanup_remove_noise": cleanup_remove_noise,
             "cleanup_smooth": cleanup_smooth,
@@ -280,14 +208,6 @@ class NV_MaskProcessingConfig:
             "vace_halo_px": vace_halo_px,
             "vace_stitch_erosion_px": vace_stitch_erosion_px,
             "vace_stitch_feather_px": vace_stitch_feather_px,
-            # Old keys (backward compat for consumers not yet updated)
-            "mask_erode_dilate": crop_expand_px,
-            "mask_fill_holes": cleanup_fill_holes,
-            "mask_remove_noise": cleanup_remove_noise,
-            "mask_smooth": cleanup_smooth,
-            "mask_blend_pixels": crop_blend_feather_px,
-            "vace_stitch_erosion": vace_stitch_erosion_px,
-            "vace_stitch_feather": vace_stitch_feather_px,
         }
         return (config,)
 

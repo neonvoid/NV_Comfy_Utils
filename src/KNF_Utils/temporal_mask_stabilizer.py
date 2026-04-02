@@ -503,15 +503,6 @@ class NV_TemporalMaskStabilizer:
                     "default": 0, "min": 0, "max": 127, "step": 1,
                     "tooltip": "Post-stabilization edge smoothing. Overridden by mask_config."
                 }),
-                # Deprecated (kept for old workflow compat — do not remove)
-                "mask_erode_dilate": ("INT", {"default": 0, "min": -128, "max": 128, "step": 1,
-                    "tooltip": "DEPRECATED — use crop_expand_px"}),
-                "mask_fill_holes": ("INT", {"default": 0, "min": 0, "max": 128, "step": 1,
-                    "tooltip": "DEPRECATED — use cleanup_fill_holes"}),
-                "mask_remove_noise": ("INT", {"default": 0, "min": 0, "max": 32, "step": 1,
-                    "tooltip": "DEPRECATED — use cleanup_remove_noise"}),
-                "mask_smooth": ("INT", {"default": 0, "min": 0, "max": 127, "step": 1,
-                    "tooltip": "DEPRECATED — use cleanup_smooth"}),
                 "enable_sdf": ("BOOLEAN", {
                     "default": False,
                     "tooltip": "Enable legacy SDF smoothing after bilateral + pop pipeline. Off by default."
@@ -548,16 +539,9 @@ class NV_TemporalMaskStabilizer:
                 pop_detection=True, pop_area_thresh=0.20, pop_iou_thresh=0.65,
                 use_logit_space=False, cc_gate_enable=False, cc_gate_min_area=300,
                 crop_expand_px=0, cleanup_fill_holes=0, cleanup_remove_noise=0, cleanup_smooth=0,
-                # Deprecated names (backward compat)
-                mask_erode_dilate=0, mask_fill_holes=0, mask_remove_noise=0, mask_smooth=0,
                 enable_sdf=False, sdf_sigma_temporal=1.0, sdf_sigma_spatial=0.5, crop_padding=0.15):
 
-        # Resolve deprecated param names
-        from .mask_processing_config import resolve_deprecated, apply_mask_config
-        crop_expand_px = resolve_deprecated(crop_expand_px, 0, mask_erode_dilate, 0)
-        cleanup_fill_holes = resolve_deprecated(cleanup_fill_holes, 0, mask_fill_holes, 0)
-        cleanup_remove_noise = resolve_deprecated(cleanup_remove_noise, 0, mask_remove_noise, 0)
-        cleanup_smooth = resolve_deprecated(cleanup_smooth, 0, mask_smooth, 0)
+        from .mask_processing_config import apply_mask_config
 
         if mask.dim() != 3:
             raise ValueError(f"mask must be [B, H, W], got shape {list(mask.shape)}")

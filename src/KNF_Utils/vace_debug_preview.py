@@ -147,7 +147,9 @@ class NV_VaceDebugPreview:
             stitch_mask = _resize_to_match(stitch_mask, H, W)
 
         # Extract crop blend mask from stitcher (if connected)
-        # Blend masks are in CROP space — must be placed at crop coordinates on a full-frame canvas
+        # Blend masks are in crop space (target_w x target_h).
+        # If debug image is the same crop space, resize to match directly.
+        # If debug image is full-frame, project blend mask onto full-frame coordinates.
         crop_blend_masks = None
         crop_info = ""
         if stitcher is not None:
@@ -162,6 +164,11 @@ class NV_VaceDebugPreview:
             ctc_h_list = stitcher.get("cropped_to_canvas_h", [])
             skipped = set(stitcher.get("skipped_indices", []))
             crop_info = f"Crop: {crop_target_w}x{crop_target_h}"
+
+            # Detect if debug image is crop-space or full-frame
+            # If image dims match crop target, blend masks can be resized directly
+            is_crop_space = (abs(W - crop_target_w) < 32 and abs(H - crop_target_h) < 32)
+
             if blend_list:
                 crop_blend_masks = []
                 blend_idx = 0
@@ -175,31 +182,33 @@ class NV_VaceDebugPreview:
                     bm = blend_list[blend_idx].cpu().float()
                     if bm.dim() == 2:
                         bm = bm.unsqueeze(0)
-                    # Resize from target crop size to actual crop region size in canvas
-                    ctc_w = ctc_w_list[blend_idx] if blend_idx < len(ctc_w_list) else W
-                    ctc_h = ctc_h_list[blend_idx] if blend_idx < len(ctc_h_list) else H
-                    ctc_x = ctc_x_list[blend_idx] if blend_idx < len(ctc_x_list) else 0
-                    ctc_y = ctc_y_list[blend_idx] if blend_idx < len(ctc_y_list) else 0
-                    cto_x = cto_x_list[blend_idx] if blend_idx < len(cto_x_list) else 0
-                    cto_y = cto_y_list[blend_idx] if blend_idx < len(cto_y_list) else 0
-                    # Resize blend mask from crop target to actual crop dimensions
-                    bm_resized = _resize_to_match(bm, ctc_h, ctc_w).squeeze(0)
-                    # Place on full-frame canvas at the correct position
-                    # ctc_x/y are in canvas space, cto_x/y is offset to original image
-                    orig_x = ctc_x - cto_x
-                    orig_y = ctc_y - cto_y
-                    canvas = torch.zeros(H, W)
-                    # Clamp placement to frame bounds
-                    src_y0 = max(0, -orig_y)
-                    src_x0 = max(0, -orig_x)
-                    dst_y0 = max(0, orig_y)
-                    dst_x0 = max(0, orig_x)
-                    copy_h = min(ctc_h - src_y0, H - dst_y0)
-                    copy_w = min(ctc_w - src_x0, W - dst_x0)
-                    if copy_h > 0 and copy_w > 0:
-                        canvas[dst_y0:dst_y0 + copy_h, dst_x0:dst_x0 + copy_w] = \
-                            bm_resized[src_y0:src_y0 + copy_h, src_x0:src_x0 + copy_w]
-                    crop_blend_masks.append(canvas)
+
+                    if is_crop_space:
+                        # Image is crop-space — just resize blend mask to match
+                        bm_out = _resize_to_match(bm, H, W).squeeze(0)
+                    else:
+                        # Image is full-frame — project blend mask to full-frame coords
+                        ctc_w = ctc_w_list[blend_idx] if blend_idx < len(ctc_w_list) else W
+                        ctc_h = ctc_h_list[blend_idx] if blend_idx < len(ctc_h_list) else H
+                        ctc_x = ctc_x_list[blend_idx] if blend_idx < len(ctc_x_list) else 0
+                        ctc_y = ctc_y_list[blend_idx] if blend_idx < len(ctc_y_list) else 0
+                        cto_x = cto_x_list[blend_idx] if blend_idx < len(cto_x_list) else 0
+                        cto_y = cto_y_list[blend_idx] if blend_idx < len(cto_y_list) else 0
+                        bm_resized = _resize_to_match(bm, ctc_h, ctc_w).squeeze(0)
+                        orig_x = ctc_x - cto_x
+                        orig_y = ctc_y - cto_y
+                        bm_out = torch.zeros(H, W)
+                        src_y0 = max(0, -orig_y)
+                        src_x0 = max(0, -orig_x)
+                        dst_y0 = max(0, orig_y)
+                        dst_x0 = max(0, orig_x)
+                        copy_h = min(ctc_h - src_y0, H - dst_y0)
+                        copy_w = min(ctc_w - src_x0, W - dst_x0)
+                        if copy_h > 0 and copy_w > 0:
+                            bm_out[dst_y0:dst_y0 + copy_h, dst_x0:dst_x0 + copy_w] = \
+                                bm_resized[src_y0:src_y0 + copy_h, src_x0:src_x0 + copy_w]
+
+                    crop_blend_masks.append(bm_out)
                     blend_idx += 1
 
         # Match batch sizes
@@ -277,14 +286,14 @@ class NV_VaceDebugPreview:
         # Build expansion info
         info_lines = []
         if mask_config is not None:
-            grow = mask_config.get("vace_input_grow_px", mask_config.get("mask_grow", 0))
-            expand = mask_config.get("crop_expand_px", mask_config.get("mask_erode_dilate", 0))
+            grow = mask_config.get("vace_input_grow_px", 0)
+            expand = mask_config.get("crop_expand_px", 0)
             halo = mask_config.get("vace_halo_px", 0)
             erosion_blocks = mask_config.get("vace_erosion_blocks", 0.5)
             feather_blocks = mask_config.get("vace_feather_blocks", 1.5)
-            blend = mask_config.get("crop_blend_feather_px", mask_config.get("mask_blend_pixels", 16))
-            stitch_ero = mask_config.get("vace_stitch_erosion_px", mask_config.get("vace_stitch_erosion", 0))
-            stitch_fea = mask_config.get("vace_stitch_feather_px", mask_config.get("vace_stitch_feather", 8))
+            blend = mask_config.get("crop_blend_feather_px", 16)
+            stitch_ero = mask_config.get("vace_stitch_erosion_px", 0)
+            stitch_fea = mask_config.get("vace_stitch_feather_px", 8)
             vae_stride = 8  # WAN default
 
             erosion_px = erosion_blocks * vae_stride

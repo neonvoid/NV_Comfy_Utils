@@ -303,19 +303,6 @@ class NV_InpaintCrop:
                     "tooltip": "Optional shared config from NV_MaskProcessingConfig. "
                                "When connected, overrides cleanup, crop_expand, and blend_feather widgets."
                 }),
-                # Deprecated (kept for old workflow compat — do not remove)
-                "mask_erode_dilate": ("INT", {"default": 0, "min": -128, "max": 128, "step": 1,
-                    "tooltip": "DEPRECATED — use crop_expand_px"}),
-                "mask_fill_holes": ("INT", {"default": 0, "min": 0, "max": 128, "step": 1,
-                    "tooltip": "DEPRECATED — use cleanup_fill_holes"}),
-                "mask_remove_noise": ("INT", {"default": 0, "min": 0, "max": 32, "step": 1,
-                    "tooltip": "DEPRECATED — use cleanup_remove_noise"}),
-                "mask_smooth": ("INT", {"default": 0, "min": 0, "max": 127, "step": 1,
-                    "tooltip": "DEPRECATED — use cleanup_smooth"}),
-                "stitch_source": (["tight", "processed", "hybrid", "bbox"], {"default": "tight",
-                    "tooltip": "DEPRECATED — use crop_stitch_source"}),
-                "mask_blend_pixels": ("INT", {"default": 16, "min": 0, "max": 64, "step": 1,
-                    "tooltip": "DEPRECATED — use crop_blend_feather_px"}),
                 "bounding_box_mask": ("MASK", {
                     "tooltip": "Optional mask defining minimum crop area. Crop region will encompass this entire mask. "
                                "Use to ensure specific areas are included even if main mask is smaller. "
@@ -339,23 +326,10 @@ class NV_InpaintCrop:
 
     def crop(self, image, mask, target_mode, target_width, target_height, auto_preset,
              padding_multiple,
-             # New names
              cleanup_fill_holes=0, cleanup_remove_noise=0, cleanup_smooth=0,
              crop_expand_px=0, crop_stitch_source="tight", crop_blend_feather_px=16,
              hybrid_falloff=48, hybrid_curve=0.6, resize_algorithm="bicubic",
-             mask_config=None, bounding_box_mask=None, anomaly_threshold=1.5,
-             # Deprecated names (backward compat)
-             mask_erode_dilate=0, mask_fill_holes=0, mask_remove_noise=0,
-             mask_smooth=0, stitch_source="tight", mask_blend_pixels=16):
-
-        # Resolve deprecated param names
-        from .mask_processing_config import resolve_deprecated
-        crop_expand_px = resolve_deprecated(crop_expand_px, 0, mask_erode_dilate, 0)
-        cleanup_fill_holes = resolve_deprecated(cleanup_fill_holes, 0, mask_fill_holes, 0)
-        cleanup_remove_noise = resolve_deprecated(cleanup_remove_noise, 0, mask_remove_noise, 0)
-        cleanup_smooth = resolve_deprecated(cleanup_smooth, 0, mask_smooth, 0)
-        crop_stitch_source = resolve_deprecated(crop_stitch_source, "tight", stitch_source, "tight")
-        crop_blend_feather_px = resolve_deprecated(crop_blend_feather_px, 16, mask_blend_pixels, 16)
+             mask_config=None, bounding_box_mask=None, anomaly_threshold=1.5):
 
         # Apply shared config override if connected
         from .mask_processing_config import apply_mask_config

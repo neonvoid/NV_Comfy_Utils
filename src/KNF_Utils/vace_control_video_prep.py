@@ -204,23 +204,6 @@ class NV_VaceControlVideoPrep:
                     "tooltip": "Feather VACE pixel-space stitch mask edges. "
                                "8-16px = subtle, 0 = hard edge. (Previously: stitch_feather)"
                 }),
-                # Deprecated (kept for old workflow compat — do not remove)
-                "mask_grow": ("INT", {"default": 0, "min": -128, "max": 128, "step": 1,
-                    "tooltip": "DEPRECATED — use vace_input_grow_px"}),
-                "mask_fill_holes": ("INT", {"default": 0, "min": 0, "max": 128, "step": 1,
-                    "tooltip": "DEPRECATED — use cleanup_fill_holes"}),
-                "mask_remove_noise": ("INT", {"default": 0, "min": 0, "max": 32, "step": 1,
-                    "tooltip": "DEPRECATED — use cleanup_remove_noise"}),
-                "mask_smooth": ("INT", {"default": 0, "min": 0, "max": 127, "step": 1,
-                    "tooltip": "DEPRECATED — use cleanup_smooth"}),
-                "stitch_source": (["tight", "bbox"], {"default": "tight",
-                    "tooltip": "DEPRECATED — use vace_stitch_source"}),
-                "halo_pixels": ("INT", {"default": 16, "min": 0, "max": 48, "step": 4,
-                    "tooltip": "DEPRECATED — use vace_halo_px"}),
-                "stitch_erosion": ("INT", {"default": 0, "min": -32, "max": 32, "step": 1,
-                    "tooltip": "DEPRECATED — use vace_stitch_erosion_px"}),
-                "stitch_feather": ("INT", {"default": 8, "min": 0, "max": 64, "step": 1,
-                    "tooltip": "DEPRECATED — use vace_stitch_feather_px"}),
             },
         }
 
@@ -240,25 +223,10 @@ class NV_VaceControlVideoPrep:
     def execute(self, image, mask, mask_shape, mode, erosion_blocks, feather_blocks, fill_mode,
                 mask_config=None, bbox_padding=0.15, bbox_smooth_frames=5,
                 fill_value=0.5, threshold=False,
-                # New names
                 vace_input_grow_px=0, cleanup_fill_holes=0, cleanup_remove_noise=0,
                 cleanup_smooth=0, vae_stride=8,
                 vace_stitch_source="tight", vace_halo_px=16,
-                vace_stitch_erosion_px=0, vace_stitch_feather_px=8,
-                # Deprecated names (backward compat)
-                mask_grow=0, mask_fill_holes=0, mask_remove_noise=0, mask_smooth=0,
-                stitch_source="tight", halo_pixels=16, stitch_erosion=0, stitch_feather=8):
-
-        # Resolve deprecated param names
-        from .mask_processing_config import resolve_deprecated
-        vace_input_grow_px = resolve_deprecated(vace_input_grow_px, 0, mask_grow, 0)
-        cleanup_fill_holes = resolve_deprecated(cleanup_fill_holes, 0, mask_fill_holes, 0)
-        cleanup_remove_noise = resolve_deprecated(cleanup_remove_noise, 0, mask_remove_noise, 0)
-        cleanup_smooth = resolve_deprecated(cleanup_smooth, 0, mask_smooth, 0)
-        vace_stitch_source = resolve_deprecated(vace_stitch_source, "tight", stitch_source, "tight")
-        vace_halo_px = resolve_deprecated(vace_halo_px, 16, halo_pixels, 16)
-        vace_stitch_erosion_px = resolve_deprecated(vace_stitch_erosion_px, 0, stitch_erosion, 0)
-        vace_stitch_feather_px = resolve_deprecated(vace_stitch_feather_px, 8, stitch_feather, 8)
+                vace_stitch_erosion_px=0, vace_stitch_feather_px=8):
 
         # Apply shared config override if connected
         from .mask_processing_config import apply_vace_mask_config

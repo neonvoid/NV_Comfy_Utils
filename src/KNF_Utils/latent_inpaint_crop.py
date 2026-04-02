@@ -219,17 +219,6 @@ class NV_LatentInpaintCrop:
                            "tooltip": "Manual crop width in pixels. Ignored when bbox_mask is connected."}),
                 "height": ("INT", {"default": 512, "min": 8, "max": 8192, "step": 8,
                             "tooltip": "Manual crop height in pixels. Ignored when bbox_mask is connected."}),
-                # Deprecated (kept for old workflow compat — do not remove)
-                "mask_erode_dilate": ("INT", {"default": 0, "min": -128, "max": 128, "step": 1,
-                    "tooltip": "DEPRECATED — use crop_expand_px"}),
-                "mask_fill_holes": ("INT", {"default": 0, "min": 0, "max": 128, "step": 1,
-                    "tooltip": "DEPRECATED — use cleanup_fill_holes"}),
-                "mask_remove_noise": ("INT", {"default": 0, "min": 0, "max": 32, "step": 1,
-                    "tooltip": "DEPRECATED — use cleanup_remove_noise"}),
-                "mask_smooth": ("INT", {"default": 0, "min": 0, "max": 127, "step": 1,
-                    "tooltip": "DEPRECATED — use cleanup_smooth"}),
-                "mask_blend_pixels": ("INT", {"default": 16, "min": 0, "max": 64, "step": 1,
-                    "tooltip": "DEPRECATED — use crop_blend_feather_px"}),
             }
         }
 
@@ -252,21 +241,10 @@ class NV_LatentInpaintCrop:
                 cleanup_remove_noise=0, cleanup_smooth=0,
                 crop_blend_feather_px=16,
                 mask_config=None, bbox_mask=None, subject_mask=None,
-                x=0, y=0, width=512, height=512,
-                # Deprecated names (backward compat)
-                mask_erode_dilate=0, mask_fill_holes=0,
-                mask_remove_noise=0, mask_smooth=0,
-                mask_blend_pixels=16):
-
-        # Resolve deprecated param names
-        from .mask_processing_config import resolve_deprecated, apply_mask_config
-        crop_expand_px = resolve_deprecated(crop_expand_px, 0, mask_erode_dilate, 0)
-        cleanup_fill_holes = resolve_deprecated(cleanup_fill_holes, 0, mask_fill_holes, 0)
-        cleanup_remove_noise = resolve_deprecated(cleanup_remove_noise, 0, mask_remove_noise, 0)
-        cleanup_smooth = resolve_deprecated(cleanup_smooth, 0, mask_smooth, 0)
-        crop_blend_feather_px = resolve_deprecated(crop_blend_feather_px, 16, mask_blend_pixels, 16)
+                x=0, y=0, width=512, height=512):
 
         # Apply shared config override if connected
+        from .mask_processing_config import apply_mask_config
         vals = apply_mask_config(mask_config,
             crop_expand_px=crop_expand_px,
             cleanup_fill_holes=cleanup_fill_holes,
