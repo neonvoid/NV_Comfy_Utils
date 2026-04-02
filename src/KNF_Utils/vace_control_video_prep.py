@@ -251,6 +251,11 @@ class NV_VaceControlVideoPrep:
         vace_input_grow_px = vals["vace_input_grow_px"]
         vace_halo_px = vals["vace_halo_px"]
 
+        print(f"[NV_VaceControlVideoPrep] CONFIG DEBUG: vace_input_grow_px={vace_input_grow_px}, "
+              f"vace_halo_px={vace_halo_px}, config_connected={mask_config is not None}")
+        if mask_config is not None:
+            print(f"[NV_VaceControlVideoPrep] CONFIG DICT: {mask_config}")
+
         if mask.dim() == 2:
             mask = mask.unsqueeze(0)
 
