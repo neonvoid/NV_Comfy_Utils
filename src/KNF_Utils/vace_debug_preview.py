@@ -5,15 +5,17 @@ Shows the processed mask and grey control video side-by-side so you can SEE
 what VACE is actually working with. Also outputs a cumulative expansion summary
 so you can audit the total effect of all mask parameters without mental math.
 
-Wire after NV_VaceControlVideoPrep:
+Wire after NV_VaceControlVideoPrep + NV_InpaintCrop2:
   VaceControlVideoPrep.control_video  →  VaceDebugPreview.control_video
   VaceControlVideoPrep.control_masks  →  VaceDebugPreview.control_masks
   VaceControlVideoPrep.stitch_mask    →  VaceDebugPreview.stitch_mask (optional)
+  InpaintCrop2.stitcher               →  VaceDebugPreview.stitcher (optional)
   source image                        →  VaceDebugPreview.image
 """
 
 import torch
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 
 
 def _overlay_mask(image_np, mask_np, color, alpha=0.5):
@@ -34,17 +36,39 @@ def _overlay_mask(image_np, mask_np, color, alpha=0.5):
     return np.clip(result, 0.0, 1.0)
 
 
-def _draw_label(image_np, text, y=10, color=(1.0, 1.0, 1.0)):
-    """Draw a simple text label by burning white pixels. Crude but dependency-free."""
-    # Simple 5x3 pixel font for uppercase + digits (enough for labels)
-    # Skip actual font rendering — just add a colored bar with no text dependency
+def _get_font(size=14):
+    """Load a font with fallback chain."""
+    for name in ("arial.ttf", "Arial.ttf", "DejaVuSans.ttf"):
+        try:
+            return ImageFont.truetype(name, size)
+        except (OSError, IOError):
+            continue
+    try:
+        return ImageFont.load_default(size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def _draw_label(image_np, text, position="top_left"):
+    """Draw a text label on an image using PIL. Returns modified copy."""
     H, W, _ = image_np.shape
-    bar_h = min(24, H // 20)
-    if bar_h < 4:
-        return image_np
-    result = image_np.copy()
-    result[y:y + bar_h, :, :] = result[y:y + bar_h, :, :] * 0.3  # darken bar
-    return result
+    pil_img = Image.fromarray((image_np * 255).astype(np.uint8))
+    draw = ImageDraw.Draw(pil_img)
+    font_size = max(12, min(24, H // 20))
+    font = _get_font(font_size)
+    bbox = draw.textbbox((0, 0), text, font=font)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    pad = 4
+    if position == "top_left":
+        x, y = pad, pad
+    elif position == "top_center":
+        x, y = (W - tw) // 2, pad
+    else:
+        x, y = pad, pad
+    # Dark background for readability
+    draw.rectangle([x - pad, y - pad, x + tw + pad, y + th + pad], fill=(0, 0, 0, 180))
+    draw.text((x, y), text, fill=(255, 255, 255), font=font)
+    return np.array(pil_img).astype(np.float32) / 255.0
 
 
 def _resize_to_match(tensor, target_h, target_w):
@@ -83,6 +107,10 @@ class NV_VaceDebugPreview:
                 "stitch_mask": ("MASK", {
                     "tooltip": "Stitch boundary mask from VaceControlVideoPrep. Shown in cyan overlay."
                 }),
+                "stitcher": ("STITCHER", {
+                    "tooltip": "Stitcher from InpaintCrop2. Shows the crop blend mask (yellow) — "
+                               "this is what actually controls the pixel-space composite boundary."
+                }),
                 "mask_config": ("MASK_PROCESSING_CONFIG", {
                     "tooltip": "Config dict — used to compute cumulative expansion summary."
                 }),
@@ -105,7 +133,7 @@ class NV_VaceDebugPreview:
     )
 
     def execute(self, image, control_video, control_masks, mode="side_by_side",
-                stitch_mask=None, mask_config=None, overlay_alpha=0.5):
+                stitch_mask=None, stitcher=None, mask_config=None, overlay_alpha=0.5):
 
         B = image.shape[0]
         H, W = image.shape[1], image.shape[2]
@@ -117,6 +145,26 @@ class NV_VaceDebugPreview:
             control_masks = _resize_to_match(control_masks, H, W)
         if stitch_mask is not None and (stitch_mask.shape[1] != H or stitch_mask.shape[2] != W):
             stitch_mask = _resize_to_match(stitch_mask, H, W)
+
+        # Extract crop blend mask from stitcher (if connected)
+        # This is the actual mask InpaintStitch2 uses for compositing
+        crop_blend_masks = None
+        crop_info = ""
+        if stitcher is not None:
+            blend_list = stitcher.get("cropped_mask_for_blend", [])
+            stitch_source = stitcher.get("stitch_source", "?")
+            crop_target_w = stitcher.get("crop_target_w", "?")
+            crop_target_h = stitcher.get("crop_target_h", "?")
+            crop_info = f"Crop: {crop_target_w}x{crop_target_h}, stitch_source={stitch_source}"
+            if blend_list:
+                # Blend masks are in crop space — resize to full frame for overlay
+                # They're [H_crop, W_crop] tensors stored per-frame
+                crop_blend_masks = []
+                for bm in blend_list:
+                    if bm.dim() == 2:
+                        bm = bm.unsqueeze(0)  # [1, H, W]
+                    bm = _resize_to_match(bm, H, W)
+                    crop_blend_masks.append(bm.squeeze(0))
 
         # Match batch sizes
         ctrl_B = control_video.shape[0]
@@ -134,31 +182,54 @@ class NV_VaceDebugPreview:
             ctrl = control_video[b].cpu().numpy().astype(np.float32)
             vace_m = control_masks[b].cpu().numpy().astype(np.float32)
             stitch_m = stitch_mask[b].cpu().numpy().astype(np.float32) if stitch_mask is not None else None
+            crop_bm = None
+            if crop_blend_masks is not None and b < len(crop_blend_masks):
+                crop_bm = crop_blend_masks[b].cpu().numpy().astype(np.float32)
 
             if mode == "side_by_side":
-                # [original | control_video | VACE mask overlay on original]
-                overlay = _overlay_mask(img, vace_m, (0.86, 0.31, 1.0), overlay_alpha)  # magenta
+                # [original | control_video | VACE mask | crop blend mask]
+                img_labeled = _draw_label(img, "Original", "top_left")
+                ctrl_labeled = _draw_label(ctrl, "VACE Control Video", "top_left")
+                vace_overlay = _overlay_mask(img, vace_m, (0.86, 0.31, 1.0), overlay_alpha)
                 if stitch_m is not None:
-                    overlay = _overlay_mask(overlay, stitch_m, (0.31, 0.86, 1.0), overlay_alpha * 0.5)  # cyan
-                frame = np.concatenate([img, ctrl, overlay], axis=1)  # [H, 3W, 3]
+                    vace_overlay = _overlay_mask(vace_overlay, stitch_m, (0.31, 0.86, 1.0), overlay_alpha * 0.5)
+                vace_labeled = _draw_label(vace_overlay, "VACE mask (magenta) + stitch (cyan)", "top_left")
+
+                panels = [img_labeled, ctrl_labeled, vace_labeled]
+
+                if crop_bm is not None:
+                    crop_overlay = _overlay_mask(img, crop_bm, (1.0, 0.85, 0.2), overlay_alpha)  # yellow
+                    crop_labeled = _draw_label(crop_overlay, "Crop Blend Mask (yellow)", "top_left")
+                    panels.append(crop_labeled)
+
+                frame = np.concatenate(panels, axis=1)
 
             elif mode == "overlay":
-                # Single frame with both masks overlaid
                 overlay = _overlay_mask(img, vace_m, (0.86, 0.31, 1.0), overlay_alpha)
                 if stitch_m is not None:
                     overlay = _overlay_mask(overlay, stitch_m, (0.31, 0.86, 1.0), overlay_alpha * 0.5)
-                frame = overlay
+                if crop_bm is not None:
+                    overlay = _overlay_mask(overlay, crop_bm, (1.0, 0.85, 0.2), overlay_alpha * 0.3)
+                frame = _draw_label(overlay, "VACE (magenta) + stitch (cyan) + crop blend (yellow)", "top_left")
 
             elif mode == "grid":
-                # 2x2: [original, control_video] / [VACE mask overlay, stitch mask overlay]
+                # 2x2: [original, control_video] / [VACE mask, crop blend mask]
+                img_labeled = _draw_label(img, "Original", "top_left")
+                ctrl_labeled = _draw_label(ctrl, "VACE Control Video", "top_left")
                 vace_overlay = _overlay_mask(img, vace_m, (0.86, 0.31, 1.0), overlay_alpha)
-                if stitch_m is not None:
-                    stitch_overlay = _overlay_mask(img, stitch_m, (0.31, 0.86, 1.0), overlay_alpha)
+                vace_labeled = _draw_label(vace_overlay, "VACE Cond Mask", "top_left")
+                if crop_bm is not None:
+                    crop_overlay = _overlay_mask(img, crop_bm, (1.0, 0.85, 0.2), overlay_alpha)
+                    crop_labeled = _draw_label(crop_overlay, "Crop Blend Mask", "top_left")
+                elif stitch_m is not None:
+                    crop_labeled = _draw_label(
+                        _overlay_mask(img, stitch_m, (0.31, 0.86, 1.0), overlay_alpha),
+                        "VACE Stitch Mask", "top_left")
                 else:
-                    stitch_overlay = img.copy()
-                top = np.concatenate([img, ctrl], axis=1)
-                bottom = np.concatenate([vace_overlay, stitch_overlay], axis=1)
-                frame = np.concatenate([top, bottom], axis=0)  # [2H, 2W, 3]
+                    crop_labeled = _draw_label(img.copy(), "No stitch data", "top_left")
+                top = np.concatenate([img_labeled, ctrl_labeled], axis=1)
+                bottom = np.concatenate([vace_labeled, crop_labeled], axis=1)
+                frame = np.concatenate([top, bottom], axis=0)
             else:
                 frame = img
 
@@ -183,19 +254,81 @@ class NV_VaceDebugPreview:
             erosion_px = erosion_blocks * vae_stride
             feather_px = feather_blocks * vae_stride
 
+            info_lines.append("── VACE Side ──")
             info_lines.append(f"Input mask grow:    {grow:+d} px")
-            info_lines.append(f"Crop expansion:     {expand:+d} px")
             info_lines.append(f"VACE halo:          {halo:+d} px")
             info_lines.append(f"VACE erosion:       {-erosion_px:+.0f} px (inward)")
             info_lines.append(f"VACE feather:       {feather_px:.0f} px")
+            info_lines.append(f"VACE stitch erosion:{stitch_ero:+d} px")
+            info_lines.append(f"VACE stitch feather:{stitch_fea:d} px")
+            info_lines.append("")
+            info_lines.append("── Crop/Stitch Side ──")
+            info_lines.append(f"Crop expansion:     {expand:+d} px")
             info_lines.append(f"Blend feather:      {blend:d} px")
-            info_lines.append(f"Stitch erosion:     {stitch_ero:+d} px")
-            info_lines.append(f"Stitch feather:     {stitch_fea:d} px")
-            info_lines.append("─" * 30)
-            approx_outward = grow + expand + halo - erosion_px
-            info_lines.append(f"Approx outward:     ~{approx_outward:.0f} px")
+            if crop_info:
+                info_lines.append(f"{crop_info}")
+            info_lines.append("")
+            info_lines.append("── Net Effect ──")
+            vace_outward = grow + halo - erosion_px
+            stitch_outward = expand + blend
+            gap = vace_outward - stitch_outward
+            info_lines.append(f"VACE outward:       ~{vace_outward:.0f} px (grow + halo - erosion)")
+            info_lines.append(f"Stitch outward:     ~{stitch_outward:.0f} px (expand + feather)")
+            info_lines.append(f"Gap (VACE - stitch): ~{gap:.0f} px")
+
+            # ── Diagnosis + Suggestions ──
+            info_lines.append("")
+            info_lines.append("── Suggestions ──")
+            suggestions = []
+
+            if gap > 8:
+                # VACE extends well past stitch — grey fill visible at boundary
+                fix_expand = int(expand + gap)
+                suggestions.append(f"GREY VISIBLE: VACE extends {gap:.0f}px past stitch boundary")
+                suggestions.append(f"  Fix A: crop_expand_px {expand:+d} → {fix_expand:+d} (expand stitch to match)")
+                suggestions.append(f"  Fix B: vace_halo_px {halo} → {max(0, halo - int(gap))} (shrink VACE to match)")
+                if grow > 0:
+                    suggestions.append(f"  Fix C: vace_input_grow_px {grow:+d} → {max(0, grow - int(gap)):+d} (less input growth)")
+
+            elif gap < -8:
+                # Stitch extends past VACE — original/unregenerated content in blend zone
+                suggestions.append(f"STITCH OVERREACH: stitch extends {-gap:.0f}px past VACE boundary")
+                suggestions.append(f"  Fix A: crop_expand_px {expand:+d} → {max(-128, expand + int(gap)):+d} (shrink stitch)")
+                suggestions.append(f"  Fix B: crop_blend_feather_px {blend} → {max(4, blend + int(gap))} (less feather)")
+                suggestions.append(f"  Fix C: vace_halo_px {halo} → {halo + int(-gap)} (extend VACE to cover)")
+
+            else:
+                suggestions.append("OK: VACE and stitch boundaries are well-matched")
+
+            # Check for overmasking risk (total expansion > 40px)
+            total_out = max(vace_outward, stitch_outward)
+            if total_out > 40:
+                suggestions.append(f"")
+                suggestions.append(f"OVERMASKING RISK: ~{total_out:.0f}px total outward expansion")
+                suggestions.append(f"  Consider: vace_input_grow_px=0 + mask_shape=bbox if adding new object")
+                suggestions.append(f"  Or reduce: total of grow({grow}) + halo({halo}) + expand({expand}) + feather({blend})")
+
+            # Check for dark seam risk
+            if erosion_blocks == 0:
+                suggestions.append("")
+                suggestions.append("DARK SEAM RISK: vace_erosion_blocks=0 — set to 0.5 minimum")
+            if feather_blocks == 0:
+                suggestions.append("")
+                suggestions.append("DARK SEAM RISK: vace_feather_blocks=0 — set to 1.0 minimum")
+
+            # Check for clipping (stitch has no expansion but VACE generates beyond mask)
+            if expand == 0 and grow > 0:
+                suggestions.append("")
+                suggestions.append(f"CLIP RISK: vace_input_grow_px={grow} but crop_expand_px=0")
+                suggestions.append(f"  Generated content may extend beyond stitch boundary")
+                suggestions.append(f"  Set crop_expand_px to {min(grow, 16):+d} to cover generated area")
+
+            for s in suggestions:
+                info_lines.append(s)
         else:
             info_lines.append("Connect mask_config for expansion summary")
+            if crop_info:
+                info_lines.append(crop_info)
 
         expansion_info = "\n".join(info_lines)
         print(f"[NV_VaceDebugPreview] {B} frames, mode={mode}")
