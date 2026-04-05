@@ -221,21 +221,11 @@ class NV_VaceDebugPreview:
         if stitch_mask is not None and stitch_mask.shape[0] < B:
             stitch_mask = stitch_mask[-1:].expand(B, -1, -1)
 
-        # Debug: check what we actually received
-        print(f"[VaceDebugPreview] image shape={image.shape}, control_video shape={control_video.shape}, "
-              f"control_masks shape={control_masks.shape}")
-        print(f"[VaceDebugPreview] control_masks stats: min={control_masks.min():.3f}, max={control_masks.max():.3f}, "
-              f"mean={control_masks.float().mean():.3f}, nonzero={(control_masks > 0.01).sum().item()}/{control_masks.numel()}")
-
         frames = []
         for b in range(B):
             img = image[b].cpu().numpy().astype(np.float32)
             ctrl = control_video[b].cpu().numpy().astype(np.float32)
             vace_m = control_masks[b].cpu().numpy().astype(np.float32)
-            if b == 0:
-                print(f"[VaceDebugPreview] frame0 vace_m: min={vace_m.min():.3f}, max={vace_m.max():.3f}, "
-                      f"mean={vace_m.mean():.3f}, shape={vace_m.shape}, "
-                      f"nonzero={(vace_m > 0.01).sum()}/{vace_m.size}")
             stitch_m = stitch_mask[b].cpu().numpy().astype(np.float32) if stitch_mask is not None else None
             crop_bm = None
             if crop_blend_masks is not None and b < len(crop_blend_masks):

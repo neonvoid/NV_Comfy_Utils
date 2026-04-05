@@ -164,14 +164,15 @@ class NV_VacePrePassReference:
     Accepts reference frames (current chunk's Kling output) and an optional
     identity anchor (chunk 0's Kling output) to combat cross-chunk identity drift.
 
-    Prepend order: [identity_anchor, reference_frames, control_video]
+    Prepend order: [identity_anchor, reference_frames, previous_chunk_tail, control_video]
     - identity_anchor at t=0: WAN 2.2 training prior treats t=0 as identity source
     - reference_frames after: RoPE locality for pose/expression guidance
+    - previous_chunk_tail last: maximum RoPE locality to generation start for seam continuity
     - control_video: grey masked inpaint target (mask=1 generate)
 
     Wiring per chunk:
-    - Chunk 0: reference_frames=Chunk0 Kling, identity_anchor=not connected
-    - Chunk N: reference_frames=ChunkN Kling, identity_anchor=Chunk0 Kling
+    - Chunk 0: reference_frames=Chunk0 Kling, identity_anchor=not connected, tail=not connected
+    - Chunk N: reference_frames=ChunkN Kling, identity_anchor=Chunk0 Kling, tail=ChunkN-1 last frames
     """
 
     @classmethod
@@ -231,6 +232,17 @@ class NV_VacePrePassReference:
                                   "tooltip": "Minimum Laplacian variance for identity anchor frames. Frames below this "
                                              "threshold are rejected before sampling. Set to 0 to disable. "
                                              "reference_frames bypass this filter (current chunk's own output)."}),
+                "previous_chunk_tail": ("IMAGE", {
+                    "tooltip": "Last N frames of previous chunk's raw Kling crop output (pre-stitch). "
+                               "Prepended LAST in the ref block, immediately before control_video, for "
+                               "maximum RoPE locality to the first generated frames. Provides fine-detail "
+                               "continuity across chunk boundaries via late-block VACE skip connections. "
+                               "Leave unconnected for chunk 0 or single-chunk runs."
+                }),
+                "num_tail_frames": ("INT", {"default": 2, "min": 0, "max": 8, "step": 1,
+                    "tooltip": "Number of tail frames to take from the END of previous_chunk_tail. "
+                               "0 = disabled (tail input ignored). At frame_repeat=4, each tail frame "
+                               "= 1 latent frame. 2 is the recommended default (March 2026 synthesis)."}),
                 "control_video": ("IMAGE", {
                     "tooltip": "Grey masked inpaint video — the generation target. Mask=1 regions are where "
                                "VACE will paint new content using the reference frames as identity guide."
@@ -249,13 +261,15 @@ class NV_VacePrePassReference:
         "Multi-frame VACE reference for cascaded pre-pass workflows. "
         "Wire this chunk's Kling output to reference_frames. "
         "Optionally wire chunk 0's Kling output to identity_anchor for cross-chunk identity lock. "
+        "Optionally wire previous chunk's last frames to previous_chunk_tail for seam continuity. "
         "Wire grey masked inpaint video to control_video."
     )
 
     def execute(self, positive, negative, vae, width, height, length, batch_size, strength,
                 ref_strength, reference_frames, num_refs, ref_sampling, frame_repeat,
                 identity_anchor=None, num_anchors=3, anchor_sampling="uniform",
-                min_sharpness=50.0, control_video=None, control_masks=None):
+                min_sharpness=50.0, previous_chunk_tail=None, num_tail_frames=2,
+                control_video=None, control_masks=None):
 
         latent_length = ((length - 1) // 4) + 1
 
@@ -308,17 +322,60 @@ class NV_VacePrePassReference:
                     print(f"[NV_VacePrePassReference] Anchor IFS scores: "
                           f"{', '.join(f'[{idx}]={anchor_scores[idx]:.3f}' for idx in anchor_indices)}")
 
-        # === Step 1c: Concatenate [identity_anchor, reference_frames] — anchor FIRST ===
-        # Anchor-first ordering exploits:
-        # 1. WAN 2.2 training prior: t=0 = identity anchor
-        # 2. RoPE locality: reference_frames closest to generation start get stronger local attention
+        # === Step 1b-tail: Extract last N frames of previous chunk (optional) ===
+        # Tail frames provide fine-detail continuity across chunk boundaries.
+        # Positioned LAST in the ref block = closest to control_video = maximum RoPE
+        # locality to first generated frames. VACE late-block skip connections (10 layers
+        # across 40 DiT blocks) reassert tail detail during late denoising where
+        # micro-texture (hair, fabric, speculars) is resolved.
+        sampled_tail = None
+        if previous_chunk_tail is not None and num_tail_frames > 0 and previous_chunk_tail.shape[0] > 0:
+            total_tail_available = previous_chunk_tail.shape[0]
+            actual_tail_count = min(num_tail_frames, total_tail_available)
+            # Explicit start index to avoid Python's -0 == 0 gotcha
+            # (tensor[-0:] returns the FULL tensor, not empty)
+            start_idx = total_tail_available - actual_tail_count
+            sampled_tail = previous_chunk_tail[start_idx:]
+            print(f"[NV_VacePrePassReference] Tail: {actual_tail_count} frames from end of "
+                  f"previous chunk ({total_tail_available} available)")
+
+        # === Step 1c: Concatenate [identity_anchor, reference_frames, tail] ===
+        # Order matters for RoPE temporal locality + WAN training prior:
+        # - anchor FIRST: exploits WAN t=0 training prior for identity anchoring
+        # - refs MIDDLE: pose/expression guidance with moderate RoPE locality
+        # - tail LAST: maximum RoPE locality to generation start for seam continuity
+        # Conv3d kernel_t=1 at patch embedding means no temporal mixing at entry —
+        # ordering only affects attention (Stage 8) and skip injection (Stage 9).
+        # Validate spatial dimensions match before concat (different crop
+        # resolutions will cause a raw torch.cat RuntimeError otherwise)
+        ref_shape = sampled_refs.shape[1:]  # [H, W, C]
+        if sampled_anchors is not None and sampled_anchors.shape[1:] != ref_shape:
+            raise ValueError(
+                f"[NV_VacePrePassReference] Spatial mismatch: identity_anchor {list(sampled_anchors.shape[1:])} "
+                f"vs reference_frames {list(ref_shape)}. Resize before connecting.")
+        if sampled_tail is not None and sampled_tail.shape[1:] != ref_shape:
+            raise ValueError(
+                f"[NV_VacePrePassReference] Spatial mismatch: previous_chunk_tail {list(sampled_tail.shape[1:])} "
+                f"vs reference_frames {list(ref_shape)}. Resize before connecting.")
+
+        refs_list = []
         if sampled_anchors is not None:
-            all_refs = torch.cat([sampled_anchors, sampled_refs], dim=0)
-            print(f"[NV_VacePrePassReference] Combined refs: {sampled_anchors.shape[0]} anchors + "
-                  f"{sampled_refs.shape[0]} refs = {all_refs.shape[0]} total (anchor-first order)")
-        else:
-            all_refs = sampled_refs
-            print(f"[NV_VacePrePassReference] Refs: {all_refs.shape[0]} reference frames only (no identity anchor)")
+            refs_list.append(sampled_anchors)
+        refs_list.append(sampled_refs)
+        if sampled_tail is not None:
+            refs_list.append(sampled_tail)
+
+        all_refs = torch.cat(refs_list, dim=0) if len(refs_list) > 1 else refs_list[0]
+
+        # Log the composition
+        log_parts = []
+        if sampled_anchors is not None:
+            log_parts.append(f"{sampled_anchors.shape[0]} anchor")
+        log_parts.append(f"{sampled_refs.shape[0]} ref")
+        if sampled_tail is not None:
+            log_parts.append(f"{sampled_tail.shape[0]} tail")
+        print(f"[NV_VacePrePassReference] Prepend: {' + '.join(log_parts)} = "
+              f"{all_refs.shape[0]} total (order: {'→'.join(log_parts)})")
 
         # Frame repeat: duplicate each reference frame_repeat times in pixel space
         # [r1,r1,r1,r1, r2,r2,r2,r2, ...] for 3D VAE temporal compression

@@ -286,15 +286,7 @@ class NV_VaceControlVideoPrep:
         # --- Step 1b: Mask pre-processing (grow/shrink, fill holes, denoise, smooth) ---
         preproc_applied = []
         if vace_input_grow_px != 0:
-            before_sum = result_mask.sum().item()
-            before_nonzero = (result_mask > 0.01).sum().item()
             result_mask = mask_erode_dilate(result_mask, vace_input_grow_px)
-            after_sum = result_mask.sum().item()
-            after_nonzero = (result_mask > 0.01).sum().item()
-            print(f"[GROW DEBUG] before: sum={before_sum:.0f}, nonzero={before_nonzero} | "
-                  f"after: sum={after_sum:.0f}, nonzero={after_nonzero} | "
-                  f"device={result_mask.device} | shape={result_mask.shape} | "
-                  f"grow={vace_input_grow_px}")
             preproc_applied.append(f"grow={vace_input_grow_px}px")
         if fill_holes_v > 0:
             result_mask = mask_fill_holes(result_mask, fill_holes_v)

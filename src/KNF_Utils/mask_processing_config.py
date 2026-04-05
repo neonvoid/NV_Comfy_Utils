@@ -22,7 +22,7 @@ Parameters are organized by category:
 def apply_mask_config(mask_config, **local_values):
     """Merge mask_config over local widget values. Config wins when connected.
 
-    Accepts both old and new config key names for backward compatibility.
+    Direct key lookup — local param names must match config dict keys exactly.
 
     Usage in consuming node:
         vals = apply_mask_config(mask_config,
