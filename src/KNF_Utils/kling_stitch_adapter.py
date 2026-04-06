@@ -1,4 +1,8 @@
 """
+DEPRECATED (2026-04-06): Kling edit mode doesn't reliably preserve the original
+framing/camera, making direct stitch-back onto original frames unreliable.
+Unregistered from __init__.py. File kept for potential future reuse.
+
 NV Kling Stitch Adapter — Bridges Kling API output back to InpaintStitch2.
 
 Handles the two mismatches that occur when routing InpaintCrop2 → Kling → InpaintStitch2:

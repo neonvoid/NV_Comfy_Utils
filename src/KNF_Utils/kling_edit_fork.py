@@ -299,6 +299,50 @@ class NV_KlingUploadPreview(IO.ComfyNode):
                         "In reference mode: 'auto' infers from input dimensions."
                     ),
                 ),
+                # --- Sequential chunking ---
+                IO.Boolean.Input(
+                    "chunk_mode",
+                    default=False,
+                    tooltip=(
+                        "Enable sequential chunking for long videos. "
+                        "Auto-truncates input to ~10s per chunk, extracts tail "
+                        "frames from previous chunk as references, and outputs "
+                        "next_chunk_start for wiring into the next pass."
+                    ),
+                ),
+                IO.Int.Input(
+                    "chunk_start_frame",
+                    default=0,
+                    min=0,
+                    max=100000,
+                    display_mode=IO.NumberDisplay.number,
+                    tooltip=(
+                        "Frame index to start this chunk from. "
+                        "First chunk = 0. Subsequent chunks = next_chunk_start "
+                        "output from the previous pass."
+                    ),
+                ),
+                IO.Image.Input(
+                    "prev_chunk_output",
+                    tooltip=(
+                        "Output frames from the previous Kling chunk. "
+                        "Tail frames are auto-extracted as reference images "
+                        "for visual consistency across chunks."
+                    ),
+                    optional=True,
+                ),
+                IO.Int.Input(
+                    "tail_ref_count",
+                    default=1,
+                    min=0,
+                    max=3,
+                    display_mode=IO.NumberDisplay.number,
+                    tooltip=(
+                        "How many tail frames to extract from prev_chunk_output "
+                        "as reference images (fills first unused image_N slots). "
+                        "0 = disabled."
+                    ),
+                ),
                 # --- Reference images (explicit slot → tag mapping) ---
                 IO.Image.Input("image_1", tooltip="Reference image for @image1.", optional=True),
                 IO.String.Input("alias_1", default="", tooltip="Describe @image1.", optional=True),
@@ -317,6 +361,7 @@ class NV_KlingUploadPreview(IO.ComfyNode):
                 IO.Int.Output(display_name="ref_count"),
                 IO.Int.Output(display_name="char_count"),
                 IO.String.Output(display_name="metadata"),
+                IO.Int.Output(display_name="next_chunk_start"),
             ],
         )
 
@@ -332,6 +377,10 @@ class NV_KlingUploadPreview(IO.ComfyNode):
         duration: int,
         aspect_ratio: str,
         negative_prompt: str = "",
+        chunk_mode: bool = False,
+        chunk_start_frame: int = 0,
+        prev_chunk_output: Input.Image | None = None,
+        tail_ref_count: int = 1,
         image_1: Input.Image | None = None,
         alias_1: str = "",
         image_2: Input.Image | None = None,
@@ -344,6 +393,87 @@ class NV_KlingUploadPreview(IO.ComfyNode):
         import torch
 
         is_feature = refer_type == "reference (feature)"
+
+        # --- chunk mode: slice + truncate ---
+        total_input_frames = images.shape[0]
+        chunk_truncated = False
+        next_chunk_start = -1  # -1 = no more chunks
+
+        if chunk_mode:
+            # Resolve encode fps early for max frame calculation
+            if upload_fps == "match input":
+                _enc_fps = fps
+            else:
+                _enc_fps = int(upload_fps.split()[0])
+
+            # Max frames that fit in ~10s, snapped DOWN to 8k+1
+            max_chunk_frames = (int(_enc_fps * 10) // 8) * 8 + 1
+
+            # Slice from chunk_start_frame
+            if chunk_start_frame > 0:
+                if chunk_start_frame >= total_input_frames:
+                    raise ValueError(
+                        f"chunk_start_frame ({chunk_start_frame}) >= total frames "
+                        f"({total_input_frames}). No frames to process."
+                    )
+                images = images[chunk_start_frame:]
+                print(
+                    f"[NV_KlingUploadPreview] Chunk mode: sliced from frame "
+                    f"{chunk_start_frame}, {images.shape[0]} frames remaining"
+                )
+
+            # Truncate if too long
+            if images.shape[0] > max_chunk_frames:
+                chunk_truncated = True
+                next_chunk_start = chunk_start_frame + max_chunk_frames
+                images = images[:max_chunk_frames]
+                remaining = total_input_frames - next_chunk_start
+                print(
+                    f"[NV_KlingUploadPreview] Chunk mode: truncated to {max_chunk_frames} "
+                    f"frames (~10s at {_enc_fps}fps). "
+                    f"Next chunk: set chunk_start_frame={next_chunk_start} "
+                    f"({remaining} frames remaining)"
+                )
+            else:
+                next_chunk_start = -1
+                print(
+                    f"[NV_KlingUploadPreview] Chunk mode: {images.shape[0]} frames "
+                    f"fits within limit — this is the final chunk."
+                )
+
+        # --- auto-fill ref slots from previous chunk tail ---
+        auto_filled_slots = []
+        if prev_chunk_output is not None and tail_ref_count > 0:
+            slots_list = [image_1, image_2, image_3, image_4]
+            aliases_list = [alias_1, alias_2, alias_3, alias_4]
+            prev_frames = prev_chunk_output.shape[0]
+            count = min(tail_ref_count, prev_frames)
+
+            for ti in range(count):
+                # Find first unused slot
+                free_idx = None
+                for si, s in enumerate(slots_list):
+                    if s is None:
+                        free_idx = si
+                        break
+                if free_idx is None:
+                    print(f"[NV_KlingUploadPreview] All 4 ref slots occupied — skipping tail frame {ti + 1}")
+                    break
+
+                # Extract frame from tail (last, second-to-last, etc.)
+                frame_idx = prev_frames - count + ti
+                tail_frame = prev_chunk_output[frame_idx:frame_idx + 1]
+                slots_list[free_idx] = tail_frame
+                aliases_list[free_idx] = "previous chunk — maintain visual consistency"
+                auto_filled_slots.append(free_idx + 1)  # 1-indexed for @imageN
+
+            image_1, image_2, image_3, image_4 = slots_list
+            alias_1, alias_2, alias_3, alias_4 = aliases_list
+            print(
+                f"[NV_KlingUploadPreview] Sequential chunk: extracted {len(auto_filled_slots)} "
+                f"tail frame(s) from prev output ({prev_frames} frames) → "
+                f"slot(s) {', '.join(f'@image{i}' for i in auto_filled_slots)}"
+            )
 
         # --- video frame processing ---
         num_frames = images.shape[0]
@@ -463,6 +593,11 @@ class NV_KlingUploadPreview(IO.ComfyNode):
         if negative_prompt and negative_prompt.strip():
             prompt = f"{prompt}\nAvoid: {negative_prompt.strip()}"
 
+        # Auto-append consistency hint for sequential chunks
+        if auto_filled_slots:
+            refs = ", ".join(f"@image{i}" for i in auto_filled_slots)
+            prompt = f"{prompt}\nMaintain visual consistency with {refs}."
+
         prompt = _normalize_omni_prompt_references(prompt)
 
         # --- validation ---
@@ -475,10 +610,11 @@ class NV_KlingUploadPreview(IO.ComfyNode):
                 f"Upload video too short: {num_frames} frames at {encode_fps}fps = "
                 f"{upload_duration_exact:.2f}s (minimum ~3s)."
             )
-        if upload_duration_exact > 10.5:
+        if upload_duration_exact > 10.5 and not chunk_mode:
             raise ValueError(
                 f"Upload video too long: {num_frames} frames at {encode_fps}fps = "
-                f"{upload_duration_exact:.2f}s (maximum ~10s)."
+                f"{upload_duration_exact:.2f}s (maximum ~10s). "
+                f"Enable chunk_mode to auto-truncate long videos."
             )
         if w > 2160 or h > 2160:
             raise ValueError(f"Dimensions {w}x{h} too large (maximum 2160x2160).")
@@ -530,6 +666,34 @@ class NV_KlingUploadPreview(IO.ComfyNode):
             },
         }
 
+        if chunk_mode:
+            chunk_info = {
+                "total_input_frames": total_input_frames,
+                "chunk_start_frame": chunk_start_frame,
+                "chunk_frames": images.shape[0],
+                "truncated": chunk_truncated,
+                "next_chunk_start": next_chunk_start,
+                "is_final_chunk": next_chunk_start == -1,
+            }
+            if next_chunk_start > 0:
+                remaining = total_input_frames - next_chunk_start
+                chunk_info["remaining_frames"] = remaining
+                chunk_info["estimated_remaining_chunks"] = math.ceil(remaining / images.shape[0])
+                chunk_info["guidance"] = (
+                    f"Set chunk_start_frame={next_chunk_start} for the next pass. "
+                    f"{remaining} frames remaining (~{chunk_info['estimated_remaining_chunks']} more chunk(s))."
+                )
+            else:
+                chunk_info["guidance"] = "This is the final chunk — no more passes needed."
+            metadata["chunk"] = chunk_info
+
+        if auto_filled_slots:
+            metadata.setdefault("chunk", {})["tail_refs"] = {
+                "prev_chunk_frames": prev_chunk_output.shape[0],
+                "tail_refs_extracted": len(auto_filled_slots),
+                "auto_filled_slots": [f"@image{i}" for i in auto_filled_slots],
+            }
+
         if original_num_frames != num_frames:
             prev_valid = original_num_frames - ((original_num_frames - 1) % 8)
             next_valid = valid_frames
@@ -547,6 +711,7 @@ class NV_KlingUploadPreview(IO.ComfyNode):
             num_ref,
             len(prompt),
             json.dumps(metadata, indent=2),
+            next_chunk_start,
         )
 
 
