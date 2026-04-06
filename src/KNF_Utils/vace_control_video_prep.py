@@ -270,41 +270,34 @@ class NV_VaceControlVideoPrep:
         if mask.dim() == 2:
             mask = mask.unsqueeze(0)
 
-        # --- Step 0: Prepend previous chunk tail (chunk continuity) ---
-        # Tail frames become mask=0 (preserve exactly) at the start of the control video.
-        # VACE sees [preserved_tail, inpaint_region] — trained inpainting continuation.
-        # Tail goes through the SAME VAE encode path as control video — zero domain mismatch.
+        # --- Step 0: Prepare tail frames (DON'T prepend yet) ---
+        # Tail is prepended AFTER all mask analysis to avoid contaminating inscribed
+        # radius, auto-mode geometry, bbox temporal smoothing. Only control_video and
+        # control_masks get the prepend; stitch_mask/tight_mask stay at original length.
         tail_trim = 0
+        _tail_frames = None
         if previous_chunk_tail is not None and tail_overlap_frames > 0:
             # Snap to multiple of 4 (WAN 4k+1 rule: adding 4k preserves valid frame counts)
             tail_overlap_frames = (tail_overlap_frames // 4) * 4
-            if tail_overlap_frames == 0:
-                previous_chunk_tail = None  # effectively disabled
-            available = previous_chunk_tail.shape[0]
-            actual_tail = min(tail_overlap_frames, available)
-            if actual_tail > 0:
-                # Take the last N frames from the previous chunk's output
-                start_idx = available - actual_tail
-                tail_frames = previous_chunk_tail[start_idx:]
+            if tail_overlap_frames > 0:
+                available = previous_chunk_tail.shape[0]
+                actual_tail = (min(tail_overlap_frames, available) // 4) * 4
+                if actual_tail > 0:
+                    start_idx = available - actual_tail
+                    _tail_frames = previous_chunk_tail[start_idx:]
 
-                # Resize tail to match control video if dimensions differ
-                if tail_frames.shape[1:] != image.shape[1:]:
-                    tail_frames = torch.nn.functional.interpolate(
-                        tail_frames.movedim(-1, 1),
-                        size=(image.shape[1], image.shape[2]),
-                        mode="bilinear", align_corners=False
-                    ).movedim(1, -1)
+                    # Resize tail to match control video if dimensions differ
+                    if _tail_frames.shape[1:] != image.shape[1:]:
+                        _tail_frames = torch.nn.functional.interpolate(
+                            _tail_frames.movedim(-1, 1),
+                            size=(image.shape[1], image.shape[2]),
+                            mode="bilinear", align_corners=False
+                        ).movedim(1, -1)
 
-                # Prepend tail to image and zero-mask to mask
-                image = torch.cat([tail_frames, image], dim=0)
-                tail_mask = torch.zeros(actual_tail, mask.shape[1], mask.shape[2],
-                                        device=mask.device, dtype=mask.dtype)
-                mask = torch.cat([tail_mask, mask], dim=0)
-                tail_trim = actual_tail
-
-                print(f"[NV_VaceControlVideoPrep] Tail: prepended {actual_tail} frames from previous chunk "
-                      f"(mask=0, preserve). Total frames: {image.shape[0]} "
-                      f"(tail_trim={tail_trim} — strip from output after generation)")
+                    _tail_frames = _tail_frames.to(device=image.device, dtype=image.dtype)
+                    tail_trim = actual_tail
+                    print(f"[NV_VaceControlVideoPrep] Tail: {actual_tail} frames prepared "
+                          f"(will prepend to control_video/control_masks after mask processing)")
 
         info_lines = [
             f"[NV_VaceControlVideoPrep] shape={mask_shape} | mode={mode} | "
@@ -530,6 +523,19 @@ class NV_VaceControlVideoPrep:
             info_lines.append(
                 "  WARNING: stitch_feather=0 produces hard edges — visible seams likely."
             )
+
+        # --- Step 11: Prepend tail to control_video and control_masks ONLY ---
+        # stitch_mask and tight_processed stay at original N-frame length
+        # (they're used for pixel compositing against the original video which has N frames)
+        if _tail_frames is not None and tail_trim > 0:
+            control_video = torch.cat([_tail_frames, control_video], dim=0)
+            tail_mask_zeros = torch.zeros(tail_trim, result_mask.shape[1], result_mask.shape[2],
+                                          device=result_mask.device, dtype=result_mask.dtype)
+            result_mask = torch.cat([tail_mask_zeros, result_mask], dim=0)
+            info_lines.append(
+                f"  Tail prepended: {tail_trim} frames (mask=0). "
+                f"control_video={control_video.shape[0]} frames, "
+                f"stitch/tight_mask={stitch_mask.shape[0]} frames (unchanged)")
 
         info = "\n".join(info_lines)
         print(info)
