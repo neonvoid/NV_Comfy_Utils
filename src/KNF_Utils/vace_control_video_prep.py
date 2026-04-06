@@ -204,11 +204,26 @@ class NV_VaceControlVideoPrep:
                     "tooltip": "Feather VACE pixel-space stitch mask edges. "
                                "8-16px = subtle, 0 = hard edge. (Previously: stitch_feather)"
                 }),
+                "previous_chunk_tail": ("IMAGE", {
+                    "tooltip": "Last N frames of previous chunk's output (post-CropColorFix, pre-stitch). "
+                               "Prepended to control video with mask=0 (preserve exactly). VACE continues "
+                               "generation from these frames — trained inpainting continuation behavior. "
+                               "No domain mismatch: tail goes through same VAE encode as control video. "
+                               "Leave unconnected for chunk 0."
+                }),
+                "tail_overlap_frames": ("INT", {
+                    "default": 4, "min": 0, "max": 16, "step": 4,
+                    "tooltip": "Number of tail frames to prepend from previous_chunk_tail. "
+                               "0 = disabled. MUST be a multiple of 4 (WAN temporal compression rule: "
+                               "adding 4k frames to a valid 4k+1 count preserves validity). "
+                               "4 = 1 latent frame, 8 = 2 latent frames. "
+                               "Strip tail_trim frames from output after generation."
+                }),
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "MASK", "MASK", "MASK", "STRING")
-    RETURN_NAMES = ("control_video", "control_masks", "stitch_mask", "tight_mask", "info")
+    RETURN_TYPES = ("IMAGE", "MASK", "MASK", "MASK", "STRING", "INT")
+    RETURN_NAMES = ("control_video", "control_masks", "stitch_mask", "tight_mask", "info", "tail_trim")
     FUNCTION = "execute"
     CATEGORY = "NV_Utils/VACE"
     DESCRIPTION = (
@@ -226,7 +241,8 @@ class NV_VaceControlVideoPrep:
                 vace_input_grow_px=0, cleanup_fill_holes=0, cleanup_remove_noise=0,
                 cleanup_smooth=0, vae_stride=8,
                 vace_stitch_source="tight", vace_halo_px=16,
-                vace_stitch_erosion_px=0, vace_stitch_feather_px=8):
+                vace_stitch_erosion_px=0, vace_stitch_feather_px=8,
+                previous_chunk_tail=None, tail_overlap_frames=4):
 
         # Apply shared config override if connected
         from .mask_processing_config import apply_vace_mask_config
@@ -254,6 +270,42 @@ class NV_VaceControlVideoPrep:
         if mask.dim() == 2:
             mask = mask.unsqueeze(0)
 
+        # --- Step 0: Prepend previous chunk tail (chunk continuity) ---
+        # Tail frames become mask=0 (preserve exactly) at the start of the control video.
+        # VACE sees [preserved_tail, inpaint_region] — trained inpainting continuation.
+        # Tail goes through the SAME VAE encode path as control video — zero domain mismatch.
+        tail_trim = 0
+        if previous_chunk_tail is not None and tail_overlap_frames > 0:
+            # Snap to multiple of 4 (WAN 4k+1 rule: adding 4k preserves valid frame counts)
+            tail_overlap_frames = (tail_overlap_frames // 4) * 4
+            if tail_overlap_frames == 0:
+                previous_chunk_tail = None  # effectively disabled
+            available = previous_chunk_tail.shape[0]
+            actual_tail = min(tail_overlap_frames, available)
+            if actual_tail > 0:
+                # Take the last N frames from the previous chunk's output
+                start_idx = available - actual_tail
+                tail_frames = previous_chunk_tail[start_idx:]
+
+                # Resize tail to match control video if dimensions differ
+                if tail_frames.shape[1:] != image.shape[1:]:
+                    tail_frames = torch.nn.functional.interpolate(
+                        tail_frames.movedim(-1, 1),
+                        size=(image.shape[1], image.shape[2]),
+                        mode="bilinear", align_corners=False
+                    ).movedim(1, -1)
+
+                # Prepend tail to image and zero-mask to mask
+                image = torch.cat([tail_frames, image], dim=0)
+                tail_mask = torch.zeros(actual_tail, mask.shape[1], mask.shape[2],
+                                        device=mask.device, dtype=mask.dtype)
+                mask = torch.cat([tail_mask, mask], dim=0)
+                tail_trim = actual_tail
+
+                print(f"[NV_VaceControlVideoPrep] Tail: prepended {actual_tail} frames from previous chunk "
+                      f"(mask=0, preserve). Total frames: {image.shape[0]} "
+                      f"(tail_trim={tail_trim} — strip from output after generation)")
+
         info_lines = [
             f"[NV_VaceControlVideoPrep] shape={mask_shape} | mode={mode} | "
             f"fill={fill_mode} | vae_stride={vae_stride}px"
@@ -267,14 +319,14 @@ class NV_VaceControlVideoPrep:
             info_lines.append("  Mask is all zeros — passing through unchanged")
             info = "\n".join(info_lines)
             print(info)
-            return (image, mask, mask, mask, info)
+            return (image, mask, mask, mask, info, tail_trim)
 
         if mask_min > 0.99:
             fill = torch.full_like(image, fill_value) if fill_mode == "soft" else image
             info_lines.append("  Mask is all ones — full fill applied")
             info = "\n".join(info_lines)
             print(info)
-            return (fill, mask, mask, mask, info)
+            return (fill, mask, mask, mask, info, tail_trim)
 
         result_mask = mask.clone()
 
@@ -315,7 +367,7 @@ class NV_VaceControlVideoPrep:
             if result_mask.max().item() < 0.01:
                 info = "\n".join(info_lines)
                 print(info)
-                return (image, result_mask, mask, mask, info)
+                return (image, result_mask, mask, mask, info, tail_trim)
 
         # --- Step 3: Analyze mask geometry ---
         radii, min_frame = compute_inscribed_radius(result_mask)
@@ -482,7 +534,7 @@ class NV_VaceControlVideoPrep:
         info = "\n".join(info_lines)
         print(info)
 
-        return (control_video, result_mask, stitch_mask, tight_processed, info)
+        return (control_video, result_mask, stitch_mask, tight_processed, info, tail_trim)
 
 
 NODE_CLASS_MAPPINGS = {

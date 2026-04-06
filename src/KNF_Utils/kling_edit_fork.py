@@ -394,20 +394,20 @@ class NV_KlingUploadPreview(IO.ComfyNode):
 
         is_feature = refer_type == "reference (feature)"
 
+        # --- resolve encode fps (once, used by both chunk mode and later) ---
+        if upload_fps == "match input":
+            encode_fps = fps
+        else:
+            encode_fps = int(upload_fps.split()[0])
+
         # --- chunk mode: slice + truncate ---
         total_input_frames = images.shape[0]
         chunk_truncated = False
         next_chunk_start = -1  # -1 = no more chunks
 
         if chunk_mode:
-            # Resolve encode fps early for max frame calculation
-            if upload_fps == "match input":
-                _enc_fps = fps
-            else:
-                _enc_fps = int(upload_fps.split()[0])
-
-            # Max frames that fit in ~10s, snapped DOWN to 8k+1
-            max_chunk_frames = (int(_enc_fps * 10) // 8) * 8 + 1
+            # Max frames that fit in ~10s, snapped DOWN to largest 8k+1 value
+            max_chunk_frames = ((int(encode_fps * 10) - 1) // 8) * 8 + 1
 
             # Slice from chunk_start_frame
             if chunk_start_frame > 0:
@@ -430,7 +430,7 @@ class NV_KlingUploadPreview(IO.ComfyNode):
                 remaining = total_input_frames - next_chunk_start
                 print(
                     f"[NV_KlingUploadPreview] Chunk mode: truncated to {max_chunk_frames} "
-                    f"frames (~10s at {_enc_fps}fps). "
+                    f"frames (~10s at {encode_fps}fps). "
                     f"Next chunk: set chunk_start_frame={next_chunk_start} "
                     f"({remaining} frames remaining)"
                 )
@@ -502,12 +502,6 @@ class NV_KlingUploadPreview(IO.ComfyNode):
                 f"...{_snap_to_kling_temporal(original_num_frames - 8)}, {original_num_frames - (original_num_frames - 1) % 8}, "
                 f"{valid_frames}, {valid_frames + 8}..."
             )
-
-        # --- resolve encode fps ---
-        if upload_fps == "match input":
-            encode_fps = fps
-        else:
-            encode_fps = int(upload_fps.split()[0])
 
         input_duration_exact = num_frames / fps
         upload_duration_exact = num_frames / encode_fps
