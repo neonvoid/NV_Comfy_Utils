@@ -304,22 +304,37 @@ class NV_VaceControlVideoPrep:
             f"fill={fill_mode} | vae_stride={vae_stride}px"
         ]
 
+        # Helper: apply tail prepend to control_video + control_masks for any exit path
+        def _apply_tail(ctrl_video, ctrl_mask):
+            if _tail_frames is not None and tail_trim > 0:
+                ctrl_video = torch.cat([_tail_frames, ctrl_video], dim=0)
+                zeros = torch.zeros(tail_trim, ctrl_mask.shape[1], ctrl_mask.shape[2],
+                                    device=ctrl_mask.device, dtype=ctrl_mask.dtype)
+                ctrl_mask = torch.cat([zeros, ctrl_mask], dim=0)
+            return ctrl_video, ctrl_mask
+
         # --- Edge case: trivial masks ---
         mask_min = mask.min().item()
         mask_max = mask.max().item()
 
         if mask_max < 0.01:
             info_lines.append("  Mask is all zeros — passing through unchanged")
+            cv, cm = _apply_tail(image, mask)
+            if tail_trim > 0:
+                info_lines.append(f"  Tail prepended: {tail_trim} frames (trivial mask path)")
             info = "\n".join(info_lines)
             print(info)
-            return (image, mask, mask, mask, info, tail_trim)
+            return (cv, cm, mask, mask, info, tail_trim)
 
         if mask_min > 0.99:
             fill = torch.full_like(image, fill_value) if fill_mode == "soft" else image
             info_lines.append("  Mask is all ones — full fill applied")
+            cv, cm = _apply_tail(fill, mask)
+            if tail_trim > 0:
+                info_lines.append(f"  Tail prepended: {tail_trim} frames (trivial mask path)")
             info = "\n".join(info_lines)
             print(info)
-            return (fill, mask, mask, mask, info, tail_trim)
+            return (cv, cm, mask, mask, info, tail_trim)
 
         result_mask = mask.clone()
 
@@ -358,9 +373,12 @@ class NV_VaceControlVideoPrep:
 
             # Re-check for trivial after bbox conversion
             if result_mask.max().item() < 0.01:
+                cv, cm = _apply_tail(image, result_mask)
+                if tail_trim > 0:
+                    info_lines.append(f"  Tail prepended: {tail_trim} frames (post-bbox trivial path)")
                 info = "\n".join(info_lines)
                 print(info)
-                return (image, result_mask, mask, mask, info, tail_trim)
+                return (cv, cm, mask, mask, info, tail_trim)
 
         # --- Step 3: Analyze mask geometry ---
         radii, min_frame = compute_inscribed_radius(result_mask)
@@ -527,11 +545,8 @@ class NV_VaceControlVideoPrep:
         # --- Step 11: Prepend tail to control_video and control_masks ONLY ---
         # stitch_mask and tight_processed stay at original N-frame length
         # (they're used for pixel compositing against the original video which has N frames)
+        control_video, result_mask = _apply_tail(control_video, result_mask)
         if _tail_frames is not None and tail_trim > 0:
-            control_video = torch.cat([_tail_frames, control_video], dim=0)
-            tail_mask_zeros = torch.zeros(tail_trim, result_mask.shape[1], result_mask.shape[2],
-                                          device=result_mask.device, dtype=result_mask.dtype)
-            result_mask = torch.cat([tail_mask_zeros, result_mask], dim=0)
             info_lines.append(
                 f"  Tail prepended: {tail_trim} frames (mask=0). "
                 f"control_video={control_video.shape[0]} frames, "

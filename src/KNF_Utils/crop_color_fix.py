@@ -253,7 +253,15 @@ class NV_CropColorFix:
         # --- Batch / spatial alignment ---
         B_orig = original_crop.shape[0]
         B_gen = generated_crop.shape[0]
-        B = min(B_orig, B_gen)
+        if B_orig != B_gen:
+            raise ValueError(
+                f"{TAG} Frame count mismatch! original_crop has {B_orig} frames but "
+                f"generated_crop has {B_gen} frames. If using tail prepend from "
+                f"VaceControlVideoPrep, ensure tail_trim frames are stripped from the "
+                f"generated output BEFORE feeding into CropColorFix. "
+                f"Use ImageFromBatch(batch_index=tail_trim, length={B_orig})."
+            )
+        B = B_orig
         H, W, C = original_crop.shape[1], original_crop.shape[2], original_crop.shape[3]
         print(f"{TAG} Starting: {B} frames, {H}x{W}, correction={color_correction}, composite={composite_mode}")
 

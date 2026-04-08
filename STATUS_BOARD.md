@@ -1,18 +1,29 @@
 # Status Board — NV_Comfy_Utils
 
 > Auto-managed by `/handoff`. Content is never deleted — old entries move to ARCHIVE.md.
-> Last updated: 2026-04-07b
+> Last updated: 2026-04-08
 
 ## Resume Context
 <!-- Rewritten each `/handoff` run. What does a cold-start agent need RIGHT NOW? -->
 
-- **Current focus:** Runtime test Kling sequential chunk mode on >10s video. Also: clean test of tail-as-control-video for chunk seam continuity.
-- **Critical files:** `src/KNF_Utils/kling_edit_fork.py`, `src/KNF_Utils/vace_control_video_prep.py`, `src/KNF_Utils/vace_prepass_reference.py`
-- **Known blockers:** Stitch crash fixes not yet applied (VRAM cleanup, frame validation, NaN warp guard).
-- **Environment notes:** KlingStitchAdapter deprecated in __init__.py. Known-truths deep-dive at `~/.multi-ai/research/20260406-155057/` needs synthesis.
+- **Current focus:** Clean end-to-end test of tail-as-control-video (VaceControlVideoPrep). Runtime test Kling sequential chunk mode on >10s video. Correct mask wiring per D-017.
+- **Critical files:** `src/KNF_Utils/vace_control_video_prep.py`, `src/KNF_Utils/inpaint_stitch.py`, `src/KNF_Utils/crop_color_fix.py`, `node_notes/guides/VACE_INPAINT_NODE_AUDIT.md`
+- **Known blockers:** None — stitch fixes applied, CropColorFix validation added.
+- **Environment notes:** 2 uncommitted files (crop_color_fix.py, vace_control_video_prep.py). Known-truths deep-dive at `~/.multi-ai/research/20260406-155057/` still needs synthesis.
 
 ## Pulse
 <!-- Last 2 session summaries, newest first. Older entries roll to Workstream Details. -->
+
+### 2026-04-08 — Integration review fixes + audit doc addendum [coding]
+- **Done:**
+  - Applied stitch crash fixes: frame count validation (single_stitcher exempt), VRAM cleanup at entry, per-frame try/except with debug context, metadata length validation, canvas clone in skip path
+  - Fixed CropColorFix silent batch truncation → hard ValueError on frame count mismatch
+  - Fixed VaceControlVideoPrep early returns bypassing tail prepend → _apply_tail() helper on all exit paths
+  - Multi-AI integration review of all 5 core pipeline nodes (3K lines)
+  - Updated VACE_INPAINT_NODE_AUDIT.md with 5 new sections (+153 lines): mask routing, chunk continuity, frame validation, multi-pass constraints, VRAM crash prevention
+- **Decisions:** CropColorFix must hard-fail on frame mismatch (D-020). All VaceControlVideoPrep exit paths must apply tail prepend consistently (D-021).
+- **Blockers:** None — stitch fixes now applied.
+- **Next:** Clean test of tail-as-control-video with corrected mask wiring. Runtime test Kling sequential chunking.
 
 ### 2026-04-07b — Kling sequential chunking + KlingStitchAdapter deprecated [coding]
 - **Done:**
@@ -24,17 +35,6 @@
 - **Blockers:** None — awaiting runtime test
 - **Next:** Runtime test chunked Kling on a >10s video. Test tail-frame refs actually improve cross-chunk consistency. Consider if chunk_mode should auto-detect (video >10s = auto-enable).
 
-### 2026-04-07 — Tail-as-control-video approach + mask wiring clarification [coding + testing]
-- **Done:**
-  - Tested latent tail (sampler output): zero color drift confirmed BUT introduced color/sharpness shift from sampler-vs-encoder domain mismatch (D-015). Both pixel and latent tail approaches add artifacts.
-  - Pivoted to Approach B: tail as mask=0 control video frames in NV_VaceControlVideoPrep (D-016). Tail prepended at END of pipeline (after all mask analysis) to avoid contaminating inscribed radius/bbox/erosion.
-  - Fixed critical review bugs: moved tail prepend from Step 0 to Step 11, output order preserved (tail_trim appended as 6th output), 4k+1 frame count enforcement (step=4, runtime snap), device/dtype alignment.
-  - Confirmed stitch mask splotches are PRE-EXISTING (not from our tail changes) — SAM3 segmentation noise.
-  - Clarified mask wiring: `control_masks` → VacePrePassReference ONLY; `cropped_mask_processed` → CropColorFix; `stitch_mask` → InpaintStitch2.
-- **Decisions:** Sampler-output and VAE-encoder latents are NOT interchangeable (D-015). Tail-as-control-video preferred (D-016). `control_masks` NEVER goes to CropColorFix or InpaintStitch (D-017).
-- **Blockers:** Stitch crash fixes still not applied. Tail-as-control-video needs clean end-to-end test.
-- **Next:** Clean test of tail-as-control-video approach. Apply stitch crash fixes. Synthesize known-truths deep-dive. Run /handoff cleanup.
-
 
 ## Active Workstreams
 
@@ -42,9 +42,9 @@
 |----|------|--------|-----------|-------------|
 | A  | Mask Pipeline UX Refactor | ACTIVE | 2026-04-06 | Renames done, deprecated removed, debug preview working. Audit doc complete. |
 | B  | Edge-of-Frame Fix | STABLE | 2026-04-03 | Crop clamp + reflection/zeros padding — runtime tested, working |
-| C  | Clothing/Bag Swap Pipeline | ACTIVE | 2026-04-07 | Full body + head swap. Mask wiring clarified (D-017). Multi-pass workflow stabilizing. |
+| C  | Clothing/Bag Swap Pipeline | ACTIVE | 2026-04-08 | Full body + head swap. CropColorFix validation added (D-020). Multi-pass workflow stabilizing. |
 | D  | Real-Time Mask Editor | STAGED | 2026-04-03 | Research complete — PySide6 + cached op graph MVP. Not started. |
-| E  | Chunk Seam Continuity | ACTIVE | 2026-04-07 | Pixel+latent tail both cause artifacts. Pivoted to tail-as-control-video (VaceControlVideoPrep). Awaiting clean test. |
+| E  | Chunk Seam Continuity | ACTIVE | 2026-04-08 | Stitch fixes applied. Tail-as-control-video ready for clean test. Audit doc updated (+153 lines). |
 | F  | Kling API Chunking | ACTIVE | 2026-04-07 | Sequential chunk mode built + code-reviewed. KlingStitchAdapter deprecated. Awaiting runtime test. |
 
 ### Status Tags
@@ -99,6 +99,8 @@
 | D-017 | 2026-04-07 | ACTIVE | C,E | `control_masks` → VACE only. CropColorFix uses `cropped_mask_processed`. InpaintStitch uses `stitch_mask`. |
 | D-018 | 2026-04-07 | ACTIVE | F | KlingStitchAdapter deprecated — Kling edit mode doesn't reliably preserve framing/camera for stitch-back |
 | D-019 | 2026-04-07 | ACTIVE | F | No chunk overlap/crossfade — same framing instability that killed stitch makes crossfade produce ghosting |
+| D-020 | 2026-04-08 | ACTIVE | C,E | CropColorFix must hard-fail on original≠generated frame count (was silently truncating, misaligning all frames) |
+| D-021 | 2026-04-08 | ACTIVE | E | All VaceControlVideoPrep exit paths must apply tail prepend via _apply_tail() helper |
 
 ### Decision Statuses
 - **ACTIVE** — Currently in effect
@@ -202,6 +204,10 @@
   Outcome: Latent tail tested — domain mismatch confirmed (D-015). Pivoted to tail-as-control-video in VaceControlVideoPrep (D-016). Critical review fixes applied. Mask wiring clarified (D-017).
   Decision: Sampler≠encoder latents (D-015). Tail-as-control-video preferred (D-016). control_masks→VACE only (D-017).
   Next: Clean end-to-end test of tail-as-control-video. Apply stitch fixes. Synthesize known-truths doc.
+- **2026-04-08 | coding**
+  Outcome: Stitch fixes applied (validation+VRAM+try/except). CropColorFix hard-fail on mismatch (D-020). VaceControlVideoPrep _apply_tail() on all exits (D-021). Audit doc +153 lines.
+  Decision: Hard-fail > silent truncate (D-020). Consistent tail prepend (D-021).
+  Next: Clean e2e test of tail-as-control-video. Runtime test Kling chunking.
 
 ### F. Kling API Chunking
 **Current state:** ACTIVE — chunk mode built + code-reviewed, awaiting runtime test
@@ -226,6 +232,7 @@
 - **2026-04-05/06:** NV_SeamAnalyzer + latent tail input built. PIPELINE_KNOWN_TRUTHS.md created. 3 multi-AI debate rounds on chunk seam architecture. Committed noise (Jan 2026) and reference_latents confirmed as dead ends for WAN.
 - **2026-04-07:** Latent tail domain mismatch confirmed (sampler≠encoder). Pivoted to tail-as-control-video (VaceControlVideoPrep). Mask wiring rules formalized (D-017).
 - **2026-04-07:** NV_KlingUploadPreview gains sequential chunk mode (auto-truncate + tail-frame refs). KlingStitchAdapter deprecated.
+- **2026-04-08:** Stitch crash fixes applied (validation+VRAM+debug). CropColorFix hard-fail on mismatch. VaceControlVideoPrep tail consistency fix. VACE_INPAINT_NODE_AUDIT.md addendum (+153 lines, 5 sections).
 
 ## Archived Workstreams Index
 <!-- Pointers to workstreams moved to ARCHIVE.md. -->

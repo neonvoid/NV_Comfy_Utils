@@ -524,8 +524,12 @@ class NV_KlingUploadPreview(IO.ComfyNode):
         slots = [image_1, image_2, image_3, image_4]
         aliases = [alias_1, alias_2, alias_3, alias_4]
         connected = [img is not None for img in slots]
+        # The last tail frame (highest index in auto_filled_slots) is closest to
+        # this chunk's start — tag it as "first_frame" so Kling anchors continuity.
+        last_tail_slot = max(auto_filled_slots) if auto_filled_slots else None
 
         ref_frames = []
+        ref_frame_types: list[str | None] = []  # parallel to ref_frames: OmniParamImage.type
         tag_map = []
         for i, (img, alias) in enumerate(zip(slots, aliases), 1):
             if img is not None:
@@ -534,12 +538,20 @@ class NV_KlingUploadPreview(IO.ComfyNode):
                 frame = _ensure_min_size(frame, min_px=_KLING_REF_MIN_PX)
                 new_h, new_w = frame.shape[1], frame.shape[2]
 
-                label = f' "{alias.strip()}"' if alias and alias.strip() else ""
-                if (new_h, new_w) != (orig_h, orig_w):
-                    tag_map.append(f"  @image{i}{label} → {orig_w}x{orig_h} (upscaled to {new_w}x{new_h})")
+                # Determine OmniParamImage.type for this ref
+                if i == last_tail_slot:
+                    frame_type = "first_frame"
                 else:
-                    tag_map.append(f"  @image{i}{label} → {orig_w}x{orig_h}")
+                    frame_type = None
+
+                label = f' "{alias.strip()}"' if alias and alias.strip() else ""
+                type_tag = f" [type={frame_type}]" if frame_type else ""
+                if (new_h, new_w) != (orig_h, orig_w):
+                    tag_map.append(f"  @image{i}{label} → {orig_w}x{orig_h} (upscaled to {new_w}x{new_h}){type_tag}")
+                else:
+                    tag_map.append(f"  @image{i}{label} → {orig_w}x{orig_h}{type_tag}")
                 ref_frames.append(frame)
+                ref_frame_types.append(frame_type)
 
         num_ref = len(ref_frames)
         if ref_frames:
@@ -630,6 +642,7 @@ class NV_KlingUploadPreview(IO.ComfyNode):
             "api_aspect_ratio": api_aspect,
             "num_ref_images": num_ref,
             "ref_frames": ref_frames,  # original tensors at native resolution
+            "ref_frame_types": ref_frame_types,  # parallel list: OmniParamImage.type per ref
             "input_resolution": (input_w, input_h),  # pre-Kling-fit crop resolution
             "original_num_frames": original_num_frames,  # pre-padding count for trim
         }
@@ -832,11 +845,15 @@ class NV_KlingEditVideo(IO.ComfyNode):
         # --- upload reference images (from config, native resolution each) ---
         image_list: list[OmniParamImage] = []
         ref_frames = upload_config.get("ref_frames", [])
-        for ref_frame in ref_frames:
+        ref_frame_types = upload_config.get("ref_frame_types")
+        if not isinstance(ref_frame_types, list):
+            ref_frame_types = [None] * len(ref_frames)
+        for idx, ref_frame in enumerate(ref_frames):
+            frame_type = ref_frame_types[idx] if idx < len(ref_frame_types) else None
             for url in await upload_images_to_comfyapi(
                 cls, ref_frame, wait_label="Uploading reference image"
             ):
-                image_list.append(OmniParamImage(image_url=url))
+                image_list.append(OmniParamImage(image_url=url, type=frame_type))
 
         # --- upload video ---
         upload_label = "Uploading reference video" if is_feature else "Uploading base video"
