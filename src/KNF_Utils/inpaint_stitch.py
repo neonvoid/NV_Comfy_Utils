@@ -306,7 +306,8 @@ class NV_InpaintStitch:
         intermediate = comfy.model_management.intermediate_device()
         resize_algorithm = _get_resize_algorithm(stitcher)
 
-        skipped_indices = set(stitcher.get('skipped_indices', []))
+        skipped_indices_raw = stitcher.get('skipped_indices', [])
+        skipped_indices = set(skipped_indices_raw)
         original_frames = stitcher.get('original_frames', [])
         total_frames = stitcher.get('total_frames', inpainted_image.shape[0])
 
@@ -314,82 +315,102 @@ class NV_InpaintStitch:
         content_warp_mode = stitcher.get('content_warp_mode', None)
         content_warp_data = stitcher.get('content_warp_data', None)
 
+        # Detect single_stitcher mode (one coordinate set broadcast across batch)
+        num_coords = len(stitcher.get('cropped_to_canvas_x', []))
+        batch_size = inpainted_image.shape[0]
+        single_stitcher = (num_coords == 1 and batch_size > 1)
+
+        # --- Entry debug logging ---
+        print(f"[NV_InpaintStitch] Starting: {batch_size} inpainted frames, "
+              f"total_frames={total_frames}, skipped={len(skipped_indices)}, "
+              f"coords={num_coords}, single_stitcher={single_stitcher}, "
+              f"warp={content_warp_mode or 'none'}, blend={blend_mode}")
+        print(f"[NV_InpaintStitch]   inpainted shape: {list(inpainted_image.shape)}, "
+              f"canvas count: {len(stitcher.get('canvas_image', []))}, "
+              f"warp_data: {len(content_warp_data) if content_warp_data else 0} entries")
+
+        # --- Frame count validation ---
+        # Prevents silent overrun when upstream changes frame count (e.g., tail prepend,
+        # WAN 4k+1 snapping, trim mismatch). Without this, the loop walks past the end
+        # of inpainted_image and produces empty [0,H,W,C] slices that crash.
+        expected_inpainted = total_frames - len(skipped_indices)
+
+        if not single_stitcher and batch_size != expected_inpainted:
+            # Build detailed diagnostic
+            diag = (
+                f"[NV_InpaintStitch] FRAME MISMATCH!\n"
+                f"  Expected {expected_inpainted} inpainted frames "
+                f"(total_frames={total_frames} - skipped={len(skipped_indices)})\n"
+                f"  Received {batch_size} frames, shape={list(inpainted_image.shape)}\n"
+                f"  Stitcher metadata: canvas_images={len(stitcher.get('canvas_image', []))}, "
+                f"coordinates={num_coords}, "
+                f"masks={len(stitcher.get('cropped_mask_for_blend', []))}, "
+                f"warp_entries={len(content_warp_data) if content_warp_data else 0}\n"
+                f"  Check: was tail_trim applied? Did WAN snap frame count (4k+1 rule)?"
+            )
+            print(diag)
+            raise ValueError(diag)
+
+        # --- Metadata length validation ---
+        if not single_stitcher and len(skipped_indices) == 0:
+            # Validate all coordinate arrays match expected count
+            for key in ['canvas_image', 'cropped_mask_for_blend',
+                        'cropped_to_canvas_x', 'cropped_to_canvas_y',
+                        'cropped_to_canvas_w', 'cropped_to_canvas_h',
+                        'canvas_to_orig_x', 'canvas_to_orig_y',
+                        'canvas_to_orig_w', 'canvas_to_orig_h']:
+                arr = stitcher.get(key, [])
+                if len(arr) != expected_inpainted and len(arr) != 1:
+                    raise ValueError(
+                        f"[NV_InpaintStitch] Metadata length mismatch: "
+                        f"stitcher['{key}'] has {len(arr)} entries, "
+                        f"expected {expected_inpainted} (or 1 for broadcast)")
+            if content_warp_data and len(content_warp_data) < expected_inpainted:
+                raise ValueError(
+                    f"[NV_InpaintStitch] Warp data mismatch: "
+                    f"{len(content_warp_data)} warp entries for {expected_inpainted} frames")
+
+        # --- Reclaim VRAM before full-res stitch operations ---
+        if torch.cuda.is_available():
+            gc.collect()
+            torch.cuda.empty_cache()
+
         results = []
         mask_results = []
 
         if len(skipped_indices) == 0:
             # Simple path: all frames were inpainted
-            batch_size = inpainted_image.shape[0]
-            num_coords = len(stitcher['cropped_to_canvas_x'])
-            single_stitcher = (num_coords == 1 and batch_size > 1)
-
             for b in range(batch_size):
                 idx = 0 if single_stitcher else b
                 warp_entry = content_warp_data[idx] if (content_warp_data and not single_stitcher) else None
-                # Clone canvas to prevent in-place mutation from accumulating across frames
-                # (single_stitcher reuses idx=0 for every frame)
-                canvas = stitcher['canvas_image'][idx].to(device).clone()
-                out, final_mask = stitch_single_frame(
-                    canvas,
-                    inpainted_image[b:b+1].to(device),
-                    stitcher['cropped_mask_for_blend'][idx].to(device),
-                    stitcher['cropped_to_canvas_x'][idx],
-                    stitcher['cropped_to_canvas_y'][idx],
-                    stitcher['cropped_to_canvas_w'][idx],
-                    stitcher['cropped_to_canvas_h'][idx],
-                    stitcher['canvas_to_orig_x'][idx],
-                    stitcher['canvas_to_orig_y'][idx],
-                    stitcher['canvas_to_orig_w'][idx],
-                    stitcher['canvas_to_orig_h'][idx],
-                    resize_algorithm,
-                    warp_mode=content_warp_mode,
-                    warp_entry=warp_entry,
-                    blend_mode=blend_mode,
-                    multiband_levels=multiband_levels,
-                    guided_refine=guided_refine,
-                    guided_radius=guided_radius,
-                    guided_eps=guided_eps,
-                    guided_strength=guided_strength,
-                )
-                results.append(out.squeeze(0).to(intermediate))
-                sm = _build_stitch_mask(
-                    final_mask,
-                    stitcher['cropped_to_canvas_x'][idx], stitcher['cropped_to_canvas_y'][idx],
-                    stitcher['cropped_to_canvas_w'][idx], stitcher['cropped_to_canvas_h'][idx],
-                    stitcher['canvas_to_orig_x'][idx], stitcher['canvas_to_orig_y'][idx],
-                    stitcher['canvas_to_orig_w'][idx], stitcher['canvas_to_orig_h'][idx],
-                    resize_algorithm,
-                )
-                mask_results.append(sm.to(intermediate))
 
-                # Periodic GPU cleanup to prevent VRAM fragmentation on long sequences
-                if (b + 1) % 32 == 0:
-                    torch.cuda.empty_cache()
-        else:
-            # Reconstruct full batch with skipped frames reinserted
-            inpainted_idx = 0
-            original_idx = 0
+                # Debug logging: first frame, every 20th, and last frame
+                if b == 0 or (b + 1) % 20 == 0 or b == batch_size - 1:
+                    ctc_w = stitcher['cropped_to_canvas_w'][idx]
+                    ctc_h = stitcher['cropped_to_canvas_h'][idx]
+                    warp_info = "none"
+                    if warp_entry and content_warp_mode == "centroid":
+                        warp_info = f"centroid(dx={warp_entry.get('dx', 0):.1f},dy={warp_entry.get('dy', 0):.1f})"
+                    elif warp_entry and content_warp_mode == "optical_flow":
+                        warp_info = "optical_flow"
+                    print(f"[NV_InpaintStitch] Frame {b}/{batch_size}: "
+                          f"crop=({ctc_w}x{ctc_h}), warp={warp_info}")
 
-            for frame_idx in range(total_frames):
-                if frame_idx in skipped_indices:
-                    orig = original_frames[original_idx].to(intermediate)
-                    results.append(orig)
-                    mask_results.append(torch.zeros(orig.shape[0], orig.shape[1], device=intermediate))
-                    original_idx += 1
-                else:
-                    warp_entry = content_warp_data[inpainted_idx] if content_warp_data else None
+                try:
+                    # Clone canvas to prevent in-place mutation from accumulating across frames
+                    canvas = stitcher['canvas_image'][idx].to(device).clone()
                     out, final_mask = stitch_single_frame(
-                        stitcher['canvas_image'][inpainted_idx].to(device),
-                        inpainted_image[inpainted_idx:inpainted_idx+1].to(device),
-                        stitcher['cropped_mask_for_blend'][inpainted_idx].to(device),
-                        stitcher['cropped_to_canvas_x'][inpainted_idx],
-                        stitcher['cropped_to_canvas_y'][inpainted_idx],
-                        stitcher['cropped_to_canvas_w'][inpainted_idx],
-                        stitcher['cropped_to_canvas_h'][inpainted_idx],
-                        stitcher['canvas_to_orig_x'][inpainted_idx],
-                        stitcher['canvas_to_orig_y'][inpainted_idx],
-                        stitcher['canvas_to_orig_w'][inpainted_idx],
-                        stitcher['canvas_to_orig_h'][inpainted_idx],
+                        canvas,
+                        inpainted_image[b:b+1].to(device),
+                        stitcher['cropped_mask_for_blend'][idx].to(device),
+                        stitcher['cropped_to_canvas_x'][idx],
+                        stitcher['cropped_to_canvas_y'][idx],
+                        stitcher['cropped_to_canvas_w'][idx],
+                        stitcher['cropped_to_canvas_h'][idx],
+                        stitcher['canvas_to_orig_x'][idx],
+                        stitcher['canvas_to_orig_y'][idx],
+                        stitcher['canvas_to_orig_w'][idx],
+                        stitcher['canvas_to_orig_h'][idx],
                         resize_algorithm,
                         warp_mode=content_warp_mode,
                         warp_entry=warp_entry,
@@ -403,13 +424,94 @@ class NV_InpaintStitch:
                     results.append(out.squeeze(0).to(intermediate))
                     sm = _build_stitch_mask(
                         final_mask,
-                        stitcher['cropped_to_canvas_x'][inpainted_idx], stitcher['cropped_to_canvas_y'][inpainted_idx],
-                        stitcher['cropped_to_canvas_w'][inpainted_idx], stitcher['cropped_to_canvas_h'][inpainted_idx],
-                        stitcher['canvas_to_orig_x'][inpainted_idx], stitcher['canvas_to_orig_y'][inpainted_idx],
-                        stitcher['canvas_to_orig_w'][inpainted_idx], stitcher['canvas_to_orig_h'][inpainted_idx],
+                        stitcher['cropped_to_canvas_x'][idx], stitcher['cropped_to_canvas_y'][idx],
+                        stitcher['cropped_to_canvas_w'][idx], stitcher['cropped_to_canvas_h'][idx],
+                        stitcher['canvas_to_orig_x'][idx], stitcher['canvas_to_orig_y'][idx],
+                        stitcher['canvas_to_orig_w'][idx], stitcher['canvas_to_orig_h'][idx],
                         resize_algorithm,
                     )
                     mask_results.append(sm.to(intermediate))
+                except Exception as e:
+                    inp_shape = list(inpainted_image[b:b+1].shape)
+                    raise RuntimeError(
+                        f"[NV_InpaintStitch] FAILED at frame {b}/{batch_size} "
+                        f"(idx={idx}, single_stitcher={single_stitcher}): "
+                        f"inpainted_slice={inp_shape}, "
+                        f"crop=({stitcher['cropped_to_canvas_w'][idx]}x{stitcher['cropped_to_canvas_h'][idx]}), "
+                        f"warp={content_warp_mode}. Error: {e}"
+                    ) from e
+
+                # Periodic GPU cleanup to prevent VRAM fragmentation on long sequences
+                if (b + 1) % 32 == 0:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+        else:
+            # Reconstruct full batch with skipped frames reinserted
+            inpainted_idx = 0
+            original_idx = 0
+
+            for frame_idx in range(total_frames):
+                if frame_idx in skipped_indices:
+                    orig = original_frames[original_idx].to(intermediate)
+                    results.append(orig)
+                    mask_results.append(torch.zeros(orig.shape[0], orig.shape[1], device=intermediate))
+                    original_idx += 1
+                else:
+                    warp_entry = content_warp_data[inpainted_idx] if content_warp_data else None
+
+                    # Debug logging: first, every 20th, last
+                    if inpainted_idx == 0 or (inpainted_idx + 1) % 20 == 0 or frame_idx == total_frames - 1:
+                        ctc_w = stitcher['cropped_to_canvas_w'][inpainted_idx]
+                        ctc_h = stitcher['cropped_to_canvas_h'][inpainted_idx]
+                        print(f"[NV_InpaintStitch] Frame {frame_idx}/{total_frames} "
+                              f"(inpainted_idx={inpainted_idx}): crop=({ctc_w}x{ctc_h})")
+
+                    try:
+                        # Clone canvas in skip path too (consistency with no-skip path)
+                        canvas = stitcher['canvas_image'][inpainted_idx].to(device).clone()
+                        out, final_mask = stitch_single_frame(
+                            canvas,
+                            inpainted_image[inpainted_idx:inpainted_idx+1].to(device),
+                            stitcher['cropped_mask_for_blend'][inpainted_idx].to(device),
+                            stitcher['cropped_to_canvas_x'][inpainted_idx],
+                            stitcher['cropped_to_canvas_y'][inpainted_idx],
+                            stitcher['cropped_to_canvas_w'][inpainted_idx],
+                            stitcher['cropped_to_canvas_h'][inpainted_idx],
+                            stitcher['canvas_to_orig_x'][inpainted_idx],
+                            stitcher['canvas_to_orig_y'][inpainted_idx],
+                            stitcher['canvas_to_orig_w'][inpainted_idx],
+                            stitcher['canvas_to_orig_h'][inpainted_idx],
+                            resize_algorithm,
+                            warp_mode=content_warp_mode,
+                            warp_entry=warp_entry,
+                            blend_mode=blend_mode,
+                            multiband_levels=multiband_levels,
+                            guided_refine=guided_refine,
+                            guided_radius=guided_radius,
+                            guided_eps=guided_eps,
+                            guided_strength=guided_strength,
+                        )
+                        results.append(out.squeeze(0).to(intermediate))
+                        sm = _build_stitch_mask(
+                            final_mask,
+                            stitcher['cropped_to_canvas_x'][inpainted_idx], stitcher['cropped_to_canvas_y'][inpainted_idx],
+                            stitcher['cropped_to_canvas_w'][inpainted_idx], stitcher['cropped_to_canvas_h'][inpainted_idx],
+                            stitcher['canvas_to_orig_x'][inpainted_idx], stitcher['canvas_to_orig_y'][inpainted_idx],
+                            stitcher['canvas_to_orig_w'][inpainted_idx], stitcher['canvas_to_orig_h'][inpainted_idx],
+                            resize_algorithm,
+                        )
+                        mask_results.append(sm.to(intermediate))
+                    except Exception as e:
+                        inp_shape = list(inpainted_image[inpainted_idx:inpainted_idx+1].shape)
+                        raise RuntimeError(
+                            f"[NV_InpaintStitch] FAILED at frame_idx={frame_idx}/{total_frames} "
+                            f"(inpainted_idx={inpainted_idx}/{batch_size}): "
+                            f"inpainted_slice={inp_shape}, "
+                            f"crop=({stitcher['cropped_to_canvas_w'][inpainted_idx]}x"
+                            f"{stitcher['cropped_to_canvas_h'][inpainted_idx]}), "
+                            f"warp={content_warp_mode}. Error: {e}"
+                        ) from e
+
                     inpainted_idx += 1
 
         result_batch = torch.stack(results, dim=0)
@@ -418,10 +520,11 @@ class NV_InpaintStitch:
         # Free intermediate lists + reclaim GPU memory before returning
         del results, mask_results
         gc.collect()
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         print(f"[NV_InpaintStitch] Stitched {result_batch.shape[0]} frames "
-              f"({len(skipped_indices)} skipped, {inpainted_image.shape[0]} inpainted, "
+              f"({len(skipped_indices)} skipped, {batch_size} inpainted, "
               f"blend={blend_mode})")
 
         return (result_batch, stitch_mask_batch)
