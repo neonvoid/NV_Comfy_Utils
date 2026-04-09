@@ -28,6 +28,8 @@ from pathlib import Path
 
 import folder_paths
 
+from .api_keys import resolve_api_key
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -346,30 +348,7 @@ def _get_mime_type(file_path):
     return _MIME_MAP.get(ext, "application/octet-stream")
 
 
-def _resolve_api_key(api_key, provider="gemini"):
-    """Resolve API key from input or environment variables.
-
-    Args:
-        api_key: Explicit key from node input (takes priority).
-        provider: "gemini" or "openrouter" — determines which env vars to check.
-    """
-    if api_key and api_key.strip():
-        return api_key.strip()
-    if provider == "openrouter":
-        for var in ("OPENROUTER_API_KEY",):
-            val = os.environ.get(var)
-            if val:
-                return val.strip()
-        raise RuntimeError(
-            "No API key for OpenRouter. Set the api_key input or OPENROUTER_API_KEY env var."
-        )
-    for var in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
-        val = os.environ.get(var)
-        if val:
-            return val.strip()
-    raise RuntimeError(
-        "No API key provided. Set the api_key input, or GEMINI_API_KEY / GOOGLE_API_KEY env var."
-    )
+# _resolve_api_key removed — now imported from .api_keys
 
 
 # ---------------------------------------------------------------------------
@@ -813,8 +792,7 @@ class NV_GeminiVideoExtractor:
             "optional": {
                 "api_key": ("STRING", {
                     "default": "",
-                    "tooltip": "Gemini API key from AI Studio. Leave empty to use "
-                               "GEMINI_API_KEY or GOOGLE_API_KEY env vars.",
+                    "tooltip": "Optional. Leave blank to use GEMINI_API_KEY / GOOGLE_API_KEY from environment or .env file.",
                 }),
                 "model": (["gemini-2.5-pro", "gemini-2.5-flash", "gemini-3-pro-preview", "gemini-3.1-pro-preview", "gemini-3-flash-preview", "gemini-2.0-flash"], {
                     "default": "gemini-2.5-pro",
@@ -871,7 +849,7 @@ class NV_GeminiVideoExtractor:
     def extract(self, video_path, api_key="", model="gemini-2.5-pro",
                 media_resolution="default", skip_existing=True, output_dir="",
                 prompt_override="", max_tokens=16384, trigger=None):
-        api_key = _resolve_api_key(api_key)
+        api_key = resolve_api_key(api_key)
 
         # Validate video path
         video_path = video_path.strip()
@@ -1029,9 +1007,7 @@ class NV_GeminiCourseSynthesizer:
             "optional": {
                 "api_key": ("STRING", {
                     "default": "",
-                    "tooltip": "API key. For Gemini models: GEMINI_API_KEY env var. "
-                               "For OpenRouter models (anthropic/, openai/, etc.): "
-                               "OPENROUTER_API_KEY env var. Or paste directly.",
+                    "tooltip": "Optional. Leave blank to use GEMINI_API_KEY / GOOGLE_API_KEY (Gemini) or OPENROUTER_API_KEY (OpenRouter) from environment or .env file.",
                 }),
                 "model": (_SYNTHESIS_MODELS, {
                     "default": "gemini-2.5-pro",
@@ -1088,13 +1064,13 @@ class NV_GeminiCourseSynthesizer:
     def _call_model(self, model_name, api_key, prompt, sys_instr, max_tokens):
         """Route a synthesis call to the right provider. Returns (text, usage_meta)."""
         if _is_openrouter_model(model_name):
-            resolved_key = _resolve_api_key(api_key, "openrouter")
+            resolved_key = resolve_api_key(api_key, "openrouter")
             return _call_openrouter(
                 api_key=resolved_key, model=model_name, prompt=prompt,
                 system_instruction=sys_instr, temperature=0.7, max_tokens=max_tokens,
             )
         else:
-            resolved_key = _resolve_api_key(api_key, "gemini")
+            resolved_key = resolve_api_key(api_key, "gemini")
             return _generate_content(
                 api_key=resolved_key, model=model_name,
                 contents=[{"text": prompt}],
@@ -1270,8 +1246,7 @@ class NV_GeminiBatchExtractor:
             "optional": {
                 "api_key": ("STRING", {
                     "default": "",
-                    "tooltip": "Gemini API key. Leave empty to use "
-                               "GEMINI_API_KEY or GOOGLE_API_KEY env vars.",
+                    "tooltip": "Optional. Leave blank to use GEMINI_API_KEY / GOOGLE_API_KEY from environment or .env file.",
                 }),
                 "model": (["gemini-2.5-pro", "gemini-2.5-flash", "gemini-3-pro-preview", "gemini-3.1-pro-preview", "gemini-3-flash-preview", "gemini-2.0-flash"], {
                     "default": "gemini-2.5-pro",
@@ -1406,7 +1381,7 @@ class NV_GeminiBatchExtractor:
             return (json.dumps(summary, indent=2, ensure_ascii=False), output_dir, 0)
 
         # --- EXTRACTION MODE ---
-        api_key = _resolve_api_key(api_key)
+        api_key = resolve_api_key(api_key)
         os.makedirs(output_dir, exist_ok=True)
 
         print(f"\n{'=' * 60}")

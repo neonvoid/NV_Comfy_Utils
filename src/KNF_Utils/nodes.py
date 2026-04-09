@@ -23,6 +23,7 @@ import platform
 from .vace_context_window import NV_VACEContextWindowPatcher
 # Import multi-model sampler
 from .multi_model_sampler import NV_MultiModelSampler
+from .api_keys import resolve_api_key
 # Import streaming VAE decode for long videos
 from .streaming_vae_decode import NV_StreamingVAEDecode
 # Import streaming VAE encode for long videos (frees GPU before WAN model loading)
@@ -152,7 +153,7 @@ class GeminiVideoCaptioner:
         return {
             "required": {
                 "prompt_text": ("STRING", {"multiline": True, "default": "Describe this video in detail."}),
-                "api_key": ("STRING", {"default": ""}),
+                "api_key": ("STRING", {"default": "", "tooltip": "Optional. Leave blank to use GEMINI_API_KEY / GOOGLE_API_KEY (Gemini) or OPENROUTER_API_KEY (OpenRouter) from environment or .env file."}),
                 "provider": (["Gemini", "OpenRouter"], {"default": "Gemini"}),
                 "model": ([
                     # Gemini models (works with both providers - auto-prefixed for OpenRouter)
@@ -359,8 +360,8 @@ class GeminiVideoCaptioner:
         if use_cached_prompt and not _LAST_VALID_CAPTION:
             print("No cached prompt available, calling API...")
 
-        if not api_key:
-            raise RuntimeError("API key is required")
+        env_provider = "openrouter" if provider == "OpenRouter" else "gemini"
+        api_key = resolve_api_key(api_key, provider=env_provider)
         
         file_path = None
         is_temp_file = False

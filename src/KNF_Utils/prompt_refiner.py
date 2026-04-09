@@ -22,6 +22,8 @@ import requests
 
 import folder_paths
 
+from .api_keys import resolve_api_key
+
 
 # ---------------------------------------------------------------------------
 # Conversation state (persists across ComfyUI re-executions)
@@ -372,17 +374,20 @@ _MODEL_LIST = [
     "gemini-3-flash-preview",
     "gemini-3-pro-preview",
     "gemini-3.1-pro-preview",
-    # OpenRouter text models
-    "anthropic/claude-sonnet-4",
-    "anthropic/claude-haiku-4",
-    "openai/gpt-4o",
-    "openai/gpt-4o-mini",
-    "meta-llama/llama-3.3-70b-instruct",
-    "google/gemini-2.5-pro",
-    "google/gemini-2.5-flash",
-    # OpenRouter vision models (for use with media inputs)
-    "qwen/qwen2.5-vl-72b-instruct",
-    "meta-llama/llama-3.2-90b-vision-instruct",
+    # OpenRouter text+image models
+    "anthropic/claude-opus-4.6",
+    "anthropic/claude-sonnet-4.6",
+    "openai/gpt-5.4",
+    "openai/gpt-5.4-mini",
+    "openai/gpt-5.4-nano",
+    # OpenRouter vision+video models (Gemini and Qwen support video input)
+    "google/gemini-3.1-pro-preview",
+    "google/gemini-3-flash-preview",
+    "google/gemini-3.1-flash-lite-preview",
+    "qwen/qwen3.6-plus",
+    "qwen/qwen3.5-122b-a10b",
+    "qwen/qwen3.5-27b",
+    "qwen/qwen3.5-flash-02-23",
 ]
 
 
@@ -667,7 +672,7 @@ class NV_PromptRefiner:
                 }),
                 "api_key": ("STRING", {
                     "default": "",
-                    "tooltip": "API key for Gemini (direct) or OpenRouter."
+                    "tooltip": "Optional. Leave blank to use GEMINI_API_KEY / GOOGLE_API_KEY (Gemini) or OPENROUTER_API_KEY (OpenRouter) from environment or .env file."
                 }),
                 "provider": (["Gemini", "OpenRouter"], {
                     "default": "Gemini",
@@ -843,9 +848,13 @@ class NV_PromptRefiner:
             return (initial_prompt, system_instruction,
                     "(no instruction — passing through initial prompt)",
                     "Pass-through: no user_instruction provided")
-        if not api_key:
+        # Resolve API key from input / env / .env
+        env_provider = "openrouter" if provider == "OpenRouter" else "gemini"
+        try:
+            api_key = resolve_api_key(api_key, provider=env_provider)
+        except RuntimeError as e:
             return ("(no API key)", system_instruction,
-                    "(no conversation)", "Error: api_key is empty")
+                    "(no conversation)", f"Error: {e}")
 
         # --- Prepare all media (primary + refs, with caching) ---
         media_list = []

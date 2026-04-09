@@ -854,6 +854,7 @@ class NV_KlingEditVideo(IO.ComfyNode):
                 cls, ref_frame, wait_label="Uploading reference image"
             ):
                 image_list.append(OmniParamImage(image_url=url, type=frame_type))
+                print(f"[NV_KlingEditVideo] Ref image {idx + 1}: type={frame_type!r}, url=...{url[-40:]}")
 
         # --- upload video ---
         upload_label = "Uploading reference video" if is_feature else "Uploading base video"
@@ -878,6 +879,12 @@ class NV_KlingEditVideo(IO.ComfyNode):
             sound=api_sound,
         )
 
+        # --- debug: log the image_list types being sent ---
+        type_summary = [f"@image{i+1}:type={img.type!r}" for i, img in enumerate(image_list)]
+        print(f"[NV_KlingEditVideo] image_list types → [{', '.join(type_summary) or 'empty'}]")
+        print(f"[NV_KlingEditVideo] video_list → refer_type={api_refer_type!r}, "
+              f"has_video={bool(video_list)}, has_images={bool(image_list)}")
+
         t_submit = time.time()
 
         # --- submit ---
@@ -887,6 +894,11 @@ class NV_KlingEditVideo(IO.ComfyNode):
             response_model=TaskStatusResponse,
             data=request_data,
         )
+
+        # --- debug: log raw API response ---
+        print(f"[NV_KlingEditVideo] API response → code={response.code!r}, "
+              f"message={response.message!r}, "
+              f"task_status={response.data.task_status if response.data else 'N/A'}")
 
         if response.code:
             raise RuntimeError(

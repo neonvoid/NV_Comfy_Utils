@@ -1,18 +1,31 @@
 # Status Board — NV_Comfy_Utils
 
 > Auto-managed by `/handoff`. Content is never deleted — old entries move to ARCHIVE.md.
-> Last updated: 2026-04-08
+> Last updated: 2026-04-09
 
 ## Resume Context
 <!-- Rewritten each `/handoff` run. What does a cold-start agent need RIGHT NOW? -->
 
-- **Current focus:** Clean end-to-end test of tail-as-control-video (VaceControlVideoPrep). Runtime test Kling sequential chunk mode on >10s video. Correct mask wiring per D-017.
-- **Critical files:** `src/KNF_Utils/vace_control_video_prep.py`, `src/KNF_Utils/inpaint_stitch.py`, `src/KNF_Utils/crop_color_fix.py`, `node_notes/guides/VACE_INPAINT_NODE_AUDIT.md`
-- **Known blockers:** None — stitch fixes applied, CropColorFix validation added.
-- **Environment notes:** 2 uncommitted files (crop_color_fix.py, vace_control_video_prep.py). Known-truths deep-dive at `~/.multi-ai/research/20260406-155057/` still needs synthesis.
+- **Current focus:** Runtime test Kling sequential chunking with type="first_frame" hints. Verify API accepts type= alongside video input. Clean test of tail-as-control-video (VaceControlVideoPrep).
+- **Critical files:** `src/KNF_Utils/kling_edit_fork.py`, `src/KNF_Utils/vace_control_video_prep.py`, `node_notes/guides/VACE_INPAINT_NODE_AUDIT.md`
+- **Known blockers:** None — if API rejects type="first_frame" with video, revert to type=None (one-line change).
+- **Environment notes:** 2 uncommitted files (kling_edit_fork.py, prompt_refiner.py). Debug logging active in NV_KlingEditVideo — watch console for `[NV_KlingEditVideo] image_list types →` and `API response →` lines.
 
 ## Pulse
 <!-- Last 2 session summaries, newest first. Older entries roll to Workstream Details. -->
+
+### 2026-04-09 — Kling OmniParamImage.type hints + multi-AI review [coding]
+- **Done:**
+  - Researched full Kling Omni API surface for mask/region support — confirmed no mask parameter exists
+  - Discovered `OmniParamImage.type` field ("first_frame"/"end_frame") — used by built-in I2V node but never sent by edit/V2V nodes
+  - Implemented type hints on tail ref images in NV_KlingUploadPreview: last tail frame tagged `type="first_frame"` for chunk continuity
+  - Multi-AI review (Codex + Gemini): both approved implementation, flagged API compat as main risk (built-in edit node always sends type=None)
+  - Post-review fixes: removed dead `tail_slot_set` variable, hardened `ref_frame_types` fallback against None values
+  - Added 3 debug log points in NV_KlingEditVideo for runtime validation of type= field acceptance
+  - Updated prompt_refiner.py model list (latest OpenRouter models)
+- **Decisions:** Tag last tail frame as type="first_frame" for chunk-start anchoring (D-022, PROVISIONAL — untested with live API).
+- **Blockers:** None — needs runtime test to confirm API accepts type="first_frame" alongside video input.
+- **Next:** Runtime test chunked Kling with type= hints. If API rejects, strip type back to None when video present.
 
 ### 2026-04-08 — Integration review fixes + audit doc addendum [coding]
 - **Done:**
@@ -25,16 +38,6 @@
 - **Blockers:** None — stitch fixes now applied.
 - **Next:** Clean test of tail-as-control-video with corrected mask wiring. Runtime test Kling sequential chunking.
 
-### 2026-04-07b — Kling sequential chunking + KlingStitchAdapter deprecated [coding]
-- **Done:**
-  - Added sequential chunk mode to NV_KlingUploadPreview: `chunk_mode`, `chunk_start_frame`, `prev_chunk_output`, `tail_ref_count` inputs + `next_chunk_start` output
-  - Auto-truncates long videos to ~10s per chunk (snapped to 8k+1), extracts tail frames from previous chunk as ref images, auto-appends consistency prompt
-  - Deprecated KlingStitchAdapter (unregistered from __init__.py) — Kling edit mode doesn't reliably preserve framing/camera
-  - Multi-AI review (Codex): fixed max_chunk_frames formula (was overshooting by 1 frame at 24fps), collapsed duplicate fps resolution into single source of truth
-- **Decisions:** KlingStitchAdapter deprecated — Kling edit doesn't preserve framing (D-018). No overlap/crossfade between chunks — same framing instability applies (D-019).
-- **Blockers:** None — awaiting runtime test
-- **Next:** Runtime test chunked Kling on a >10s video. Test tail-frame refs actually improve cross-chunk consistency. Consider if chunk_mode should auto-detect (video >10s = auto-enable).
-
 
 ## Active Workstreams
 
@@ -45,7 +48,7 @@
 | C  | Clothing/Bag Swap Pipeline | ACTIVE | 2026-04-08 | Full body + head swap. CropColorFix validation added (D-020). Multi-pass workflow stabilizing. |
 | D  | Real-Time Mask Editor | STAGED | 2026-04-03 | Research complete — PySide6 + cached op graph MVP. Not started. |
 | E  | Chunk Seam Continuity | ACTIVE | 2026-04-08 | Stitch fixes applied. Tail-as-control-video ready for clean test. Audit doc updated (+153 lines). |
-| F  | Kling API Chunking | ACTIVE | 2026-04-07 | Sequential chunk mode built + code-reviewed. KlingStitchAdapter deprecated. Awaiting runtime test. |
+| F  | Kling API Chunking | ACTIVE | 2026-04-09 | type="first_frame" hints on tail refs. Debug logging added. Awaiting runtime test of API acceptance. |
 
 ### Status Tags
 - **ACTIVE** — Currently being worked on
@@ -101,6 +104,7 @@
 | D-019 | 2026-04-07 | ACTIVE | F | No chunk overlap/crossfade — same framing instability that killed stitch makes crossfade produce ghosting |
 | D-020 | 2026-04-08 | ACTIVE | C,E | CropColorFix must hard-fail on original≠generated frame count (was silently truncating, misaligning all frames) |
 | D-021 | 2026-04-08 | ACTIVE | E | All VaceControlVideoPrep exit paths must apply tail prepend via _apply_tail() helper |
+| D-022 | 2026-04-09 | PROVISIONAL | F | Tag last tail ref as type="first_frame" for chunk-start anchoring — API acceptance unverified |
 
 ### Decision Statuses
 - **ACTIVE** — Currently in effect
@@ -210,19 +214,24 @@
   Next: Clean e2e test of tail-as-control-video. Runtime test Kling chunking.
 
 ### F. Kling API Chunking
-**Current state:** ACTIVE — chunk mode built + code-reviewed, awaiting runtime test
+**Current state:** ACTIVE — type hints added + multi-AI reviewed, awaiting runtime test of API acceptance
 **Goal:** Enable Kling API processing for videos >10s via sequential chunking with tail-frame reference continuity
 **Key files:** `kling_edit_fork.py`, `kling_stitch_adapter.py` (deprecated)
 **Active constraints:** No overlap/crossfade (D-019). Max 4 ref images total (API limit). Kling output is standalone — not stitchable (D-018).
 
 **Milestones:**
 - 2026-04-07 — Sequential chunk mode implemented. KlingStitchAdapter deprecated. Multi-AI reviewed.
+- 2026-04-09 — OmniParamImage.type hints implemented. Multi-AI reviewed (Codex+Gemini approved, API compat flagged).
 
 **History:**
 - **2026-04-07 | coding**
   Outcome: Built chunk_mode on UploadPreview (auto-truncate + tail refs + next_chunk_start). Deprecated KlingStitchAdapter. Codex caught max_chunk_frames overshoot bug — fixed.
   Decision: No stitch-back (D-018), no crossfade (D-019). Hard cuts between chunks with ref-image consistency hints.
   Next: Runtime test on >10s video. Evaluate tail-frame ref effectiveness.
+- **2026-04-07b | coding**
+  Outcome: Built chunk_mode on UploadPreview (auto-truncate + tail refs + next_chunk_start). Deprecated KlingStitchAdapter. Codex caught max_chunk_frames bug.
+  Decision: No stitch-back (D-018), no crossfade (D-019).
+  Next: Runtime test >10s video. Evaluate tail-frame ref effectiveness.
 
 ## Global Timeline
 <!-- Thin chronological index of project-wide events. NOT per-workstream progress. -->
