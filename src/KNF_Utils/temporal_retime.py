@@ -12,7 +12,12 @@ Pipeline:
   RetimePrep → GIMM-VFI (external) → rediffuse → RetimeRestore
 """
 
+import json
+import os
+import tempfile
 import torch
+
+import folder_paths
 
 from .chunk_utils import is_wan_aligned
 
@@ -22,12 +27,87 @@ from .chunk_utils import is_wan_aligned
 # ---------------------------------------------------------------------------
 
 def _compute_slowed_frame_count(original: int, factor: int) -> int:
-    """Compute frame count after slowdown: (N-1) * factor + 1.
-
-    This preserves WAN alignment automatically:
-      original = 4k+1  →  slowed = 4*(k*factor) + 1
-    """
+    """Compute frame count after slowdown: (N-1) * factor + 1."""
     return (original - 1) * factor + 1
+
+
+def _default_config_dir():
+    return os.path.join(folder_paths.get_output_directory(), "retime_configs")
+
+
+def _resolve_config_path(path: str) -> str:
+    """Resolve a save/load path to an absolute .json path."""
+    if not path:
+        return ""
+    resolved = path
+    if not os.path.isabs(resolved):
+        resolved = os.path.join(_default_config_dir(), resolved)
+    root, ext = os.path.splitext(resolved)
+    if ext.lower() != ".json":
+        resolved = resolved + ".json"
+    return os.path.normpath(resolved)
+
+
+def _validate_retime_config(config: dict) -> dict:
+    """Validate and normalize config dict. Raises ValueError on bad data."""
+    required_keys = ["original_frame_count", "slowdown_factor", "expected_slowed_count", "source_fps", "target_fps"]
+    missing = [k for k in required_keys if k not in config]
+    if missing:
+        raise ValueError(f"[NV_Retime] Config missing keys: {', '.join(missing)}")
+    try:
+        original = int(config["original_frame_count"])
+        factor = int(config["slowdown_factor"])
+        expected = int(config["expected_slowed_count"])
+        source_fps = float(config["source_fps"])
+        target_fps = float(config["target_fps"])
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"[NV_Retime] Invalid config values: {e}") from e
+    if original < 1:
+        raise ValueError("[NV_Retime] original_frame_count must be >= 1")
+    if factor < 2:
+        raise ValueError("[NV_Retime] slowdown_factor must be >= 2")
+    return {
+        "original_frame_count": original,
+        "slowdown_factor": factor,
+        "expected_slowed_count": expected,
+        "source_fps": source_fps,
+        "target_fps": target_fps,
+    }
+
+
+def _save_config_atomic(config: dict, save_path: str) -> str:
+    """Write config to JSON atomically (temp file + rename)."""
+    resolved = _resolve_config_path(save_path)
+    parent = os.path.dirname(resolved)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".retime_", suffix=".json", dir=parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, resolved)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    return resolved
+
+
+def _load_config(config_path: str) -> dict:
+    """Load and validate config from JSON file."""
+    resolved = _resolve_config_path(config_path)
+    if not os.path.exists(resolved):
+        raise FileNotFoundError(f"[NV_Retime] Config not found: {resolved}")
+    try:
+        with open(resolved, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"[NV_Retime] Invalid JSON at {resolved}: {e}") from e
+    return _validate_retime_config(data)
 
 
 # ---------------------------------------------------------------------------
@@ -60,7 +140,17 @@ class NV_RetimePrep:
                     "min": 1.0,
                     "max": 120.0,
                     "step": 0.1,
-                    "tooltip": "FPS of input video. Target fps = source * factor (GIMM-VFI needs higher target to generate more frames)."
+                    "tooltip": "FPS of input video. Target fps = source * factor."
+                }),
+            },
+            "optional": {
+                "save_path": ("STRING", {
+                    "default": "",
+                    "tooltip": "Save config to JSON. Relative paths resolve to ComfyUI output/retime_configs/. Leave empty to skip."
+                }),
+                "config_only": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Compute and save config only — returns a 1-frame placeholder image. Disconnect downstream image consumers when using this."
                 }),
             },
         }
@@ -69,15 +159,16 @@ class NV_RetimePrep:
     RETURN_NAMES = ("images", "source_fps", "target_fps", "expected_frames", "retime_config")
     FUNCTION = "execute"
     CATEGORY = "NV_Utils/temporal"
-    DESCRIPTION = "Prepare video for slowdown rediffusion. Outputs fps values for an external frame interpolator (e.g. GIMM-VFI) and a config for NV_RetimeRestore."
+    DESCRIPTION = "Prepare video for slowdown rediffusion. Outputs fps values for GIMM-VFI and a config for NV_RetimeRestore."
 
-    def execute(self, images, slowdown_factor, source_fps):
-        original_count = images.shape[0]
+    def execute(self, images, slowdown_factor, source_fps, save_path="", config_only=False):
+        original_count = int(images.shape[0])
+        if original_count < 1:
+            raise ValueError("[NV_RetimePrep] Requires at least 1 input frame")
+
+        slowdown_factor = int(slowdown_factor)
+        source_fps = float(source_fps)
         slowed_count = _compute_slowed_frame_count(original_count, slowdown_factor)
-
-        # To create MORE frames (slowdown), GIMM-VFI needs target_fps > source_fps.
-        # GIMM-VFI formula: output = round((N-1) * target/source) + 1
-        # So target = source * factor gives: round((N-1) * factor) + 1 = slowed_count
         target_fps = source_fps * slowdown_factor
 
         wan_note = ""
@@ -89,13 +180,22 @@ class NV_RetimePrep:
         print(f"[NV_RetimePrep] {original_count} frames @ {source_fps}fps → "
               f"{slowed_count} frames @ {target_fps:.1f}fps ({slowdown_factor}x slowdown){wan_note}")
 
-        config = {
+        config = _validate_retime_config({
             "original_frame_count": original_count,
             "slowdown_factor": slowdown_factor,
             "expected_slowed_count": slowed_count,
             "source_fps": source_fps,
             "target_fps": target_fps,
-        }
+        })
+
+        if save_path:
+            resolved = _save_config_atomic(config, save_path)
+            print(f"[NV_RetimePrep] Config saved to {resolved}")
+
+        if config_only:
+            placeholder = images.new_zeros((1, *images.shape[1:]))
+            print(f"[NV_RetimePrep] Config-only mode — returning 1-frame placeholder")
+            return (placeholder, source_fps, target_fps, slowed_count, config)
 
         return (images, source_fps, target_fps, slowed_count, config)
 
@@ -118,12 +218,19 @@ class NV_RetimeRestore:
                 "images": ("IMAGE", {
                     "tooltip": "Rediffused slowed video frames [B,H,W,C]"
                 }),
-                "retime_config": ("RETIME_CONFIG", {
-                    "tooltip": "Config from NV_RetimePrep"
-                }),
                 "method": (["select", "blend"], {
                     "default": "select",
-                    "tooltip": "select: pick every Nth frame (sharp). blend: weighted average of neighbors (smooth, handles count mismatches)."
+                    "tooltip": "select: pick every Nth frame (sharp). blend: weighted average of neighbors (smooth)."
+                }),
+            },
+            "optional": {
+                "retime_config": ("RETIME_CONFIG", {
+                    "forceInput": True,
+                    "tooltip": "Config from NV_RetimePrep (direct connection)"
+                }),
+                "config_path": ("STRING", {
+                    "default": "",
+                    "tooltip": "Load config from JSON file. Same filename used in RetimePrep save_path. Ignored if retime_config is connected."
                 }),
             },
         }
@@ -134,15 +241,24 @@ class NV_RetimeRestore:
     CATEGORY = "NV_Utils/temporal"
     DESCRIPTION = "Restore original frame timing from a rediffused slow video. Pair with NV_RetimePrep."
 
-    def execute(self, images, retime_config, method):
+    def execute(self, images, method, retime_config=None, config_path=""):
+        available = int(images.shape[0])
+        if available < 1:
+            raise ValueError("[NV_RetimeRestore] Requires at least 1 input frame")
+
+        if retime_config is not None:
+            retime_config = _validate_retime_config(retime_config)
+        elif config_path:
+            retime_config = _load_config(config_path)
+        else:
+            raise ValueError("[NV_RetimeRestore] Either connect retime_config or provide a config_path")
+
         factor = retime_config["slowdown_factor"]
         original_count = retime_config["original_frame_count"]
         expected = retime_config["expected_slowed_count"]
-        available = images.shape[0]
 
         if available != expected:
-            print(f"[NV_RetimeRestore] WARNING: expected {expected} slowed frames but got {available} "
-                  f"(GIMM-VFI rounding). Using proportional mapping.")
+            print(f"[NV_RetimeRestore] WARNING: expected {expected} slowed frames but got {available}. Using proportional mapping.")
 
         if method == "select":
             output = self._select_frames(images, original_count, available)
@@ -156,11 +272,7 @@ class NV_RetimeRestore:
 
     @staticmethod
     def _select_frames(images, original_count, available):
-        """Pick evenly-spaced frames using proportional mapping.
-
-        Maps original frame i to slowed frame position proportionally,
-        handling any count mismatch from interpolator rounding.
-        """
+        """Pick evenly-spaced frames using proportional mapping."""
         if original_count == 1:
             return images[0:1]
         step = (available - 1) / (original_count - 1)
@@ -169,11 +281,7 @@ class NV_RetimeRestore:
 
     @staticmethod
     def _blend_frames(images, original_count, available):
-        """Weighted average of two nearest source frames for each target position.
-
-        Uses proportional positioning so it handles any slowed frame count,
-        not just exact multiples.
-        """
+        """Weighted average of two nearest source frames for each target position."""
         if original_count == 1:
             return images[0:1]
         step = (available - 1) / (original_count - 1)

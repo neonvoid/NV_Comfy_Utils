@@ -1,18 +1,32 @@
 # Status Board — NV_Comfy_Utils
 
 > Auto-managed by `/handoff`. Content is never deleted — old entries move to ARCHIVE.md.
-> Last updated: 2026-04-09
+> Last updated: 2026-04-09b
 
 ## Resume Context
 <!-- Rewritten each `/handoff` run. What does a cold-start agent need RIGHT NOW? -->
 
-- **Current focus:** Runtime test Kling sequential chunking with type="first_frame" hints. Verify API accepts type= alongside video input. Clean test of tail-as-control-video (VaceControlVideoPrep).
-- **Critical files:** `src/KNF_Utils/kling_edit_fork.py`, `src/KNF_Utils/vace_control_video_prep.py`, `node_notes/guides/VACE_INPAINT_NODE_AUDIT.md`
-- **Known blockers:** None — if API rejects type="first_frame" with video, revert to type=None (one-line change).
-- **Environment notes:** 2 uncommitted files (kling_edit_fork.py, prompt_refiner.py). Debug logging active in NV_KlingEditVideo — watch console for `[NV_KlingEditVideo] image_list types →` and `API response →` lines.
+- **Current focus:** Runtime test SAM3→MatAnyone→mask multiply pipeline for head-only soft alpha. Test SAM3 chunked tracking (enable_chunking=True, chunk_size=150) on 600+ frame video. Test retime JSON save/load across separate batch runs.
+- **Critical files:** `src/KNF_Utils/match_interp_frames.py`, `src/KNF_Utils/temporal_retime.py`, `ComfyUI-MatAnyone/mat_anyone2.py` (warmup drift issue)
+- **Known blockers:** MatAnyone v2 warmup discards input mask after 1 step — drifts to hands on sub-object masks. Full-body mask input works. Potential code fix in warming_up2() to re-inject mask each iteration.
+- **Environment notes:** NV_MatchInterpFrames new node (not yet runtime tested). temporal_retime.py modified (JSON save/load + config_only). SAM3 chunking built-in but not yet tested on long video.
 
 ## Pulse
 <!-- Last 2 session summaries, newest first. Older entries roll to Workstream Details. -->
+
+### 2026-04-09b — Masking deep dive + VFI research + utility nodes [research + coding]
+- **Done:**
+  - Multi-AI research: Mocha Pro vs SAM 3 for gen-AI mask generation — wrote comprehensive guide (08_genai_mask_pipeline.md)
+  - Multi-AI research: segmentation vs matting model architectures — deep dive doc (2026-04-07_segmentation_matting_deep_dive.md)
+  - Multi-AI research: MatAnyone v2 as mask refinement stage — confirmed whole-person matting, not sub-object
+  - Multi-AI research: VFI SOTA 2026 — GIMM-VFI still Tier 1 for arbitrary-timestep source-faithful interpolation
+  - Built NV_MatchInterpFrames node (expand mask batch to match frame-interpolated video). Multi-AI reviewed, 6 bugs fixed.
+  - Updated NV_RetimePrep/Restore with JSON save/load for separate batch runs + config_only mode. Multi-AI reviewed, atomic writes + validation added.
+  - Verified SAM3 nvFork already has chunked tracking (enable_chunking + chunk_size on SAM3Propagate). No new node needed.
+  - Learned Mocha Pro 2026 hands-on: Mask ML workflow (click → generate → create spline), Matte Assist ML, layer composition
+- **Decisions:** Mocha for sub-object masks (head/hand/prop), SAM 3 for full body. MatAnyone for whole-person edge refinement only. GIMM-VFI stays as primary VFI.
+- **Blockers:** MatAnyone v2 ComfyUI wrapper has warmup drift issue — mask input gets discarded after 1 step, model drifts to high-contrast body parts (hands). n_warmup=1 is partial fix.
+- **Next:** Runtime test full pipeline: SAM3→MatAnyone→mask multiply for head-only soft alpha. Test SAM3 chunked tracking on 600+ frame video. Test retime config save/load across separate batches.
 
 ### 2026-04-09 — Kling OmniParamImage.type hints + multi-AI review [coding]
 - **Done:**
@@ -27,17 +41,6 @@
 - **Blockers:** None — needs runtime test to confirm API accepts type="first_frame" alongside video input.
 - **Next:** Runtime test chunked Kling with type= hints. If API rejects, strip type back to None when video present.
 
-### 2026-04-08 — Integration review fixes + audit doc addendum [coding]
-- **Done:**
-  - Applied stitch crash fixes: frame count validation (single_stitcher exempt), VRAM cleanup at entry, per-frame try/except with debug context, metadata length validation, canvas clone in skip path
-  - Fixed CropColorFix silent batch truncation → hard ValueError on frame count mismatch
-  - Fixed VaceControlVideoPrep early returns bypassing tail prepend → _apply_tail() helper on all exit paths
-  - Multi-AI integration review of all 5 core pipeline nodes (3K lines)
-  - Updated VACE_INPAINT_NODE_AUDIT.md with 5 new sections (+153 lines): mask routing, chunk continuity, frame validation, multi-pass constraints, VRAM crash prevention
-- **Decisions:** CropColorFix must hard-fail on frame mismatch (D-020). All VaceControlVideoPrep exit paths must apply tail prepend consistently (D-021).
-- **Blockers:** None — stitch fixes now applied.
-- **Next:** Clean test of tail-as-control-video with corrected mask wiring. Runtime test Kling sequential chunking.
-
 
 ## Active Workstreams
 
@@ -49,6 +52,7 @@
 | D  | Real-Time Mask Editor | STAGED | 2026-04-03 | Research complete — PySide6 + cached op graph MVP. Not started. |
 | E  | Chunk Seam Continuity | ACTIVE | 2026-04-08 | Stitch fixes applied. Tail-as-control-video ready for clean test. Audit doc updated (+153 lines). |
 | F  | Kling API Chunking | ACTIVE | 2026-04-09 | type="first_frame" hints on tail refs. Debug logging added. Awaiting runtime test of API acceptance. |
+| G  | Masking & VFI Pipeline Research | ACTIVE | 2026-04-09 | Mocha for sub-object, SAM3 for full body, MatAnyone for edge refinement. GIMM-VFI stays. NV_MatchInterpFrames + RetimePrep JSON persistence built. |
 
 ### Status Tags
 - **ACTIVE** — Currently being worked on
@@ -212,6 +216,10 @@
   Outcome: Stitch fixes applied (validation+VRAM+try/except). CropColorFix hard-fail on mismatch (D-020). VaceControlVideoPrep _apply_tail() on all exits (D-021). Audit doc +153 lines.
   Decision: Hard-fail > silent truncate (D-020). Consistent tail prepend (D-021).
   Next: Clean e2e test of tail-as-control-video. Runtime test Kling chunking.
+- **2026-04-08b | coding**
+  Outcome: Stitch crash fixes (validation+VRAM+debug). CropColorFix hard-fail on mismatch (D-020). VaceControlVideoPrep _apply_tail() consistency (D-021). Audit doc +153 lines.
+  Decision: Hard-fail > silent truncate (D-020). Consistent tail prepend (D-021).
+  Next: Clean e2e test of tail-as-control-video. Runtime test Kling chunking.
 
 ### F. Kling API Chunking
 **Current state:** ACTIVE — type hints added + multi-AI reviewed, awaiting runtime test of API acceptance
@@ -233,6 +241,18 @@
   Decision: No stitch-back (D-018), no crossfade (D-019).
   Next: Runtime test >10s video. Evaluate tail-frame ref effectiveness.
 
+### G. Masking & VFI Pipeline Research
+**Current state:** ACTIVE
+**Goal:** Establish optimal mask generation + frame interpolation pipeline for WAN/VACE workflows
+**Key files:** `src/KNF_Utils/match_interp_frames.py`, `src/KNF_Utils/temporal_retime.py`, `D:/DereksFiles/.../mochapro/08_genai_mask_pipeline.md`
+**Active constraints:** MatAnyone v2 = whole-person only (not sub-object). SAM3 chunking exists but untested on long videos.
+
+**Milestones:**
+- 2026-04-09 — Mocha-for-GenAI guide written. NV_MatchInterpFrames built. RetimePrep/Restore gains JSON persistence.
+
+**History:**
+*First session.*
+
 ## Global Timeline
 <!-- Thin chronological index of project-wide events. NOT per-workstream progress. -->
 
@@ -242,6 +262,7 @@
 - **2026-04-07:** Latent tail domain mismatch confirmed (sampler≠encoder). Pivoted to tail-as-control-video (VaceControlVideoPrep). Mask wiring rules formalized (D-017).
 - **2026-04-07:** NV_KlingUploadPreview gains sequential chunk mode (auto-truncate + tail-frame refs). KlingStitchAdapter deprecated.
 - **2026-04-08:** Stitch crash fixes applied (validation+VRAM+debug). CropColorFix hard-fail on mismatch. VaceControlVideoPrep tail consistency fix. VACE_INPAINT_NODE_AUDIT.md addendum (+153 lines, 5 sections).
+- **2026-04-09:** Masking research arc: Mocha Pro guide (08_genai_mask_pipeline.md), segmentation/matting deep dive, VFI SOTA review. NV_MatchInterpFrames node built. RetimePrep/Restore gains JSON persistence + config_only mode.
 
 ## Archived Workstreams Index
 <!-- Pointers to workstreams moved to ARCHIVE.md. -->
