@@ -71,9 +71,11 @@ class NV_SaveLatentReference:
         if output_dir and not os.path.exists(output_dir):
             os.makedirs(output_dir, exist_ok=True)
 
-        # Save with metadata
+        # Save with metadata — preserve native dtype (fp32/bf16) for lossless
+        # round-trip. fp16 quantization causes visible artifacts when latents are
+        # spliced directly into VACE conditioning (NV_VaceLatentSplice).
         data = {
-            "latents": samples.cpu().half(),  # Save as fp16 to reduce size
+            "latents": samples.cpu(),
             "shape": list(samples.shape),
             "metadata": {
                 "steps": metadata_steps,
@@ -124,7 +126,7 @@ class NV_LoadLatentReference:
         if not os.path.exists(reference_path):
             raise FileNotFoundError(f"Latent reference not found: {reference_path}")
 
-        data = torch.load(reference_path, map_location='cpu', weights_only=False)
+        data = torch.load(reference_path, map_location='cpu', weights_only=True)
 
         print(f"[NV_LoadLatentReference] Loaded from {reference_path}")
         print(f"  Shape: {data.get('shape', 'unknown')}")
