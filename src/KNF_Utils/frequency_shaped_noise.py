@@ -47,7 +47,13 @@ class _FrequencyShapedNoiseObj:
         """Apply radial frequency shaping to noise tensor.
 
         Works on both 4D [B, C, H, W] and 5D [B, C, T, H, W] latents.
-        Shapes each spatial (H, W) slice independently.
+        Shapes each spatial (H, W) slice independently using batched FFT.
+
+        Algorithm (post-bugfix):
+        1. FFT noise → fftshift to put DC at center (matches profile extraction)
+        2. Build smooth gain curve H(k) from target/white power ratio (log domain)
+        3. Multiply: F_out = H * F_white (linear filter, preserves Gaussianity)
+        4. ifftshift → IFFT back to spatial
         """
         shape = noise.shape
         device = noise.device
@@ -56,7 +62,6 @@ class _FrequencyShapedNoiseObj:
 
         if noise.ndim == 5:
             B, C, T, H, W = shape
-            # Reshape to [B*C*T, H, W] for per-slice FFT
             flat = noise.reshape(-1, H, W)
         elif noise.ndim == 4:
             B, C, H, W = shape
@@ -64,33 +69,64 @@ class _FrequencyShapedNoiseObj:
         else:
             return noise
 
-        # Build 2D radial frequency map for this spatial size
+        # Build 2D radial frequency map (DC at center to match fftshift convention)
         radial_map = _build_radial_map(H, W, len(profile), device)  # [H, W]
 
         # Look up target amplitude per pixel from radial profile
-        target_amp = profile[radial_map]  # [H, W]
+        target_amp_2d = profile[radial_map]  # [H, W]
 
-        # FFT each slice
-        shaped_slices = []
-        for i in range(flat.shape[0]):
-            f = torch.fft.fft2(flat[i])
-            amp = torch.abs(f)
-            phase = f / (amp + 1e-8)
+        # Compute deterministic gain H(k) from target amplitude.
+        # Profile is normalized to mean=1, so a "white" profile would give H=1 everywhere.
+        # gain = (target / mean_target) ** strength interpolates in log space:
+        #   strength=0 → H=1 (no shaping)
+        #   strength=1 → H = target/mean (full shaping)
+        eps = 1e-8
+        target_norm = target_amp_2d / (target_amp_2d.mean() + eps)
+        log_gain = torch.log(target_norm.clamp(min=eps))
+        # Clamp log gain to bound the effective gain range (~0.5x to 2x at strength=1)
+        log_gain = log_gain.clamp(min=-0.7, max=0.7)
+        gain = torch.exp(log_gain * strength)  # [H, W]
 
-            # Blend amplitude toward target profile
-            blended_amp = amp * (1.0 - strength) + target_amp * strength
+        # Batched FFT — much faster than per-slice loop
+        f = torch.fft.fft2(flat)                   # [N, H, W]
+        f_shifted = torch.fft.fftshift(f, dim=(-2, -1))  # DC at center
 
-            # Reconstruct
-            shaped = torch.fft.ifft2(blended_amp * phase).real
-            shaped_slices.append(shaped)
+        # Apply deterministic linear filter (preserves Gaussianity)
+        f_shaped = f_shifted * gain                # broadcast [N, H, W] * [H, W]
 
-        result = torch.stack(shaped_slices, dim=0).reshape(shape)
+        # Unshift and inverse FFT
+        f_unshifted = torch.fft.ifftshift(f_shaped, dim=(-2, -1))
+        shaped = torch.fft.ifft2(f_unshifted).real
 
-        # Normalize to match original noise statistics (preserve sigma scale)
-        orig_std = noise.std()
-        result_std = result.std()
-        if result_std > 1e-8:
-            result = result * (orig_std / result_std)
+        result = shaped.reshape(shape)
+
+        # Per-channel renormalization to preserve original noise statistics.
+        # WAN latents have per-channel mean/std that the sampler relies on.
+        if noise.ndim == 5:
+            # [B, C, T, H, W] — normalize per channel
+            for c in range(C):
+                orig_std_c = noise[:, c].std()
+                res_std_c = result[:, c].std()
+                if res_std_c > eps:
+                    result[:, c] = result[:, c] * (orig_std_c / res_std_c)
+                # Match mean too (filter shouldn't shift mean but be safe)
+                result[:, c] = result[:, c] - result[:, c].mean() + noise[:, c].mean()
+        elif noise.ndim == 4:
+            for c in range(C):
+                orig_std_c = noise[:, c].std()
+                res_std_c = result[:, c].std()
+                if res_std_c > eps:
+                    result[:, c] = result[:, c] * (orig_std_c / res_std_c)
+                result[:, c] = result[:, c] - result[:, c].mean() + noise[:, c].mean()
+
+        # Debug: log what the gain curve actually looks like
+        gain_min = gain.min().item()
+        gain_max = gain.max().item()
+        gain_mean = gain.mean().item()
+        print(f"[NV_FrequencyShapedNoise] Applied gain: range=[{gain_min:.3f}, {gain_max:.3f}], "
+              f"mean={gain_mean:.3f} (strength={strength})")
+        print(f"[NV_FrequencyShapedNoise] Noise stats: white std={noise.std().item():.4f}, "
+              f"shaped std={result.std().item():.4f}")
 
         return result
 
@@ -113,47 +149,60 @@ def _build_radial_map(H, W, num_bins, device):
     return dist.long().clamp(0, num_bins - 1)
 
 
-def _compute_radial_profile(image, num_bins=64):
+def _compute_radial_profile(image, num_bins=64, skip_dc_bins=2):
     """Compute radial power spectrum profile from pixel-space image.
 
-    Takes [B, H, W, C] IMAGE tensor, returns [num_bins] amplitude profile (averaged
-    across batch, channels, normalized).
+    Takes [B, H, W, C] IMAGE tensor, returns [num_bins] AMPLITUDE profile.
+    Profile is sqrt of radially-averaged power, with mean removed and DC excluded.
+
+    Returns the profile normalized so the average gain is 1.0 (so it can be used
+    directly as a multiplicative filter, with 1.0 = pass-through).
     """
     # Convert to grayscale for frequency analysis
     gray = 0.299 * image[..., 0] + 0.587 * image[..., 1] + 0.114 * image[..., 2]
-    # gray shape: [B, H, W]
-
     B, H, W = gray.shape
-    profiles = []
 
-    for b in range(B):
-        f = torch.fft.fft2(gray[b])
-        f_shifted = torch.fft.fftshift(f)
-        amp = torch.abs(f_shifted)
+    # Subtract per-frame mean to suppress DC (large image-wide brightness bias)
+    gray = gray - gray.mean(dim=(1, 2), keepdim=True)
 
-        # Build radial bin map
-        radial_map = _build_radial_map(H, W, num_bins, gray.device)
-
-        # Average amplitude per radial bin
-        profile = torch.zeros(num_bins, device=gray.device)
-        counts = torch.zeros(num_bins, device=gray.device)
-        for bin_idx in range(num_bins):
-            mask = radial_map == bin_idx
-            if mask.any():
-                profile[bin_idx] = amp[mask].mean()
-                counts[bin_idx] = mask.float().sum()
-
-        profiles.append(profile)
+    # Batched FFT
+    f = torch.fft.fft2(gray)                                  # [B, H, W]
+    f_shifted = torch.fft.fftshift(f, dim=(-2, -1))           # DC at center
+    power = (f_shifted.real ** 2 + f_shifted.imag ** 2)       # [B, H, W]
 
     # Average across batch
-    avg_profile = torch.stack(profiles, dim=0).mean(dim=0)
+    avg_power = power.mean(dim=0)  # [H, W]
 
-    # Normalize so total energy = 1
-    total = avg_profile.sum()
-    if total > 0:
-        avg_profile = avg_profile / total
+    # Build radial bin map
+    radial_map = _build_radial_map(H, W, num_bins, gray.device)  # [H, W]
 
-    return avg_profile
+    # Radial average using scatter
+    profile_power = torch.zeros(num_bins, device=gray.device)
+    counts = torch.zeros(num_bins, device=gray.device)
+    flat_power = avg_power.flatten()
+    flat_bins = radial_map.flatten()
+    profile_power.scatter_add_(0, flat_bins, flat_power)
+    counts.scatter_add_(0, flat_bins, torch.ones_like(flat_power))
+    profile_power = profile_power / counts.clamp(min=1)
+
+    # Convert power to amplitude (sqrt) — this is what we'll use as a filter
+    profile = torch.sqrt(profile_power.clamp(min=1e-12))
+
+    # Zero out DC and first few bins (scene brightness, gross composition)
+    if skip_dc_bins > 0:
+        profile[:skip_dc_bins] = 0.0
+
+    # Replace zeroed bins with the value of the first valid bin (avoids
+    # division-by-zero when computing log gain — these frequencies just
+    # become "no shaping" at strength=1)
+    if skip_dc_bins > 0 and skip_dc_bins < num_bins:
+        first_valid = profile[skip_dc_bins]
+        profile[:skip_dc_bins] = first_valid
+
+    # Normalize so the MEAN gain is 1.0 (filter that doesn't change total energy)
+    profile = profile / (profile.mean() + 1e-12)
+
+    return profile
 
 
 class NV_FrequencyShapedNoise:
@@ -220,15 +269,18 @@ class NV_FrequencyShapedNoise:
         print(f"{TAG} Analyzing {sampled.shape[0]} frames at {sampled.shape[1]}x{sampled.shape[2]} "
               f"({num_bins} bins, strength={strength})")
 
-        # Compute radial power spectrum profile
-        profile = _compute_radial_profile(sampled, num_bins)
+        # Compute radial amplitude profile (DC removed, normalized to mean=1)
+        profile = _compute_radial_profile(sampled, num_bins, skip_dc_bins=2)
 
-        # Log profile shape (low vs high frequency energy)
-        low_energy = profile[:num_bins // 4].sum().item()
-        high_energy = profile[num_bins * 3 // 4:].sum().item()
-        ratio = low_energy / max(high_energy, 1e-8)
-        print(f"{TAG} Profile: low-freq energy={low_energy:.4f}, high-freq={high_energy:.4f}, "
-              f"ratio={ratio:.1f}x (higher = softer source)")
+        # Log profile shape — now meaningful since DC is removed and mean is 1.0
+        # Values < 1.0 = below average, > 1.0 = above average
+        # A "soft" source has high low-freq values and low high-freq values
+        low_avg = profile[2:num_bins // 4].mean().item()  # skip DC bins
+        mid_avg = profile[num_bins // 4:num_bins * 3 // 4].mean().item()
+        high_avg = profile[num_bins * 3 // 4:].mean().item()
+        slope = profile[2].item() / max(profile[-1].item(), 1e-8)
+        print(f"{TAG} Profile (mean=1.0): low={low_avg:.3f}, mid={mid_avg:.3f}, high={high_avg:.3f}, "
+              f"low/high slope={slope:.1f}x")
 
         noise_obj = _FrequencyShapedNoiseObj(noise_seed, profile, strength)
         return (noise_obj,)

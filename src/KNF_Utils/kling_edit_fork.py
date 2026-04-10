@@ -793,6 +793,8 @@ class NV_KlingEditVideo(IO.ComfyNode):
                 IO.Float.Output(display_name="output_fps"),
                 IO.Int.Output(display_name="output_frames"),
                 IO.String.Output(display_name="api_metadata"),
+                IO.Float.Output(display_name="estimated_credits"),
+                IO.Float.Output(display_name="estimated_usd"),
             ],
             hidden=[
                 IO.Hidden.auth_token_comfy_org,
@@ -831,8 +833,19 @@ class NV_KlingEditVideo(IO.ComfyNode):
         num_frames = images.shape[0]
         h, w = images.shape[1], images.shape[2]
 
+        # --- cost estimate (Kling Omni Edit pricing) ---
+        # Rates from comfy_api_nodes/nodes_kling.py:1500-1509 (OmniProEditVideoNode price_badge).
+        # Comfy USD→credits ratio is 211 (comfy_api_nodes/util/client.py:443).
+        # Kling Edit bills on the input video duration (output length == input length).
+        billed_seconds = num_frames / encode_fps if encode_fps > 0 else 0.0
+        usd_per_sec = 0.168 if api_mode == "pro" else 0.126
+        estimated_usd = round(billed_seconds * usd_per_sec, 4)
+        estimated_credits = round(estimated_usd * 211, 1)
+
         print(f"[NV_KlingEditVideo] Encoding {num_frames} frames at {encode_fps}fps, "
               f"{w}x{h}, mode={api_mode}, refer_type={api_refer_type}")
+        print(f"[NV_KlingEditVideo] Cost estimate: {billed_seconds:.2f}s × ${usd_per_sec}/s "
+              f"= ${estimated_usd} ≈ {estimated_credits} credits ({api_mode} mode)")
 
         # --- encode images to video ---
         video = InputImpl.VideoFromComponents(
@@ -899,6 +912,18 @@ class NV_KlingEditVideo(IO.ComfyNode):
         print(f"[NV_KlingEditVideo] API response → code={response.code!r}, "
               f"message={response.message!r}, "
               f"task_status={response.data.task_status if response.data else 'N/A'}")
+
+        # --- billing-field scout: dump raw payload to look for credits/cost fields ---
+        # If the Kling proxy ever exposes a billing field in the response, we can wire
+        # it into a price_extractor on sync_op/poll_op to override the estimate with
+        # the actual deduction. Until then, this print verifies what's in the payload.
+        try:
+            raw_dump = response.model_dump()
+            print(f"[NV_KlingEditVideo] raw response keys: {sorted(raw_dump.keys())}")
+            if raw_dump.get("data"):
+                print(f"[NV_KlingEditVideo] raw data keys: {sorted(raw_dump['data'].keys())}")
+        except Exception as _e:
+            print(f"[NV_KlingEditVideo] raw payload dump failed: {_e}")
 
         if response.code:
             raise RuntimeError(
@@ -981,6 +1006,18 @@ class NV_KlingEditVideo(IO.ComfyNode):
                 "download_sec": round(t_end - t_done, 1),
                 "total_sec": round(t_end - t_start, 1),
             },
+            "cost_estimate": {
+                "billed_seconds": round(billed_seconds, 3),
+                "mode": api_mode,
+                "usd_per_sec": usd_per_sec,
+                "estimated_usd": estimated_usd,
+                "estimated_credits": estimated_credits,
+                "credits_per_usd": 211,
+                "note": (
+                    "Local estimate from price_badge rates in nodes_kling.py:1500-1509. "
+                    "Actual deduction may differ — proxy server is the source of truth."
+                ),
+            },
         }
 
         return IO.NodeOutput(
@@ -988,6 +1025,8 @@ class NV_KlingEditVideo(IO.ComfyNode):
             output_fps,
             output_frames,
             json.dumps(metadata, indent=2),
+            estimated_credits,
+            estimated_usd,
         )
 
 
