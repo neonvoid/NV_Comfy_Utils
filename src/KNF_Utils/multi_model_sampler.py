@@ -85,6 +85,12 @@ class NV_MultiModelSampler:
                     )}),
                 "end_at_step": ("INT", {"default": 0, "min": 0, "max": 10000,
                     "tooltip": "Stop at this step (0=run to end). For cascaded: wire expanded_steps here."}),
+                # Noise override
+                "noise": ("NOISE", {
+                    "tooltip": "Optional custom noise object (e.g., from NV_FrequencyShapedNoise). "
+                               "When connected, replaces internal noise generation. "
+                               "When not connected, uses standard random noise from seed."
+                }),
                 # Debug
                 "verbose": ("BOOLEAN", {"default": False,
                     "tooltip": "Log detailed noise/latent statistics at each stage for debugging path equivalence."}),
@@ -101,7 +107,7 @@ class NV_MultiModelSampler:
                sampler_name, scheduler, denoise, model_2=None, model_3=None,
                mode="single", model_steps="", shift_override=0.0,
                add_noise="enable", start_at_step=0, end_at_step=0,
-               verbose=False):
+               noise=None, verbose=False):
 
         # ============= Shift Override (patches model_sampling sigma schedule) =============
         if shift_override > 0.0:
@@ -168,7 +174,7 @@ class NV_MultiModelSampler:
                 seed, steps, cfg, sampler_name, scheduler, denoise,
                 disable_noise=disable_noise,
                 start_step=start_step, last_step=last_step,
-                verbose=verbose
+                noise_obj=noise, verbose=verbose
             )
         elif mode == "sequential":
             return self._sample_sequential(
@@ -177,7 +183,7 @@ class NV_MultiModelSampler:
                 model_steps,
                 disable_noise=disable_noise,
                 start_step=start_step, last_step=last_step,
-                verbose=verbose
+                noise_obj=noise, verbose=verbose
             )
         else:
             # Fallback to single
@@ -186,13 +192,14 @@ class NV_MultiModelSampler:
                 seed, steps, cfg, sampler_name, scheduler, denoise,
                 disable_noise=disable_noise,
                 start_step=start_step, last_step=last_step,
-                verbose=verbose
+                noise_obj=noise, verbose=verbose
             )
 
     def _sample_single(self, model, positive, negative, latent_image,
                        seed, steps, cfg, sampler_name, scheduler, denoise,
                        disable_noise=False,
-                       start_step=None, last_step=None, verbose=False):
+                       start_step=None, last_step=None,
+                       noise_obj=None, verbose=False):
         """Standard KSampler behavior with cascaded pipeline support."""
 
         if verbose:
@@ -213,6 +220,17 @@ class NV_MultiModelSampler:
                 _log_tensor_stats("pre_noised_latent (input)", latent_image["samples"])
             result = self._ksampler_with_noise(
                 model, identity_noise, seed, steps, cfg, sampler_name, scheduler,
+                positive, negative, latent_image, denoise=denoise,
+                start_step=start_step, last_step=last_step
+            )
+        elif noise_obj is not None:
+            # Custom noise object provided (e.g., frequency-shaped noise)
+            custom_noise = noise_obj.generate_noise(latent_image)
+            print(f"[NV_MultiModelSampler] Using custom noise object (seed={noise_obj.seed})")
+            if verbose:
+                _log_tensor_stats("custom_noise", custom_noise)
+            result = self._ksampler_with_noise(
+                model, custom_noise, seed, steps, cfg, sampler_name, scheduler,
                 positive, negative, latent_image, denoise=denoise,
                 start_step=start_step, last_step=last_step
             )
@@ -238,7 +256,7 @@ class NV_MultiModelSampler:
                            seed, steps, cfg, sampler_name, scheduler,
                            denoise, model_steps_str,
                            disable_noise=False, start_step=None, last_step=None,
-                           verbose=False):
+                           noise_obj=None, verbose=False):
         """
         Chain models by step count.
 
@@ -311,6 +329,20 @@ class NV_MultiModelSampler:
                     positive, negative, current_latent,
                     denoise=denoise,
                     disable_noise=True,
+                    start_step=seg_start,
+                    last_step=seg_end,
+                    force_full_denoise=(i == len(models) - 1)
+                )
+            elif i == 0 and noise_obj is not None:
+                # First model with custom noise object (e.g., frequency-shaped noise)
+                custom_noise = noise_obj.generate_noise(current_latent)
+                print(f"[NV_MultiModelSampler] Model {i+1}: using custom noise object (seed={noise_obj.seed})")
+                if verbose:
+                    _log_tensor_stats(f"custom_noise (model {i+1})", custom_noise)
+                result = self._ksampler_with_noise(
+                    model, custom_noise, seed, steps, cfg, sampler_name, scheduler,
+                    positive, negative, current_latent,
+                    denoise=denoise,
                     start_step=seg_start,
                     last_step=seg_end,
                     force_full_denoise=(i == len(models) - 1)

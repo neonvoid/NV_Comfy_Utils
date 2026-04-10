@@ -9,8 +9,12 @@ combat identity drift in chunked pipelines.
 
 Prepend order: [identity_anchor, reference_frames, control_video]
 - identity_anchor at t=0: exploits WAN 2.2 training prior (t=0 = identity source)
-- reference_frames after: RoPE locality gives stronger attention to generation start
+- reference_frames after: RoPE locality for pose/expression guidance
 - control_video last: grey masked inpaint target (mask=1, generate regions)
+
+Chunk tail continuity is handled separately by VaceControlVideoPrep (pixel tail
+prepend in control video) + NV_VaceLatentSplice (clean latent injection into
+VACE conditioning). This node focuses purely on Kling reference conditioning.
 
 Key differences from native WanVaceToVideo:
 - Multiple reference frames (not just 1)
@@ -164,15 +168,18 @@ class NV_VacePrePassReference:
     Accepts reference frames (current chunk's Kling output) and an optional
     identity anchor (chunk 0's Kling output) to combat cross-chunk identity drift.
 
-    Prepend order: [identity_anchor, reference_frames, previous_chunk_tail, control_video]
+    Prepend order: [identity_anchor, reference_frames, control_video]
     - identity_anchor at t=0: WAN 2.2 training prior treats t=0 as identity source
     - reference_frames after: RoPE locality for pose/expression guidance
-    - previous_chunk_tail last: maximum RoPE locality to generation start for seam continuity
     - control_video: grey masked inpaint target (mask=1 generate)
 
+    Chunk tail continuity is handled separately by VaceControlVideoPrep (pixel tail
+    prepend) + NV_VaceLatentSplice (clean latent injection). This node focuses
+    purely on Kling reference frame conditioning.
+
     Wiring per chunk:
-    - Chunk 0: reference_frames=Chunk0 Kling, identity_anchor=not connected, tail=not connected
-    - Chunk N: reference_frames=ChunkN Kling, identity_anchor=Chunk0 Kling, tail=ChunkN-1 last frames
+    - Chunk 0: reference_frames=Chunk0 Kling, identity_anchor=not connected
+    - Chunk N: reference_frames=ChunkN Kling, identity_anchor=Chunk0 Kling
     """
 
     @classmethod
@@ -232,24 +239,6 @@ class NV_VacePrePassReference:
                                   "tooltip": "Minimum Laplacian variance for identity anchor frames. Frames below this "
                                              "threshold are rejected before sampling. Set to 0 to disable. "
                                              "reference_frames bypass this filter (current chunk's own output)."}),
-                "previous_chunk_tail": ("IMAGE", {
-                    "tooltip": "Last N pixel frames of previous chunk's output (post-CropColorFix). "
-                               "Gets VAE-encoded internally. Use previous_chunk_tail_latent instead "
-                               "to avoid the re-encode color drift. Leave unconnected for chunk 0."
-                }),
-                "previous_chunk_tail_latent": ("LATENT", {
-                    "tooltip": "Previous chunk's sampler latent output (post-trim, pre-decode). "
-                               "Bypasses VAE re-encode entirely — zero color drift. Preferred over "
-                               "the IMAGE tail input. Last num_tail_latent_frames are extracted. "
-                               "If both IMAGE and LATENT tail are connected, LATENT takes priority."
-                }),
-                "num_tail_frames": ("INT", {"default": 2, "min": 0, "max": 8, "step": 1,
-                    "tooltip": "Number of tail frames from IMAGE tail input. "
-                               "0 = disabled. At frame_repeat=4, each = 1 latent frame."}),
-                "num_tail_latent_frames": ("INT", {"default": 2, "min": 0, "max": 8, "step": 1,
-                    "tooltip": "Number of latent frames from LATENT tail input. "
-                               "0 = disabled. These are already in latent space — no frame_repeat applied. "
-                               "2-3 recommended."}),
                 "control_video": ("IMAGE", {
                     "tooltip": "Grey masked inpaint video — the generation target. Mask=1 regions are where "
                                "VACE will paint new content using the reference frames as identity guide."
@@ -268,16 +257,14 @@ class NV_VacePrePassReference:
         "Multi-frame VACE reference for cascaded pre-pass workflows. "
         "Wire this chunk's Kling output to reference_frames. "
         "Optionally wire chunk 0's Kling output to identity_anchor for cross-chunk identity lock. "
-        "Optionally wire previous chunk's last frames to previous_chunk_tail for seam continuity. "
-        "Wire grey masked inpaint video to control_video."
+        "Wire grey masked inpaint video to control_video. "
+        "Chunk tail continuity is handled separately by VaceControlVideoPrep + NV_VaceLatentSplice."
     )
 
     def execute(self, positive, negative, vae, width, height, length, batch_size, strength,
                 ref_strength, reference_frames, num_refs, ref_sampling, frame_repeat,
                 identity_anchor=None, num_anchors=3, anchor_sampling="uniform",
-                min_sharpness=50.0, previous_chunk_tail=None,
-                previous_chunk_tail_latent=None, num_tail_frames=2,
-                num_tail_latent_frames=2,
+                min_sharpness=50.0,
                 control_video=None, control_masks=None):
 
         latent_length = ((length - 1) // 4) + 1
@@ -331,79 +318,23 @@ class NV_VacePrePassReference:
                     print(f"[NV_VacePrePassReference] Anchor IFS scores: "
                           f"{', '.join(f'[{idx}]={anchor_scores[idx]:.3f}' for idx in anchor_indices)}")
 
-        # === Step 1b-tail: Extract tail from previous chunk (optional) ===
-        # Tail provides fine-detail continuity across chunk boundaries.
-        # Positioned LAST in the ref block = closest to control_video = maximum RoPE
-        # locality to first generated frames. VACE late-block skip connections (10 layers
-        # across 40 DiT blocks) reassert tail detail during late denoising where
-        # micro-texture (hair, fabric, speculars) is resolved.
-        #
-        # Two paths:
-        #   LATENT path (preferred): sampler output latent, zero re-encode, zero color drift
-        #   IMAGE path (fallback): pixel frames, gets VAE-encoded (adds one round-trip)
-        #   If both connected, LATENT takes priority.
-        sampled_tail = None        # pixel-space tail (IMAGE path)
-        tail_latent_direct = None  # latent-space tail (LATENT path, bypasses encode)
-
-        if previous_chunk_tail_latent is not None and num_tail_latent_frames > 0:
-            # LATENT path — extract last N latent frames directly
-            tail_samples = previous_chunk_tail_latent.get("samples", None) if isinstance(previous_chunk_tail_latent, dict) else None
-            if tail_samples is not None and tail_samples.ndim == 5 and tail_samples.shape[1] == 16 and tail_samples.shape[2] > 0:
-                # Force batch=1 and extract last N latent frames
-                tail_samples = tail_samples[0:1]  # guarantee B=1
-                total_tail_latent = tail_samples.shape[2]
-                actual_count = min(num_tail_latent_frames, total_tail_latent)
-                start_idx = total_tail_latent - actual_count
-                tail_latent_direct = tail_samples[:, :, start_idx:, :, :]  # [1, 16, N, H/8, W/8]
-                print(f"[NV_VacePrePassReference] Tail (LATENT): {actual_count} latent frames from "
-                      f"previous chunk ({total_tail_latent} available) — zero re-encode")
-            else:
-                print(f"[NV_VacePrePassReference] WARNING: LATENT tail connected but unusable "
-                      f"(shape={list(tail_samples.shape) if tail_samples is not None else 'None'}, "
-                      f"expected [1,16,T,H,W]). Falling back to IMAGE tail if available.")
-
-        if tail_latent_direct is None and previous_chunk_tail is not None and num_tail_frames > 0 and previous_chunk_tail.shape[0] > 0:
-            # IMAGE path — pixel frames, will be concat'd with refs and VAE-encoded
-            total_tail_available = previous_chunk_tail.shape[0]
-            actual_tail_count = min(num_tail_frames, total_tail_available)
-            # Explicit start index to avoid Python's -0 == 0 gotcha
-            start_idx = total_tail_available - actual_tail_count
-            sampled_tail = previous_chunk_tail[start_idx:]
-            print(f"[NV_VacePrePassReference] Tail (IMAGE): {actual_tail_count} pixel frames from "
-                  f"previous chunk ({total_tail_available} available) — will VAE-encode")
-
-        # === Step 1c: Concatenate [identity_anchor, reference_frames, tail] ===
+        # === Step 1c: Concatenate [identity_anchor, reference_frames] ===
         # Order matters for RoPE temporal locality + WAN training prior:
         # - anchor FIRST: exploits WAN t=0 training prior for identity anchoring
-        # - refs MIDDLE: pose/expression guidance with moderate RoPE locality
-        # - tail LAST: maximum RoPE locality to generation start for seam continuity
+        # - refs AFTER: pose/expression guidance with moderate RoPE locality
         # Conv3d kernel_t=1 at patch embedding means no temporal mixing at entry —
-        # ordering only affects attention (Stage 8) and skip injection (Stage 9).
-        # Validate spatial dimensions match before concat (different crop
-        # resolutions will cause a raw torch.cat RuntimeError otherwise)
+        # ordering only affects attention and skip injection.
+        # Chunk tail continuity is handled by VaceControlVideoPrep + NV_VaceLatentSplice.
         ref_shape = sampled_refs.shape[1:]  # [H, W, C]
         if sampled_anchors is not None and sampled_anchors.shape[1:] != ref_shape:
             raise ValueError(
                 f"[NV_VacePrePassReference] Spatial mismatch: identity_anchor {list(sampled_anchors.shape[1:])} "
                 f"vs reference_frames {list(ref_shape)}. Resize before connecting.")
-        if sampled_tail is not None and sampled_tail.shape[1:] != ref_shape:
-            raise ValueError(
-                f"[NV_VacePrePassReference] Spatial mismatch: previous_chunk_tail {list(sampled_tail.shape[1:])} "
-                f"vs reference_frames {list(ref_shape)}. Resize before connecting.")
-        if tail_latent_direct is not None:
-            tail_h, tail_w = tail_latent_direct.shape[3], tail_latent_direct.shape[4]
-            expected_h, expected_w = height // 8, width // 8
-            if tail_h != expected_h or tail_w != expected_w:
-                raise ValueError(
-                    f"[NV_VacePrePassReference] Spatial mismatch: tail latent ({tail_w*8}x{tail_h*8} pixels) "
-                    f"vs target ({width}x{height}). Tail latent must match target resolution.")
 
         refs_list = []
         if sampled_anchors is not None:
             refs_list.append(sampled_anchors)
         refs_list.append(sampled_refs)
-        if sampled_tail is not None:
-            refs_list.append(sampled_tail)
 
         all_refs = torch.cat(refs_list, dim=0) if len(refs_list) > 1 else refs_list[0]
 
@@ -412,10 +343,8 @@ class NV_VacePrePassReference:
         if sampled_anchors is not None:
             log_parts.append(f"{sampled_anchors.shape[0]} anchor")
         log_parts.append(f"{sampled_refs.shape[0]} ref")
-        if sampled_tail is not None:
-            log_parts.append(f"{sampled_tail.shape[0]} tail")
         print(f"[NV_VacePrePassReference] Prepend: {' + '.join(log_parts)} = "
-              f"{all_refs.shape[0]} total (order: {'→'.join(log_parts)})")
+              f"{all_refs.shape[0]} total (order: {', '.join(log_parts)})")
 
         # Frame repeat: duplicate each reference frame_repeat times in pixel space
         # [r1,r1,r1,r1, r2,r2,r2,r2, ...] for 3D VAE temporal compression
@@ -452,8 +381,6 @@ class NV_VacePrePassReference:
         del repeated, all_refs, sampled_refs
         if sampled_anchors is not None:
             del sampled_anchors
-        if sampled_tail is not None:
-            del sampled_tail
 
         # Build 32ch reference: 16ch encoded + 16ch neutral reactive
         # This matches native WanVaceToVideo reference_image encoding:
@@ -477,38 +404,6 @@ class NV_VacePrePassReference:
             print(f"[NV_VacePrePassReference] Pre-scaled reference latent by {ref_scale:.2f}x "
                   f"(ref_strength={ref_strength}, vace_strength={strength}, "
                   f"effective reference influence={ref_strength})")
-
-        # === Step 1e: Append latent tail AFTER ref_strength scaling ===
-        # Latent tail is injected directly — no VAE re-encode, no frame_repeat,
-        # no ref_strength scaling. It represents the exact sampler output state
-        # from the previous chunk. Scaling it would change its latent coordinates
-        # and introduce a brightness/contrast shift at the seam.
-        tail_latent_length = 0
-        if tail_latent_direct is not None:
-            # Align device with the pixel-encoded ref block
-            tail_latent_direct = tail_latent_direct.to(ref_latent.device)
-
-            # Build 32ch for the tail: 16ch content + 16ch neutral reactive
-            tail_32ch = torch.cat([
-                tail_latent_direct,
-                comfy.latent_formats.Wan21().process_out(torch.zeros_like(tail_latent_direct))
-            ], dim=1)
-            # tail_32ch shape: [1, 32, N_tail, H/8, W/8]
-
-            # Append tail AFTER the scaled ref block (tail is unscaled)
-            ref_latent = torch.cat([ref_latent, tail_32ch], dim=2)
-            tail_latent_length = tail_32ch.shape[2]
-
-            # Also append to the 16ch output for NV_PrependReferenceLatent
-            ref_latent_16ch = torch.cat([ref_latent_16ch, tail_latent_direct.to(ref_latent_16ch.device)], dim=2)
-
-            # Update ref_latent_length to include tail
-            ref_latent_length += tail_latent_length
-
-            print(f"[NV_VacePrePassReference] Appended {tail_latent_length} latent tail frames "
-                  f"(unscaled, no re-encode). Total ref block: {ref_latent_length} latent frames")
-
-            del tail_32ch, tail_latent_direct
 
         # === Step 2: Process control video (same as native WanVaceToVideo) ===
         if control_video is not None:

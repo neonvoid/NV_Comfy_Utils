@@ -1,18 +1,30 @@
 # Status Board — NV_Comfy_Utils
 
 > Auto-managed by `/handoff`. Content is never deleted — old entries move to ARCHIVE.md.
-> Last updated: 2026-04-10
+> Last updated: 2026-04-10b
 
 ## Resume Context
 <!-- Rewritten each `/handoff` run. What does a cold-start agent need RIGHT NOW? -->
 
-- **Current focus:** Build NV_VaceChunkedOrchestrator — single-node chunked VACE inpainting. Phase 1: frame slicing + rollback math. NV_VaceLatentSplice is built and validated.
-- **Critical files:** `src/KNF_Utils/vace_latent_splice.py`, `src/KNF_Utils/latent_guidance.py`, future `src/KNF_Utils/vace_chunked_orchestrator.py`
-- **Known blockers:** None — architecture designed, splice validated.
-- **Environment notes:** 1 uncommitted file (temporal_retime.py). Splice node + latent guidance fixes committed.
+- **Current focus:** Build NV_FrequencyShapedNoise — pixel-space FFT of full frame → shaped latent noise for SamplerCustomAdvanced. Experiment: does frequency-shaped starting noise make generation match source aesthetic?
+- **Critical files:** `src/KNF_Utils/texture_harmonize.py` (built), `src/KNF_Utils/vace_prepass_reference.py` (tail removed), future `src/KNF_Utils/frequency_shaped_noise.py`
+- **Known blockers:** None.
+- **Environment notes:** 1 uncommitted file (vace_prepass_reference.py — tail inputs removed). Texture harmonize committed.
 
 ## Pulse
 <!-- Last 2 session summaries, newest first. Older entries roll to Workstream Details. -->
+
+### 2026-04-10b — Texture harmonize + aesthetic conditioning research + prepass cleanup [coding + research]
+- **Done:**
+  - Built NV_TextureHarmonize node — Laplacian pyramid variance matching (sharpness/micro-contrast) + per-channel grain synthesis. Multi-AI reviewed (Codex+Gemini): fixed reversed pyramid indexing, tightened ratio clamp (0.25-3.0), batch-averaged ratios for temporal stability, per-frame grain seeding, soft mask weights.
+  - Runtime tested: sharpness ratios 0.54/0.57 confirmed AI crop was ~2x too sharp. Grain stage correctly added nothing (clean source).
+  - Cleaned up VacePrePassReference: removed tail inputs (previous_chunk_tail, previous_chunk_tail_latent, num_tail_frames, num_tail_latent_frames) — ~80 lines removed. Tail continuity now fully owned by VaceControlVideoPrep + NV_VaceLatentSplice.
+  - Multi-AI deep dive: texture harmonization algorithms (Laplacian pyramids, FFT grain synthesis, differentiable JPEG). Validated approach matches Adobe Multi-scale Harmonization (2010) lineage.
+  - Multi-AI deep dive: papers research (20+ papers reviewed). Key finds: Real-ESRGAN degradation model, Film Grain Rendering (Zhang 2023), DISTS metric, signal-dependent noise.
+  - Multi-AI brainstorm: WAN DiT aesthetic conditioning injection points. Secondary VACE branch (sigma-gated) = best v1. Feature stats transfer (blocks 30-39) = best v2. Frequency-shaped noise = easy zero-risk experiment.
+- **Decisions:** VacePrePassReference tail inputs removed — redundant with control video + splice path (D-026). Texture harmonize is post-decode only — VAE bottleneck prevents DiT-level grain/sharpness control (D-027). Frequency-shaped noise worth testing as complementary approach (D-028 PROVISIONAL).
+- **Blockers:** None.
+- **Next:** Build NV_FrequencyShapedNoise — pixel-space FFT of full frame → shaped latent noise for SamplerCustomAdvanced. Test if generation quality character shifts toward source aesthetic.
 
 ### 2026-04-10 — VACE latent splice + orchestrator architecture [coding + research]
 - **Done:**
@@ -24,20 +36,6 @@
 - **Decisions:** Latent splice into vace_frames inactive channels is correct approach (D-023). Save latents as native dtype, not fp16 (D-024). Orchestrator: crop-space only, CropColorFix inside loop, Kling refs chunk 0 only, last-chunk rollback (D-025 PROVISIONAL).
 - **Blockers:** None — splice validated, orchestrator architecture designed.
 - **Next:** Build NV_VaceChunkedOrchestrator. Phase 1: frame slicing + rollback math skeleton. Phase 2: VAE encode + KSampler + splice loop. Phase 3: CropColorFix + refs + checkpoint/resume.
-
-### 2026-04-09b — Masking deep dive + VFI research + utility nodes [research + coding]
-- **Done:**
-  - Multi-AI research: Mocha Pro vs SAM 3 for gen-AI mask generation — wrote comprehensive guide (08_genai_mask_pipeline.md)
-  - Multi-AI research: segmentation vs matting model architectures — deep dive doc (2026-04-07_segmentation_matting_deep_dive.md)
-  - Multi-AI research: MatAnyone v2 as mask refinement stage — confirmed whole-person matting, not sub-object
-  - Multi-AI research: VFI SOTA 2026 — GIMM-VFI still Tier 1 for arbitrary-timestep source-faithful interpolation
-  - Built NV_MatchInterpFrames node (expand mask batch to match frame-interpolated video). Multi-AI reviewed, 6 bugs fixed.
-  - Updated NV_RetimePrep/Restore with JSON save/load for separate batch runs + config_only mode. Multi-AI reviewed, atomic writes + validation added.
-  - Verified SAM3 nvFork already has chunked tracking (enable_chunking + chunk_size on SAM3Propagate). No new node needed.
-  - Learned Mocha Pro 2026 hands-on: Mask ML workflow (click → generate → create spline), Matte Assist ML, layer composition
-- **Decisions:** Mocha for sub-object masks (head/hand/prop), SAM 3 for full body. MatAnyone for whole-person edge refinement only. GIMM-VFI stays as primary VFI.
-- **Blockers:** MatAnyone v2 ComfyUI wrapper has warmup drift issue — mask input gets discarded after 1 step, model drifts to high-contrast body parts (hands). n_warmup=1 is partial fix.
-- **Next:** Runtime test full pipeline: SAM3→MatAnyone→mask multiply for head-only soft alpha. Test SAM3 chunked tracking on 600+ frame video. Test retime config save/load across separate batches.
 
 
 
@@ -53,6 +51,7 @@
 | F  | Kling API Chunking | ACTIVE | 2026-04-09 | type="first_frame" hints on tail refs. Debug logging added. Awaiting runtime test of API acceptance. |
 | G  | Masking & VFI Pipeline Research | ACTIVE | 2026-04-09 | Mocha for sub-object, SAM3 for full body, MatAnyone for edge refinement. GIMM-VFI stays. NV_MatchInterpFrames + RetimePrep JSON persistence built. |
 | H  | VACE Chunked Orchestrator | STAGED | 2026-04-10 | Architecture designed (4 multi-AI rounds). Single-queue-press chunked VACE inpainting with latent splice. |
+| I  | Texture Harmonize + Aesthetic Conditioning | ACTIVE | 2026-04-10 | NV_TextureHarmonize built + runtime tested. Frequency-shaped noise next. Full-frame aesthetic reference planned. |
 
 ### Status Tags
 - **ACTIVE** — Currently being worked on
@@ -83,6 +82,8 @@
 - Kling edit mode does NOT preserve original framing/camera — output cannot be stitched back onto original frames. Use as standalone output, not as InpaintStitch input.
 - NV_VaceLatentSplice offset must account for VacePrePassReference ref frames: splice at [:16, ref_T:ref_T+tail_T], not [:16, :tail_T]
 - Latent save MUST use native dtype — fp16 quantization causes visible noise bump artifacts when spliced into VACE conditioning
+- VAE bottleneck destroys film grain, sensor noise, and compression artifacts — DiT cannot generate these. Texture harmonization must be post-decode.
+- Laplacian pyramid level 0 = finest detail (highest frequency), last level = base residual (lowest frequency). Skip base levels from END, not from 0.
 
 ## Project Decisions Index
 <!-- Numbered decisions with lifecycle status. Never renumber IDs. -->
@@ -114,6 +115,9 @@
 | D-023 | 2026-04-10 | ACTIVE | E,H | Latent splice into vace_frames[:, :16] inactive channels — encoder-domain KSampler output directly replaces roundtrip-drifted tail |
 | D-024 | 2026-04-10 | ACTIVE | E,H | Save latents as native dtype (fp32/bf16), never fp16 — quantization causes visible noise in splice path |
 | D-025 | 2026-04-10 | PROVISIONAL | H | Orchestrator architecture: crop-space, CropColorFix inside loop, Kling refs chunk 0 only, last-chunk rollback, seed+chunk_idx |
+| D-026 | 2026-04-10 | ACTIVE | E | VacePrePassReference tail inputs removed — redundant with VaceControlVideoPrep + VaceLatentSplice |
+| D-027 | 2026-04-10 | ACTIVE | I | Texture harmonize must be post-decode only — VAE bottleneck prevents DiT-level grain/sharpness control |
+| D-028 | 2026-04-10 | PROVISIONAL | I | Frequency-shaped noise (pixel-space FFT of full frame → shaped latent noise) as complementary aesthetic conditioning |
 
 ### Decision Statuses
 - **ACTIVE** — Currently in effect
@@ -260,7 +264,10 @@
 - 2026-04-09 — Mocha-for-GenAI guide written. NV_MatchInterpFrames built. RetimePrep/Restore gains JSON persistence.
 
 **History:**
-*First session.*
+- **2026-04-09 | research + coding**
+  Outcome: Mocha Pro guide, segmentation/matting deep dive, VFI SOTA review. NV_MatchInterpFrames + RetimePrep JSON persistence built. SAM3 chunking confirmed built-in.
+  Decision: Mocha for sub-object, SAM3 for full body, MatAnyone whole-person only. GIMM-VFI stays.
+  Next: Runtime test SAM3→MatAnyone pipeline. Test chunked tracking on 600+ frames.
 
 ### H. VACE Chunked Orchestrator
 **Current state:** STAGED — architecture designed, implementation not started
@@ -281,6 +288,31 @@
 **History:**
 *First session — architecture design only.*
 
+### I. Texture Harmonize + Aesthetic Conditioning
+**Current state:** ACTIVE — NV_TextureHarmonize built + tested, frequency-shaped noise next
+**Goal:** Make AI-generated crops visually match the source footage's texture quality (sharpness, grain, micro-contrast) via post-processing and optionally pre-conditioning the sampler
+**Key files:** `texture_harmonize.py` (built), future `frequency_shaped_noise.py`
+**Active constraints:** VAE bottleneck prevents DiT-level grain/sharpness — post-decode only for texture. Frequency-shaped noise is the one DiT-influencing approach that might work (affects starting noise, not model internals).
+
+**Architecture:**
+- Stage 1 (built): Laplacian pyramid variance matching — sharpness + micro-contrast per frequency band
+- Stage 2 (built): Per-channel grain synthesis — additive only, frame-seeded
+- Stage 3 (planned): NV_FrequencyShapedNoise — full-frame pixel FFT → shaped latent noise for SamplerCustomAdvanced
+- Future: optional full_frame_reference IMAGE input on TextureHarmonize for global aesthetic vs crop-border-local
+
+**Research findings (20+ papers):**
+- Our approach matches Adobe Multi-scale Harmonization (Sunkavalli 2010) lineage
+- Real-ESRGAN degradation model useful as reverse-application reference
+- DISTS/A-DISTS metrics best for texture similarity evaluation
+- Signal-dependent noise (heteroscedastic: variance scales with luminance) = key upgrade for grain realism
+- Secondary sigma-gated VACE branch = best WAN-native aesthetic injection (future)
+
+**Milestones:**
+- 2026-04-10 — NV_TextureHarmonize built + runtime tested (sharpness ratios 0.54/0.57). Multi-AI reviewed + 5 fixes applied.
+
+**History:**
+*First session.*
+
 ## Global Timeline
 <!-- Thin chronological index of project-wide events. NOT per-workstream progress. -->
 
@@ -292,6 +324,7 @@
 - **2026-04-08:** Stitch crash fixes applied (validation+VRAM+debug). CropColorFix hard-fail on mismatch. VaceControlVideoPrep tail consistency fix. VACE_INPAINT_NODE_AUDIT.md addendum (+153 lines, 5 sections).
 - **2026-04-09:** Masking research arc: Mocha Pro guide (08_genai_mask_pipeline.md), segmentation/matting deep dive, VFI SOTA review. NV_MatchInterpFrames node built. RetimePrep/Restore gains JSON persistence + config_only mode.
 - **2026-04-10:** NV_VaceLatentSplice built + runtime validated (zero-drift tail overlap). Latent save/load security + precision fixes. Orchestrator architecture designed (4 multi-AI rounds). New workstream H: VACE Chunked Orchestrator.
+- **2026-04-10:** NV_TextureHarmonize built + runtime tested (AI crop 2x too sharp, auto-corrected). VacePrePassReference tail inputs removed (D-026). Aesthetic conditioning research: 20+ papers, WAN DiT injection points mapped. New workstream I: Texture Harmonize + Aesthetic Conditioning.
 
 ## Archived Workstreams Index
 <!-- Pointers to workstreams moved to ARCHIVE.md. -->
