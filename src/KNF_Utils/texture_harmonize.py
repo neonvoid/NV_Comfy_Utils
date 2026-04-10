@@ -70,15 +70,16 @@ def _masked_mad(tensor, mask_4d, min_pixels=100):
     Returns [B, C, 1, 1] scaled by 1.4826 to be std-equivalent for normal data,
     or None if any frame has too few masked pixels.
 
-    Why MAD instead of std: a single bright outlier in the context ring (eyelash,
-    specular highlight, stray edge) drags std up by 20-40%, then drops it again on
-    the next frame as the mask wiggles. That swings the texture-match ratio against
-    a hard clamp, producing visible temporal strobing in the harmonized output.
-    The median is unaffected by isolated outliers, so MAD stays stable frame-to-frame.
+    USED ONLY FOR THE GRAIN STAGE, NOT THE SHARPNESS PYRAMID. Grain is the bulk
+    distribution of high-freq residual after blur — most pixels have small noise,
+    edges are outliers that pollute the measurement. MAD captures the bulk and
+    ignores edge contamination. The sharpness pyramid wants the OPPOSITE — band
+    energy IS dominated by edges, so std (which is sensitive to those outliers)
+    is the right tool there.
 
-    Implementation: soft mask weights are binarized at 0.5. At coarse pyramid
-    levels the bilinear edge fraction is a small slice of the total, so the
-    discretization error on the bulk statistic is negligible.
+    Implementation: binarized masks (>= 0.5). The grain stage operates at the
+    full crop resolution so binarization is exact for hard masks; soft masks
+    only matter at coarse pyramid levels which use std (not this function).
     """
     B, C, H, W = tensor.shape
     binary_mask = mask_4d.clamp(0, 1) >= 0.5  # [B, 1, H, W] bool
@@ -97,17 +98,6 @@ def _masked_mad(tensor, mask_4d, min_pixels=100):
             result[b, c, 0, 0] = mad * 1.4826
 
     return result.clamp(min=1e-6)
-
-
-def _masked_scale(tensor, mask_4d, mode, min_pixels=100):
-    """Dispatch to std or MAD based on mode. Both return [B, C, 1, 1] or None.
-
-    Drop-in replacement for either estimator — they produce comparable values
-    for normal data (MAD is scaled by 1.4826 to match std on a Gaussian).
-    """
-    if mode == "mad":
-        return _masked_mad(tensor, mask_4d, min_pixels)
-    return _masked_std(tensor, mask_4d, min_pixels)
 
 
 def _downsample_mask_to(mask_4d, target_h, target_w):
@@ -168,13 +158,6 @@ class NV_TextureHarmonize:
                     "default": 1000, "min": 100, "max": 50000, "step": 100,
                     "tooltip": "Minimum context pixels needed for statistics. Below this, skip matching."
                 }),
-                "stat_mode": (["mad", "std"], {
-                    "default": "mad",
-                    "tooltip": "Statistic for measuring texture spread. "
-                               "mad = Median Absolute Deviation (robust to outliers like eyelashes/highlights — "
-                               "kills temporal strobing in tight crops, recommended). "
-                               "std = standard deviation (legacy behavior, sensitive to outliers)."
-                }),
                 "context_scope": (["ring_only", "whole_crop"], {
                     "default": "ring_only",
                     "tooltip": "Where to measure original-footage texture stats. "
@@ -203,12 +186,13 @@ class NV_TextureHarmonize:
                 sharpness_strength=1.0, grain_strength=1.0,
                 pyramid_levels=4, grain_blur_sigma=1.5,
                 skip_base_levels=1, temporal_seed=0, min_context_pixels=1000,
-                stat_mode="mad", context_scope="ring_only"):
+                context_scope="ring_only"):
         TAG = "[NV_TextureHarmonize]"
         device = generated_crop.device
         B, H, W, C = generated_crop.shape
         info_lines = [f"{TAG} {B} frames, {H}x{W}, sharpness={sharpness_strength}, "
-                      f"grain={grain_strength}, stat={stat_mode}, scope={context_scope}"]
+                      f"grain={grain_strength}, scope={context_scope} "
+                      f"(sharpness=std/soft-mask, grain=mad/binary-mask)"]
 
         if original_crop.shape[0] != B:
             raise ValueError(f"{TAG} Frame count mismatch: generated={B}, original={original_crop.shape[0]}")
@@ -274,8 +258,10 @@ class NV_TextureHarmonize:
                 lvl_meas_ctx = _downsample_mask_to(meas_ctx_4d, lh, lw)
                 lvl_meas_gen = _downsample_mask_to(meas_gen_4d, lh, lw)
 
-                ctx_std = _masked_scale(orig_pyr[lvl], lvl_meas_ctx, stat_mode)
-                gen_std = _masked_scale(gen_pyr[lvl], lvl_meas_gen, stat_mode)
+                # Sharpness uses std (not MAD) — the pyramid band energy IS the
+                # outliers (edges). MAD would discard exactly what we want to measure.
+                ctx_std = _masked_std(orig_pyr[lvl], lvl_meas_ctx)
+                gen_std = _masked_std(gen_pyr[lvl], lvl_meas_gen)
 
                 if ctx_std is None or gen_std is None:
                     ratios.append("-")
@@ -319,7 +305,9 @@ class NV_TextureHarmonize:
             for c in range(min(C, 3)):
                 # Measure context grain std (per channel)
                 ctx_ch = ctx_grain[:, c:c+1, :, :]
-                ctx_std = _masked_scale(ctx_ch, meas_ctx_4d, stat_mode)
+                # Grain uses MAD — the noise residual's BULK is the signal,
+                # edges in the residual are texture pollution we want to ignore.
+                ctx_std = _masked_mad(ctx_ch, meas_ctx_4d)
                 if ctx_std is None:
                     grain_added.append("skip")
                     continue
@@ -328,7 +316,7 @@ class NV_TextureHarmonize:
 
                 # Measure generated grain std
                 gen_ch = gen_grain[:, c:c+1, :, :]
-                gen_std = _masked_scale(gen_ch, meas_gen_4d, stat_mode)
+                gen_std = _masked_mad(gen_ch, meas_gen_4d)
                 gen_val = gen_std.mean().item() if gen_std is not None else 0.0
 
                 # Additional grain needed = difference (only add, don't subtract)
