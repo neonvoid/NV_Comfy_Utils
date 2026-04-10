@@ -107,17 +107,60 @@ def _downsample_mask_to(mask_4d, target_h, target_w):
     return F.interpolate(mask_4d, size=(target_h, target_w), mode="bilinear", align_corners=False)
 
 
-def _build_full_frame_context_from_stitcher(stitcher, device, dtype):
-    """Reconstruct the full-frame context per batch frame from a STITCHER dict.
+def _build_per_frame_inpaint_mask(blend_mask, ctc_x, ctc_y, ctc_w, ctc_h,
+                                  frame_h, frame_w, device, dtype):
+    """Place a single crop-space blend mask back into native frame coordinates.
 
-    Returns:
-        full_frames [B, C, frame_h, frame_w]: original frames at native resolution
-        ctx_masks   [B, 1, frame_h, frame_w]: 1.0 = full-frame context (excluding inpaint area)
-        gen_masks   [B, 1, frame_h, frame_w]: 1.0 = inpaint area (in native frame coords)
-        ctc_dims    list of (ctc_w, ctc_h) tuples per frame — native crop bbox dims
+    Returns [1, 1, frame_h, frame_w] tensor with inpaint area = blend values, rest = 0.
+    """
+    blend = blend_mask.to(device=device, dtype=dtype)
+    if blend.dim() == 2:
+        blend = blend.unsqueeze(0).unsqueeze(0)
+    elif blend.dim() == 3:
+        blend = blend.unsqueeze(1)
 
-    All frames in a stitcher batch share the same canvas (frame) dimensions, so
-    we stack them into a single tensor. Per-frame bbox positions still vary.
+    cw = int(ctc_w)
+    ch = int(ctc_h)
+    cx = int(ctc_x)
+    cy = int(ctc_y)
+
+    if blend.shape[2] != ch or blend.shape[3] != cw:
+        blend_native = F.interpolate(blend, size=(ch, cw), mode="bilinear", align_corners=False)
+    else:
+        blend_native = blend
+
+    inpaint_mask = torch.zeros(1, 1, frame_h, frame_w, device=device, dtype=dtype)
+    x0 = max(0, cx)
+    y0 = max(0, cy)
+    x1 = min(frame_w, cx + cw)
+    y1 = min(frame_h, cy + ch)
+    bw = x1 - x0
+    bh = y1 - y0
+    if bw > 0 and bh > 0:
+        sx = x0 - cx
+        sy = y0 - cy
+        inpaint_mask[0, 0, y0:y1, x0:x1] = blend_native[0, 0, sy:sy+bh, sx:sx+bw]
+
+    return inpaint_mask
+
+
+def _compute_full_frame_ctx_stats(stitcher, device, dtype, kernel, pyramid_levels,
+                                  grain_blur_sigma, H, W, C,
+                                  do_sharpness, do_grain, min_context_pixels):
+    """Per-frame full-frame context statistics, memory-bounded.
+
+    Loads ONE full frame at a time from the stitcher, computes pyramid std per
+    level (for sharpness, on a resize-to-crop-dims version) and native-resolution
+    MAD per channel (for grain). Returns small stat tensors instead of holding
+    the [B, C, frame_h, frame_w] full-frame batch in memory.
+
+    Memory budget per frame: ~25MB for a 1080p frame + ~100MB transient pyramid +
+    blur intermediates. Free at end of each iteration. 100× less than the
+    previous batched approach.
+
+    Returns dict {'sharpness_ctx_stds': list[level] of [B, C, 1, 1],
+                  'grain_ctx_mads':     [B, C, 1, 1]}, or None if any frame fails
+    its per-frame min_context_pixels check (caller falls back to whole_crop).
     """
     canvas_images = stitcher['canvas_image']
     cropped_blend_masks = stitcher['cropped_mask_for_blend']
@@ -126,64 +169,77 @@ def _build_full_frame_context_from_stitcher(stitcher, device, dtype):
     ctc_w_list = stitcher['cropped_to_canvas_w']
     ctc_h_list = stitcher['cropped_to_canvas_h']
 
-    n = len(canvas_images)
-    if n == 0:
-        return None, None, None, None
+    B = len(canvas_images)
+    if B == 0:
+        return None
 
-    # All canvas frames in a NV_InpaintCrop2 stitcher share the same native dims
-    # (canvas_image == original full frame, with cto_x/y == 0, cto_w/h == frame dims)
-    first = canvas_images[0]
-    frame_h, frame_w = first.shape[0], first.shape[1]
+    first_frame = canvas_images[0]
+    frame_h, frame_w = first_frame.shape[0], first_frame.shape[1]
 
-    full_frames = torch.empty(n, frame_h, frame_w, first.shape[2], device=device, dtype=dtype)
-    inpaint_masks = torch.zeros(n, 1, frame_h, frame_w, device=device, dtype=dtype)
-    ctc_dims = []
+    # Lazy-init the per-level sharpness result list (we don't know exact pyramid
+    # length until we build one — build_laplacian_pyramid returns levels+1 entries)
+    sharpness_stds = None
+    grain_mads = torch.zeros(B, C, 1, 1, device=device, dtype=dtype) if do_grain else None
 
-    for b in range(n):
-        # Move full frame to the working device + dtype
-        full_frames[b] = canvas_images[b].to(device=device, dtype=dtype)
+    for b in range(B):
+        # --- Load this frame to GPU (one frame's worth — ~25MB at 1080p) ---
+        full_frame = canvas_images[b].to(device=device, dtype=dtype)  # [frame_h, frame_w, C]
+        full_frame_nchw = full_frame.permute(2, 0, 1).unsqueeze(0).contiguous()  # [1, C, frame_h, frame_w]
 
-        # The blend mask is in crop processing space (e.g., 832×832).
-        # Resize back to native crop bbox dims, then paste at the bbox position.
-        blend = cropped_blend_masks[b].to(device=device, dtype=dtype)  # [crop_h, crop_w]
-        if blend.dim() == 2:
-            blend = blend.unsqueeze(0).unsqueeze(0)  # [1, 1, crop_h, crop_w]
-        elif blend.dim() == 3:
-            blend = blend.unsqueeze(1)  # [1, 1, crop_h, crop_w]
+        # --- Build per-frame inpaint mask in native coords ---
+        inpaint_mask = _build_per_frame_inpaint_mask(
+            cropped_blend_masks[b],
+            ctc_x[b], ctc_y[b], ctc_w_list[b], ctc_h_list[b],
+            frame_h, frame_w, device, dtype,
+        )
+        ff_ctx_mask = (inpaint_mask < 0.5).to(dtype)  # [1, 1, frame_h, frame_w]
 
-        cw = int(ctc_w_list[b])
-        ch = int(ctc_h_list[b])
-        cx = int(ctc_x[b])
-        cy = int(ctc_y[b])
-        ctc_dims.append((cw, ch))
+        # === SHARPNESS: resize to crop dims, build pyramid, per-level std ===
+        if do_sharpness:
+            ff_resized = F.interpolate(full_frame_nchw, size=(H, W), mode="bilinear", align_corners=False)
+            ctx_mask_resized = F.interpolate(ff_ctx_mask, size=(H, W), mode="bilinear", align_corners=False)
+            ref_pyr = build_laplacian_pyramid(ff_resized, pyramid_levels, kernel)
 
-        # Resize blend mask to native bbox dims
-        if blend.shape[2] != ch or blend.shape[3] != cw:
-            blend_native = F.interpolate(blend, size=(ch, cw), mode="bilinear", align_corners=False)
-        else:
-            blend_native = blend
+            # Lazy init result tensors with the actual pyramid length
+            if sharpness_stds is None:
+                sharpness_stds = [
+                    torch.zeros(B, C, 1, 1, device=device, dtype=dtype)
+                    for _ in range(len(ref_pyr))
+                ]
 
-        # Clip to frame bounds (defensive — bbox should already be in-bounds from cropper)
-        x0 = max(0, cx)
-        y0 = max(0, cy)
-        x1 = min(frame_w, cx + cw)
-        y1 = min(frame_h, cy + ch)
-        bw = x1 - x0
-        bh = y1 - y0
-        if bw <= 0 or bh <= 0:
-            continue
-        sx = x0 - cx
-        sy = y0 - cy
-        inpaint_masks[b, 0, y0:y1, x0:x1] = blend_native[0, 0, sy:sy+bh, sx:sx+bw]
+            for lvl in range(len(ref_pyr)):
+                lh, lw = ref_pyr[lvl].shape[2], ref_pyr[lvl].shape[3]
+                lvl_ctx = _downsample_mask_to(ctx_mask_resized, lh, lw)
+                lvl_min_px = max(50, min_context_pixels // (4 ** lvl))
+                std_b = _masked_std(ref_pyr[lvl], lvl_ctx, min_pixels=lvl_min_px)
+                if std_b is None:
+                    return None  # this frame doesn't have enough context — total bail
+                sharpness_stds[lvl][b] = std_b[0]
 
-    # Permute to NCHW
-    full_frames_nchw = full_frames.permute(0, 3, 1, 2).contiguous()  # [B, C, H, W]
+            del ff_resized, ctx_mask_resized, ref_pyr
 
-    # Context = inverse of inpaint area (binarize at 0.5 to avoid soft-edge contamination)
-    ctx_masks = (inpaint_masks < 0.5).to(dtype)
-    gen_masks = (inpaint_masks >= 0.5).to(dtype)
+        # === GRAIN: native-resolution per-channel MAD ===
+        if do_grain:
+            ff_blur = _gaussian_blur_sep(full_frame_nchw, grain_blur_sigma)
+            ff_grain = full_frame_nchw - ff_blur
+            del ff_blur
 
-    return full_frames_nchw, ctx_masks, gen_masks, ctc_dims
+            for c in range(min(C, 3)):
+                ch_grain = ff_grain[:, c:c+1, :, :]
+                mad_b = _masked_mad(ch_grain, ff_ctx_mask, min_pixels=min_context_pixels)
+                if mad_b is None:
+                    return None
+                grain_mads[b, c, 0, 0] = mad_b[0, 0, 0, 0]
+
+            del ff_grain
+
+        # Free this frame's transient tensors before next iteration
+        del full_frame, full_frame_nchw, inpaint_mask, ff_ctx_mask
+
+    return {
+        'sharpness_ctx_stds': sharpness_stds,
+        'grain_ctx_mads': grain_mads,
+    }
 
 
 class NV_TextureHarmonize:
@@ -303,20 +359,31 @@ class NV_TextureHarmonize:
             m = m.unsqueeze(0)
         if m.shape[0] == 1 and B > 1:
             m = m.expand(B, -1, -1)
+        if m.shape[0] != B:
+            raise ValueError(
+                f"{TAG} Mask frame count mismatch: generated_crop has {B} frames, "
+                f"mask has {m.shape[0]}. Mask must be 1 frame (broadcast) or {B} frames."
+            )
         if m.shape[1:] != (H, W):
             m = F.interpolate(m.unsqueeze(1), size=(H, W), mode="bilinear", align_corners=False).squeeze(1)
 
         ctx_4d = (m < 0.5).float().unsqueeze(1)   # [B, 1, H, W] context (mask=0 ring)
         gen_4d = (m >= 0.5).float().unsqueeze(1)   # [B, 1, H, W] generated (mask=1 region)
 
-        # Measurement masks: where we sample stats from. Application masks (gen_4d/ctx_4d
-        # above) are unchanged — we still only modify the inpaint region.
+        # Measurement masks: where we sample stats from. Application masks
+        # (gen_4d/ctx_4d above) are unchanged — we still only modify the inpaint region.
+        #
+        # IMPORTANT: only the REFERENCE side (meas_ctx_4d) ever expands beyond the
+        # mask=0 ring. The TARGET side (meas_gen_4d) always stays constrained to the
+        # actual inpaint region (mask=1), because the generated_crop is mostly
+        # identical to the original outside the mask — measuring `gen` over the
+        # whole crop would dilute the stat with unedited pixels and collapse the
+        # correction ratio toward 1 (under-correction).
+        meas_gen_4d = gen_4d  # always — never measure target over the unedited region
         if effective_scope == "whole_crop":
             meas_ctx_4d = torch.ones_like(ctx_4d)
-            meas_gen_4d = torch.ones_like(gen_4d)
-        else:  # ring_only or full_frame (full_frame uses these only as fallback for non-stitcher data)
+        else:  # ring_only (full_frame uses ff_* tensors below for the reference path)
             meas_ctx_4d = ctx_4d
-            meas_gen_4d = gen_4d
 
         # Convert crop tensors to NCHW
         gen = generated_crop.permute(0, 3, 1, 2).float()   # [B, C, H, W]
@@ -324,35 +391,44 @@ class NV_TextureHarmonize:
         result = gen.clone()
 
         # =================================================================
-        # Full-frame data path (only when effective_scope == "full_frame")
+        # Full-frame stats precompute (only when effective_scope == "full_frame")
         # =================================================================
-        # We pull the full original frames from the stitcher, build a per-frame
-        # context mask in native coords, and use these as the MEASUREMENT source.
-        # The generated_crop / original_crop are still the APPLICATION targets —
-        # we only change WHERE we measure stats from.
-        ff_full_frames = None  # [B, C, frame_h, frame_w]
-        ff_ctx_4d = None       # [B, 1, frame_h, frame_w] full-frame context mask
-        ff_ctc_dims = None     # list of (ctc_w, ctc_h)
+        # Memory-bounded: processes one frame at a time inside the helper. Returns
+        # SMALL stat tensors (per-level [B,C,1,1]), never holds the full-frame
+        # batch in memory. Falls back to whole_crop on any failure.
+        ff_stats = None
         if effective_scope == "full_frame":
-            ff_full_frames, ff_ctx_4d, _, ff_ctc_dims = _build_full_frame_context_from_stitcher(
-                stitcher, device, gen.dtype
+            ff_kernel = _make_gaussian_kernel_2d(5).to(device)
+            ff_stats = _compute_full_frame_ctx_stats(
+                stitcher=stitcher,
+                device=device,
+                dtype=gen.dtype,
+                kernel=ff_kernel,
+                pyramid_levels=pyramid_levels,
+                grain_blur_sigma=grain_blur_sigma,
+                H=H, W=W, C=C,
+                do_sharpness=sharpness_strength > 0,
+                do_grain=grain_strength > 0,
+                min_context_pixels=min_context_pixels,
             )
-            if ff_full_frames is None:
-                print(f"{TAG} WARNING: stitcher full-frame reconstruction failed — falling back to whole_crop")
+            del ff_kernel
+            if ff_stats is None:
+                print(f"{TAG} WARNING: full-frame stats failed (insufficient context per frame) — "
+                      f"falling back to whole_crop")
                 effective_scope = "whole_crop"
                 meas_ctx_4d = torch.ones_like(ctx_4d)
-                meas_gen_4d = torch.ones_like(gen_4d)
+                # meas_gen_4d already correctly set to gen_4d above
 
-        # Check we have enough measurement support (use full-frame mask if active)
-        if effective_scope == "full_frame":
-            avg_ctx_px = ff_ctx_4d.sum(dim=(2, 3)).mean().item()
-        else:
-            avg_ctx_px = meas_ctx_4d.sum(dim=(2, 3)).mean().item()
-        if avg_ctx_px < min_context_pixels:
-            info_lines.append(f"  Skipped: {int(avg_ctx_px)} measurement pixels < {min_context_pixels}")
-            info = "\n".join(info_lines)
-            print(info)
-            return (generated_crop, info)
+        # Check we have enough measurement support for non-full-frame modes.
+        # full_frame mode does its own per-frame min check inside the precompute and
+        # returns None on failure (handled above).
+        if effective_scope != "full_frame":
+            min_ctx_px = int(meas_ctx_4d.sum(dim=(2, 3)).min().item())
+            if min_ctx_px < min_context_pixels:
+                info_lines.append(f"  Skipped: worst frame has {min_ctx_px} measurement pixels < {min_context_pixels}")
+                info = "\n".join(info_lines)
+                print(info)
+                return (generated_crop, info)
 
         # =================================================================
         # Stage 1: Laplacian Pyramid Sharpness/Micro-Contrast Matching
@@ -361,17 +437,11 @@ class NV_TextureHarmonize:
             kernel = _make_gaussian_kernel_2d(5).to(device)
             gen_pyr = build_laplacian_pyramid(result, pyramid_levels, kernel)
 
-            # Build the REFERENCE pyramid: in full_frame mode, resize the full frame
-            # to crop dims first so the pyramid bands align with the crop's processing
-            # resolution. The same resize kernel is used consistently, so band-energy
-            # ratios remain meaningful even though absolute spectral content differs.
-            if effective_scope == "full_frame":
-                ref_source = F.interpolate(ff_full_frames, size=(H, W), mode="bilinear", align_corners=False)
-                ref_ctx_mask = F.interpolate(ff_ctx_4d, size=(H, W), mode="bilinear", align_corners=False)
-                ref_pyr = build_laplacian_pyramid(ref_source, pyramid_levels, kernel)
-            else:
+            # Build the REFERENCE pyramid only for non-full-frame modes.
+            # full_frame mode uses precomputed per-level stats from the per-frame
+            # precompute above (no need to hold a full-frame pyramid in memory).
+            if effective_scope != "full_frame":
                 ref_pyr = build_laplacian_pyramid(orig, pyramid_levels, kernel)
-                ref_ctx_mask = None  # use the per-level downsampled crop-space mask below
 
             # Pyramid layout: [0]=finest detail, ..., [N-1]=coarse detail, [N]=base residual
             # Process from finest (0) up to but excluding base levels at the end.
@@ -389,16 +459,21 @@ class NV_TextureHarmonize:
                 lvl_gen = _downsample_mask_to(gen_4d, lh, lw)  # application mask (mask=1 only)
                 lvl_meas_gen = _downsample_mask_to(meas_gen_4d, lh, lw)
 
-                # Reference (ctx) measurement mask — full-frame or crop-space
+                # Per-level min-pixel threshold scales with the downsample factor.
+                # Each pyramid level halves H and W, so pixel count drops by 4× per level.
+                # Floor at 50 to keep coarse levels from being unnecessarily strict.
+                lvl_min_px = max(50, min_context_pixels // (4 ** lvl))
+
+                # CTX std: precomputed in full_frame mode, live for other modes
                 if effective_scope == "full_frame":
-                    lvl_meas_ctx = _downsample_mask_to(ref_ctx_mask, lh, lw)
+                    ctx_std = ff_stats['sharpness_ctx_stds'][lvl]
                 else:
                     lvl_meas_ctx = _downsample_mask_to(meas_ctx_4d, lh, lw)
+                    ctx_std = _masked_std(ref_pyr[lvl], lvl_meas_ctx, min_pixels=lvl_min_px)
 
                 # Sharpness uses std (not MAD) — the pyramid band energy IS the
                 # outliers (edges). MAD would discard exactly what we want to measure.
-                ctx_std = _masked_std(ref_pyr[lvl], lvl_meas_ctx)
-                gen_std = _masked_std(gen_pyr[lvl], lvl_meas_gen)
+                gen_std = _masked_std(gen_pyr[lvl], lvl_meas_gen, min_pixels=lvl_min_px)
 
                 if ctx_std is None or gen_std is None:
                     ratios.append("-")
@@ -428,35 +503,31 @@ class NV_TextureHarmonize:
         # Stage 2: Grain Synthesis (Per-Channel Noise Matching)
         # =================================================================
         if grain_strength > 0:
-            # Extract grain from context: high-freq residual = original - blur(original)
-            # In full_frame mode we measure on the NATIVE-RESOLUTION full frame, which
-            # is the most representative sample of the camera/codec grain pipeline.
-            # The grain residual is dominated by sensor noise + sharpening halos which
-            # are roughly stationary across the frame — so the lighting-locality concern
-            # that applies to the sharpness pyramid is much weaker here.
-            if effective_scope == "full_frame":
-                grain_source = ff_full_frames
-                grain_ctx_mask = ff_ctx_4d
-            else:
-                grain_source = orig
-                grain_ctx_mask = meas_ctx_4d
-
-            grain_blur_src = _gaussian_blur_sep(grain_source, grain_blur_sigma)
-            ctx_grain = grain_source - grain_blur_src
-
-            # Generated grain is always measured on the crop (it's where we apply the noise)
+            # Generated grain — always computed from the crop result (it's where
+            # we apply the noise back).
             gen_blur = _gaussian_blur_sep(result, grain_blur_sigma)
             gen_grain = result - gen_blur
+
+            # CTX grain residual — only needed when NOT in full_frame mode.
+            # full_frame mode has precomputed CTX MAD values from native-resolution
+            # full frames in ff_stats['grain_ctx_mads'].
+            if effective_scope != "full_frame":
+                orig_blur = _gaussian_blur_sep(orig, grain_blur_sigma)
+                ctx_grain = orig - orig_blur
 
             grain_added = []
             generator = torch.Generator(device=device)
 
             for c in range(min(C, 3)):
-                # Measure context grain std (per channel)
-                ctx_ch = ctx_grain[:, c:c+1, :, :]
-                # Grain uses MAD — the noise residual's BULK is the signal,
-                # edges in the residual are texture pollution we want to ignore.
-                ctx_std = _masked_mad(ctx_ch, grain_ctx_mask)
+                # CTX measurement — precomputed in full_frame mode, live otherwise
+                if effective_scope == "full_frame":
+                    # ff_stats grain_ctx_mads is [B, C, 1, 1]; slice this channel
+                    ctx_std = ff_stats['grain_ctx_mads'][:, c:c+1, :, :]
+                else:
+                    ctx_ch = ctx_grain[:, c:c+1, :, :]
+                    # Grain uses MAD — the noise residual's BULK is the signal,
+                    # edges in the residual are texture pollution we want to ignore.
+                    ctx_std = _masked_mad(ctx_ch, meas_ctx_4d, min_pixels=min_context_pixels)
                 if ctx_std is None:
                     grain_added.append("skip")
                     continue
@@ -465,7 +536,7 @@ class NV_TextureHarmonize:
 
                 # Measure generated grain std
                 gen_ch = gen_grain[:, c:c+1, :, :]
-                gen_std = _masked_mad(gen_ch, meas_gen_4d)
+                gen_std = _masked_mad(gen_ch, meas_gen_4d, min_pixels=min_context_pixels)
                 gen_val = gen_std.mean().item() if gen_std is not None else 0.0
 
                 # Additional grain needed = difference (only add, don't subtract)
