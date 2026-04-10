@@ -1,18 +1,29 @@
 # Status Board — NV_Comfy_Utils
 
 > Auto-managed by `/handoff`. Content is never deleted — old entries move to ARCHIVE.md.
-> Last updated: 2026-04-09b
+> Last updated: 2026-04-10
 
 ## Resume Context
 <!-- Rewritten each `/handoff` run. What does a cold-start agent need RIGHT NOW? -->
 
-- **Current focus:** Runtime test SAM3→MatAnyone→mask multiply pipeline for head-only soft alpha. Test SAM3 chunked tracking (enable_chunking=True, chunk_size=150) on 600+ frame video. Test retime JSON save/load across separate batch runs.
-- **Critical files:** `src/KNF_Utils/match_interp_frames.py`, `src/KNF_Utils/temporal_retime.py`, `ComfyUI-MatAnyone/mat_anyone2.py` (warmup drift issue)
-- **Known blockers:** MatAnyone v2 warmup discards input mask after 1 step — drifts to hands on sub-object masks. Full-body mask input works. Potential code fix in warming_up2() to re-inject mask each iteration.
-- **Environment notes:** NV_MatchInterpFrames new node (not yet runtime tested). temporal_retime.py modified (JSON save/load + config_only). SAM3 chunking built-in but not yet tested on long video.
+- **Current focus:** Build NV_VaceChunkedOrchestrator — single-node chunked VACE inpainting. Phase 1: frame slicing + rollback math. NV_VaceLatentSplice is built and validated.
+- **Critical files:** `src/KNF_Utils/vace_latent_splice.py`, `src/KNF_Utils/latent_guidance.py`, future `src/KNF_Utils/vace_chunked_orchestrator.py`
+- **Known blockers:** None — architecture designed, splice validated.
+- **Environment notes:** 1 uncommitted file (temporal_retime.py). Splice node + latent guidance fixes committed.
 
 ## Pulse
 <!-- Last 2 session summaries, newest first. Older entries roll to Workstream Details. -->
+
+### 2026-04-10 — VACE latent splice + orchestrator architecture [coding + research]
+- **Done:**
+  - Built NV_VaceLatentSplice node — splices clean encoder-domain latents from prev chunk's KSampler into VACE conditioning inactive channels. Eliminates VAE roundtrip drift on tail overlap. Multi-AI reviewed (Codex+Gemini), batch/channel/modulo-4 validation added.
+  - Fixed NV_SaveLatentReference: fp16 quantization → native dtype (fp32). Prevents noise artifacts in splice path.
+  - Fixed NV_LoadLatentReference: weights_only=False → True (security: eliminates pickle code execution).
+  - 4 rounds multi-AI brainstorm: VAE drift solutions, autoregressive chunking architecture, orchestrator design (2 rounds). Comprehensive architecture for single-queue-press chunked VACE inpainting.
+  - Runtime tested splice on multi-chunk knight armor video — color consistency confirmed good.
+- **Decisions:** Latent splice into vace_frames inactive channels is correct approach (D-023). Save latents as native dtype, not fp16 (D-024). Orchestrator: crop-space only, CropColorFix inside loop, Kling refs chunk 0 only, last-chunk rollback (D-025 PROVISIONAL).
+- **Blockers:** None — splice validated, orchestrator architecture designed.
+- **Next:** Build NV_VaceChunkedOrchestrator. Phase 1: frame slicing + rollback math skeleton. Phase 2: VAE encode + KSampler + splice loop. Phase 3: CropColorFix + refs + checkpoint/resume.
 
 ### 2026-04-09b — Masking deep dive + VFI research + utility nodes [research + coding]
 - **Done:**
@@ -28,18 +39,6 @@
 - **Blockers:** MatAnyone v2 ComfyUI wrapper has warmup drift issue — mask input gets discarded after 1 step, model drifts to high-contrast body parts (hands). n_warmup=1 is partial fix.
 - **Next:** Runtime test full pipeline: SAM3→MatAnyone→mask multiply for head-only soft alpha. Test SAM3 chunked tracking on 600+ frame video. Test retime config save/load across separate batches.
 
-### 2026-04-09 — Kling OmniParamImage.type hints + multi-AI review [coding]
-- **Done:**
-  - Researched full Kling Omni API surface for mask/region support — confirmed no mask parameter exists
-  - Discovered `OmniParamImage.type` field ("first_frame"/"end_frame") — used by built-in I2V node but never sent by edit/V2V nodes
-  - Implemented type hints on tail ref images in NV_KlingUploadPreview: last tail frame tagged `type="first_frame"` for chunk continuity
-  - Multi-AI review (Codex + Gemini): both approved implementation, flagged API compat as main risk (built-in edit node always sends type=None)
-  - Post-review fixes: removed dead `tail_slot_set` variable, hardened `ref_frame_types` fallback against None values
-  - Added 3 debug log points in NV_KlingEditVideo for runtime validation of type= field acceptance
-  - Updated prompt_refiner.py model list (latest OpenRouter models)
-- **Decisions:** Tag last tail frame as type="first_frame" for chunk-start anchoring (D-022, PROVISIONAL — untested with live API).
-- **Blockers:** None — needs runtime test to confirm API accepts type="first_frame" alongside video input.
-- **Next:** Runtime test chunked Kling with type= hints. If API rejects, strip type back to None when video present.
 
 
 ## Active Workstreams
@@ -50,9 +49,10 @@
 | B  | Edge-of-Frame Fix | STABLE | 2026-04-03 | Crop clamp + reflection/zeros padding — runtime tested, working |
 | C  | Clothing/Bag Swap Pipeline | ACTIVE | 2026-04-08 | Full body + head swap. CropColorFix validation added (D-020). Multi-pass workflow stabilizing. |
 | D  | Real-Time Mask Editor | STAGED | 2026-04-03 | Research complete — PySide6 + cached op graph MVP. Not started. |
-| E  | Chunk Seam Continuity | ACTIVE | 2026-04-08 | Stitch fixes applied. Tail-as-control-video ready for clean test. Audit doc updated (+153 lines). |
+| E  | Chunk Seam Continuity | ACTIVE | 2026-04-10 | NV_VaceLatentSplice built + runtime validated. Zero-drift tail overlap confirmed. |
 | F  | Kling API Chunking | ACTIVE | 2026-04-09 | type="first_frame" hints on tail refs. Debug logging added. Awaiting runtime test of API acceptance. |
 | G  | Masking & VFI Pipeline Research | ACTIVE | 2026-04-09 | Mocha for sub-object, SAM3 for full body, MatAnyone for edge refinement. GIMM-VFI stays. NV_MatchInterpFrames + RetimePrep JSON persistence built. |
+| H  | VACE Chunked Orchestrator | STAGED | 2026-04-10 | Architecture designed (4 multi-AI rounds). Single-queue-press chunked VACE inpainting with latent splice. |
 
 ### Status Tags
 - **ACTIVE** — Currently being worked on
@@ -81,6 +81,8 @@
 - Sampler-output latents and VAE-encoder-output latents are NOT interchangeable — different distributions cause color/sharpness shift when mixed in VACE conditioning
 - `control_masks` (from VaceControlVideoPrep) goes ONLY to VacePrePassReference/WanVaceToVideo — never to CropColorFix or InpaintStitch
 - Kling edit mode does NOT preserve original framing/camera — output cannot be stitched back onto original frames. Use as standalone output, not as InpaintStitch input.
+- NV_VaceLatentSplice offset must account for VacePrePassReference ref frames: splice at [:16, ref_T:ref_T+tail_T], not [:16, :tail_T]
+- Latent save MUST use native dtype — fp16 quantization causes visible noise bump artifacts when spliced into VACE conditioning
 
 ## Project Decisions Index
 <!-- Numbered decisions with lifecycle status. Never renumber IDs. -->
@@ -109,6 +111,9 @@
 | D-020 | 2026-04-08 | ACTIVE | C,E | CropColorFix must hard-fail on original≠generated frame count (was silently truncating, misaligning all frames) |
 | D-021 | 2026-04-08 | ACTIVE | E | All VaceControlVideoPrep exit paths must apply tail prepend via _apply_tail() helper |
 | D-022 | 2026-04-09 | PROVISIONAL | F | Tag last tail ref as type="first_frame" for chunk-start anchoring — API acceptance unverified |
+| D-023 | 2026-04-10 | ACTIVE | E,H | Latent splice into vace_frames[:, :16] inactive channels — encoder-domain KSampler output directly replaces roundtrip-drifted tail |
+| D-024 | 2026-04-10 | ACTIVE | E,H | Save latents as native dtype (fp32/bf16), never fp16 — quantization causes visible noise in splice path |
+| D-025 | 2026-04-10 | PROVISIONAL | H | Orchestrator architecture: crop-space, CropColorFix inside loop, Kling refs chunk 0 only, last-chunk rollback, seed+chunk_idx |
 
 ### Decision Statuses
 - **ACTIVE** — Currently in effect
@@ -216,10 +221,10 @@
   Outcome: Stitch fixes applied (validation+VRAM+try/except). CropColorFix hard-fail on mismatch (D-020). VaceControlVideoPrep _apply_tail() on all exits (D-021). Audit doc +153 lines.
   Decision: Hard-fail > silent truncate (D-020). Consistent tail prepend (D-021).
   Next: Clean e2e test of tail-as-control-video. Runtime test Kling chunking.
-- **2026-04-08b | coding**
-  Outcome: Stitch crash fixes (validation+VRAM+debug). CropColorFix hard-fail on mismatch (D-020). VaceControlVideoPrep _apply_tail() consistency (D-021). Audit doc +153 lines.
-  Decision: Hard-fail > silent truncate (D-020). Consistent tail prepend (D-021).
-  Next: Clean e2e test of tail-as-control-video. Runtime test Kling chunking.
+- **2026-04-10 | coding + research**
+  Outcome: Built NV_VaceLatentSplice — splices encoder-domain latents into VACE conditioning. Runtime tested on multi-chunk knight video, color consistency confirmed. Multi-AI reviewed. Fixed latent save (fp32) + load (weights_only=True).
+  Decision: Latent splice into inactive channels (D-023). Native dtype save (D-024). Orchestrator architecture designed (D-025).
+  Next: Build NV_VaceChunkedOrchestrator (Phase 1: frame slicing skeleton).
 
 ### F. Kling API Chunking
 **Current state:** ACTIVE — type hints added + multi-AI reviewed, awaiting runtime test of API acceptance
@@ -240,6 +245,10 @@
   Outcome: Built chunk_mode on UploadPreview (auto-truncate + tail refs + next_chunk_start). Deprecated KlingStitchAdapter. Codex caught max_chunk_frames bug.
   Decision: No stitch-back (D-018), no crossfade (D-019).
   Next: Runtime test >10s video. Evaluate tail-frame ref effectiveness.
+- **2026-04-09 | coding**
+  Outcome: Implemented OmniParamImage.type="first_frame" hints on tail ref images. Multi-AI reviewed (Codex+Gemini approved, API compat flagged). Debug logging added.
+  Decision: Tag last tail ref as type="first_frame" for chunk-start anchoring (D-022, PROVISIONAL).
+  Next: Runtime test chunked Kling with type= hints.
 
 ### G. Masking & VFI Pipeline Research
 **Current state:** ACTIVE
@@ -253,6 +262,25 @@
 **History:**
 *First session.*
 
+### H. VACE Chunked Orchestrator
+**Current state:** STAGED — architecture designed, implementation not started
+**Goal:** Single ComfyUI node that processes entire video through chunked VACE inpainting in one queue press
+**Key files:** `vace_latent_splice.py` (built), `latent_guidance.py` (save/load fixed), future `vace_chunked_orchestrator.py`
+**Active constraints:** Crop-space only (InpaintCrop/Stitch external). CropColorFix must run inside loop. Kling refs chunk 0 only. Last-chunk rollback (retract start frame, not pad).
+
+**Architecture (from 4 multi-AI rounds):**
+- Hybrid orchestrator: single node, internal Python loop, imports shared helpers
+- State across chunks: prev_tail_pixels (corrected) + prev_tail_latents (encoder-domain)
+- Overlap 12 frames (3 latent frames of velocity context)
+- Seed = base_seed + chunk_idx
+- Last-chunk rollback: retract start frame so WAN always sees valid 4k+1
+
+**Milestones:**
+- 2026-04-10 — Architecture designed. NV_VaceLatentSplice built + runtime validated.
+
+**History:**
+*First session — architecture design only.*
+
 ## Global Timeline
 <!-- Thin chronological index of project-wide events. NOT per-workstream progress. -->
 
@@ -263,6 +291,7 @@
 - **2026-04-07:** NV_KlingUploadPreview gains sequential chunk mode (auto-truncate + tail-frame refs). KlingStitchAdapter deprecated.
 - **2026-04-08:** Stitch crash fixes applied (validation+VRAM+debug). CropColorFix hard-fail on mismatch. VaceControlVideoPrep tail consistency fix. VACE_INPAINT_NODE_AUDIT.md addendum (+153 lines, 5 sections).
 - **2026-04-09:** Masking research arc: Mocha Pro guide (08_genai_mask_pipeline.md), segmentation/matting deep dive, VFI SOTA review. NV_MatchInterpFrames node built. RetimePrep/Restore gains JSON persistence + config_only mode.
+- **2026-04-10:** NV_VaceLatentSplice built + runtime validated (zero-drift tail overlap). Latent save/load security + precision fixes. Orchestrator architecture designed (4 multi-AI rounds). New workstream H: VACE Chunked Orchestrator.
 
 ## Archived Workstreams Index
 <!-- Pointers to workstreams moved to ARCHIVE.md. -->

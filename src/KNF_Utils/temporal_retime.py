@@ -226,11 +226,25 @@ class NV_RetimeRestore:
             "optional": {
                 "retime_config": ("RETIME_CONFIG", {
                     "forceInput": True,
-                    "tooltip": "Config from NV_RetimePrep (direct connection)"
+                    "tooltip": "Config from NV_RetimePrep (direct connection). Highest priority."
                 }),
                 "config_path": ("STRING", {
                     "default": "",
-                    "tooltip": "Load config from JSON file. Same filename used in RetimePrep save_path. Ignored if retime_config is connected."
+                    "tooltip": "Load config from JSON file. Same filename used in RetimePrep save_path. Second priority."
+                }),
+                "original_frame_count": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 100000,
+                    "step": 1,
+                    "tooltip": "Manual fallback: original frame count before interpolation. Used only when retime_config and config_path are empty. 0 = disabled."
+                }),
+                "slowdown_factor": ("INT", {
+                    "default": 2,
+                    "min": 2,
+                    "max": 8,
+                    "step": 1,
+                    "tooltip": "Manual fallback: interpolation factor used (e.g., 2 for 2x). Used only when retime_config and config_path are empty."
                 }),
             },
         }
@@ -239,9 +253,10 @@ class NV_RetimeRestore:
     RETURN_NAMES = ("images",)
     FUNCTION = "execute"
     CATEGORY = "NV_Utils/temporal"
-    DESCRIPTION = "Restore original frame timing from a rediffused slow video. Pair with NV_RetimePrep."
+    DESCRIPTION = "Restore original frame timing from a rediffused slow video. Pair with NV_RetimePrep, or provide original_frame_count manually."
 
-    def execute(self, images, method, retime_config=None, config_path=""):
+    def execute(self, images, method, retime_config=None, config_path="",
+                original_frame_count=0, slowdown_factor=2):
         available = int(images.shape[0])
         if available < 1:
             raise ValueError("[NV_RetimeRestore] Requires at least 1 input frame")
@@ -250,8 +265,19 @@ class NV_RetimeRestore:
             retime_config = _validate_retime_config(retime_config)
         elif config_path:
             retime_config = _load_config(config_path)
+        elif original_frame_count > 0:
+            # Manual fallback — build config from widget values
+            expected = _compute_slowed_frame_count(original_frame_count, slowdown_factor)
+            retime_config = {
+                "original_frame_count": original_frame_count,
+                "slowdown_factor": slowdown_factor,
+                "expected_slowed_count": expected,
+                "source_fps": 0.0,
+                "target_fps": 0.0,
+            }
+            print(f"[NV_RetimeRestore] Using manual config: {original_frame_count} original frames, {slowdown_factor}x factor")
         else:
-            raise ValueError("[NV_RetimeRestore] Either connect retime_config or provide a config_path")
+            raise ValueError("[NV_RetimeRestore] Provide one of: retime_config connection, config_path, or original_frame_count > 0")
 
         factor = retime_config["slowdown_factor"]
         original_count = retime_config["original_frame_count"]
