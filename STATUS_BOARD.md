@@ -1,18 +1,30 @@
 # Status Board — NV_Comfy_Utils
 
 > Auto-managed by `/handoff`. Content is never deleted — old entries move to ARCHIVE.md.
-> Last updated: 2026-04-10b
+> Last updated: 2026-04-10c
 
 ## Resume Context
 <!-- Rewritten each `/handoff` run. What does a cold-start agent need RIGHT NOW? -->
 
-- **Current focus:** Build NV_FrequencyShapedNoise — pixel-space FFT of full frame → shaped latent noise for SamplerCustomAdvanced. Experiment: does frequency-shaped starting noise make generation match source aesthetic?
-- **Critical files:** `src/KNF_Utils/texture_harmonize.py` (built), `src/KNF_Utils/vace_prepass_reference.py` (tail removed), future `src/KNF_Utils/frequency_shaped_noise.py`
+- **Current focus:** Build NV_VaceChunkedOrchestrator (workstream H). Single-queue-press chunked VACE inpainting. NV_FrequencyShapedNoise experiment shelved — flow-matching DiTs reject init-noise priors. TextureHarmonize is the production aesthetic-matching path.
+- **Critical files:** `src/KNF_Utils/texture_harmonize.py` (production, MAD mode), `src/KNF_Utils/vace_latent_splice.py` (production), `src/KNF_Utils/frequency_shaped_noise.py` (SHELVED, kept for reference), future `src/KNF_Utils/vace_chunked_orchestrator.py`
 - **Known blockers:** None.
-- **Environment notes:** 1 uncommitted file (vace_prepass_reference.py — tail inputs removed). Texture harmonize committed.
+- **Environment notes:** Multi uncommitted: texture_harmonize.py (MAD upgrade), frequency_shaped_noise.py (built+shelved), multi_model_sampler.py (gained noise input — keep), vace_prepass_reference.py (tail removed).
 
 ## Pulse
 <!-- Last 2 session summaries, newest first. Older entries roll to Workstream Details. -->
+
+### 2026-04-10c — Frequency-shaped noise experiment SHELVED + texture harmonize MAD upgrade [coding + research]
+- **Done:**
+  - Built NV_FrequencyShapedNoise node — full-frame pixel-space FFT → radial profile → shaped latent noise via deterministic linear filter. Wired into NV_MultiModelSampler via optional NOISE input (no SamplerCustomAdvanced swap needed).
+  - Multi-AI bug review found CRITICAL fftshift mismatch (DC at center for profile extraction, DC at corners for shaping → entire spectrum was inverted). Plus DC bin domination (127x ratio was mostly image mean), linear amplitude blending instead of deterministic filter, no high-freq floor.
+  - Fixed all 7 issues: fftshift alignment, DC removal (skip first 2 bins), power spectrum + sqrt for amplitude, log-domain blending with bounded clamp (gain range [0.5, 2.0]), deterministic linear filter F_out=H*F_white, per-channel renormalization, batched FFT.
+  - Runtime tested at strength=1.0 with bug fixes: STILL severe rainbow checkerboard artifacts. The model is treating shaped noise as content to denoise, not as a stylistic prior.
+  - Multi-AI final verdict: DEAD END. Both Codex and Gemini independently concluded the approach is fundamentally incompatible with WAN's flow-matching DiT architecture. No useful operating window between "ignored" (weak shaping) and "destabilizing" (catastrophic artifacts).
+  - Texture harmonize gained MAD (Median Absolute Deviation) stat mode — replaces std as default for measuring texture spread. Robust to single bright outliers (eyelashes, specular highlights) that caused temporal strobing in tight crops as masks wiggled frame-to-frame.
+- **Decisions:** NV_FrequencyShapedNoise SHELVED — fundamentally incompatible with flow-matching DiTs (D-029). Init-noise covariance changes are read as content by flow-matching models, not as priors. TextureHarmonize defaults to MAD instead of std — kills temporal strobing from outlier-driven ratio swings (D-030).
+- **Blockers:** None.
+- **Next:** Build NV_VaceChunkedOrchestrator. The aesthetic problem is now fully owned by post-processing (TextureHarmonize). Move on from prior-hacking experiments.
 
 ### 2026-04-10b — Texture harmonize + aesthetic conditioning research + prepass cleanup [coding + research]
 - **Done:**
@@ -25,18 +37,6 @@
 - **Decisions:** VacePrePassReference tail inputs removed — redundant with control video + splice path (D-026). Texture harmonize is post-decode only — VAE bottleneck prevents DiT-level grain/sharpness control (D-027). Frequency-shaped noise worth testing as complementary approach (D-028 PROVISIONAL).
 - **Blockers:** None.
 - **Next:** Build NV_FrequencyShapedNoise — pixel-space FFT of full frame → shaped latent noise for SamplerCustomAdvanced. Test if generation quality character shifts toward source aesthetic.
-
-### 2026-04-10 — VACE latent splice + orchestrator architecture [coding + research]
-- **Done:**
-  - Built NV_VaceLatentSplice node — splices clean encoder-domain latents from prev chunk's KSampler into VACE conditioning inactive channels. Eliminates VAE roundtrip drift on tail overlap. Multi-AI reviewed (Codex+Gemini), batch/channel/modulo-4 validation added.
-  - Fixed NV_SaveLatentReference: fp16 quantization → native dtype (fp32). Prevents noise artifacts in splice path.
-  - Fixed NV_LoadLatentReference: weights_only=False → True (security: eliminates pickle code execution).
-  - 4 rounds multi-AI brainstorm: VAE drift solutions, autoregressive chunking architecture, orchestrator design (2 rounds). Comprehensive architecture for single-queue-press chunked VACE inpainting.
-  - Runtime tested splice on multi-chunk knight armor video — color consistency confirmed good.
-- **Decisions:** Latent splice into vace_frames inactive channels is correct approach (D-023). Save latents as native dtype, not fp16 (D-024). Orchestrator: crop-space only, CropColorFix inside loop, Kling refs chunk 0 only, last-chunk rollback (D-025 PROVISIONAL).
-- **Blockers:** None — splice validated, orchestrator architecture designed.
-- **Next:** Build NV_VaceChunkedOrchestrator. Phase 1: frame slicing + rollback math skeleton. Phase 2: VAE encode + KSampler + splice loop. Phase 3: CropColorFix + refs + checkpoint/resume.
-
 
 
 ## Active Workstreams
@@ -51,7 +51,7 @@
 | F  | Kling API Chunking | ACTIVE | 2026-04-09 | type="first_frame" hints on tail refs. Debug logging added. Awaiting runtime test of API acceptance. |
 | G  | Masking & VFI Pipeline Research | ACTIVE | 2026-04-09 | Mocha for sub-object, SAM3 for full body, MatAnyone for edge refinement. GIMM-VFI stays. NV_MatchInterpFrames + RetimePrep JSON persistence built. |
 | H  | VACE Chunked Orchestrator | STAGED | 2026-04-10 | Architecture designed (4 multi-AI rounds). Single-queue-press chunked VACE inpainting with latent splice. |
-| I  | Texture Harmonize + Aesthetic Conditioning | ACTIVE | 2026-04-10 | NV_TextureHarmonize built + runtime tested. Frequency-shaped noise next. Full-frame aesthetic reference planned. |
+| I  | Texture Harmonize + Aesthetic Conditioning | ACTIVE | 2026-04-10 | NV_TextureHarmonize w/ MAD stat mode (kills temporal strobing). Frequency-shaped noise SHELVED — incompatible with WAN flow-matching DiT. |
 
 ### Status Tags
 - **ACTIVE** — Currently being worked on
@@ -84,6 +84,8 @@
 - Latent save MUST use native dtype — fp16 quantization causes visible noise bump artifacts when spliced into VACE conditioning
 - VAE bottleneck destroys film grain, sensor noise, and compression artifacts — DiT cannot generate these. Texture harmonization must be post-decode.
 - Laplacian pyramid level 0 = finest detail (highest frequency), last level = base residual (lowest frequency). Skip base levels from END, not from 0.
+- WAN/VACE flow-matching DiTs are MORE brittle to init-noise structure than older U-Net DDPM models. Init noise must be near-isotropic Gaussian — covariance perturbations get read as content and produce structured failure modes (rainbow checkerboards). Aesthetic control must be post-decode, not init-shaping.
+- TextureHarmonize: use MAD (default) instead of std for texture spread on tight crops where mask edges contain outlier pixels. std swings 20-40% from a single bright pixel and causes temporal strobing.
 
 ## Project Decisions Index
 <!-- Numbered decisions with lifecycle status. Never renumber IDs. -->
@@ -117,7 +119,9 @@
 | D-025 | 2026-04-10 | PROVISIONAL | H | Orchestrator architecture: crop-space, CropColorFix inside loop, Kling refs chunk 0 only, last-chunk rollback, seed+chunk_idx |
 | D-026 | 2026-04-10 | ACTIVE | E | VacePrePassReference tail inputs removed — redundant with VaceControlVideoPrep + VaceLatentSplice |
 | D-027 | 2026-04-10 | ACTIVE | I | Texture harmonize must be post-decode only — VAE bottleneck prevents DiT-level grain/sharpness control |
-| D-028 | 2026-04-10 | PROVISIONAL | I | Frequency-shaped noise (pixel-space FFT of full frame → shaped latent noise) as complementary aesthetic conditioning |
+| D-028 | 2026-04-10 | SUPERSEDED → D-029 | I | Frequency-shaped noise (pixel-space FFT of full frame → shaped latent noise) as complementary aesthetic conditioning |
+| D-029 | 2026-04-10 | ACTIVE | I | NV_FrequencyShapedNoise SHELVED — flow-matching DiTs read init-noise covariance changes as content, not as priors. No usable operating window between "ignored" and "destabilizing". Post-processing (TextureHarmonize) is the right architectural answer. |
+| D-030 | 2026-04-10 | ACTIVE | I | TextureHarmonize defaults to MAD (Median Absolute Deviation) instead of std for texture spread — robust to single-pixel outliers (eyelashes/highlights) that caused temporal strobing in tight crops as masks wiggled |
 
 ### Decision Statuses
 - **ACTIVE** — Currently in effect
@@ -289,29 +293,47 @@
 *First session — architecture design only.*
 
 ### I. Texture Harmonize + Aesthetic Conditioning
-**Current state:** ACTIVE — NV_TextureHarmonize built + tested, frequency-shaped noise next
-**Goal:** Make AI-generated crops visually match the source footage's texture quality (sharpness, grain, micro-contrast) via post-processing and optionally pre-conditioning the sampler
-**Key files:** `texture_harmonize.py` (built), future `frequency_shaped_noise.py`
-**Active constraints:** VAE bottleneck prevents DiT-level grain/sharpness — post-decode only for texture. Frequency-shaped noise is the one DiT-influencing approach that might work (affects starting noise, not model internals).
+**Current state:** ACTIVE — NV_TextureHarmonize is the production texture-matching path. NV_FrequencyShapedNoise SHELVED.
+**Goal:** Make AI-generated crops visually match source footage's texture quality (sharpness, grain, micro-contrast) via post-processing
+**Key files:** `texture_harmonize.py` (production), `frequency_shaped_noise.py` (shelved, kept for reference), `multi_model_sampler.py` (has noise input — keep for future use)
+**Active constraints:** VAE bottleneck prevents DiT-level grain/sharpness — post-decode is the ONLY viable control surface for texture characteristics. Init-noise priors do NOT work on flow-matching DiTs (D-029).
 
-**Architecture:**
-- Stage 1 (built): Laplacian pyramid variance matching — sharpness + micro-contrast per frequency band
-- Stage 2 (built): Per-channel grain synthesis — additive only, frame-seeded
-- Stage 3 (planned): NV_FrequencyShapedNoise — full-frame pixel FFT → shaped latent noise for SamplerCustomAdvanced
-- Future: optional full_frame_reference IMAGE input on TextureHarmonize for global aesthetic vs crop-border-local
+**Architecture (production):**
+- Laplacian pyramid variance matching — sharpness + micro-contrast per frequency band
+- Per-channel grain synthesis — additive only, frame-seeded, MAD-based stat for outlier robustness
+- Pipeline position: VAE Decode → CropColorFix → NV_TextureHarmonize → InpaintStitch
 
-**Research findings (20+ papers):**
-- Our approach matches Adobe Multi-scale Harmonization (Sunkavalli 2010) lineage
+**Shelved experiment — NV_FrequencyShapedNoise:**
+- Approach: pixel-space FFT of full source frame → radial power spectrum → shaped initial noise via deterministic linear filter
+- Why it failed: WAN flow-matching DiT reads init-noise covariance changes as content, not as priors
+- Empirical: NO useful operating window. Weak shaping = ignored. Strong shaping = rainbow checkerboard catastrophic failure.
+- Bug fixes that didn't save it: fftshift alignment, DC removal, log-domain blending, bounded gain [0.5, 2.0], deterministic linear filter F=H*F_white, per-channel renormalization. ALL applied. Still failed.
+- Theoretical reason: DDPM U-Nets have SDE drift that washes out off-distribution starts. Flow-matching ODEs don't — bad start = bad trajectory all the way through.
+- The node + the optional noise input on NV_MultiModelSampler are kept for potential future use with non-flow-matching architectures, but should NOT be wired in current production workflows.
+
+**Lessons learned (preserve for future):**
+- Modern DiTs are MORE brittle to init-noise structure than older U-Nets, not less
+- The "control noise to control output" intuition is wrong for flow matching
+- Aesthetic control on flow matching = post-decode pixel ops, not prior hacking
+- If aesthetic conditioning is ever needed inside the model, look at FreeU-style feature manipulation (block 30-39 hidden state shaping), not noise shaping
+- Secondary sigma-gated VACE branch is the most promising untested approach for in-model aesthetic conditioning
+
+**Research findings (20+ papers reviewed):**
+- Our texture harmonize approach matches Adobe Multi-scale Harmonization (Sunkavalli 2010) lineage
 - Real-ESRGAN degradation model useful as reverse-application reference
 - DISTS/A-DISTS metrics best for texture similarity evaluation
 - Signal-dependent noise (heteroscedastic: variance scales with luminance) = key upgrade for grain realism
-- Secondary sigma-gated VACE branch = best WAN-native aesthetic injection (future)
 
 **Milestones:**
 - 2026-04-10 — NV_TextureHarmonize built + runtime tested (sharpness ratios 0.54/0.57). Multi-AI reviewed + 5 fixes applied.
+- 2026-04-10 — NV_FrequencyShapedNoise built, fully debugged, empirically tested, shelved. Knowledge captured.
+- 2026-04-10 — TextureHarmonize gained MAD stat mode for outlier robustness.
 
 **History:**
-*First session.*
+- **2026-04-10 | coding + research (shelved experiment)**
+  Outcome: NV_FrequencyShapedNoise built and tested through 2 multi-AI review rounds + bug fixes. Empirically confirmed dead end for flow-matching DiTs. TextureHarmonize gained MAD mode.
+  Decision: SHELVE init-noise shaping for WAN/VACE (D-029). MAD as default texture statistic (D-030). Aesthetic control via post-decode only.
+  Next: Build NV_VaceChunkedOrchestrator. Aesthetic problem is solved by TextureHarmonize.
 
 ## Global Timeline
 <!-- Thin chronological index of project-wide events. NOT per-workstream progress. -->
@@ -325,6 +347,7 @@
 - **2026-04-09:** Masking research arc: Mocha Pro guide (08_genai_mask_pipeline.md), segmentation/matting deep dive, VFI SOTA review. NV_MatchInterpFrames node built. RetimePrep/Restore gains JSON persistence + config_only mode.
 - **2026-04-10:** NV_VaceLatentSplice built + runtime validated (zero-drift tail overlap). Latent save/load security + precision fixes. Orchestrator architecture designed (4 multi-AI rounds). New workstream H: VACE Chunked Orchestrator.
 - **2026-04-10:** NV_TextureHarmonize built + runtime tested (AI crop 2x too sharp, auto-corrected). VacePrePassReference tail inputs removed (D-026). Aesthetic conditioning research: 20+ papers, WAN DiT injection points mapped. New workstream I: Texture Harmonize + Aesthetic Conditioning.
+- **2026-04-10:** NV_FrequencyShapedNoise SHELVED after full debug cycle (D-029). Empirical evidence: flow-matching DiTs reject init-noise covariance priors — no usable operating window between "ignored" and "destabilizing". Knowledge captured in workstream I history. TextureHarmonize gained MAD stat mode for outlier-robust temporal stability (D-030).
 
 ## Archived Workstreams Index
 <!-- Pointers to workstreams moved to ARCHIVE.md. -->

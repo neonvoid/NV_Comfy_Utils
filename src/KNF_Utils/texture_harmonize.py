@@ -64,6 +64,52 @@ def _masked_std(tensor, mask_4d, min_pixels=100):
     return var.sqrt().clamp(min=1e-6)
 
 
+def _masked_mad(tensor, mask_4d, min_pixels=100):
+    """Compute per-channel MAD (Median Absolute Deviation) over masked region.
+
+    Returns [B, C, 1, 1] scaled by 1.4826 to be std-equivalent for normal data,
+    or None if any frame has too few masked pixels.
+
+    Why MAD instead of std: a single bright outlier in the context ring (eyelash,
+    specular highlight, stray edge) drags std up by 20-40%, then drops it again on
+    the next frame as the mask wiggles. That swings the texture-match ratio against
+    a hard clamp, producing visible temporal strobing in the harmonized output.
+    The median is unaffected by isolated outliers, so MAD stays stable frame-to-frame.
+
+    Implementation: soft mask weights are binarized at 0.5. At coarse pyramid
+    levels the bilinear edge fraction is a small slice of the total, so the
+    discretization error on the bulk statistic is negligible.
+    """
+    B, C, H, W = tensor.shape
+    binary_mask = mask_4d.clamp(0, 1) >= 0.5  # [B, 1, H, W] bool
+    count = binary_mask.sum(dim=(2, 3))  # [B, 1]
+    if count.min().item() < min_pixels:
+        return None
+
+    result = torch.empty(B, C, 1, 1, device=tensor.device, dtype=tensor.dtype)
+    for b in range(B):
+        m = binary_mask[b, 0]  # [H, W]
+        for c in range(C):
+            values = tensor[b, c][m]  # [N] masked pixels
+            median = torch.quantile(values, 0.5)
+            abs_dev = (values - median).abs()
+            mad = torch.quantile(abs_dev, 0.5)
+            result[b, c, 0, 0] = mad * 1.4826
+
+    return result.clamp(min=1e-6)
+
+
+def _masked_scale(tensor, mask_4d, mode, min_pixels=100):
+    """Dispatch to std or MAD based on mode. Both return [B, C, 1, 1] or None.
+
+    Drop-in replacement for either estimator — they produce comparable values
+    for normal data (MAD is scaled by 1.4826 to match std on a Gaussian).
+    """
+    if mode == "mad":
+        return _masked_mad(tensor, mask_4d, min_pixels)
+    return _masked_std(tensor, mask_4d, min_pixels)
+
+
 def _downsample_mask_to(mask_4d, target_h, target_w):
     """Downsample [B, 1, H, W] mask to target spatial dims."""
     if mask_4d.shape[2] == target_h and mask_4d.shape[3] == target_w:
@@ -122,6 +168,23 @@ class NV_TextureHarmonize:
                     "default": 1000, "min": 100, "max": 50000, "step": 100,
                     "tooltip": "Minimum context pixels needed for statistics. Below this, skip matching."
                 }),
+                "stat_mode": (["mad", "std"], {
+                    "default": "mad",
+                    "tooltip": "Statistic for measuring texture spread. "
+                               "mad = Median Absolute Deviation (robust to outliers like eyelashes/highlights — "
+                               "kills temporal strobing in tight crops, recommended). "
+                               "std = standard deviation (legacy behavior, sensitive to outliers)."
+                }),
+                "context_scope": (["ring_only", "whole_crop"], {
+                    "default": "ring_only",
+                    "tooltip": "Where to measure original-footage texture stats. "
+                               "ring_only = only the mask=0 donut around the inpaint area (current behavior, "
+                               "lighting-matched but small sample). "
+                               "whole_crop = entire original_crop including the masked region (14× more samples, "
+                               "same crop = same lighting, no bias from other parts of the frame). "
+                               "Safe for most VFX edits where masked content is texturally similar to surroundings; "
+                               "avoid for dramatic material swaps (e.g., dirt→snow)."
+                }),
             },
         }
 
@@ -139,11 +202,13 @@ class NV_TextureHarmonize:
     def execute(self, generated_crop, original_crop, mask,
                 sharpness_strength=1.0, grain_strength=1.0,
                 pyramid_levels=4, grain_blur_sigma=1.5,
-                skip_base_levels=1, temporal_seed=0, min_context_pixels=1000):
+                skip_base_levels=1, temporal_seed=0, min_context_pixels=1000,
+                stat_mode="mad", context_scope="ring_only"):
         TAG = "[NV_TextureHarmonize]"
         device = generated_crop.device
         B, H, W, C = generated_crop.shape
-        info_lines = [f"{TAG} {B} frames, {H}x{W}, sharpness={sharpness_strength}, grain={grain_strength}"]
+        info_lines = [f"{TAG} {B} frames, {H}x{W}, sharpness={sharpness_strength}, "
+                      f"grain={grain_strength}, stat={stat_mode}, scope={context_scope}"]
 
         if original_crop.shape[0] != B:
             raise ValueError(f"{TAG} Frame count mismatch: generated={B}, original={original_crop.shape[0]}")
@@ -157,13 +222,24 @@ class NV_TextureHarmonize:
         if m.shape[1:] != (H, W):
             m = F.interpolate(m.unsqueeze(1), size=(H, W), mode="bilinear", align_corners=False).squeeze(1)
 
-        ctx_4d = (m < 0.5).float().unsqueeze(1)   # [B, 1, H, W] context
-        gen_4d = (m >= 0.5).float().unsqueeze(1)   # [B, 1, H, W] generated
+        ctx_4d = (m < 0.5).float().unsqueeze(1)   # [B, 1, H, W] context (mask=0 ring)
+        gen_4d = (m >= 0.5).float().unsqueeze(1)   # [B, 1, H, W] generated (mask=1 region)
 
-        # Check we have enough context
-        avg_ctx_px = ctx_4d.sum(dim=(2, 3)).mean().item()
+        # Measurement masks: where we sample stats from. Application masks (gen_4d/ctx_4d
+        # above) are unchanged — we still only modify the inpaint region.
+        # whole_crop = use the entire crop as a stat sample (more pixels, no lighting drift
+        # because it's the same crop window). Safe for most VFX edits.
+        if context_scope == "whole_crop":
+            meas_ctx_4d = torch.ones_like(ctx_4d)
+            meas_gen_4d = torch.ones_like(gen_4d)
+        else:
+            meas_ctx_4d = ctx_4d
+            meas_gen_4d = gen_4d
+
+        # Check we have enough measurement support
+        avg_ctx_px = meas_ctx_4d.sum(dim=(2, 3)).mean().item()
         if avg_ctx_px < min_context_pixels:
-            info_lines.append(f"  Skipped: {int(avg_ctx_px)} context pixels < {min_context_pixels}")
+            info_lines.append(f"  Skipped: {int(avg_ctx_px)} measurement pixels < {min_context_pixels}")
             info = "\n".join(info_lines)
             print(info)
             return (generated_crop, info)
@@ -194,11 +270,12 @@ class NV_TextureHarmonize:
                     continue
 
                 lh, lw = gen_pyr[lvl].shape[2], gen_pyr[lvl].shape[3]
-                lvl_ctx = _downsample_mask_to(ctx_4d, lh, lw)
-                lvl_gen = _downsample_mask_to(gen_4d, lh, lw)
+                lvl_gen = _downsample_mask_to(gen_4d, lh, lw)  # application mask (mask=1 only)
+                lvl_meas_ctx = _downsample_mask_to(meas_ctx_4d, lh, lw)
+                lvl_meas_gen = _downsample_mask_to(meas_gen_4d, lh, lw)
 
-                ctx_std = _masked_std(orig_pyr[lvl], lvl_ctx)
-                gen_std = _masked_std(gen_pyr[lvl], lvl_gen)
+                ctx_std = _masked_scale(orig_pyr[lvl], lvl_meas_ctx, stat_mode)
+                gen_std = _masked_scale(gen_pyr[lvl], lvl_meas_gen, stat_mode)
 
                 if ctx_std is None or gen_std is None:
                     ratios.append("-")
@@ -242,7 +319,7 @@ class NV_TextureHarmonize:
             for c in range(min(C, 3)):
                 # Measure context grain std (per channel)
                 ctx_ch = ctx_grain[:, c:c+1, :, :]
-                ctx_std = _masked_std(ctx_ch, ctx_4d)
+                ctx_std = _masked_scale(ctx_ch, meas_ctx_4d, stat_mode)
                 if ctx_std is None:
                     grain_added.append("skip")
                     continue
@@ -251,7 +328,7 @@ class NV_TextureHarmonize:
 
                 # Measure generated grain std
                 gen_ch = gen_grain[:, c:c+1, :, :]
-                gen_std = _masked_std(gen_ch, gen_4d)
+                gen_std = _masked_scale(gen_ch, meas_gen_4d, stat_mode)
                 gen_val = gen_std.mean().item() if gen_std is not None else 0.0
 
                 # Additional grain needed = difference (only add, don't subtract)

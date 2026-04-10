@@ -85,11 +85,12 @@ class NV_MultiModelSampler:
                     )}),
                 "end_at_step": ("INT", {"default": 0, "min": 0, "max": 10000,
                     "tooltip": "Stop at this step (0=run to end). For cascaded: wire expanded_steps here."}),
-                # Noise override
+                # Noise override (experimental — reserved for future non-flow-matching models)
                 "noise": ("NOISE", {
-                    "tooltip": "Optional custom noise object (e.g., from NV_FrequencyShapedNoise). "
-                               "When connected, replaces internal noise generation. "
-                               "When not connected, uses standard random noise from seed."
+                    "tooltip": "EXPERIMENTAL: Custom noise object replacing internal noise generation. "
+                               "NV_FrequencyShapedNoise was shelved (D-029) — flow-matching DiTs reject "
+                               "init-noise priors. Leave unconnected for standard sampling. "
+                               "Reserved for future non-flow-matching architectures."
                 }),
                 # Debug
                 "verbose": ("BOOLEAN", {"default": False,

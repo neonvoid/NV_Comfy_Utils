@@ -1,20 +1,45 @@
 """
-NV Frequency-Shaped Noise — Shape starting noise to match source footage's frequency profile.
+NV Frequency-Shaped Noise — SHELVED 2026-04-10 (D-029)
 
-Standard diffusion starts from white noise (equal energy at all frequencies). This biases
-the model toward generating "clean" AI-perfect output. By shaping the starting noise to
-match the source footage's frequency profile, we bias the model toward generating at the
-same quality level as the source.
+Status: SHELVED — kept for reference and potential future use with non-flow-matching models.
 
-The node analyzes a full-frame reference image's radial power spectrum (how much energy
-at each spatial frequency) and transfers that profile onto the standard random noise.
-Phase (spatial arrangement) stays random — we're not copying the image, just its
-"frequency fingerprint."
+Original idea: shape the starting noise of the diffusion sampler to match the source
+footage's radial power spectrum, biasing the model toward generating at the source's
+quality level (softness, grain, micro-contrast) instead of the typical "AI-clean" look.
 
-Uses pixel-space FFT on the full frame for maximum fidelity — captures lens softness,
-sensor grain, compression artifacts that the VAE would destroy.
+Why it failed for WAN/VACE:
+- WAN uses flow-matching with a DiT backbone. Flow-matching ODEs solve a deterministic
+  trajectory from N(0, I) to data. There is no SDE drift to correct off-distribution
+  starts. Any covariance perturbation in the init noise produces a bad trajectory.
+- The model reads spatially correlated noise as content to denoise, not as a stylistic
+  prior. Even bounded shaping (gain range [0.5, 2.0]) produced rainbow checkerboard
+  artifacts in the inpainted region.
+- Modern DiT/flow-matching architectures are MORE brittle to init-noise structure than
+  older U-Net DDPM models, not less.
 
-Outputs a NOISE object compatible with SamplerCustomAdvanced / SamplerCustom.
+Empirical evidence:
+- Weak shaping (strength=0.5): no measurable effect on output (post-process sharpness
+  measurements identical to baseline).
+- Strong shaping (strength=1.0): catastrophic structured artifacts.
+- All bug fixes applied (fftshift alignment, DC removal, log-domain blending, bounded
+  clamp, deterministic linear filter, per-channel renormalization). Still failed.
+- Multi-AI consensus from 2 review rounds: no usable operating window between "ignored"
+  and "destabilizing".
+
+Decision: Texture matching is owned by post-processing (NV_TextureHarmonize). For aesthetic
+control INSIDE flow-matching DiTs, the recommended approach is FreeU-style feature
+manipulation in late blocks (30-39), not init-noise shaping.
+
+The node is not unregistered — it's preserved as a research artifact and may be useful
+for non-flow-matching architectures (older U-Net DDPM models). Do NOT wire it into
+production WAN/VACE workflows.
+
+Implementation notes (for the curious):
+- Pixel-space FFT of full source frame, radial bin averaging, DC excluded
+- Power spectrum analysis with sqrt for amplitude filter
+- Deterministic linear filter F_out = H * F_white preserves Gaussianity
+- Log-domain blending with bounded clamp prevents extreme gain values
+- Per-channel renormalization to preserve WAN's 16-channel statistics
 """
 
 import torch
