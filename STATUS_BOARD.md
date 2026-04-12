@@ -1,18 +1,30 @@
 # Status Board — NV_Comfy_Utils
 
 > Auto-managed by `/handoff`. Content is never deleted — old entries move to ARCHIVE.md.
-> Last updated: 2026-04-10c
+> Last updated: 2026-04-12
 
 ## Resume Context
 <!-- Rewritten each `/handoff` run. What does a cold-start agent need RIGHT NOW? -->
 
-- **Current focus:** Build NV_VaceChunkedOrchestrator (workstream H). Single-queue-press chunked VACE inpainting. NV_FrequencyShapedNoise experiment shelved — flow-matching DiTs reject init-noise priors. TextureHarmonize is the production aesthetic-matching path.
-- **Critical files:** `src/KNF_Utils/texture_harmonize.py` (production, MAD mode), `src/KNF_Utils/vace_latent_splice.py` (production), `src/KNF_Utils/frequency_shaped_noise.py` (SHELVED, kept for reference), future `src/KNF_Utils/vace_chunked_orchestrator.py`
-- **Known blockers:** None.
-- **Environment notes:** Multi uncommitted: texture_harmonize.py (MAD upgrade), frequency_shaped_noise.py (built+shelved), multi_model_sampler.py (gained noise input — keep), vace_prepass_reference.py (tail removed).
+- **Current focus:** Runtime test NV_TextureHarmonize high-band reinjection (highband_strength=0.5, sigma=3.0) on WAN-on-Kling identity refinement shot. Compare orig_hf vs ai_hf diagnostic values. If it works, establish default sigma/strength for production.
+- **Critical files:** `src/KNF_Utils/texture_harmonize.py` (Stage 3 high-band reinjection — the main thing to test), `src/KNF_Utils/temporal_retime.py` (manual fallback inputs added)
+- **Known blockers:** None — code complete, awaiting runtime test.
+- **Environment notes:** texture_harmonize.py has all session's work uncommitted (per-stage stats, context_scope, full_frame, OOM fix, Codex fixes, high-band reinjection). Foundations course at `node_notes/courses/foundations_for_video_gen/` (5 docs, multi-AI reviewed + all 3 tiers of fixes applied).
 
 ## Pulse
 <!-- Last 2 session summaries, newest first. Older entries roll to Workstream Details. -->
+
+### 2026-04-10/12 — TextureHarmonize major overhaul + high-band reinjection + foundations course [coding + research]
+- **Done:**
+  - Multi-AI research: how video edit models (Kling, InstructPix2Pix) work vs mask-based inpainting (VACE). Confirmed Kling = conditional re-synthesis, not spatial constraint.
+  - TextureHarmonize overhaul: per-stage stat split (std for sharpness pyramid, MAD for grain — fixed regression where MAD was blurring output). Added context_scope (ring_only/whole_crop/full_frame), full_frame mode via stitcher (OOM-safe per-frame precompute), Codex review bug fixes (whole_crop measurement bug, min_context_pixels threading, mask batch validation).
+  - Built high-band reinjection (Stage 3): frequency separation transfer from original_crop — grafts original's HF texture onto AI-refined result inside mask. Addresses cross-model cartoon drift (Kling→WAN).
+  - Multi-AI diagnosis of AI-on-AI cartoon drift: compound of prior attraction + VAE round-trip loss + sampler convergence. Pre-process sharpening rejected (model ignores structured HF input). Post-process frequency separation confirmed as the principled fix.
+  - Fixed RetimeRestore: added manual fallback inputs (original_frame_count + slowdown_factor) + corrected saved config for shot2.
+  - Created foundations_for_video_gen course (5 docs): Thinking in Frequencies, Estimators, Manifolds, Diffusion + curated README. Multi-AI reviewed + all 3 tiers of fixes applied.
+- **Decisions:** Per-stage estimator choice — std for sharpness pyramid bands, MAD for grain residual (D-031). High-band reinjection = post-process frequency separation, not pre-process sharpening (D-032). Pre-process HF boost is dead end — model's prior ignores it (D-033).
+- **Blockers:** None — high-band reinjection awaiting first runtime test.
+- **Next:** Runtime test highband_strength=0.5 on WAN-on-Kling identity refinement shot. Compare with/without. If it works, establish default sigma/strength for production.
 
 ### 2026-04-10c — Frequency-shaped noise experiment SHELVED + texture harmonize MAD upgrade [coding + research]
 - **Done:**
@@ -26,17 +38,6 @@
 - **Blockers:** None.
 - **Next:** Build NV_VaceChunkedOrchestrator. The aesthetic problem is now fully owned by post-processing (TextureHarmonize). Move on from prior-hacking experiments.
 
-### 2026-04-10b — Texture harmonize + aesthetic conditioning research + prepass cleanup [coding + research]
-- **Done:**
-  - Built NV_TextureHarmonize node — Laplacian pyramid variance matching (sharpness/micro-contrast) + per-channel grain synthesis. Multi-AI reviewed (Codex+Gemini): fixed reversed pyramid indexing, tightened ratio clamp (0.25-3.0), batch-averaged ratios for temporal stability, per-frame grain seeding, soft mask weights.
-  - Runtime tested: sharpness ratios 0.54/0.57 confirmed AI crop was ~2x too sharp. Grain stage correctly added nothing (clean source).
-  - Cleaned up VacePrePassReference: removed tail inputs (previous_chunk_tail, previous_chunk_tail_latent, num_tail_frames, num_tail_latent_frames) — ~80 lines removed. Tail continuity now fully owned by VaceControlVideoPrep + NV_VaceLatentSplice.
-  - Multi-AI deep dive: texture harmonization algorithms (Laplacian pyramids, FFT grain synthesis, differentiable JPEG). Validated approach matches Adobe Multi-scale Harmonization (2010) lineage.
-  - Multi-AI deep dive: papers research (20+ papers reviewed). Key finds: Real-ESRGAN degradation model, Film Grain Rendering (Zhang 2023), DISTS metric, signal-dependent noise.
-  - Multi-AI brainstorm: WAN DiT aesthetic conditioning injection points. Secondary VACE branch (sigma-gated) = best v1. Feature stats transfer (blocks 30-39) = best v2. Frequency-shaped noise = easy zero-risk experiment.
-- **Decisions:** VacePrePassReference tail inputs removed — redundant with control video + splice path (D-026). Texture harmonize is post-decode only — VAE bottleneck prevents DiT-level grain/sharpness control (D-027). Frequency-shaped noise worth testing as complementary approach (D-028 PROVISIONAL).
-- **Blockers:** None.
-- **Next:** Build NV_FrequencyShapedNoise — pixel-space FFT of full frame → shaped latent noise for SamplerCustomAdvanced. Test if generation quality character shifts toward source aesthetic.
 
 
 ## Active Workstreams
@@ -49,9 +50,9 @@
 | D  | Real-Time Mask Editor | STAGED | 2026-04-03 | Research complete — PySide6 + cached op graph MVP. Not started. |
 | E  | Chunk Seam Continuity | ACTIVE | 2026-04-10 | NV_VaceLatentSplice built + runtime validated. Zero-drift tail overlap confirmed. |
 | F  | Kling API Chunking | ACTIVE | 2026-04-09 | type="first_frame" hints on tail refs. Debug logging added. Awaiting runtime test of API acceptance. |
-| G  | Masking & VFI Pipeline Research | ACTIVE | 2026-04-09 | Mocha for sub-object, SAM3 for full body, MatAnyone for edge refinement. GIMM-VFI stays. NV_MatchInterpFrames + RetimePrep JSON persistence built. |
+| G  | Masking & VFI Pipeline Research | ACTIVE | 2026-04-10 | Mocha for sub-object, SAM3 for full body, MatAnyone for edge refinement. GIMM-VFI stays. NV_MatchInterpFrames + RetimePrep/Restore manual fallback inputs. |
 | H  | VACE Chunked Orchestrator | STAGED | 2026-04-10 | Architecture designed (4 multi-AI rounds). Single-queue-press chunked VACE inpainting with latent splice. |
-| I  | Texture Harmonize + Aesthetic Conditioning | ACTIVE | 2026-04-10 | NV_TextureHarmonize w/ MAD stat mode (kills temporal strobing). Frequency-shaped noise SHELVED — incompatible with WAN flow-matching DiT. |
+| I  | Texture Harmonize + Aesthetic Conditioning | ACTIVE | 2026-04-12 | High-band reinjection (Stage 3) built — frequency separation transfer from original crop. Per-stage stats: std for pyramid, MAD for grain. Full-frame mode via stitcher (OOM-safe). Awaiting runtime test. |
 
 ### Status Tags
 - **ACTIVE** — Currently being worked on
@@ -86,6 +87,8 @@
 - Laplacian pyramid level 0 = finest detail (highest frequency), last level = base residual (lowest frequency). Skip base levels from END, not from 0.
 - WAN/VACE flow-matching DiTs are MORE brittle to init-noise structure than older U-Net DDPM models. Init noise must be near-isotropic Gaussian — covariance perturbations get read as content and produce structured failure modes (rainbow checkerboards). Aesthetic control must be post-decode, not init-shaping.
 - TextureHarmonize: use MAD (default) instead of std for texture spread on tight crops where mask edges contain outlier pixels. std swings 20-40% from a single bright pixel and causes temporal strobing.
+- TextureHarmonize per-stage estimator: std for Laplacian pyramid bands (edges ARE the signal), MAD for grain (edges are pollution). Using MAD for sharpness causes blurriness; using std for grain causes temporal strobing.
+- High-band reinjection sigma controls the frequency split: too high → identity features leak from original into AI result (ghosting). 3.0 = safe default for 832×832.
 
 ## Project Decisions Index
 <!-- Numbered decisions with lifecycle status. Never renumber IDs. -->
@@ -122,6 +125,9 @@
 | D-028 | 2026-04-10 | SUPERSEDED → D-029 | I | Frequency-shaped noise (pixel-space FFT of full frame → shaped latent noise) as complementary aesthetic conditioning |
 | D-029 | 2026-04-10 | ACTIVE | I | NV_FrequencyShapedNoise SHELVED — flow-matching DiTs read init-noise covariance changes as content, not as priors. No usable operating window between "ignored" and "destabilizing". Post-processing (TextureHarmonize) is the right architectural answer. |
 | D-030 | 2026-04-10 | ACTIVE | I | TextureHarmonize defaults to MAD (Median Absolute Deviation) instead of std for texture spread — robust to single-pixel outliers (eyelashes/highlights) that caused temporal strobing in tight crops as masks wiggled |
+| D-031 | 2026-04-12 | ACTIVE | I | Per-stage estimator: std for Laplacian pyramid sharpness (edges ARE the signal), MAD for grain residual (edges are pollution). Using wrong estimator for sharpness causes blurriness. |
+| D-032 | 2026-04-12 | PROVISIONAL | I | High-band reinjection (frequency separation) as primary fix for cross-model cartoon drift — grafts original HF onto AI LF inside mask |
+| D-033 | 2026-04-12 | ACTIVE | I | Pre-process HF boost is dead end — model's prior actively ignores structured HF in reference latent during denoising |
 
 ### Decision Statuses
 - **ACTIVE** — Currently in effect
@@ -293,10 +299,10 @@
 *First session — architecture design only.*
 
 ### I. Texture Harmonize + Aesthetic Conditioning
-**Current state:** ACTIVE — NV_TextureHarmonize is the production texture-matching path. NV_FrequencyShapedNoise SHELVED.
-**Goal:** Make AI-generated crops visually match source footage's texture quality (sharpness, grain, micro-contrast) via post-processing
-**Key files:** `texture_harmonize.py` (production), `frequency_shaped_noise.py` (shelved, kept for reference), `multi_model_sampler.py` (has noise input — keep for future use)
-**Active constraints:** VAE bottleneck prevents DiT-level grain/sharpness — post-decode is the ONLY viable control surface for texture characteristics. Init-noise priors do NOT work on flow-matching DiTs (D-029).
+**Current state:** ACTIVE — high-band reinjection (Stage 3) built, awaiting runtime test on WAN-on-Kling identity refinement shot
+**Goal:** Make AI-generated crops visually match source footage's texture quality (sharpness, grain, micro-contrast) via post-processing. For cross-model refinement (Kling→WAN), graft original's HF texture back onto identity-changed result.
+**Key files:** `texture_harmonize.py` (production — 3 stages: sharpness pyramid, grain synthesis, high-band reinjection), `frequency_shaped_noise.py` (shelved), `multi_model_sampler.py` (has noise input — keep for future use)
+**Active constraints:** VAE bottleneck prevents DiT-level grain/sharpness — post-decode is the ONLY viable control surface (D-029). Pre-process HF boost dead end — model ignores it (D-033). Per-stage estimator: std for pyramid, MAD for grain (D-031).
 
 **Architecture (production):**
 - Laplacian pyramid variance matching — sharpness + micro-contrast per frequency band
@@ -328,8 +334,14 @@
 - 2026-04-10 — NV_TextureHarmonize built + runtime tested (sharpness ratios 0.54/0.57). Multi-AI reviewed + 5 fixes applied.
 - 2026-04-10 — NV_FrequencyShapedNoise built, fully debugged, empirically tested, shelved. Knowledge captured.
 - 2026-04-10 — TextureHarmonize gained MAD stat mode for outlier robustness.
+- 2026-04-12 — TextureHarmonize major overhaul: per-stage stat split (std/MAD), context_scope modes, full_frame via stitcher (OOM-safe), high-band reinjection (Stage 3). Multi-AI reviewed (Codex). Foundations course created (5 docs).
+- 2026-04-12 — Pre-process HF boost rejected as dead end (D-033). Post-process frequency separation confirmed as principled fix for cross-model cartoon drift.
 
 **History:**
+- **2026-04-10b | coding + research**
+  Outcome: Built NV_TextureHarmonize (Laplacian pyramid + grain synthesis). Runtime tested (0.54/0.57 sharpness ratios). Removed VacePrePassReference tail inputs. 20+ papers reviewed. WAN DiT aesthetic injection points mapped.
+  Decision: Tail inputs removed from PrePassReference (D-026). Texture harmonize post-decode only (D-027). Freq-shaped noise worth testing (D-028 PROVISIONAL).
+  Next: Build NV_FrequencyShapedNoise.
 - **2026-04-10 | coding + research (shelved experiment)**
   Outcome: NV_FrequencyShapedNoise built and tested through 2 multi-AI review rounds + bug fixes. Empirically confirmed dead end for flow-matching DiTs. TextureHarmonize gained MAD mode.
   Decision: SHELVE init-noise shaping for WAN/VACE (D-029). MAD as default texture statistic (D-030). Aesthetic control via post-decode only.
@@ -348,6 +360,7 @@
 - **2026-04-10:** NV_VaceLatentSplice built + runtime validated (zero-drift tail overlap). Latent save/load security + precision fixes. Orchestrator architecture designed (4 multi-AI rounds). New workstream H: VACE Chunked Orchestrator.
 - **2026-04-10:** NV_TextureHarmonize built + runtime tested (AI crop 2x too sharp, auto-corrected). VacePrePassReference tail inputs removed (D-026). Aesthetic conditioning research: 20+ papers, WAN DiT injection points mapped. New workstream I: Texture Harmonize + Aesthetic Conditioning.
 - **2026-04-10:** NV_FrequencyShapedNoise SHELVED after full debug cycle (D-029). Empirical evidence: flow-matching DiTs reject init-noise covariance priors — no usable operating window between "ignored" and "destabilizing". Knowledge captured in workstream I history. TextureHarmonize gained MAD stat mode for outlier-robust temporal stability (D-030).
+- **2026-04-10/12:** NV_TextureHarmonize major overhaul: per-stage estimator split (std/MAD), context_scope modes (ring_only/whole_crop/full_frame), OOM-safe full-frame precompute via stitcher, high-band reinjection (Stage 3 frequency separation). Multi-AI research on edit model architectures + AI-on-AI cartoon drift diagnosis. Foundations course created (4 intuition modules + README, multi-AI reviewed). RetimeRestore manual fallback inputs added.
 
 ## Archived Workstreams Index
 <!-- Pointers to workstreams moved to ARCHIVE.md. -->

@@ -309,6 +309,23 @@ class NV_TextureHarmonize:
                                "from the actual full frame (which is what the inpaint will be stitched back into) "
                                "instead of just the crop window."
                 }),
+                "highband_strength": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "High-band reinjection from original_crop. Grafts the original's high-frequency "
+                               "texture (pores, hair, micro-detail) back onto the AI-generated result. "
+                               "Useful when the AI pass smoothed out detail you want to keep (e.g., cross-model "
+                               "refinement where Kling/Veo base looks more realistic than WAN's output). "
+                               "0.0 = disabled. 0.5 = half original HF blended back. 1.0 = full original HF. "
+                               "Start at 0.3-0.5 and adjust by eye."
+                }),
+                "highband_sigma": ("FLOAT", {
+                    "default": 3.0, "min": 0.5, "max": 10.0, "step": 0.5,
+                    "tooltip": "Gaussian blur sigma for the frequency split that separates HF from LF. "
+                               "Controls which frequencies count as 'high band' for reinjection. "
+                               "Lower = only the finest detail (pores, grain). "
+                               "Higher = coarser features included (wrinkles, small edges). "
+                               "3.0 = good default for 832×832 crops (captures skin texture without face shape)."
+                }),
             },
         }
 
@@ -327,7 +344,8 @@ class NV_TextureHarmonize:
                 sharpness_strength=1.0, grain_strength=1.0,
                 pyramid_levels=4, grain_blur_sigma=1.5,
                 skip_base_levels=1, temporal_seed=0, min_context_pixels=1000,
-                context_scope="ring_only", stitcher=None):
+                context_scope="ring_only", stitcher=None,
+                highband_strength=0.0, highband_sigma=3.0):
         TAG = "[NV_TextureHarmonize]"
         device = generated_crop.device
         B, H, W, C = generated_crop.shape
@@ -558,6 +576,55 @@ class NV_TextureHarmonize:
                 grain_added.append(f"+{additional:.4f}")
 
             info_lines.append(f"  Grain: sigma={grain_blur_sigma}, channels=[{', '.join(grain_added)}]")
+
+        # =================================================================
+        # Stage 3: High-Band Reinjection (Frequency Separation Transfer)
+        # =================================================================
+        # Grafts the original_crop's high-frequency texture back onto the
+        # AI-generated result. The principle: identity changes live in the
+        # low-to-mid frequencies (face shape, eye position, jaw angle).
+        # Texture realism lives in the high frequencies (pores, hair strands,
+        # micro-shading, sensor noise). These bands are mostly orthogonal,
+        # so you can take the LF from the AI pass (which has the identity
+        # change you wanted) and the HF from the original (which has the
+        # texture the AI pass destroyed) and combine them.
+        #
+        # This is the same operation as "frequency separation" in professional
+        # photo retouching — except here we're recombining bands from two
+        # DIFFERENT images instead of editing bands of one image.
+        #
+        # The highband_sigma parameter controls the frequency split:
+        #   low sigma (1-2)  → only the very finest detail (grain-scale)
+        #   medium sigma (3-4) → skin texture, pores, fine hair (default)
+        #   high sigma (5-8)  → coarser features, wrinkles, small edges
+        #
+        # The math:
+        #   orig_lf  = blur(original_crop, sigma)
+        #   orig_hf  = original_crop - orig_lf      ← the texture layer
+        #   result  += orig_hf * strength * mask     ← graft onto AI output
+        if highband_strength > 0:
+            orig_lf = _gaussian_blur_sep(orig, highband_sigma)
+            orig_hf = orig - orig_lf
+
+            # Also extract the AI result's existing HF to see what we're replacing.
+            # This lets us do a WEIGHTED replacement rather than blind addition:
+            # we subtract the AI's HF and add the original's HF, scaled by strength.
+            # At strength=1.0 this fully replaces the AI's HF with the original's.
+            # At strength=0.5 it's a 50/50 blend of both HF layers.
+            result_lf = _gaussian_blur_sep(result, highband_sigma)
+            result_hf = result - result_lf
+
+            # Blend: result_lf + lerp(result_hf, orig_hf, strength)
+            blended_hf = result_hf + highband_strength * (orig_hf - result_hf)
+            result = result_lf + blended_hf * gen_4d + result_hf * (1.0 - gen_4d)
+
+            # Diagnostic: measure how much HF energy changed
+            orig_hf_energy = (orig_hf * gen_4d).abs().mean().item()
+            result_hf_pre = (result_hf * gen_4d).abs().mean().item()
+            blended_hf_energy = (blended_hf * gen_4d).abs().mean().item()
+            info_lines.append(f"  Highband: sigma={highband_sigma}, strength={highband_strength}, "
+                              f"orig_hf={orig_hf_energy:.4f}, ai_hf={result_hf_pre:.4f}, "
+                              f"blended_hf={blended_hf_energy:.4f}")
 
         # Clamp and convert back to BHWC
         result = result.clamp(0.0, 1.0).permute(0, 2, 3, 1)
