@@ -357,9 +357,48 @@ meta-commentary.
 - When iterating, build on the previous version — do not restart from \
 scratch unless explicitly asked."""
 
+_SEEDANCE_REF_SYSTEM = """\
+You are a prompt engineer for the ByteDance Seedance 2.0 reference-to-video \
+API. The API takes a multimodal reference bundle — up to 9 images, up to 3 \
+video clips, and up to 3 audio clips — and generates a new video that fuses \
+those references according to your prompt.
+
+## Key Constraints
+- Seedance 2.0 has NO negative prompt field. Convert avoidances into positive \
+language ("clear sky" instead of "no clouds", "empty street" instead of "no \
+people"). Do NOT add "Avoid:" or "Negative:" lines.
+- Reference handles follow ByteDance's documented convention: `@Image1`, \
+`@Image2`, … for reference images; `@Video1` for a reference video; `@Audio1` \
+for reference audio. Always include the numeric index — write `@Image1`, \
+never `@Image`.
+- Tags must be woven INLINE in the prose, not listed as a prefix. Correct: \
+"a woman resembling @Image1 wearing @Image2's outfit, with the camera \
+movement of @Video1". Incorrect: "@Image1 @Image2 @Video1: a woman ...".
+- Do NOT add [References: ...] legends or <<<image_N>>> wire-format syntax — \
+the Seedance node handles API serialization.
+- Signal the operating mode through verb choice rather than any explicit \
+flag. The API has no mode selector; the model infers intent from phrasing:
+  - Compose: "Generate a scene featuring @Image1 and @Image2 in ..."
+  - Motion transfer: "... with the camera movement and pacing of @Video1"
+  - Extend: "Extend @Video1 forward, continuing the action as ..."
+  - Edit: "Edit @Video1: replace X with ..."
+  - Style reference: "... in the visual style of @Video1"
+  - MV / audio-driven: "... synchronized to the rhythm of @Audio1"
+- Seedance outputs 4-15 seconds at 480p or 720p (no 1080p). Scope the scene \
+to one coherent shot — no multi-shot sequences, no scene transitions.
+- Mention every reference that is actually supplied. Unused refs waste API \
+tokens. Only mention `@Audio1` if reference audio is attached.
+- Write as a single flowing paragraph with inline tags. No bullet points, no \
+section headers — Seedance consumes the prompt as free text.
+- Output ONLY the prompt text — no explanations, preamble, or \
+meta-commentary.
+- When iterating, build on the previous version — do not restart from \
+scratch unless explicitly asked."""
+
 _KLING_MODE_MAP = {
     "kling_edit": _KLING_EDIT_SYSTEM,
     "kling_reference": _KLING_REFERENCE_SYSTEM,
+    "seedance_ref": _SEEDANCE_REF_SYSTEM,
 }
 
 
@@ -646,13 +685,14 @@ class NV_PromptRefiner:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "mode": (["custom", "kling_edit", "kling_reference"], {
+                "mode": (["custom", "kling_edit", "kling_reference", "seedance_ref"], {
                     "default": "custom",
                     "tooltip": (
                         "'custom' = use system_instruction input as-is (for V2V Prompt Builder workflows).\n"
                         "'kling_edit' = built-in Kling edit mode system prompt — describe what to change.\n"
                         "'kling_reference' = built-in Kling reference mode system prompt — describe new scene to generate.\n"
-                        "Kling modes bypass V2V Prompt Builder — type your edit goal directly into initial_prompt."
+                        "'seedance_ref' = built-in ByteDance Seedance 2.0 ref-to-video prompt — multimodal refs (@Image1/@Video1/@Audio1).\n"
+                        "Built-in modes bypass V2V Prompt Builder — type your edit/scene goal directly into initial_prompt."
                     ),
                 }),
                 "system_instruction": ("STRING", {
@@ -915,10 +955,17 @@ class NV_PromptRefiner:
         # --- Build the new user message ---
         if not history:
             if is_kling_mode:
-                # Kling mode: initial_prompt = edit goal / scene description
-                mode_label = "edit" if mode == "kling_edit" else "reference-to-video"
+                # Built-in API mode: initial_prompt = edit goal / scene description
+                if mode == "kling_edit":
+                    api_label = "Kling edit"
+                elif mode == "kling_reference":
+                    api_label = "Kling reference-to-video"
+                elif mode == "seedance_ref":
+                    api_label = "Seedance 2.0 reference-to-video"
+                else:
+                    api_label = mode
                 user_message = (
-                    f"Analyze the attached video and write a Kling {mode_label} prompt.\n\n"
+                    f"Analyze the attached media and write a {api_label} prompt.\n\n"
                     f"Goal: {initial_prompt}"
                     f"{ref_context}\n\n"
                     f"Additional instruction: {user_instruction}"
