@@ -1026,15 +1026,17 @@ class NV_PromptRefiner:
             else:
                 raise RuntimeError(f"Unknown provider: {provider}")
         except Exception as e:
-            # Remove the failed user turn so history stays clean
+            # Remove the failed user turn so history stays clean for retries
             history.pop()
             _CONVERSATION_HISTORY[conversation_key] = history
             error_msg = str(e)
-            print(f"[NV_PromptRefiner] Error: {error_msg}")
-            fallback = _LAST_REFINED.get(conversation_key, initial_prompt)
-            return (fallback, system_instruction,
-                    _format_conversation_log(history),
-                    f"Error on turn {turn_number}: {error_msg}")
+            print(f"[NV_PromptRefiner] Error on turn {turn_number}: {error_msg}")
+            # Fail the ComfyUI workflow on API errors (429 quota, auth, network,
+            # malformed request, etc.). Silent fallback masks real issues —
+            # downstream nodes should not proceed with a stale cached prompt.
+            raise RuntimeError(
+                f"NV_PromptRefiner failed on turn {turn_number} ({provider} / {model}): {error_msg}"
+            ) from e
 
         # --- Track cost ---
         turn_cost = token_info.get("cost", 0.0)

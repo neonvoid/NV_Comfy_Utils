@@ -1,21 +1,16 @@
-"""NV Seedance Ref Video (Fork)
+"""NV Seedance Ref Video — slim API caller for Seedance 2.0 ref-to-video.
 
-MVP single-node fork of ComfyUI's ByteDance2ReferenceNode. Fixes the input
-surface for programmatic pipeline wiring:
+Pairs with NV_SeedancePrep in a two-node pattern (mirrors the Kling fork):
 
-  - `prompt` is a top-level STRING (force_input), not nested in DynamicCombo.
-    Enables chaining with NV_V2VPromptBuilder / PromptRefiner.
-  - `reference_images` accepts a batched IMAGE tensor [N,H,W,C] and unpacks
-    internally (uniform-sampled down to 9 if N > 9). No Autogrow slots.
-  - `reference_video` is a single top-level VIDEO input (stock node allows up
-    to 3; MVP supports 1 — multi-video can be added later if needed).
-  - Auto-injects @Image1..N handles into the prompt if the prompt does not
-    already contain them. The documented Seedance 2.0 convention is
-    `@Image1 / @Image 1` (ByteDance Seed blog + BytePlus ModelArk playground).
-    `@Video1` / `@Audio1` follow by inference.
+  NV_SeedancePrep        → uploads refs, emits SEEDANCE_UPLOAD_CONFIG
+  NV_SeedanceRefVideo    → consumes config + final_prompt, calls the API
 
-Calls the same BytePlus Seedance 2.0 endpoint as the stock node and reuses
-the stock request/response models from comfy_api_nodes.apis.bytedance.
+This node does NO uploading or tensor manipulation. It reads pre-uploaded
+asset URLs from the config, assembles the Seedance 2.0 request, polls the
+task endpoint, and downloads the result.
+
+`@Image1..N / @Video1` auto-injection is preserved as a safety net in case
+the upstream prompt lacks tags (e.g. user bypassed the refiner).
 """
 
 from __future__ import annotations
@@ -24,10 +19,8 @@ import json
 import re
 import time
 
-import torch
-from comfy_api.latest import IO, Input
+from comfy_api.latest import IO
 from comfy_api_nodes.apis.bytedance import (
-    SEEDANCE2_REF_VIDEO_PIXEL_LIMITS,
     Seedance2TaskCreationRequest,
     TaskCreationResponse,
     TaskImageContent,
@@ -42,10 +35,10 @@ from comfy_api_nodes.util import (
     download_url_to_video_output,
     poll_op,
     sync_op,
-    upload_image_to_comfyapi,
-    upload_video_to_comfyapi,
     validate_string,
 )
+
+from .seedance_prep import SEEDANCE_UPLOAD_CONFIG
 
 
 SEEDANCE_MODELS = {
@@ -57,51 +50,15 @@ BYTEPLUS_TASK_ENDPOINT = "/proxy/byteplus/api/v3/contents/generations/tasks"
 BYTEPLUS_SEEDANCE2_TASK_STATUS_ENDPOINT = "/proxy/byteplus-seedance2/api/v3/contents/generations/tasks"
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-_MAX_REF_IMAGES = 9
-
-
-def _uniform_sample_indices(total: int, take: int) -> list[int]:
-    """Return `take` evenly spaced indices from [0, total). total >= take >= 1."""
-    if take >= total:
-        return list(range(total))
-    if take == 1:
-        return [0]
-    step = (total - 1) / (take - 1)
-    return [round(i * step) for i in range(take)]
-
-
-def _slice_image_batch(images: torch.Tensor, max_images: int) -> tuple[list[torch.Tensor], str]:
-    """Slice batched IMAGE tensor [N,H,W,C] → list of [1,H,W,C] frames.
-
-    If N > max_images, uniform-sample `max_images` frames across the batch.
-    Returns (frames, sampling_note).
-    """
-    if images is None or images.shape[0] == 0:
-        return [], "no images"
-
-    n = images.shape[0]
-    if n <= max_images:
-        frames = [images[i:i + 1] for i in range(n)]
-        return frames, f"{n}/{n} (all)"
-
-    idx = _uniform_sample_indices(n, max_images)
-    frames = [images[i:i + 1] for i in idx]
-    return frames, f"uniform-sampled {max_images}/{n} (indices {idx})"
-
-
 def _auto_inject_image_tags(prompt: str, n_images: int, has_video: bool) -> str:
-    """Prepend @Image1..N and @Video1 if the prompt lacks any reference tags."""
+    """Safety-net tag injection. Clean space-prefix (no "Using X:" text)."""
     if not prompt:
         return prompt
 
     has_image_tag = bool(re.search(r"@Image\s?\d+", prompt))
     has_video_tag = bool(re.search(r"@Video\s?\d+", prompt))
 
-    parts = []
+    parts: list[str] = []
     if has_video and not has_video_tag:
         parts.append("@Video1")
     if n_images > 0 and not has_image_tag:
@@ -109,60 +66,11 @@ def _auto_inject_image_tags(prompt: str, n_images: int, has_video: bool) -> str:
 
     if not parts:
         return prompt
-    # Clean space-join — never "Using X: prompt" since video models can render
-    # literal instructional text into the output frames.
     return f"{' '.join(parts)} {prompt}"
 
 
-def _validate_ref_video(video: Input.Video, model_id: str) -> tuple[int, int, float]:
-    """Check ref video dimensions and duration. Returns (w, h, duration_seconds).
-
-    Raises ValueError with actionable messages on out-of-bounds.
-    """
-    w, h = video.get_dimensions()
-    pixels = w * h
-
-    limits = SEEDANCE2_REF_VIDEO_PIXEL_LIMITS.get(model_id, {})
-    min_px = limits.get("min")
-    max_px = limits.get("max")
-
-    if min_px and pixels < min_px:
-        raise ValueError(
-            f"Reference video too small: {w}x{h} = {pixels:,}px. "
-            f"Minimum {min_px:,}px (~{int(min_px ** 0.5)}x{int(min_px ** 0.5)}). "
-            f"Upscale the ref video before wiring."
-        )
-    if max_px and pixels > max_px:
-        raise ValueError(
-            f"Reference video too large: {w}x{h} = {pixels:,}px. "
-            f"Maximum {max_px:,}px (~{int(max_px ** 0.5)}x{int(max_px ** 0.5)}). "
-            f"Downscale the ref video before wiring."
-        )
-
-    try:
-        dur = float(video.get_duration())
-    except Exception:
-        dur = 0.0
-
-    if dur and dur < 1.8:
-        raise ValueError(f"Reference video too short: {dur:.2f}s. Minimum 1.8s.")
-    if dur and dur > 15.1:
-        raise ValueError(f"Reference video too long: {dur:.2f}s. Maximum 15.1s.")
-
-    return w, h, dur
-
-
-# ---------------------------------------------------------------------------
-# Node
-# ---------------------------------------------------------------------------
-
 class NV_SeedanceRefVideo(IO.ComfyNode):
-    """Seedance 2.0 reference-to-video — MVP fork with pipeline-friendly inputs.
-
-    Top-level `prompt` (force_input), batched IMAGE tensor, single VIDEO.
-    Auto-injects @Image1..N handles if missing. Calls the same BytePlus
-    Seedance 2.0 endpoint as the stock node.
-    """
+    """Seedance 2.0 reference-to-video — slim API caller. Consumes SEEDANCE_UPLOAD_CONFIG."""
 
     @classmethod
     def define_schema(cls) -> IO.Schema:
@@ -171,17 +79,21 @@ class NV_SeedanceRefVideo(IO.ComfyNode):
             display_name="NV Seedance Ref Video",
             category="NV_Utils/api",
             description=(
-                "MVP Seedance 2.0 reference-to-video caller. Accepts top-level "
-                "prompt (force_input), batched IMAGE tensor (auto-sampled to 9), "
-                "and single VIDEO reference. Use with NV V2V Prompt Builder "
-                "in 'seedance_ref' mode for best results."
+                "Seedance 2.0 ref-to-video API caller. Takes an upload config "
+                "from NV Seedance Prep + a final_prompt (from NV Prompt Refiner) "
+                "and calls the BytePlus Seedance 2.0 endpoint."
             ),
             inputs=[
+                SEEDANCE_UPLOAD_CONFIG.Input(
+                    "config",
+                    tooltip="Upload config from NV Seedance Prep.",
+                ),
                 IO.String.Input(
-                    "prompt",
+                    "final_prompt",
                     tooltip=(
-                        "Final Seedance prompt. Weave @Image1..N and @Video1 inline. "
-                        "If missing, @Image / @Video tags are auto-prepended."
+                        "Final Seedance prompt (typically from NV Prompt Refiner "
+                        "in seedance_ref mode). @Image/@Video tags are auto-injected "
+                        "as a safety net if absent."
                     ),
                     force_input=True,
                 ),
@@ -217,24 +129,6 @@ class NV_SeedanceRefVideo(IO.ComfyNode):
                     default=True,
                     tooltip="Enable audio generation for the output video.",
                 ),
-                IO.Image.Input(
-                    "reference_images",
-                    tooltip=(
-                        "Batched IMAGE tensor [N,H,W,C]. Up to 9 images — if N > 9, "
-                        "uniform-sampled. Each image becomes a role='reference_image' "
-                        "entry in the API content array."
-                    ),
-                    optional=True,
-                ),
-                IO.Video.Input(
-                    "reference_video",
-                    tooltip=(
-                        "Single reference video. Pixel budget ~409K-927K per frame "
-                        "(~640x640 to ~960x960). Duration 1.8-15.1s. Becomes "
-                        "role='reference_video' in the API content array."
-                    ),
-                    optional=True,
-                ),
                 IO.Int.Input(
                     "seed",
                     default=0,
@@ -268,79 +162,58 @@ class NV_SeedanceRefVideo(IO.ComfyNode):
     @classmethod
     async def execute(
         cls,
-        prompt: str,
+        config: dict,
+        final_prompt: str,
         model: str,
         resolution: str,
         ratio: str,
         duration: int,
         generate_audio: bool,
-        reference_images: Input.Image | None = None,
-        reference_video: Input.Video | None = None,
         seed: int = 0,
         watermark: bool = False,
     ) -> IO.NodeOutput:
         t_start = time.time()
 
-        validate_string(prompt, strip_whitespace=True, min_length=1)
+        validate_string(final_prompt, strip_whitespace=True, min_length=1)
         model_id = SEEDANCE_MODELS[model]
 
-        # --- unpack image batch ---
-        image_frames, image_sampling_note = _slice_image_batch(
-            reference_images, _MAX_REF_IMAGES
-        ) if reference_images is not None else ([], "none")
-        n_images = len(image_frames)
+        uploaded_image_urls: list[str] = config.get("uploaded_image_urls", [])
+        uploaded_video_url: str | None = config.get("uploaded_video_url")
+        n_images = len(uploaded_image_urls)
+        has_video = uploaded_video_url is not None
 
-        # --- validate ref video ---
-        ref_w = ref_h = 0
-        ref_dur = 0.0
-        if reference_video is not None:
-            ref_w, ref_h, ref_dur = _validate_ref_video(reference_video, model_id)
-
-        if n_images == 0 and reference_video is None:
+        if n_images == 0 and not has_video:
             raise ValueError(
-                "At least one reference_images frame or reference_video is required "
-                "for the Seedance 2.0 Reference API."
+                "SEEDANCE_UPLOAD_CONFIG has no uploaded refs. "
+                "Wire at least one image or video into NV Seedance Prep."
             )
 
-        # --- prepare final prompt ---
-        final_prompt = _auto_inject_image_tags(
-            prompt.strip(), n_images, has_video=reference_video is not None
-        )
+        # --- safety-net tag injection ---
+        final_prompt = _auto_inject_image_tags(final_prompt.strip(), n_images, has_video)
 
         print(f"[NV_SeedanceRefVideo] Model: {model_id} | res={resolution} ratio={ratio} dur={duration}s")
-        print(f"[NV_SeedanceRefVideo] Refs: images={image_sampling_note}, "
-              f"video={'yes ' + str(ref_w) + 'x' + str(ref_h) + ' ' + f'{ref_dur:.2f}s' if reference_video else 'no'}")
+        print(f"[NV_SeedanceRefVideo] Refs: images={n_images} ({config.get('image_sampling_note', '?')}), "
+              f"video={'yes' if has_video else 'no'}")
         print(f"[NV_SeedanceRefVideo] Final prompt ({len(final_prompt)} chars):\n{final_prompt}")
 
-        # --- upload refs + build content array ---
+        # --- build content array from config ---
         content: list[TaskTextContent | TaskImageContent | TaskVideoContent] = [
             TaskTextContent(text=final_prompt),
         ]
-
-        for i, frame in enumerate(image_frames, 1):
-            url = await upload_image_to_comfyapi(
-                cls, image=frame, wait_label=f"Uploading @Image{i}"
-            )
+        for url in uploaded_image_urls:
             content.append(
                 TaskImageContent(
                     image_url=TaskImageContentUrl(url=url),
                     role="reference_image",
                 )
             )
-            print(f"[NV_SeedanceRefVideo] @Image{i} uploaded → ...{url[-40:]}")
-
-        has_video_input = reference_video is not None
-        if reference_video is not None:
-            url = await upload_video_to_comfyapi(
-                cls, reference_video, wait_label="Uploading @Video1"
-            )
+        if uploaded_video_url is not None:
             content.append(
                 TaskVideoContent(
-                    video_url=TaskVideoContentUrl(url=url),
+                    video_url=TaskVideoContentUrl(url=uploaded_video_url),
                     role="reference_video",
                 )
             )
-            print(f"[NV_SeedanceRefVideo] @Video1 uploaded → ...{url[-40:]}")
 
         t_submit = time.time()
 
@@ -412,10 +285,9 @@ class NV_SeedanceRefVideo(IO.ComfyNode):
                 "seed": seed,
                 "watermark": watermark,
                 "n_reference_images": n_images,
-                "image_sampling": image_sampling_note,
-                "has_reference_video": has_video_input,
-                "ref_video_dimensions": f"{ref_w}x{ref_h}" if has_video_input else None,
-                "ref_video_duration_s": round(ref_dur, 3) if has_video_input else None,
+                "has_reference_video": has_video,
+                "ref_video_dimensions": config.get("ref_video_dimensions"),
+                "ref_video_duration_s": config.get("ref_video_duration_s"),
                 "prompt_length": len(final_prompt),
             },
             "response": {
@@ -425,7 +297,7 @@ class NV_SeedanceRefVideo(IO.ComfyNode):
                 "output_frames": out_frames,
             },
             "timing": {
-                "upload_sec": round(t_submit - t_start, 1),
+                "api_submit_sec": round(t_submit - t_start, 1),
                 "api_processing_sec": round(t_done - t_submit, 1),
                 "download_sec": round(t_end - t_done, 1),
                 "total_sec": round(t_end - t_start, 1),
