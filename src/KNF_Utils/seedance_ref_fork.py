@@ -69,6 +69,97 @@ def _auto_inject_image_tags(prompt: str, n_images: int, has_video: bool) -> str:
     return f"{' '.join(parts)} {prompt}"
 
 
+def _analyze_prompt_tags(prompt: str, n_images: int, has_video: bool) -> dict:
+    """Extract @Image / @Video / @Audio tag usage for probe-mode diagnostics.
+
+    Returns per-tag counts + mismatch warnings. Useful when the model's
+    adherence to a specific tag is being tested.
+    """
+    image_tags = re.findall(r"@Image\s?(\d+)", prompt)
+    video_tags = re.findall(r"@Video\s?(\d+)", prompt)
+    audio_tags = re.findall(r"@Audio\s?(\d+)", prompt)
+
+    image_indices = sorted({int(t) for t in image_tags})
+    video_indices = sorted({int(t) for t in video_tags})
+    audio_indices = sorted({int(t) for t in audio_tags})
+
+    warnings: list[str] = []
+    if image_indices and max(image_indices) > n_images:
+        warnings.append(
+            f"prompt references @Image{max(image_indices)} but only {n_images} image(s) uploaded"
+        )
+    if video_indices and max(video_indices) > (1 if has_video else 0):
+        warnings.append(
+            f"prompt references @Video{max(video_indices)} but "
+            f"{'only 1 video uploaded' if has_video else 'no video uploaded'}"
+        )
+    if audio_indices:
+        warnings.append(
+            f"prompt references @Audio{audio_indices} but this node does not support audio refs yet"
+        )
+    if n_images > 0 and not image_indices:
+        warnings.append(f"{n_images} image(s) uploaded but no @ImageN tags in prompt")
+    if has_video and not video_indices:
+        warnings.append("reference video uploaded but no @Video1 tag in prompt")
+
+    return {
+        "image_tag_indices": image_indices,
+        "video_tag_indices": video_indices,
+        "audio_tag_indices": audio_indices,
+        "n_image_tags": len(image_tags),
+        "n_video_tags": len(video_tags),
+        "n_audio_tags": len(audio_tags),
+        "warnings": warnings,
+    }
+
+
+def _summarize_content(content: list) -> list[dict]:
+    """Compact summary of the request content array for debug logs."""
+    summary = []
+    for i, item in enumerate(content):
+        cls_name = type(item).__name__
+        entry: dict = {"index": i, "type": cls_name}
+        if cls_name == "TaskTextContent":
+            text = getattr(item, "text", "")
+            entry["text_length"] = len(text)
+            entry["text_head"] = text[:120] + ("…" if len(text) > 120 else "")
+        elif cls_name == "TaskImageContent":
+            entry["role"] = getattr(item, "role", None)
+            url = getattr(getattr(item, "image_url", None), "url", "") or ""
+            entry["url_tail"] = "..." + url[-40:] if url else None
+        elif cls_name == "TaskVideoContent":
+            entry["role"] = getattr(item, "role", None)
+            url = getattr(getattr(item, "video_url", None), "url", "") or ""
+            entry["url_tail"] = "..." + url[-40:] if url else None
+        summary.append(entry)
+    return summary
+
+
+def _scout_raw_response(response) -> dict:
+    """Dump top-level response keys for schema-evolution scouting.
+
+    ByteDance may add fields (prompt_refined, moderation_notes, seed_used,
+    etc.) that aren't in our Pydantic model. This surfaces them so we know
+    to update the model if new data appears.
+    """
+    scout: dict = {"top_level_keys": None, "content_keys": None, "extra_notes": []}
+    try:
+        raw = response.model_dump() if hasattr(response, "model_dump") else None
+        if isinstance(raw, dict):
+            scout["top_level_keys"] = sorted(raw.keys())
+            content = raw.get("content")
+            if isinstance(content, dict):
+                scout["content_keys"] = sorted(content.keys())
+                # Flag any content keys we don't model
+                modeled = {"video_url"}
+                extra = sorted(set(content.keys()) - modeled)
+                if extra:
+                    scout["extra_notes"].append(f"unmodeled content keys: {extra}")
+    except Exception as e:
+        scout["extra_notes"].append(f"model_dump failed: {e}")
+    return scout
+
+
 class NV_SeedanceRefVideo(IO.ComfyNode):
     """Seedance 2.0 reference-to-video — slim API caller. Consumes SEEDANCE_UPLOAD_CONFIG."""
 
@@ -115,13 +206,23 @@ class NV_SeedanceRefVideo(IO.ComfyNode):
                     default="adaptive",
                     tooltip="Output aspect ratio. 'adaptive' lets the model pick based on refs.",
                 ),
+                IO.Combo.Input(
+                    "duration_mode",
+                    options=["auto", "manual"],
+                    default="auto",
+                    tooltip=(
+                        "'auto' = match the ref video's duration (ceil, clamped 4-15s). "
+                        "Falls back to the manual duration if no ref video is in the config.\n"
+                        "'manual' = always use the duration slider below."
+                    ),
+                ),
                 IO.Int.Input(
                     "duration",
                     default=7,
                     min=4,
                     max=15,
                     step=1,
-                    tooltip="Output duration in seconds (4-15).",
+                    tooltip="Output duration in seconds (4-15). Used when duration_mode='manual' or no ref video.",
                     display_mode=IO.NumberDisplay.slider,
                 ),
                 IO.Boolean.Input(
@@ -170,6 +271,7 @@ class NV_SeedanceRefVideo(IO.ComfyNode):
         model: str,
         resolution: str,
         ratio: str,
+        duration_mode: str,
         duration: int,
         generate_audio: bool,
         seed: int = 0,
@@ -191,12 +293,38 @@ class NV_SeedanceRefVideo(IO.ComfyNode):
                 "Wire at least one image or video into NV Seedance Prep."
             )
 
-        # --- safety-net tag injection ---
-        final_prompt = _auto_inject_image_tags(final_prompt.strip(), n_images, has_video)
+        # --- resolve duration ---
+        import math
+        ref_dur = config.get("ref_video_duration_s")
+        if duration_mode == "auto" and ref_dur:
+            api_duration = max(4, min(15, math.ceil(float(ref_dur))))
+            duration_source = f"auto (from ref video {ref_dur:.2f}s → ceil → {api_duration}s, clamped 4-15)"
+        else:
+            api_duration = duration
+            if duration_mode == "auto":
+                duration_source = f"auto-fallback to manual ({duration}s) — no ref video in config"
+            else:
+                duration_source = f"manual ({duration}s)"
 
-        print(f"[NV_SeedanceRefVideo] Model: {model_id} | res={resolution} ratio={ratio} dur={duration}s")
+        # --- safety-net tag injection ---
+        prompt_before_inject = final_prompt.strip()
+        final_prompt = _auto_inject_image_tags(prompt_before_inject, n_images, has_video)
+        tag_injected = final_prompt != prompt_before_inject
+
+        # --- probe-mode prompt tag analysis ---
+        tag_analysis = _analyze_prompt_tags(final_prompt, n_images, has_video)
+
+        print(f"[NV_SeedanceRefVideo] Model: {model_id} | res={resolution} ratio={ratio} dur={api_duration}s [{duration_source}]")
         print(f"[NV_SeedanceRefVideo] Refs: images={n_images} ({config.get('image_sampling_note', '?')}), "
               f"video={'yes' if has_video else 'no'}")
+        print(f"[NV_SeedanceRefVideo] Seed: {seed} | generate_audio={generate_audio} | watermark={watermark}")
+        print(f"[NV_SeedanceRefVideo] Tag analysis: "
+              f"@Image{tag_analysis['image_tag_indices'] or '[]'}, "
+              f"@Video{tag_analysis['video_tag_indices'] or '[]'}, "
+              f"@Audio{tag_analysis['audio_tag_indices'] or '[]'}"
+              f"{' (auto-injected)' if tag_injected else ''}")
+        for w in tag_analysis["warnings"]:
+            print(f"[NV_SeedanceRefVideo] ⚠ tag warning: {w}")
         print(f"[NV_SeedanceRefVideo] Final prompt ({len(final_prompt)} chars):\n{final_prompt}")
 
         # --- build content array from config ---
@@ -218,6 +346,15 @@ class NV_SeedanceRefVideo(IO.ComfyNode):
                 )
             )
 
+        # --- probe: dump request content array structure ---
+        content_summary = _summarize_content(content)
+        print(f"[NV_SeedanceRefVideo] Content array ({len(content)} items):")
+        for entry in content_summary:
+            print(f"  [{entry['index']}] {entry['type']} "
+                  f"role={entry.get('role', '-')} "
+                  f"{'url=' + entry['url_tail'] if entry.get('url_tail') else ''}"
+                  f"{'text=' + repr(entry['text_head']) if 'text_head' in entry else ''}")
+
         t_submit = time.time()
 
         # --- submit task ---
@@ -230,7 +367,7 @@ class NV_SeedanceRefVideo(IO.ComfyNode):
                 generate_audio=generate_audio,
                 resolution=resolution,
                 ratio=ratio,
-                duration=duration,
+                duration=api_duration,
                 seed=seed,
                 watermark=watermark,
             ),
@@ -250,6 +387,42 @@ class NV_SeedanceRefVideo(IO.ComfyNode):
         )
 
         t_done = time.time()
+
+        # --- probe: scout raw response for unmodeled fields ---
+        response_scout = _scout_raw_response(response)
+        print(f"[NV_SeedanceRefVideo] Response scout: "
+              f"status={response.status!r} top_keys={response_scout.get('top_level_keys')}")
+        if response_scout.get("content_keys"):
+            print(f"  content keys: {response_scout['content_keys']}")
+        for note in response_scout.get("extra_notes", []):
+            print(f"  ⚠ {note}")
+
+        # --- probe: token usage + cost estimate ---
+        token_usage: dict = {
+            "completion_tokens": None,
+            "total_tokens": None,
+            "cost_estimate_usd": None,
+            "cost_formula": None,
+        }
+        try:
+            if response.usage is not None:
+                token_usage["completion_tokens"] = int(response.usage.completion_tokens)
+                token_usage["total_tokens"] = int(response.usage.total_tokens)
+                # Pricing: total_tokens × 1.43 × rate_per_1K / 1000
+                # rate depends on model + has_video_input
+                from comfy_api_nodes.apis.bytedance import SEEDANCE2_PRICE_PER_1K_TOKENS
+                rate = SEEDANCE2_PRICE_PER_1K_TOKENS.get((model_id, has_video))
+                if rate is not None:
+                    cost = token_usage["total_tokens"] * 1.43 * rate / 1000.0
+                    token_usage["cost_estimate_usd"] = round(cost, 4)
+                    token_usage["cost_formula"] = (
+                        f"{token_usage['total_tokens']} × 1.43 × ${rate}/1K = ${cost:.4f}"
+                    )
+                print(f"[NV_SeedanceRefVideo] Tokens: total={token_usage['total_tokens']}, "
+                      f"completion={token_usage['completion_tokens']} | "
+                      f"cost≈${token_usage['cost_estimate_usd']}")
+        except Exception as e:
+            print(f"[NV_SeedanceRefVideo] Warning: token usage capture failed: {e}")
 
         # --- surface terminal failures before dereferencing content ---
         if response.status != "succeeded":
@@ -287,7 +460,9 @@ class NV_SeedanceRefVideo(IO.ComfyNode):
                 "model": model_id,
                 "resolution": resolution,
                 "ratio": ratio,
-                "duration": duration,
+                "duration": api_duration,
+                "duration_source": duration_source,
+                "duration_manual_input": duration,
                 "generate_audio": generate_audio,
                 "seed": seed,
                 "watermark": watermark,
@@ -296,12 +471,19 @@ class NV_SeedanceRefVideo(IO.ComfyNode):
                 "ref_video_dimensions": config.get("ref_video_dimensions"),
                 "ref_video_duration_s": config.get("ref_video_duration_s"),
                 "prompt_length": len(final_prompt),
+                "prompt_tags_auto_injected": tag_injected,
+                "tag_analysis": tag_analysis,
+                "content_array": content_summary,
             },
             "response": {
                 "task_id": task_id,
+                "status": response.status,
                 "video_url_tail": video_url[-60:] if video_url else None,
                 "output_fps": out_fps,
                 "output_frames": out_frames,
+                "output_duration_s": round(out_frames / out_fps, 3) if out_fps else None,
+                "scout": response_scout,
+                "token_usage": token_usage,
             },
             "timing": {
                 "api_submit_sec": round(t_submit - t_start, 1),

@@ -266,6 +266,16 @@ class NV_SeedancePrep(IO.ComfyNode):
         reference_video: Input.Video | None = None,
         reference_video_frames: Input.Image | None = None,
     ) -> IO.NodeOutput:
+        # --- probe: log raw input shapes ---
+        if reference_images is not None:
+            ri_shape = tuple(reference_images.shape)
+            ri_range = (float(reference_images.min().item()), float(reference_images.max().item()))
+            print(f"[NV_SeedancePrep] reference_images: shape={ri_shape} range=({ri_range[0]:.3f}..{ri_range[1]:.3f})")
+        if reference_video_frames is not None:
+            rvf_shape = tuple(reference_video_frames.shape)
+            rvf_range = (float(reference_video_frames.min().item()), float(reference_video_frames.max().item()))
+            print(f"[NV_SeedancePrep] reference_video_frames: shape={rvf_shape} range=({rvf_range[0]:.3f}..{rvf_range[1]:.3f})")
+
         # --- sample reference images ---
         image_frames, image_sampling_note = (
             _sample_image_batch(reference_images, sample_mode, _MAX_REF_IMAGES)
@@ -273,6 +283,9 @@ class NV_SeedancePrep(IO.ComfyNode):
             else ([], "none")
         )
         n_images = len(image_frames)
+        if n_images > 0:
+            ref_dims = [(int(f.shape[2]), int(f.shape[1])) for f in image_frames]
+            print(f"[NV_SeedancePrep] ref image dims (WxH): {ref_dims} | sampling: {image_sampling_note}")
 
         # --- prepare ref video (either encoded or from frames) ---
         ref_video_obj: Input.Video | None = None
