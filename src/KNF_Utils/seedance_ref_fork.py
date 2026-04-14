@@ -148,6 +148,9 @@ class NV_SeedanceRefVideo(IO.ComfyNode):
             ],
             outputs=[
                 IO.Video.Output(display_name="video"),
+                IO.Image.Output(display_name="images"),
+                IO.Float.Output(display_name="output_fps"),
+                IO.Int.Output(display_name="output_frames"),
                 IO.String.Output(display_name="final_prompt"),
                 IO.String.Output(display_name="api_metadata"),
             ],
@@ -265,11 +268,15 @@ class NV_SeedanceRefVideo(IO.ComfyNode):
         video_url = response.content.video_url
         output_video = await download_url_to_video_output(video_url)
 
+        import torch
         try:
             components = output_video.get_components()
+            out_images = components.images
             out_fps = float(components.frame_rate)
-            out_frames = int(components.images.shape[0])
-        except Exception:
+            out_frames = int(out_images.shape[0])
+        except Exception as e:
+            print(f"[NV_SeedanceRefVideo] Warning: failed to decode frames from returned video: {e}")
+            out_images = torch.zeros(1, 64, 64, 3)
             out_fps = 0.0
             out_frames = 0
 
@@ -306,6 +313,9 @@ class NV_SeedanceRefVideo(IO.ComfyNode):
 
         return IO.NodeOutput(
             output_video,
+            out_images,
+            out_fps,
+            out_frames,
             final_prompt,
             json.dumps(metadata, indent=2),
         )
