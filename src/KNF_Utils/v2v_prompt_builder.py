@@ -9,7 +9,8 @@ Supports:
 - Task mode selection: 'full_restyle' (scene-wide style transfer),
   'character_swap' (targeted character replacement via inpainting),
   'r2v_bootstrap' (scene prompts for WAN 2.6 R2V API),
-  'kling_edit' (Kling API edit mode), or 'kling_reference' (Kling API reference mode)
+  'kling_edit' (Kling API edit mode), 'kling_reference' (Kling API reference mode),
+  or 'seedance_ref' (ByteDance Seedance 2.0 multimodal ref-to-video)
 - Automatic word budget selection based on subject count and motion intensity
 - Denoise-strength-aware analysis priority weighting
 - Chunked processing mode with temporal continuity from previous chunk captions
@@ -632,6 +633,176 @@ images that are relevant to the scene."""
 
 
 # ---------------------------------------------------------------------------
+# Seedance 2.0 Reference-to-Video (ByteDance API) templates
+#
+# Seedance 2.0 uses role-tagged multimodal content (images + videos + audio)
+# rather than positional tokens. The official prompt convention documented by
+# ByteDance Seed + BytePlus ModelArk is `@Image1 / @Image 1` for image refs;
+# `@Video1` and `@Audio1` follow the same pattern by inference.
+#
+# Mode selection is prompt-directed — the API has no explicit "edit vs extend
+# vs compose" flag. The phrasing of the prompt tells the model what to do:
+#   - "Extend @Video1, showing..."           → continuation
+#   - "Edit @Video1: replace the car with..."→ editing
+#   - "Generate a scene featuring @Image1..."→ composition (default)
+#   - "...with the camera movement of @Video1, and the look of @Image1"
+#                                            → motion/style reference
+#   - "...synchronized to @Audio1"           → MV / audio-driven
+#
+# No negative prompt field exists on the API — avoidance must be expressed as
+# positive language inside the main prompt.
+# ---------------------------------------------------------------------------
+
+_SD_SYSTEM_ROLE = """\
+You are a prompt engineer for the ByteDance Seedance 2.0 reference-to-video \
+API. Seedance 2.0 accepts a multimodal reference bundle — images, video clips, \
+and audio — and synthesizes a new video that fuses those references according \
+to your prompt.
+
+Reference handles follow ByteDance's documented convention:
+- `@Image1`, `@Image2`, … for reference images (characters, objects, style anchors)
+- `@Video1` for a reference video (camera language, motion, pacing, or source to edit/extend)
+- `@Audio1` for reference audio (music rhythm, lip sync, sound characteristics)
+
+Tags must be woven into the prose inline — not listed as a prefix. "A woman \
+resembling @Image1 wearing @Image2's outfit, with the camera movement of \
+@Video1" is the correct shape. "@Image1 @Image2 @Video1: a woman…" is wrong.
+
+The operating mode (compose / motion-transfer / extend / edit / style-ref / \
+mv-with-audio) is selected by how you phrase the prompt, not by any API flag. \
+Choose phrasing that matches the user's intent:
+- Compose: "Generate a scene featuring @Image1 and @Image2 in …"
+- Motion transfer: "…with the camera movement and pacing of @Video1"
+- Extend: "Extend @Video1 forward, continuing the action as …"
+- Edit: "Edit @Video1: replace X with …"
+- Style ref: "…in the visual style of @Video1"
+- MV / audio-driven: "…synchronized to the rhythm of @Audio1" or "lip-syncing to @Audio1"
+
+Seedance 2.0 has no negative prompt field — express avoidances as positive \
+language ("clear sky" instead of "no clouds")."""
+
+_SD_ANALYSIS_PRIORITIES = """\
+## Analysis Priorities
+
+- **Subject identity from @Image refs**: When reference images provide \
+character or object identity, mention them inline with @Image tags. Describe \
+the attribute you want carried over ("the facial features of @Image1", "the \
+outfit in @Image2") rather than just naming the tag.{denoise_structural_note}
+- **Motion and camera from @Video1**: If a reference video is present, \
+explicitly describe what to borrow from it — camera trajectory, pacing, \
+choreography, or visual style. Seedance treats @Video1 as a general \
+conditioning signal; the prompt disambiguates which axis to transfer.{denoise_surface_note}
+- **Rhythm and audio from @Audio1**: If a reference audio is present, describe \
+how the visual should respond to it (beat-cut rhythm, drum hits, lip sync, \
+ambient layering). Seedance can align visual timing to audio features.
+- **Scene composition**: Describe the environment, lighting, and atmosphere of \
+the output. Seedance generates 4–15 seconds at 480p or 720p — scope the scene \
+to that timeframe.{temporal_note}
+{motion_priority_clause}"""
+
+_SD_OUTPUT_CONSTRAINTS = """\
+## Output Constraints
+
+- Weave @Image / @Video / @Audio tags INLINE into the scene prose. Never list \
+them as a prefix or in a bracketed legend.
+- The output operating mode (compose / motion-transfer / extend / edit / \
+style-ref / mv-with-audio) must be clear from your phrasing. Use verbs like \
+"extend", "edit", "featuring", "with the camera of", "in the style of", \
+"synchronized to" to signal intent.
+- Do NOT add "Avoid:" or "Negative:" lines — Seedance has no negative prompt \
+field. Convert avoidances to positive language ("empty street" not "no people").
+- Do NOT add bracketed [References: …] legends — Seedance parses tags inline.
+- Do NOT add <<<image_N>>>, <image>, or other API-wire syntax — use `@Image1` \
+style only (the downstream node handles API serialization).
+- Keep the prompt focused on ONE coherent shot (4–15s). No scene transitions, \
+no multi-shot sequences, no narrative arcs.
+- Be specific about visual elements: shot type, lighting direction, colour \
+palette, material cues. "A woman resembling @Image1 walks through a rain-slick \
+alley at dusk, warm sodium street lamps" beats "a cool scene with @Image1".
+- Assume 24fps output and 720p maximum resolution — do not describe 4K-level \
+micro-detail that the model cannot produce.
+- If the user lists multiple ref images, use ALL of them purposefully. A ref \
+that is uploaded but never mentioned is wasted API cost."""
+
+_SD_WORD_BUDGET = """\
+## Word Budget Allocation
+
+Distribute the target word count based on reference density and motion:
+
+| Condition | Scene/Action | Subject (refs) | Style/Lighting | Camera/Motion |
+|-----------|-------------|----------------|----------------|---------------|
+| 1 subject, low motion | 25% | 35% | 25% | 15% |
+| 1 subject, medium motion | 30% | 30% | 20% | 20% |
+| 1 subject, high motion | 30% | 25% | 20% | 25% |
+| 2+ subjects, low motion | 25% | 40% | 20% | 15% |
+| 2+ subjects, medium motion | 30% | 35% | 15% | 20% |
+| 2+ subjects, high motion | 30% | 30% | 15% | 25% |
+| Scene-only (no subjects) | 40% | 0% | 35% | 25% |
+
+**Active row for this video**: {budget_row_label}
+
+When @Video1 is present and motion-transfer intent applies, shift ~10% into \
+Camera/Motion. When @Audio1 is present, reserve ~10% for rhythm/sync language \
+pulled from Scene/Action."""
+
+_SD_OUTPUT_FORMAT = """\
+## Output Format
+
+{word_count_min}-{word_count_max} words of flowing scene description with \
+reference tags woven inline. {trigger_word_clause}
+
+Structure your prompt in this priority order:
+1. Primary subject and action (introduce @Image / @Video refs here)
+2. Scene, environment, and lighting
+3. Camera framing and motion (explicit @Video1 borrow, if applicable)
+4. Audio sync language (if @Audio1 is present)
+
+Write as a single paragraph, no bullet points, no headings. The Seedance API \
+consumes the prompt as free text."""
+
+_SD_PROMPT_TEMPLATE = """\
+Write a Seedance 2.0 reference-to-video scene prompt using these parameters:
+
+**Scene Goal**: {style_display}
+**Subjects**: {subjects_display}
+**Setting**: {setting_display}
+**Props/Details**: {props_display}
+**Reference Tags Available**: {trigger_word_display}
+**Creative Freedom**: {denoise_strength} (0.0 = closely follow refs, 1.0 = free interpretation)
+**Video Duration**: {duration_display}
+**Camera**: {camera_display}
+**Subject Count**: {subject_count}
+**Motion Level**: {motion_intensity}
+**Target Word Count**: {word_count_min}-{word_count_max} words
+{chunked_section}
+
+Write the prompt body only — weave @Image / @Video / @Audio tags inline, no \
+bracketed legends, no "Avoid:" lines, no API-wire syntax. Signal operating \
+mode (compose / extend / edit / motion-transfer / style-ref / mv-audio) \
+through your verb choice."""
+
+_SD_CHARACTER_RECOGNITION = """\
+## Reference Tag Mapping
+
+These reference assets will be supplied to the Seedance node. Mention each \
+relevant tag INLINE when describing its role in the scene:
+
+| Tag | Role |
+|-----|------|
+{character_table_rows}
+
+Example phrasings:
+- `@Image1`: "a woman with the features of @Image1"
+- `@Image2`: "wearing the outfit seen in @Image2"
+- `@Video1` (motion): "with the slow dolly-in camera movement of @Video1"
+- `@Video1` (extend): "extend @Video1 forward as she turns toward…"
+- `@Audio1` (rhythm): "cuts synchronized to the drum beat of @Audio1"
+
+Only reference tags that materially contribute to the scene. Unused refs waste \
+API tokens."""
+
+
+# ---------------------------------------------------------------------------
 # Mode template registry
 # ---------------------------------------------------------------------------
 
@@ -680,6 +851,15 @@ _MODE_TEMPLATES = {
         "output_format": _KR_OUTPUT_FORMAT,
         "prompt_template": _KR_PROMPT_TEMPLATE,
         "character_recognition": _KR_CHARACTER_RECOGNITION,
+    },
+    "seedance_ref": {
+        "system_role": _SD_SYSTEM_ROLE,
+        "analysis_priorities": _SD_ANALYSIS_PRIORITIES,
+        "output_constraints": _SD_OUTPUT_CONSTRAINTS,
+        "word_budget": _SD_WORD_BUDGET,
+        "output_format": _SD_OUTPUT_FORMAT,
+        "prompt_template": _SD_PROMPT_TEMPLATE,
+        "character_recognition": _SD_CHARACTER_RECOGNITION,
     },
 }
 
@@ -821,7 +1001,8 @@ class NV_V2VPromptBuilder:
                         "'character_swap' = targeted character replacement via inpainting.\n"
                         "'r2v_bootstrap' = scene prompts for WAN 2.6 R2V API.\n"
                         "'kling_edit' = Kling API edit mode — describe what to change.\n"
-                        "'kling_reference' = Kling API reference mode — describe new scene to generate."
+                        "'kling_reference' = Kling API reference mode — describe new scene to generate.\n"
+                        "'seedance_ref' = ByteDance Seedance 2.0 multimodal ref-to-video (@Image1/@Video1/@Audio1)."
                     ),
                 }),
                 "trigger_word": ("STRING", {
@@ -927,7 +1108,8 @@ class NV_V2VPromptBuilder:
         "Assemble a structured captioning/prompting prompt from individual parameters. "
         "Supports task modes: 'full_restyle' (V2V style transfer), "
         "'character_swap' (inpainting), 'r2v_bootstrap' (WAN R2V API), "
-        "'kling_edit' (Kling edit API), 'kling_reference' (Kling reference API). "
+        "'kling_edit' (Kling edit API), 'kling_reference' (Kling reference API), "
+        "'seedance_ref' (ByteDance Seedance 2.0 ref-to-video). "
         "Outputs system_instruction and prompt_text for the LLM prompt refiner."
     )
 
@@ -1072,6 +1254,21 @@ class NV_V2VPromptBuilder:
                 "Reference images (@image1, @image2, etc.) can be mentioned "
                 "naturally where relevant — do not force them in."
             )
+        elif task_mode == "seedance_ref":
+            if trigger_word:
+                trigger_clause = (
+                    f"Available reference tags: **{trigger_word}**. "
+                    "Weave each relevant tag inline where it contributes to the scene "
+                    "(e.g., 'a woman with the features of @Image1'). Do not prefix "
+                    "the prompt with a list of tags."
+                )
+            else:
+                trigger_clause = (
+                    "Weave @Image1..N and @Video1 tags inline where they contribute "
+                    "to the scene (always include the numeric index — `@Image1`, not `@Image`). "
+                    "Do not prefix the prompt with a list of tags. Only mention @Audio1 "
+                    "if a reference audio is actually being supplied to the Seedance node."
+                )
         else:
             if trigger_word:
                 trigger_clause = f"Always begin with the trigger word: **{trigger_word}**"

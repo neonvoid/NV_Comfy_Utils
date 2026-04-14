@@ -293,15 +293,17 @@ class NV_TextureHarmonize:
                     "default": 1000, "min": 100, "max": 50000, "step": 100,
                     "tooltip": "Minimum context pixels needed for statistics. Below this, skip matching."
                 }),
-                "context_scope": (["ring_only", "whole_crop", "full_frame"], {
-                    "default": "ring_only",
+                "context_scope": (["whole_crop", "ring_only", "full_frame"], {
+                    "default": "whole_crop",
                     "tooltip": "Where to measure original-footage texture stats. "
-                               "ring_only = only the mask=0 donut around the inpaint area (smallest sample, most local). "
-                               "whole_crop = entire original_crop including the masked region (14× more samples, "
-                               "same lighting). "
-                               "full_frame = use the entire original full frame from stitcher (largest sample, "
-                               "matches the actual stitch target since the inpaint will be composited back into "
-                               "the full frame). REQUIRES stitcher input — falls back to whole_crop if missing."
+                               "whole_crop = entire original_crop including the masked region. Best default — "
+                               "14× more samples than ring_only for temporal stability, same local lighting. "
+                               "ring_only = only the mask=0 donut around the inpaint area. Strictest seam "
+                               "matching but may flicker on thin/irregular masks with changing pixel counts. "
+                               "full_frame = entire original frame via stitcher. WARNING: includes background "
+                               "and out-of-focus areas — will over-sharpen or over-soften subjects on footage "
+                               "with depth-of-field. Only use for flat content (anime, motion graphics). "
+                               "REQUIRES stitcher input — falls back to whole_crop if missing."
                 }),
                 "stitcher": ("STITCHER", {
                     "tooltip": "Optional STITCHER from NV_InpaintCrop2. Required for context_scope=full_frame. "
@@ -310,13 +312,14 @@ class NV_TextureHarmonize:
                                "instead of just the crop window."
                 }),
                 "highband_strength": ("FLOAT", {
-                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "default": 0.0, "min": 0.0, "max": 0.5, "step": 0.05,
                     "tooltip": "High-band reinjection from original_crop. Grafts the original's high-frequency "
                                "texture (pores, hair, micro-detail) back onto the AI-generated result. "
-                               "Useful when the AI pass smoothed out detail you want to keep (e.g., cross-model "
-                               "refinement where Kling/Veo base looks more realistic than WAN's output). "
-                               "0.0 = disabled. 0.5 = half original HF blended back. 1.0 = full original HF. "
-                               "Start at 0.3-0.5 and adjust by eye."
+                               "Only useful for LOW denoise touch-ups where content is spatially aligned. "
+                               "WARNING: causes ghost edges at denoise > 0.5 because the sampler repositions "
+                               "fine detail — original HF no longer matches AI geometry. "
+                               "Auto-attenuated when denoise input is connected. "
+                               "0.0 = disabled. 0.2-0.3 = subtle texture recovery. 0.5 = maximum safe blend."
                 }),
                 "highband_sigma": ("FLOAT", {
                     "default": 3.0, "min": 0.5, "max": 10.0, "step": 0.5,
@@ -325,6 +328,21 @@ class NV_TextureHarmonize:
                                "Lower = only the finest detail (pores, grain). "
                                "Higher = coarser features included (wrinkles, small edges). "
                                "3.0 = good default for 832×832 crops (captures skin texture without face shape)."
+                }),
+                "denoise": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "forceInput": True,
+                    "tooltip": "KSampler denoise value. When connected, auto-attenuates highband reinjection: "
+                               "denoise 0.0-0.3 = full requested strength, 0.3-0.6 = taper, 0.6+ = disabled. "
+                               "The sampler repositions fine detail at higher denoise, making spatial HF "
+                               "transfer from the original unsafe."
+                }),
+                "grain_mode": (["add_only", "match"], {
+                    "default": "add_only",
+                    "tooltip": "add_only = only add grain when AI crop is cleaner than original (classic behavior). "
+                               "match = also REDUCE grain when AI crop is noisier than original (kills 'VAE fizz' — "
+                               "synthetic micro-noise from diffusion/VAE decoding that makes the crop look grainier "
+                               "than clean studio footage). Reduction capped at 50%% to avoid plastification."
                 }),
             },
         }
@@ -344,8 +362,9 @@ class NV_TextureHarmonize:
                 sharpness_strength=1.0, grain_strength=1.0,
                 pyramid_levels=4, grain_blur_sigma=1.5,
                 skip_base_levels=1, temporal_seed=0, min_context_pixels=1000,
-                context_scope="ring_only", stitcher=None,
-                highband_strength=0.0, highband_sigma=3.0):
+                context_scope="whole_crop", stitcher=None,
+                highband_strength=0.0, highband_sigma=3.0,
+                denoise=None, grain_mode="add_only"):
         TAG = "[NV_TextureHarmonize]"
         device = generated_crop.device
         B, H, W, C = generated_crop.shape
@@ -364,9 +383,25 @@ class NV_TextureHarmonize:
                           f"on post-skip outputs only.)")
                     effective_scope = "whole_crop"
 
+        # --- Denoise auto-taper for highband reinjection ---
+        # At high denoise, the sampler repositions fine detail — original HF pixels
+        # no longer align with AI geometry. Smoothstep taper: full below 0.3, zero above 0.6.
+        effective_highband = highband_strength
+        if denoise is not None and highband_strength > 0:
+            if denoise >= 0.6:
+                effective_highband = 0.0
+            elif denoise > 0.3:
+                # smoothstep from 1.0 at denoise=0.3 to 0.0 at denoise=0.6
+                t = (denoise - 0.3) / 0.3
+                t = t * t * (3.0 - 2.0 * t)  # smoothstep
+                effective_highband = highband_strength * (1.0 - t)
+
         info_lines = [f"{TAG} {B} frames, {H}x{W}, sharpness={sharpness_strength}, "
-                      f"grain={grain_strength}, scope={effective_scope} "
+                      f"grain={grain_strength}, grain_mode={grain_mode}, scope={effective_scope} "
                       f"(sharpness=std/soft-mask, grain=mad/binary-mask)"]
+        if denoise is not None and highband_strength > 0:
+            info_lines.append(f"  Denoise={denoise:.2f} → effective highband={effective_highband:.3f} "
+                              f"(requested={highband_strength:.2f})")
 
         if original_crop.shape[0] != B:
             raise ValueError(f"{TAG} Frame count mismatch: generated={B}, original={original_crop.shape[0]}")
@@ -517,6 +552,22 @@ class NV_TextureHarmonize:
             info_lines.append(f"  Sharpness: levels={pyramid_levels}, skip_base={skip_base_levels}, "
                               f"ratios=[{', '.join(str(r) for r in ratios)}]")
 
+            # Diagnostic: warn when full_frame scope gives opposite direction vs local expectation.
+            # If full_frame ratio > 1.0 at the finest detail level, the frame's global texture
+            # is softer than the subject crop — likely DOF/background contamination.
+            if effective_scope == "full_frame" and len(ratios) > 0 and ratios[0] != "-":
+                try:
+                    l0_ratio = float(ratios[0])
+                    if l0_ratio > 1.05:
+                        info_lines.append(
+                            f"  WARNING: full_frame L0 ratio={l0_ratio:.2f} (sharpening). "
+                            f"This often means the frame contains soft background/OOF areas "
+                            f"dragging down the reference. Try whole_crop or ring_only for "
+                            f"accurate subject-local texture matching."
+                        )
+                except ValueError:
+                    pass
+
         # =================================================================
         # Stage 2: Grain Synthesis (Per-Channel Noise Matching)
         # =================================================================
@@ -557,23 +608,44 @@ class NV_TextureHarmonize:
                 gen_std = _masked_mad(gen_ch, meas_gen_4d, min_pixels=min_context_pixels)
                 gen_val = gen_std.mean().item() if gen_std is not None else 0.0
 
-                # Additional grain needed = difference (only add, don't subtract)
-                additional = max(0.0, ctx_val - gen_val)
-                if additional < 1e-5:
-                    grain_added.append(f"{ctx_val:.4f}={gen_val:.4f}")
-                    continue
+                if ctx_val >= gen_val:
+                    # AI is cleaner than original — add grain to match
+                    additional = ctx_val - gen_val
+                    if additional < 1e-5:
+                        grain_added.append(f"{ctx_val:.4f}={gen_val:.4f}")
+                        continue
 
-                # Per-frame deterministic noise — unique seed per frame to avoid
-                # fixed-overlay look and grain reset between batch chunks
-                noise = torch.empty(B, 1, H, W, device=device)
-                for b in range(B):
-                    generator.manual_seed(temporal_seed + b * 97 + c * 13)
-                    noise[b:b+1] = torch.randn(1, 1, H, W, device=device, generator=generator)
-                noise = noise * additional * grain_strength
+                    # Per-frame deterministic noise — unique seed per frame to avoid
+                    # fixed-overlay look and grain reset between batch chunks
+                    noise = torch.empty(B, 1, H, W, device=device)
+                    for b in range(B):
+                        generator.manual_seed(temporal_seed + b * 97 + c * 13)
+                        noise[b:b+1] = torch.randn(1, 1, H, W, device=device, generator=generator)
+                    noise = noise * additional * grain_strength
 
-                # Apply only to generated region
-                result[:, c:c+1, :, :] = result[:, c:c+1, :, :] + noise * gen_4d
-                grain_added.append(f"+{additional:.4f}")
+                    # Apply only to generated region
+                    result[:, c:c+1, :, :] = result[:, c:c+1, :, :] + noise * gen_4d
+                    grain_added.append(f"+{additional:.4f}")
+                else:
+                    # AI is noisier than original (VAE fizz)
+                    if grain_mode == "match":
+                        # Attenuate the grain residual — scale down toward ctx level.
+                        # Cap removal at 50% to avoid plastification.
+                        ratio = ctx_val / max(gen_val, 1e-6)
+                        scale = max(ratio, 0.5)  # never remove more than 50%
+                        effective_scale = 1.0 + grain_strength * (scale - 1.0)  # lerp with grain_strength
+
+                        # Scale the grain residual in the generated region
+                        gen_ch = gen_grain[:, c:c+1, :, :]
+                        dampened = gen_ch * effective_scale
+                        # Reconstruct: blur + dampened grain (only in mask region)
+                        gen_blur_ch = gen_blur[:, c:c+1, :, :]
+                        new_vals = gen_blur_ch + dampened
+                        result[:, c:c+1, :, :] = result[:, c:c+1, :, :] * (1.0 - gen_4d) + new_vals * gen_4d
+                        grain_added.append(f"-{1.0 - effective_scale:.2f}x({gen_val:.4f}>{ctx_val:.4f})")
+                    else:
+                        # add_only mode: AI is already noisier, do nothing
+                        grain_added.append(f"{ctx_val:.4f}={gen_val:.4f}")
 
             info_lines.append(f"  Grain: sigma={grain_blur_sigma}, channels=[{', '.join(grain_added)}]")
 
@@ -602,27 +674,27 @@ class NV_TextureHarmonize:
         #   orig_lf  = blur(original_crop, sigma)
         #   orig_hf  = original_crop - orig_lf      ← the texture layer
         #   result  += orig_hf * strength * mask     ← graft onto AI output
-        if highband_strength > 0:
+        if effective_highband > 0:
             orig_lf = _gaussian_blur_sep(orig, highband_sigma)
             orig_hf = orig - orig_lf
 
             # Also extract the AI result's existing HF to see what we're replacing.
             # This lets us do a WEIGHTED replacement rather than blind addition:
             # we subtract the AI's HF and add the original's HF, scaled by strength.
-            # At strength=1.0 this fully replaces the AI's HF with the original's.
             # At strength=0.5 it's a 50/50 blend of both HF layers.
             result_lf = _gaussian_blur_sep(result, highband_sigma)
             result_hf = result - result_lf
 
-            # Blend: result_lf + lerp(result_hf, orig_hf, strength)
-            blended_hf = result_hf + highband_strength * (orig_hf - result_hf)
+            # Blend: result_lf + lerp(result_hf, orig_hf, effective_strength)
+            blended_hf = result_hf + effective_highband * (orig_hf - result_hf)
             result = result_lf + blended_hf * gen_4d + result_hf * (1.0 - gen_4d)
 
             # Diagnostic: measure how much HF energy changed
             orig_hf_energy = (orig_hf * gen_4d).abs().mean().item()
             result_hf_pre = (result_hf * gen_4d).abs().mean().item()
             blended_hf_energy = (blended_hf * gen_4d).abs().mean().item()
-            info_lines.append(f"  Highband: sigma={highband_sigma}, strength={highband_strength}, "
+            info_lines.append(f"  Highband: sigma={highband_sigma}, strength={effective_highband:.3f} "
+                              f"(requested={highband_strength:.2f}), "
                               f"orig_hf={orig_hf_energy:.4f}, ai_hf={result_hf_pre:.4f}, "
                               f"blended_hf={blended_hf_energy:.4f}")
 
