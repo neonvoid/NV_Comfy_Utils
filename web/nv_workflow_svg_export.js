@@ -42,6 +42,7 @@ class NvWorkflowSvg {
             offset: app.canvas.ds.offset,
             transform: app.canvas.canvas.getContext("2d").getTransform(),
             ctx: app.canvas.ctx,
+            bgctx: app.canvas.bgctx,
         };
     }
 
@@ -52,6 +53,7 @@ class NvWorkflowSvg {
         app.canvas.ds.offset = this.state.offset;
         app.canvas.canvas.getContext("2d").setTransform(this.state.transform);
         app.canvas.ctx = this.state.ctx;
+        if (this.state.bgctx !== undefined) app.canvas.bgctx = this.state.bgctx;
     }
 
     updateView(bounds) {
@@ -139,7 +141,17 @@ class NvWorkflowSvg {
         svgCtx.getTransform = () => ctx.getTransform();
         svgCtx.resetTransform = () => ctx.resetTransform();
         svgCtx.roundRect = svgCtx.rect;
+
+        // The new Comfy frontend renders node bodies, wires, groups, and image
+        // thumbnails into bgctx (background canvas), then drawFrontCanvas blits
+        // bgcanvas as a single drawImage onto ctx. If we only hijacked ctx, the
+        // SVG ended up with one rasterized PNG of the whole graph (~18MB) and
+        // zero vector content. Hijack bgctx too so bg drawing records to SVG.
+        // We skip drawFrontCanvas entirely during export (see export() below),
+        // so we don't need to hijack ctx — but do it anyway for any overlay
+        // draws that happen to target it.
         app.canvas.ctx = svgCtx;
+        app.canvas.bgctx = svgCtx;
     }
 
     static escapeXml(s) {
@@ -186,7 +198,18 @@ class NvWorkflowSvg {
         try {
             this.updateView(this.getBounds());
             getDrawTextConfig = this.getDrawTextConfig;
-            app.canvas.draw(true, true);
+            // Only render the background canvas — it contains nodes, wires,
+            // groups, and image thumbnails in the new Comfy frontend. Skipping
+            // drawFrontCanvas avoids its clearRect + drawImage(bgcanvas) blit
+            // that would wipe our SVG recording and/or flatten it to a PNG.
+            if (typeof app.canvas.drawBackCanvas === "function") {
+                // Force a fresh bg render (no cached snapshot).
+                app.canvas.dirty_bgcanvas = true;
+                app.canvas.drawBackCanvas();
+            } else {
+                // Fallback for older frontends.
+                app.canvas.draw(true, true);
+            }
 
             const blob = this.getBlob(includeWorkflow ? JSON.stringify(app.graph.serialize()) : undefined);
             console.info("[NV_WorkflowSvg] draw complete", this._diag, "svg bytes:", blob.size);
