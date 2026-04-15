@@ -10,7 +10,8 @@ Supports:
   'character_swap' (targeted character replacement via inpainting),
   'r2v_bootstrap' (scene prompts for WAN 2.6 R2V API),
   'kling_edit' (Kling API edit mode), 'kling_reference' (Kling API reference mode),
-  or 'seedance_ref' (ByteDance Seedance 2.0 multimodal ref-to-video)
+  'seedance_ref' (ByteDance Seedance 2.0 multimodal ref-to-video),
+  or 'wan27_edit' (Alibaba Tongyi Wan 2.7 Video Edit)
 - Automatic word budget selection based on subject count and motion intensity
 - Denoise-strength-aware analysis priority weighting
 - Chunked processing mode with temporal continuity from previous chunk captions
@@ -803,6 +804,144 @@ API tokens."""
 
 
 # ---------------------------------------------------------------------------
+# Wan 2.7 Video Edit (Alibaba Tongyi) templates
+#
+# Wan 2.7 Video Edit takes an input video + optional reference images and
+# applies edit instructions per prompt. Structurally similar to Kling Omni
+# Edit but with these key differences:
+#   - NO `negative_prompt` field on Video Edit schema (present on T2V/I2V/R2V)
+#   - NO `prompt_extend` on Video Edit (present elsewhere) → prompts go verbatim
+#   - Reference images are CONTEXTUAL — no explicit tag convention like Kling's
+#     @image1 or Seedance's @Image1. Describe their role naturally.
+#   - Bilingual (English + Chinese both supported)
+#   - 2-10s duration envelope, 720P/1080P only
+# ---------------------------------------------------------------------------
+
+_W27E_SYSTEM_ROLE = """\
+You are a prompt engineer for the Alibaba Tongyi Wan 2.7 Video Edit API. The \
+API takes an input video and modifies it per text instructions. Your job is \
+to write a clear, concise edit instruction that tells the model what to \
+change about the input video.
+
+Wan 2.7 Video Edit specifics:
+- Supports English and Chinese prompts (do not machine-translate between them).
+- Up to 4 optional reference images may be attached — they are contextual, \
+with NO explicit tag convention. Describe their role in natural language \
+(e.g., "wearing the outfit shown in the reference image").
+- Output is 2-10 seconds at 720P or 1080P.
+- There is NO negative prompt field on Video Edit — express avoidances as \
+positive language ("clear sky" instead of "no clouds").
+- Prompts go through verbatim; the server does not auto-expand your prompt."""
+
+_W27E_ANALYSIS_PRIORITIES = """\
+## Analysis Priorities
+
+- **Edit deltas**: Describe what to CHANGE about the input video — not the \
+full scene. If the input shows a person walking, and you want them running, \
+say "make the subject run" not "a person running down a street."{denoise_structural_note}
+- **Preservation cues**: Note what should be preserved from the input — camera \
+angle, framing, subject identity, background structure — to help the model \
+lock those while changing what's requested.{denoise_surface_note}
+- **Reference image roles**: If reference images are attached, describe what \
+each contributes (identity, outfit, style, object appearance). Without a tag \
+convention, natural-language grounding is the only binding mechanism.
+- **Style + lighting terminology**: Use concrete visual terms. Wan 2.7 \
+responds to cinematography vocabulary.{temporal_note}
+{motion_priority_clause}"""
+
+_W27E_OUTPUT_CONSTRAINTS = """\
+## Output Constraints
+
+- Write EDIT INSTRUCTIONS, not scene descriptions. Focus on the delta between \
+the input video and the desired output. Use directive language: "replace X \
+with Y", "change the color to Z", "add W to the scene".
+- Do NOT add "Avoid:" or "Negative:" lines — Wan 2.7 Video Edit has no \
+negative prompt field. Convert avoidances into positive language.
+- Do NOT use @image, @video, @subject, <<<image_N>>>, or any tag convention. \
+Reference images are contextual — describe their role in prose.
+- Stay concise — the edit instruction should be direct and unambiguous. Long \
+scene descriptions dilute the edit signal.
+- Scope to a single shot. Wan 2.7 Video Edit produces 2-10 seconds — no \
+multi-shot sequences, no scene transitions, no narrative arcs.
+- English or Chinese are both acceptable. Do not mix unless the user's draft \
+already mixes.
+- Output ONLY the prompt text — no explanations, preamble, or \
+meta-commentary.
+- When iterating, build on the previous version — do not restart from \
+scratch unless explicitly asked."""
+
+_W27E_WORD_BUDGET = """\
+## Word Budget Allocation
+
+Distribute the target word count based on edit complexity:
+
+| Condition | Edit Delta | Preservation Cues | Style/Lighting | References |
+|-----------|-----------|-------------------|----------------|-----------|
+| 1 subject, low motion | 40% | 25% | 25% | 10% |
+| 1 subject, medium motion | 40% | 25% | 20% | 15% |
+| 1 subject, high motion | 45% | 20% | 15% | 20% |
+| 2+ subjects, low motion | 40% | 25% | 20% | 15% |
+| 2+ subjects, medium motion | 40% | 25% | 15% | 20% |
+| 2+ subjects, high motion | 45% | 20% | 15% | 20% |
+| Scene-only (no subjects) | 45% | 30% | 25% | 0% |
+
+**Active row for this video**: {budget_row_label}
+
+Edit instructions benefit from high Delta weight. Lean into what to change, \
+not how to describe the whole scene."""
+
+_W27E_OUTPUT_FORMAT = """\
+## Output Format
+
+{word_count_min}-{word_count_max} words of direct edit instruction. \
+{trigger_word_clause}
+
+Structure your prompt in this priority order:
+1. What to change (the primary edit delta)
+2. What to preserve (structural/identity cues from input)
+3. Style/lighting guidance
+4. Reference image roles (if applicable)
+
+Write as a single flowing paragraph. No bullet points, no headings."""
+
+_W27E_PROMPT_TEMPLATE = """\
+Write a Wan 2.7 Video Edit instruction using these parameters:
+
+**Edit Goal**: {style_display}
+**Subjects in input**: {subjects_display}
+**Setting in input**: {setting_display}
+**Notable props/details**: {props_display}
+**Creative Freedom**: {denoise_strength} (0.0 = minimal edit, 1.0 = aggressive transformation)
+**Video Duration**: {duration_display}
+**Camera**: {camera_display}
+**Subject Count**: {subject_count}
+**Motion Level**: {motion_intensity}
+**Target Word Count**: {word_count_min}-{word_count_max} words
+{chunked_section}
+
+Write the edit instruction only — no negative prompt, no tag conventions, no \
+API-wire syntax. Keep the prompt direct and action-oriented."""
+
+_W27E_CHARACTER_RECOGNITION = """\
+## Reference Image Context
+
+Reference images are attached to this edit. Wan 2.7 Video Edit has no tag \
+convention — reference them by role in natural language:
+
+| Description |
+|------------|
+{character_table_rows}
+
+Example phrasings:
+- "replace the subject's outfit with the one shown in the reference image"
+- "match the color grading of the first reference"
+- "restyle the background to resemble the reference photograph"
+
+Only mention references that materially contribute to the edit. Unused \
+references are ignored by the model."""
+
+
+# ---------------------------------------------------------------------------
 # Mode template registry
 # ---------------------------------------------------------------------------
 
@@ -860,6 +999,15 @@ _MODE_TEMPLATES = {
         "output_format": _SD_OUTPUT_FORMAT,
         "prompt_template": _SD_PROMPT_TEMPLATE,
         "character_recognition": _SD_CHARACTER_RECOGNITION,
+    },
+    "wan27_edit": {
+        "system_role": _W27E_SYSTEM_ROLE,
+        "analysis_priorities": _W27E_ANALYSIS_PRIORITIES,
+        "output_constraints": _W27E_OUTPUT_CONSTRAINTS,
+        "word_budget": _W27E_WORD_BUDGET,
+        "output_format": _W27E_OUTPUT_FORMAT,
+        "prompt_template": _W27E_PROMPT_TEMPLATE,
+        "character_recognition": _W27E_CHARACTER_RECOGNITION,
     },
 }
 
@@ -1002,7 +1150,8 @@ class NV_V2VPromptBuilder:
                         "'r2v_bootstrap' = scene prompts for WAN 2.6 R2V API.\n"
                         "'kling_edit' = Kling API edit mode — describe what to change.\n"
                         "'kling_reference' = Kling API reference mode — describe new scene to generate.\n"
-                        "'seedance_ref' = ByteDance Seedance 2.0 multimodal ref-to-video (@Image1/@Video1/@Audio1)."
+                        "'seedance_ref' = ByteDance Seedance 2.0 multimodal ref-to-video (@Image1/@Video1/@Audio1).\n"
+                        "'wan27_edit' = Alibaba Tongyi Wan 2.7 Video Edit — edit instructions on input video."
                     ),
                 }),
                 "trigger_word": ("STRING", {
@@ -1109,7 +1258,8 @@ class NV_V2VPromptBuilder:
         "Supports task modes: 'full_restyle' (V2V style transfer), "
         "'character_swap' (inpainting), 'r2v_bootstrap' (WAN R2V API), "
         "'kling_edit' (Kling edit API), 'kling_reference' (Kling reference API), "
-        "'seedance_ref' (ByteDance Seedance 2.0 ref-to-video). "
+        "'seedance_ref' (ByteDance Seedance 2.0 ref-to-video), "
+        "'wan27_edit' (Alibaba Tongyi Wan 2.7 Video Edit). "
         "Outputs system_instruction and prompt_text for the LLM prompt refiner."
     )
 
@@ -1269,6 +1419,15 @@ class NV_V2VPromptBuilder:
                     "Do not prefix the prompt with a list of tags. Only mention @Audio1 "
                     "if a reference audio is actually being supplied to the Seedance node."
                 )
+        elif task_mode == "wan27_edit":
+            trigger_clause = (
+                "Begin directly with the edit instruction. Do NOT use any tag "
+                "convention (@image/@video/@subject) — Wan 2.7 Video Edit has no "
+                "tag syntax. Reference images (if any) should be described by their "
+                "role naturally (e.g., 'the outfit shown in the reference image'). "
+                "Do NOT add any negative prompt line — Wan 2.7 Video Edit has no "
+                "negative prompt field; express avoidances as positive language."
+            )
         else:
             if trigger_word:
                 trigger_clause = f"Always begin with the trigger word: **{trigger_word}**"

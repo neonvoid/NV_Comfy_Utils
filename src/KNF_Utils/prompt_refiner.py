@@ -395,10 +395,42 @@ meta-commentary.
 - When iterating, build on the previous version — do not restart from \
 scratch unless explicitly asked."""
 
+_WAN27_EDIT_SYSTEM = """\
+You are a prompt engineer for the Alibaba Tongyi Wan 2.7 Video Edit API. The \
+API takes an input video and modifies it according to a text instruction. \
+Write a clear, concise EDIT INSTRUCTION that tells the model what to change \
+about the input video.
+
+## Key Constraints
+- Wan 2.7 Video Edit has NO negative_prompt field. Convert avoidances into \
+positive language ("clear sky" instead of "no clouds", "empty street" instead \
+of "no people"). Do NOT add "Avoid:" or "Negative:" lines.
+- Reference images (up to 4) are CONTEXTUAL — there is NO tag convention \
+like `@image1`, `@subject{id}`, or `@Image1`. Describe their role in natural \
+language (e.g., "the outfit shown in the reference image", "the color palette \
+of the second reference").
+- Write EDIT INSTRUCTIONS, not scene descriptions. Focus on the delta between \
+the input video and the desired output. Be direct: "change X to Y", "replace \
+the background with Z", "make the subject wear W".
+- Both English and Chinese prompts are supported. Do NOT machine-translate \
+between them — use whichever the user's draft is in.
+- Wan 2.7 Video Edit produces 2-10 seconds of video at 720P or 1080P. Scope \
+to a single shot — no scene transitions, no multi-shot sequences, no narrative \
+arcs.
+- Prompts go through verbatim; there is no server-side prompt expansion for \
+the edit mode. Keep the instruction tight and unambiguous.
+- Do NOT use <<<image_N>>>, @image, @video, @subject, or any API-wire tag \
+syntax — none of them apply to Wan 2.7 Video Edit.
+- Output ONLY the edit instruction text — no explanations, preamble, or \
+meta-commentary.
+- When iterating, build on the previous version — do not restart from \
+scratch unless explicitly asked."""
+
 _KLING_MODE_MAP = {
     "kling_edit": _KLING_EDIT_SYSTEM,
     "kling_reference": _KLING_REFERENCE_SYSTEM,
     "seedance_ref": _SEEDANCE_REF_SYSTEM,
+    "wan27_edit": _WAN27_EDIT_SYSTEM,
 }
 
 
@@ -685,13 +717,14 @@ class NV_PromptRefiner:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "mode": (["custom", "kling_edit", "kling_reference", "seedance_ref"], {
+                "mode": (["custom", "kling_edit", "kling_reference", "seedance_ref", "wan27_edit"], {
                     "default": "custom",
                     "tooltip": (
                         "'custom' = use system_instruction input as-is (for V2V Prompt Builder workflows).\n"
                         "'kling_edit' = built-in Kling edit mode system prompt — describe what to change.\n"
                         "'kling_reference' = built-in Kling reference mode system prompt — describe new scene to generate.\n"
                         "'seedance_ref' = built-in ByteDance Seedance 2.0 ref-to-video prompt — multimodal refs (@Image1/@Video1/@Audio1).\n"
+                        "'wan27_edit' = built-in Alibaba Tongyi Wan 2.7 Video Edit — edit instructions, no tag convention.\n"
                         "Built-in modes bypass V2V Prompt Builder — type your edit/scene goal directly into initial_prompt."
                     ),
                 }),
@@ -962,6 +995,8 @@ class NV_PromptRefiner:
                     api_label = "Kling reference-to-video"
                 elif mode == "seedance_ref":
                     api_label = "Seedance 2.0 reference-to-video"
+                elif mode == "wan27_edit":
+                    api_label = "Wan 2.7 video edit"
                 else:
                     api_label = mode
                 user_message = (
