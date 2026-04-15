@@ -72,12 +72,31 @@ class NvWorkflowSvg {
         const drawImage = svgCtx.drawImage;
         svgCtx.drawImage = function (...args) {
             const image = args[0];
-            if (image.nodeName === "IMG" && !image.src.startsWith("data:image/")) {
-                const canvas = document.createElement("canvas");
-                canvas.width = image.width;
-                canvas.height = image.height;
-                canvas.getContext("2d").drawImage(image, 0, 0);
-                args[0] = canvas;
+            // Convert remote <img> and <video> (current frame) to a local canvas
+            // so canvas2svg can embed pixels as a base64 data URI. Otherwise
+            // remote URLs break when the SVG is opened elsewhere, and <video>
+            // elements are ignored entirely by canvas2svg.
+            try {
+                if (image.nodeName === "VIDEO") {
+                    const w = image.videoWidth || image.width || 256;
+                    const h = image.videoHeight || image.height || 256;
+                    const canvas = document.createElement("canvas");
+                    canvas.width = w;
+                    canvas.height = h;
+                    canvas.getContext("2d").drawImage(image, 0, 0, w, h);
+                    args[0] = canvas;
+                } else if (image.nodeName === "IMG" && !image.src.startsWith("data:image/")) {
+                    const canvas = document.createElement("canvas");
+                    canvas.width = image.naturalWidth || image.width;
+                    canvas.height = image.naturalHeight || image.height;
+                    canvas.getContext("2d").drawImage(image, 0, 0);
+                    args[0] = canvas;
+                }
+            } catch (err) {
+                // Cross-origin / tainted canvas / unloaded media — skip this
+                // image rather than abort the whole export.
+                console.warn("[NV_WorkflowSvg] drawImage: could not embed", image.nodeName, image.src, err);
+                return;
             }
             return drawImage.apply(this, args);
         };
