@@ -70,32 +70,67 @@ class NvWorkflowSvg {
         svgCtx.canvas.getBoundingClientRect = () => ({ width: svgCtx.width, height: svgCtx.height });
 
         const drawImage = svgCtx.drawImage;
+        const debug = window.__NV_SVG_DEBUG === true;
+        const diag = { calls: 0, img: 0, video: 0, canvas: 0, skipped: 0, embedded: 0, failed: 0 };
+        this._diag = diag;
         svgCtx.drawImage = function (...args) {
+            diag.calls++;
             const image = args[0];
-            // Convert remote <img> and <video> (current frame) to a local canvas
-            // so canvas2svg can embed pixels as a base64 data URI. Otherwise
-            // remote URLs break when the SVG is opened elsewhere, and <video>
-            // elements are ignored entirely by canvas2svg.
+            const name = image && image.nodeName;
+
+            // Pre-bake <img>/<video>/<canvas> into a same-origin canvas whose
+            // toDataURL we invoke here, so failures (CORS taint, 0-size, unloaded)
+            // surface now instead of inside canvas2svg's downstream serializer.
+            const bake = (src, w, h) => {
+                const c = document.createElement("canvas");
+                c.width = Math.max(1, w);
+                c.height = Math.max(1, h);
+                c.getContext("2d").drawImage(src, 0, 0, c.width, c.height);
+                const dataUrl = c.toDataURL("image/png");  // throws on taint
+                c.toDataURL = () => dataUrl;  // canvas2svg will call this
+                return c;
+            };
+
             try {
-                if (image.nodeName === "VIDEO") {
-                    const w = image.videoWidth || image.width || 256;
-                    const h = image.videoHeight || image.height || 256;
-                    const canvas = document.createElement("canvas");
-                    canvas.width = w;
-                    canvas.height = h;
-                    canvas.getContext("2d").drawImage(image, 0, 0, w, h);
-                    args[0] = canvas;
-                } else if (image.nodeName === "IMG" && !image.src.startsWith("data:image/")) {
-                    const canvas = document.createElement("canvas");
-                    canvas.width = image.naturalWidth || image.width;
-                    canvas.height = image.naturalHeight || image.height;
-                    canvas.getContext("2d").drawImage(image, 0, 0);
-                    args[0] = canvas;
+                if (name === "VIDEO") {
+                    diag.video++;
+                    const w = image.videoWidth || image.width;
+                    const h = image.videoHeight || image.height;
+                    if (!w || !h || image.readyState < 2) {
+                        if (debug) console.warn("[NV_WorkflowSvg] video not ready", image.src, { w, h, readyState: image.readyState });
+                        diag.skipped++;
+                        return;
+                    }
+                    args[0] = bake(image, w, h);
+                    diag.embedded++;
+                } else if (name === "IMG") {
+                    diag.img++;
+                    const w = image.naturalWidth || image.width;
+                    const h = image.naturalHeight || image.height;
+                    if (!image.complete || !w || !h) {
+                        if (debug) console.warn("[NV_WorkflowSvg] img not loaded", image.src, { complete: image.complete, w, h });
+                        diag.skipped++;
+                        return;
+                    }
+                    // Bake even data: URLs — canvas2svg's downstream src path
+                    // can still break on some SVG consumers, data-URL-in-data-URL is safe.
+                    args[0] = bake(image, w, h);
+                    diag.embedded++;
+                } else if (name === "CANVAS") {
+                    diag.canvas++;
+                    // Pre-serialize so any taint surfaces here.
+                    const dataUrl = image.toDataURL("image/png");
+                    const proxy = image;  // canvas2svg will re-call toDataURL
+                    const origToDataURL = proxy.toDataURL;
+                    proxy.toDataURL = () => dataUrl;
+                    // Restore after this draw call to avoid polluting caller's canvas.
+                    queueMicrotask(() => { proxy.toDataURL = origToDataURL; });
+                    diag.embedded++;
                 }
             } catch (err) {
-                // Cross-origin / tainted canvas / unloaded media — skip this
-                // image rather than abort the whole export.
-                console.warn("[NV_WorkflowSvg] drawImage: could not embed", image.nodeName, image.src, err);
+                diag.failed++;
+                console.warn("[NV_WorkflowSvg] drawImage: could not embed", name,
+                             image && image.src, err && err.message);
                 return;
             }
             return drawImage.apply(this, args);
@@ -154,6 +189,7 @@ class NvWorkflowSvg {
             app.canvas.draw(true, true);
 
             const blob = this.getBlob(includeWorkflow ? JSON.stringify(app.graph.serialize()) : undefined);
+            console.info("[NV_WorkflowSvg] draw complete", this._diag, "svg bytes:", blob.size);
             this.download(blob);
         } catch (err) {
             console.error("[NV_WorkflowSvg] export failed:", err);
