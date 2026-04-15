@@ -363,6 +363,17 @@
                     //gradient
                     this.__currentElement.setAttribute("fill", format("url(#{id})", {id:value.__root.getAttribute("id")}));
                 } else if(style.apply.indexOf(type)!==-1 && style.svg !== value) {
+                    // NV patch: non-string fill/stroke values can reach this branch when
+                    // another extension (e.g. td_background) sets fillStyle to a native
+                    // CanvasPattern or CanvasGradient that isn't canvas2svg's mock.
+                    // Skip them so the export doesn't abort.
+                    if(typeof value !== "string") {
+                        if (!this.__nv_warned_nonstring) {
+                            this.__nv_warned_nonstring = true;
+                            console.warn("[NV_WorkflowSvg] canvas2svg: skipping non-string " + style.svgAttr + " value", value);
+                        }
+                        continue;
+                    }
                     if((style.svgAttr === "stroke" || style.svgAttr === "fill") && value.indexOf("rgba") !== -1) {
                         //separate alpha value, since illustrator can't handle it
                         regex = /rgba\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d?\.?\d*)\s*\)/gi;
