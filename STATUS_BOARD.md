@@ -1,18 +1,33 @@
 # Status Board — NV_Comfy_Utils
 
 > Auto-managed by `/handoff`. Content is never deleted — old entries move to ARCHIVE.md.
-> Last updated: 2026-04-15
+> Last updated: 2026-04-15b
 
 ## Resume Context
 <!-- Rewritten each `/handoff` run. What does a cold-start agent need RIGHT NOW? -->
 
-- **Current focus:** Runtime test NV_SAM3Preprocess v1 on known SAM3 failure frames. Start conservative (clahe_clip_limit=1.5, everything else off). Escalate to gamma=1.3 + guided_filter_radius=3 if needed.
-- **Critical files:** `src/KNF_Utils/sam3_preprocess.py` (new v1 node), `src/KNF_Utils/__init__.py` (registration updated), `src/KNF_Utils/guided_filter.py` (reused for denoise)
-- **Known blockers:** None — file compiles, awaiting ComfyUI server restart for module reload.
-- **Environment notes:** Gemini API quota exceeded (prior session) — multi-ai Gemini fell back to gemini-2.5-pro successfully. Earlier TextureHarmonize V2 runtime test from 2026-04-13 Resume Context still pending (workstream I untouched this session).
+- **Primary focus (when returning):** Build NV_VaceChunkedOrchestrator (workstream H, STAGED). Architecture locked, upstream pieces all runtime-validated. Phase 1 = `plan_chunks()` math helper with unit tests BEFORE sampler integration. Deep mental model established via 600-frame fight video walkthrough this session.
+- **Phase 1 math gate:** `plan_chunks(total, chunk_size, tail_overlap)` → `list[(start, end)]`. Must handle: WAN 4k+1 rule on control_video length (chunk_size + tail_overlap), last-chunk rollback (retract start never pad), zero-new-frames edge case, `prev_tail_trim` off-by-one (0 for chunk 1, tail_overlap for chunk 2+). 600-frame worked example: 7×81 + 33 runt, 41=4×10+1 valid, no rollback.
+- **Critical files:** `src/KNF_Utils/vace_latent_splice.py` (splice helper, built), `src/KNF_Utils/latent_guidance.py` (save/load with native dtype + weights_only=True), `src/KNF_Utils/vace_control_video_prep.py` (_apply_tail on all exits per D-021), future `src/KNF_Utils/vace_chunked_orchestrator.py`, future `node_notes/architecture/vace_chunked_orchestrator.md` (design doc).
+- **Also pending runtime verification:** NV_SAM3Preprocess v1 on known SAM3 failure frames (workstream J, conservative start `clahe_clip_limit=1.5`). TextureHarmonize V2 5-fix batch from 2026-04-12b (workstream I). Earlier TextureHarmonize V2 runtime test from 2026-04-13 Resume Context untouched.
+- **Visual tracking shipped this session:** `node_notes/diagrams/pipeline_architecture.excalidraw` (v4 wiring) + `workstream_map.excalidraw` (dependency graph). Open in VS Code Excalidraw extension. Audit doc `VACE_INPAINT_NODE_AUDIT.md` has 5 identified gaps — 3 new NODE sections needed (VaceLatentSplice, TextureHarmonize, VacePrePassReference) plus three-prepend intuition section.
+- **Environment notes:** 2 pre-existing uncommitted changes from prior session — `web/extensions.js` modified, new `web/nv_workflow_svg_export.js` + `web/assets/` untracked. Unrelated to today's work. Gemini API quota exceeded earlier (fallback to gemini-2.5-pro worked).
 
 ## Pulse
 <!-- Last 2 session summaries, newest first. Older entries roll to Workstream Details. -->
+
+### 2026-04-15b — Orchestrator mental model + Excalidraw visual tracking infrastructure [research + tooling]
+- **Done:**
+  - Deep walkthrough of v4 production workflow (0403_API_Template_vace_withKlingRef_inpaint_v4.json) — 48 custom NV_ nodes mapped to actual wiring. Focus areas: mask prep, color correct, ref tail prepend, texture harmonize.
+  - Established "three independent prepend systems" intuition: identity_anchor (VacePrePassReference, Kling chunk 0 frozen — currently unconnected per D-010), reference_frames (VacePrePassReference, per-chunk Kling), previous_chunk_tail (VaceControlVideoPrep, pixel continuity). Anchor+refs trimmed post-generation; tail kept then stripped by tail_trim.
+  - Nailed down "two parallel rails for chunk continuity" mental model: pixel tail establishes conditioning slot (VACE needs content at latent positions to encode), latent splice overwrites `vace_frames[:, :16, :tail_T]` inactive channels with clean encoder-domain values. Each fixes the other's blind spot; both required.
+  - Concrete orchestrator loop walkthrough using 600-frame fight video: chunk_frames=81, tail_overlap=8 → 7×81 + 33-frame runt, 8 chunks total. Last chunk 33+8=41=4×10+1 valid (no rollback needed). `prev_tail_trim` flips 0→8 at chunk 2 (off-by-one risk flagged).
+  - Identified 5 gaps in VACE_INPAINT_NODE_AUDIT.md (last updated 2026-04-08): missing full NODE sections for VaceLatentSplice, TextureHarmonize, VacePrePassReference, Save/LoadLatentReference, ImageDiffAnalyzer. Pipeline data flow diagram stale. Three-prepend layout + two-rails intuition not documented.
+  - Built visual tracking infrastructure: `node_notes/diagrams/pipeline_architecture.excalidraw` (93 elements, v4 wiring with color-coded stages + chunk loop + skip connections) and `workstream_map.excalidraw` (38 elements, 9 workstreams + dependency arrows into H). Generator script at `D:/tmp/gen_excalidraw.py`.
+  - Researched human-side tracking options: Excalidraw vs Miro vs Notion vs GitHub Projects. Excalidraw wins for solo dev with repo-committed, version-controllable, VS Code-native visual docs.
+- **Decisions:** Excalidraw selected for repo-committed pipeline/workstream visualization — VS Code extension, JSON files tracked in git, lives next to code not in a separate SaaS (D-042, PROVISIONAL). Orchestrator Phase 1 must land chunk-planning math (`plan_chunks` helper) with unit tests validated BEFORE touching sampler integration — the frame-count math is the gate (D-043, PROVISIONAL).
+- **Blockers:** None. All orchestrator upstream pieces runtime-validated (VaceLatentSplice, latent save/load, tail-as-control-video, CropColorFix hard-fail).
+- **Next:** Return to workstream H. Phase 1 scaffold: `plan_chunks(total, chunk_size, tail_overlap)` with tests covering 4k+1 validation, last-chunk rollback, zero-new-frames edge case, minimum viable chunk size. Consider capturing architecture in `node_notes/architecture/vace_chunked_orchestrator.md` before code lands (currently only lives in STATUS_BOARD workstream H details).
 
 ### 2026-04-14/15 — Research arc: mask-domain editing → mocap+UE5 reframe → grade-the-plate SAM3 preprocess v1 shipped [coding + research]
 - **Done:**
@@ -27,18 +42,6 @@
 - **Blockers:** None — code compiles, awaiting ComfyUI server restart + runtime test on known SAM3 failure frames.
 - **Next:** Runtime test NV_SAM3Preprocess on dark-hair-on-dark-bg / skin-vs-warm-bg / semi-transparent-fabric cases. Start conservative (clahe_clip_limit=1.5 only). Escalate to gamma + guided filter if needed. If VNS cases still fail, next step is MatAnyone second-opinion segmentor.
 
-### 2026-04-12b — TextureHarmonize multi-AI scope audit + 5 production fixes [coding + research]
-- **Done:**
-  - Runtime tested TextureHarmonize at multiple settings: highband_strength 0.5/1.0, context_scope full_frame/whole_crop/ring_only, shift 8.0/4.85.
-  - Discovered full_frame scope gives OPPOSITE correction direction vs local scopes on DOF footage (1.43 vs 0.84 — background blur contaminates reference stats).
-  - Confirmed highband reinjection causes ghost edges at denoise≥0.55 (spatial misalignment is fundamental, not tunable).
-  - Discovered grain stage correctly does nothing — AI output is noisier than clean studio footage ("VAE fizz").
-  - Multi-AI research (Codex + Gemini): both agreed on all 5 findings. Codex proposed grain_mode=match, Gemini named "VAE fizz" phenomenon.
-  - Implemented 5 production fixes: default→whole_crop, highband max→0.5, denoise auto-taper (smoothstep zero above 0.6), grain_mode match (50% cap removal), full_frame DOF diagnostic warning.
-- **Decisions:** Default context_scope=whole_crop not ring_only — 14x more pixels, same answer, better temporal stability (D-034). Highband max=0.5, auto-disabled above denoise 0.6 — spatial HF transfer unsafe at high denoise (D-035). Grain match mode — reduce "VAE fizz" when gen>ctx, capped 50% to prevent plastification (D-036). full_frame scope demoted — DOF-contaminated reference is wrong for subject compositing (D-037).
-- **Blockers:** None — code complete, syntax verified, awaiting runtime test.
-- **Next:** Runtime test with whole_crop default + grain_mode=match on the clothing swap shot. Compare with/without grain reduction visible. Test denoise auto-taper with connected denoise input.
-
 
 ## Active Workstreams
 
@@ -51,7 +54,7 @@
 | E  | Chunk Seam Continuity | ACTIVE | 2026-04-10 | NV_VaceLatentSplice built + runtime validated. Zero-drift tail overlap confirmed. |
 | F  | Kling API Chunking | ACTIVE | 2026-04-09 | type="first_frame" hints on tail refs. Debug logging added. Awaiting runtime test of API acceptance. |
 | G  | Masking & VFI Pipeline Research | ACTIVE | 2026-04-10 | Mocha for sub-object, SAM3 for full body, MatAnyone for edge refinement. GIMM-VFI stays. NV_MatchInterpFrames + RetimePrep/Restore manual fallback inputs. |
-| H  | VACE Chunked Orchestrator | STAGED | 2026-04-10 | Architecture designed (4 multi-AI rounds). Single-queue-press chunked VACE inpainting with latent splice. |
+| H  | VACE Chunked Orchestrator | STAGED | 2026-04-15 | Architecture designed (4 multi-AI rounds). Deep mental model established with 600-frame walkthrough. Phase 1 = plan_chunks() math helper first. |
 | I  | Texture Harmonize + Aesthetic Conditioning | ACTIVE | 2026-04-12 | Multi-AI scope audit complete. 5 fixes: default→whole_crop, HB max→0.5 + denoise taper, grain match mode, full_frame DOF warning. Awaiting runtime test. |
 | J  | SAM3 Input Quality (Grade-the-Plate) | ACTIVE | 2026-04-15 | NV_SAM3Preprocess v1 shipped (CLAHE + gamma + guided filter). Multi-AI reviewed. Awaiting runtime test. |
 
@@ -141,6 +144,8 @@
 | D-039 | 2026-04-15 | ACTIVE | research | Animate+VACE cannot merge at model level (different model classes, no common weight structure). Use sequential cascade. Animate Replacement Mode (character_mask + background_video) may be one-shot solution for mocap-driven body swap — needs validation test. |
 | D-040 | 2026-04-15 | ACTIVE | A,C,E,J | Iterative multi-pass mask editing is production-viable with existing VAE drift fixes (CropColorFix V2 + NV_VaceLatentSplice + TextureHarmonize MAD). Envelope: ≤6 passes comfortable, masks ≥64px in working-crop space. Mask quality is now dominant constraint, not VAE drift. |
 | D-041 | 2026-04-15 | ACTIVE | J | NV_SAM3Preprocess v1: guided filter (not bilateral — avoids staircasing that SAM latches onto) + gamma on Rec.601 luminance + CLAHE on Lab L with uint16-only L quantization (a/b stay float). Single output (no passthrough — ComfyUI users branch IMAGE noodle). Targeted fix for degraded inputs, not always-on. |
+| D-042 | 2026-04-15 | PROVISIONAL | tooling | Excalidraw selected for repo-committed pipeline + workstream visual tracking. VS Code extension, JSON files tracked in git, lives next to code (not Miro/Notion/GitHub Projects). `node_notes/diagrams/` is canonical location. |
+| D-043 | 2026-04-15 | PROVISIONAL | H | Orchestrator Phase 1 must land `plan_chunks()` math helper with unit tests BEFORE sampler integration. Frame-count math is the gate — if rollback/edge-case logic is wrong, the whole loop produces misaligned garbage. Validate against 600-frame worked example. |
 
 ### Decision Statuses
 - **ACTIVE** — Currently in effect
@@ -369,6 +374,10 @@
   Outcome: TextureHarmonize overhaul — per-stage stat split (std for sharpness, MAD for grain), context_scope selector, full_frame via stitcher (OOM-safe), high-band reinjection for Kling→WAN cartoon drift. 5 Codex review fixes applied. Foundations course (5 docs) created.
   Decision: Per-stage estimator std/MAD (D-031). High-band reinjection post-process via frequency separation, not pre-process sharpening (D-032). Pre-process HF boost dead end — model's prior ignores structured HF input (D-033).
   Next: Runtime test highband_strength=0.5 on WAN-on-Kling identity refinement shot.
+- **2026-04-12 | coding + research**
+  Outcome: Multi-AI scope audit on TextureHarmonize identified 5 production fixes: default→whole_crop, highband max=0.5 + denoise auto-taper, grain match mode (anti-"VAE fizz"), full_frame DOF warning. Implemented + syntax verified.
+  Decision: whole_crop default (D-034), highband capped + tapered (D-035), grain match mode (D-036), full_frame demoted (D-037).
+  Next: Runtime test with whole_crop + grain_mode=match on clothing swap shot.
 
 ### J. SAM3 Input Quality (Grade-the-Plate)
 **Current state:** ACTIVE — v1 shipped, syntax verified, awaiting runtime test
@@ -426,6 +435,7 @@
 - **2026-04-10/12:** NV_TextureHarmonize major overhaul: per-stage estimator split (std/MAD), context_scope modes (ring_only/whole_crop/full_frame), OOM-safe full-frame precompute via stitcher, high-band reinjection (Stage 3 frequency separation). Multi-AI research on edit model architectures + AI-on-AI cartoon drift diagnosis. Foundations course created (4 intuition modules + README, multi-AI reviewed). RetimeRestore manual fallback inputs added.
 - **2026-04-12:** TextureHarmonize multi-AI scope audit: full_frame DOF contamination confirmed, 5 production fixes applied (scope default, HB cap+taper, grain match mode, DOF warning). Multi-AI consensus (Codex+Gemini) on all findings.
 - **2026-04-14/15:** Mask-domain editing research arc → mocap+UE5 reframe → grade-the-plate SAM3 preprocess v1 shipped. Three new research docs (mask-domain diffusion feasibility, body representation taxonomy, image editing SOTA update). Vicon+UE5 access disclosed — synthetic-render path now preferred over diffusion-based mask editing for body-swap cases. Multi-pass mask editing validated as production-viable (≤6 passes, ≥64px masks). New workstream J: SAM3 Input Quality.
+- **2026-04-15:** Orchestrator (workstream H) deep mental model established — 600-frame fight video walkthrough documents chunk planning, two-rails-for-tail-continuity intuition, three-prepend systems. Excalidraw visual tracking infrastructure shipped to `node_notes/diagrams/` (D-042). VACE_INPAINT_NODE_AUDIT.md gap analysis: 5 missing sections flagged. Phase 1 design principle locked: math-first before sampler integration (D-043).
 
 ## Archived Workstreams Index
 <!-- Pointers to workstreams moved to ARCHIVE.md. -->
