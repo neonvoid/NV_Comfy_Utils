@@ -1213,7 +1213,8 @@ class NV_GeminiVideoExtractor:
                     # OpenRouter (base64 inline, smaller videos — use optimize=auto)
                     "google/gemini-2.5-pro",
                     "google/gemini-2.5-flash",
-                    "google/gemini-3-pro-preview",
+                    "google/gemini-3.1-pro-preview",
+                    "google/gemini-3-flash-preview",
                     "qwen/qwen3-vl-plus",
                 ], {
                     "default": "gemini-2.5-pro",
@@ -1746,7 +1747,8 @@ class NV_GeminiBatchExtractor:
                     "gemini-2.0-flash",
                     "google/gemini-2.5-pro",
                     "google/gemini-2.5-flash",
-                    "google/gemini-3-pro-preview",
+                    "google/gemini-3.1-pro-preview",
+                    "google/gemini-3-flash-preview",
                     "qwen/qwen3-vl-plus",
                 ], {
                     "default": "gemini-2.5-pro",

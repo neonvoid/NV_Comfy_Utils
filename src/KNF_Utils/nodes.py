@@ -160,7 +160,6 @@ class GeminiVideoCaptioner:
                     "gemini-2.5-flash",
                     "gemini-2.5-pro",
                     "gemini-3-flash-preview",
-                    "gemini-3-pro-preview",
                     "gemini-3.1-pro-preview",
                     # Gemini legacy (deprecated, retiring March 2026)
                     "gemini-1.5-flash",
