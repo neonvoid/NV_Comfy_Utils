@@ -66,7 +66,7 @@ class NvWorkflowSvg {
 
     createSvgCtx(bounds) {
         const ctx = this.state.ctx;
-        const svgCtx = (this.svgCtx = new C2S(bounds[2] - bounds[0], bounds[3] - bounds[1]));
+        const svgCtx = (this.svgCtx = new NV_C2S(bounds[2] - bounds[0], bounds[3] - bounds[1]));
         svgCtx.canvas.getBoundingClientRect = () => ({ width: svgCtx.width, height: svgCtx.height });
 
         const drawImage = svgCtx.drawImage;

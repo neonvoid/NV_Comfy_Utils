@@ -1193,7 +1193,9 @@
 
     //add options for alternative namespace
     if (typeof window === "object") {
-        window.C2S = ctx;
+        // NV patch: expose under a namespaced global so we don't collide with
+        // pysssss's unpatched canvas2svg.js if both extensions are installed.
+        window.NV_C2S = ctx;
     }
 
     // CommonJS/Browserify
