@@ -1,18 +1,31 @@
 # Status Board — NV_Comfy_Utils
 
 > Auto-managed by `/handoff`. Content is never deleted — old entries move to ARCHIVE.md.
-> Last updated: 2026-04-13
+> Last updated: 2026-04-15
 
 ## Resume Context
 <!-- Rewritten each `/handoff` run. What does a cold-start agent need RIGHT NOW? -->
 
-- **Current focus:** Runtime test TextureHarmonize V2 changes: whole_crop default, grain_mode=match, denoise auto-taper. Compare clothing swap shot with/without grain reduction. Test denoise input wiring.
-- **Critical files:** `src/KNF_Utils/texture_harmonize.py` (5 changes: scope default, HB cap+taper, grain match mode, DOF warning — all uncommitted)
-- **Known blockers:** None — syntax verified, awaiting runtime test.
-- **Environment notes:** Gemini API quota exceeded (gemini-3.1-pro free tier). PromptRefiner returning 429s. Use paid tier or wait for reset.
+- **Current focus:** Runtime test NV_SAM3Preprocess v1 on known SAM3 failure frames. Start conservative (clahe_clip_limit=1.5, everything else off). Escalate to gamma=1.3 + guided_filter_radius=3 if needed.
+- **Critical files:** `src/KNF_Utils/sam3_preprocess.py` (new v1 node), `src/KNF_Utils/__init__.py` (registration updated), `src/KNF_Utils/guided_filter.py` (reused for denoise)
+- **Known blockers:** None — file compiles, awaiting ComfyUI server restart for module reload.
+- **Environment notes:** Gemini API quota exceeded (prior session) — multi-ai Gemini fell back to gemini-2.5-pro successfully. Earlier TextureHarmonize V2 runtime test from 2026-04-13 Resume Context still pending (workstream I untouched this session).
 
 ## Pulse
 <!-- Last 2 session summaries, newest first. Older entries roll to Workstream Details. -->
+
+### 2026-04-14/15 — Research arc: mask-domain editing → mocap+UE5 reframe → grade-the-plate SAM3 preprocess v1 shipped [coding + research]
+- **Done:**
+  - Researched mask-domain creative editing as control surface for VACE. Two parallel research agents concluded: nobody has shipped generalist mask-domain LoRA, every published mask-diffusion paper rebuilt the VAE, parametric body path is cheapest.
+  - Three new research docs landed in the tree: `research/pipeline_techniques/2026-04-11_mask_domain_diffusion_feasibility.md`, `research/models_and_papers/2026-04-11_human_body_representation_models_taxonomy.md` (8-family taxonomy, current 2025-2026 SOTA), `research/models_and_papers/2026-04-12_image_editing_models_sota_update.md` (FLUX.2 dev/klein, HunyuanImage 3.0, Qwen-Image 2.0, BAGEL landscape).
+  - Reframed approach after user disclosed **Vicon + UE5** access. Synthetic-render path (mocap → UE5 retarget → render alpha matte → VACE) dominates diffusion-based mask editing for body-swap use case. Saved as memory `mocap_and_game_engine_access.md`.
+  - Clarified matchmove (camera) vs rotomation (subjects). Discussed Animate+VACE cascade architectures. Validated that iterative multi-pass mask editing ("fix character → fix trees → fix clouds") is production-viable with existing VAE drift fixes (CropColorFix V2 + NV_VaceLatentSplice + TextureHarmonize MAD). Bottleneck moved from VAE drift to mask quality.
+  - TeleStyle deep dive (temporal propagation via positional encoding trick, NOT optical flow as secondary sources claimed). Current open-source image editing / gen SOTA survey.
+  - Pivoted to **grade-the-plate SAM3 preprocessing** after user correctly diagnosed iterative SAM3 refinement as a dead end (same region → same embedding → same mask). Literature search found CLAHE evidence (Huang 2024, MedSAM: IoU +0.081, Dice +0.050) but RobustSAM showed preprocessing alone insufficient for hard VNS cases.
+  - Multi-AI reviewed Phase 1 node design (Codex + Gemini). Implemented NV_SAM3Preprocess v1: guided filter denoise → gamma on luminance → CLAHE on Lab L (uint16-only L quantization, a/b stay float). Single output (not passthrough). Registered in `__init__.py`, passed `py_compile`.
+- **Decisions:** Mocap+UE5 synthetic-render path dominates mask-domain diffusion for body-swap use cases (D-038). Animate+VACE cannot merge at model level — Replacement Mode may be one-shot solution (D-039). Multi-pass mask editing is production-viable; envelope ≤6 passes, ≥64px working-crop masks (D-040). SAM3 preprocessing = guided filter (not bilateral, avoids staircasing) + gamma on luma + Lab-L CLAHE, single output, targeted-fix not always-on (D-041).
+- **Blockers:** None — code compiles, awaiting ComfyUI server restart + runtime test on known SAM3 failure frames.
+- **Next:** Runtime test NV_SAM3Preprocess on dark-hair-on-dark-bg / skin-vs-warm-bg / semi-transparent-fabric cases. Start conservative (clahe_clip_limit=1.5 only). Escalate to gamma + guided filter if needed. If VNS cases still fail, next step is MatAnyone second-opinion segmentor.
 
 ### 2026-04-12b — TextureHarmonize multi-AI scope audit + 5 production fixes [coding + research]
 - **Done:**
@@ -25,18 +38,6 @@
 - **Decisions:** Default context_scope=whole_crop not ring_only — 14x more pixels, same answer, better temporal stability (D-034). Highband max=0.5, auto-disabled above denoise 0.6 — spatial HF transfer unsafe at high denoise (D-035). Grain match mode — reduce "VAE fizz" when gen>ctx, capped 50% to prevent plastification (D-036). full_frame scope demoted — DOF-contaminated reference is wrong for subject compositing (D-037).
 - **Blockers:** None — code complete, syntax verified, awaiting runtime test.
 - **Next:** Runtime test with whole_crop default + grain_mode=match on the clothing swap shot. Compare with/without grain reduction visible. Test denoise auto-taper with connected denoise input.
-
-### 2026-04-10/12 — TextureHarmonize major overhaul + high-band reinjection + foundations course [coding + research]
-- **Done:**
-  - Multi-AI research: how video edit models (Kling, InstructPix2Pix) work vs mask-based inpainting (VACE). Confirmed Kling = conditional re-synthesis, not spatial constraint.
-  - TextureHarmonize overhaul: per-stage stat split (std for sharpness pyramid, MAD for grain — fixed regression where MAD was blurring output). Added context_scope (ring_only/whole_crop/full_frame), full_frame mode via stitcher (OOM-safe per-frame precompute), Codex review bug fixes (whole_crop measurement bug, min_context_pixels threading, mask batch validation).
-  - Built high-band reinjection (Stage 3): frequency separation transfer from original_crop — grafts original's HF texture onto AI-refined result inside mask. Addresses cross-model cartoon drift (Kling→WAN).
-  - Multi-AI diagnosis of AI-on-AI cartoon drift: compound of prior attraction + VAE round-trip loss + sampler convergence. Pre-process sharpening rejected (model ignores structured HF input). Post-process frequency separation confirmed as the principled fix.
-  - Fixed RetimeRestore: added manual fallback inputs (original_frame_count + slowdown_factor) + corrected saved config for shot2.
-  - Created foundations_for_video_gen course (5 docs): Thinking in Frequencies, Estimators, Manifolds, Diffusion + curated README. Multi-AI reviewed + all 3 tiers of fixes applied.
-- **Decisions:** Per-stage estimator choice — std for sharpness pyramid bands, MAD for grain residual (D-031). High-band reinjection = post-process frequency separation, not pre-process sharpening (D-032). Pre-process HF boost is dead end — model's prior ignores it (D-033).
-- **Blockers:** None — high-band reinjection awaiting first runtime test.
-- **Next:** Runtime test highband_strength=0.5 on WAN-on-Kling identity refinement shot. Compare with/without. If it works, establish default sigma/strength for production.
 
 
 ## Active Workstreams
@@ -52,6 +53,7 @@
 | G  | Masking & VFI Pipeline Research | ACTIVE | 2026-04-10 | Mocha for sub-object, SAM3 for full body, MatAnyone for edge refinement. GIMM-VFI stays. NV_MatchInterpFrames + RetimePrep/Restore manual fallback inputs. |
 | H  | VACE Chunked Orchestrator | STAGED | 2026-04-10 | Architecture designed (4 multi-AI rounds). Single-queue-press chunked VACE inpainting with latent splice. |
 | I  | Texture Harmonize + Aesthetic Conditioning | ACTIVE | 2026-04-12 | Multi-AI scope audit complete. 5 fixes: default→whole_crop, HB max→0.5 + denoise taper, grain match mode, full_frame DOF warning. Awaiting runtime test. |
+| J  | SAM3 Input Quality (Grade-the-Plate) | ACTIVE | 2026-04-15 | NV_SAM3Preprocess v1 shipped (CLAHE + gamma + guided filter). Multi-AI reviewed. Awaiting runtime test. |
 
 ### Status Tags
 - **ACTIVE** — Currently being worked on
@@ -91,6 +93,7 @@
 - Highband reinjection (frequency separation) requires spatial alignment — unsafe above denoise ~0.5. Even at denoise 0.55, the sampler repositions fine detail enough to cause ghost edges from the original.
 - full_frame context_scope includes background/OOF areas — gives opposite correction direction from local scopes on DOF footage. Use whole_crop or ring_only for subject compositing.
 - AI diffusion output is often NOISIER than clean studio footage ("VAE fizz" — synthetic micro-noise from sampling + VAE decode). Grain synthesis add_only mode correctly does nothing; use match mode to dampen.
+- SAM3 iterative refinement on the same failure region is a dead end — same input pixels produce the same encoder embedding and the same mask. To get new signal: (a) change the input via preprocessing (grade-the-plate — NV_SAM3Preprocess), (b) use a different segmentor with different failure modes (MatAnyone for hair, BiRefNet for soft edges), or (c) apply non-ML feature-aware morphology. Clicking "add more" on the same region does NOT create new signal.
 
 ## Project Decisions Index
 <!-- Numbered decisions with lifecycle status. Never renumber IDs. -->
@@ -134,6 +137,10 @@
 | D-035 | 2026-04-12 | ACTIVE | I | Highband reinjection max=0.5, auto-disabled above denoise 0.6 via smoothstep taper. Spatial HF transfer fundamentally unsafe when sampler repositions fine detail. |
 | D-036 | 2026-04-12 | ACTIVE | I | Grain match mode: reduce AI "VAE fizz" when gen_mad > ctx_mad, capped at 50% removal. Kills synthetic micro-noise without plastification. |
 | D-037 | 2026-04-12 | ACTIVE | I | full_frame scope demoted — DOF/background contamination gives opposite correction direction. Only valid for flat content (anime/motion graphics). |
+| D-038 | 2026-04-15 | ACTIVE | research | Mocap+UE5 synthetic-render path dominates mask-domain diffusion for body-swap / silhouette-edit use cases. Every published mask-diffusion paper rebuilt the VAE; parametric body (SMPL/MetaHuman in UE5) is cheaper, deterministic, ground truth. Mask-domain diffusion is Plan B. |
+| D-039 | 2026-04-15 | ACTIVE | research | Animate+VACE cannot merge at model level (different model classes, no common weight structure). Use sequential cascade. Animate Replacement Mode (character_mask + background_video) may be one-shot solution for mocap-driven body swap — needs validation test. |
+| D-040 | 2026-04-15 | ACTIVE | A,C,E,J | Iterative multi-pass mask editing is production-viable with existing VAE drift fixes (CropColorFix V2 + NV_VaceLatentSplice + TextureHarmonize MAD). Envelope: ≤6 passes comfortable, masks ≥64px in working-crop space. Mask quality is now dominant constraint, not VAE drift. |
+| D-041 | 2026-04-15 | ACTIVE | J | NV_SAM3Preprocess v1: guided filter (not bilateral — avoids staircasing that SAM latches onto) + gamma on Rec.601 luminance + CLAHE on Lab L with uint16-only L quantization (a/b stay float). Single output (no passthrough — ComfyUI users branch IMAGE noodle). Targeted fix for degraded inputs, not always-on. |
 
 ### Decision Statuses
 - **ACTIVE** — Currently in effect
@@ -358,6 +365,50 @@
   Outcome: Built NV_FrequencyShapedNoise (FFT→shaped noise), found 7 critical bugs, fixed all, still catastrophic rainbow artifacts. SHELVED — flow-matching DiTs reject init-noise covariance. TextureHarmonize gained MAD stat mode.
   Decision: SHELVE init-noise shaping for WAN/VACE (D-029). MAD as default texture stat (D-030).
   Next: Build orchestrator. Aesthetic problem owned by post-processing (TextureHarmonize).
+- **2026-04-10/12 | coding + research**
+  Outcome: TextureHarmonize overhaul — per-stage stat split (std for sharpness, MAD for grain), context_scope selector, full_frame via stitcher (OOM-safe), high-band reinjection for Kling→WAN cartoon drift. 5 Codex review fixes applied. Foundations course (5 docs) created.
+  Decision: Per-stage estimator std/MAD (D-031). High-band reinjection post-process via frequency separation, not pre-process sharpening (D-032). Pre-process HF boost dead end — model's prior ignores structured HF input (D-033).
+  Next: Runtime test highband_strength=0.5 on WAN-on-Kling identity refinement shot.
+
+### J. SAM3 Input Quality (Grade-the-Plate)
+**Current state:** ACTIVE — v1 shipped, syntax verified, awaiting runtime test
+**Goal:** Improve SAM3 segmentation on degraded inputs (wispy hair on dark bg, skin-vs-warm-bg, semi-transparent fabric) via classical CV preprocessing — same VFX principle as keying: grade the plate, don't buy a better keyer.
+**Key files:** `src/KNF_Utils/sam3_preprocess.py` (new), `src/KNF_Utils/guided_filter.py` (reused), `src/KNF_Utils/__init__.py` (registered)
+**Active constraints:** Targeted fix for degraded inputs only — NOT always-on (gains small-to-negative on well-exposed photos). Per-frame CLAHE may flicker on video if clip_limit > 1.5. Does NOT solve true VNS cases (use MatAnyone/BiRefNet second-opinion for those). Evidence base narrow: Huang 2024 MedSAM is closest direct precedent; RobustSAM proves preprocessing alone insufficient for hardest cases.
+
+**Architecture (v1):**
+- Operation order (optional/skippable at each stage): guided filter denoise → gamma on Rec.601 luminance → CLAHE on Lab L channel
+- Guided filter chosen over bilateral (both reviewers agreed: bilateral staircases, SAM latches onto staircases as false boundaries). Reuses existing `guided_filter.py` infrastructure, GPU-batched, auto-selects fast variant ≥720p.
+- Gamma applied via per-pixel luminance ratio (preserves chroma) — >1.0 lifts shadows for dark-on-dark cases.
+- CLAHE: float32 Lab throughout, only L quantized to uint16 [0, 65535] for OpenCV's CLAHE call. a/b never leave float. clipLimit capped at 3.0 (off-manifold above).
+- Single output (no passthrough) — ComfyUI users branch the IMAGE noodle themselves for downstream compositing.
+
+**Multi-AI review synthesis (Codex + Gemini, 2026-04-15):**
+- Convergence: drop `apply_to` dropdown, drop `rgb_each`, drop sharpening/vibrance/ensemble from v1, add `gamma` on luminance, order = denoise→gamma→CLAHE, conservative defaults, quantize only L.
+- Disagreement 1 (denoise algorithm): Gemini's guided-filter argument won over Codex's bilateral — staircasing is a hard SAM failure mode.
+- Disagreement 2 (output shape): Gemini's single-output argument won over Codex's dual-output — passthrough is ComfyUI graph clutter.
+
+**Parameters (all optional, default off except CLAHE):**
+- `gamma` (0.5-2.0, default 1.0) — luminance shadow lift
+- `clahe_clip_limit` (0.0-3.0, default 1.5) — 0 = disabled
+- `clahe_tile_grid` (4-16, default 8) — OpenCV tileGridSize
+- `guided_filter_radius` (0-16, default 0) — 0 = disabled
+- `guided_filter_eps` (0.0001-0.1, default 0.01) — smoothing regularization
+
+**Deferred to v2:**
+- Temporal smoothing via EMA on per-tile L statistics (NOT first-frame LUT reuse — both reviewers rejected that as wrong trade-off)
+- Ensemble output (union/intersection/voting across preprocessed variants)
+- Presets (`wispy_hair`, `dark_on_dark`) — wait for runtime data before picking
+- Kornia migration for GPU-native CLAHE if CPU per-frame becomes bottleneck
+
+**Milestones:**
+- 2026-04-15 — NV_SAM3Preprocess v1 built, multi-AI reviewed (Codex + Gemini), registered, syntax verified
+
+**History:**
+- **2026-04-14/15 | coding + research**
+  Outcome: Built NV_SAM3Preprocess v1 — guided filter denoise → gamma on luminance → CLAHE on Lab L (uint16 L-only quantization, a/b stay float). Multi-AI review synthesized: drop bilateral for guided filter (no staircasing), drop dual output for single output, drop apply_to/rgb_each/sharpening, add gamma.
+  Decision: Guided filter over bilateral, Lab-L CLAHE with L-only quantization, single output (D-041). Evidence: Huang 2024 (MedSAM: IoU +0.081), RobustSAM CVPR 2024 (preprocessing alone insufficient for VNS cases).
+  Next: Runtime test on known failure frames — start with clahe_clip_limit=1.5 only.
 
 ## Global Timeline
 <!-- Thin chronological index of project-wide events. NOT per-workstream progress. -->
@@ -374,6 +425,7 @@
 - **2026-04-10:** NV_FrequencyShapedNoise SHELVED after full debug cycle (D-029). Empirical evidence: flow-matching DiTs reject init-noise covariance priors — no usable operating window between "ignored" and "destabilizing". Knowledge captured in workstream I history. TextureHarmonize gained MAD stat mode for outlier-robust temporal stability (D-030).
 - **2026-04-10/12:** NV_TextureHarmonize major overhaul: per-stage estimator split (std/MAD), context_scope modes (ring_only/whole_crop/full_frame), OOM-safe full-frame precompute via stitcher, high-band reinjection (Stage 3 frequency separation). Multi-AI research on edit model architectures + AI-on-AI cartoon drift diagnosis. Foundations course created (4 intuition modules + README, multi-AI reviewed). RetimeRestore manual fallback inputs added.
 - **2026-04-12:** TextureHarmonize multi-AI scope audit: full_frame DOF contamination confirmed, 5 production fixes applied (scope default, HB cap+taper, grain match mode, DOF warning). Multi-AI consensus (Codex+Gemini) on all findings.
+- **2026-04-14/15:** Mask-domain editing research arc → mocap+UE5 reframe → grade-the-plate SAM3 preprocess v1 shipped. Three new research docs (mask-domain diffusion feasibility, body representation taxonomy, image editing SOTA update). Vicon+UE5 access disclosed — synthetic-render path now preferred over diffusion-based mask editing for body-swap cases. Multi-pass mask editing validated as production-viable (≤6 passes, ≥64px masks). New workstream J: SAM3 Input Quality.
 
 ## Archived Workstreams Index
 <!-- Pointers to workstreams moved to ARCHIVE.md. -->

@@ -18,6 +18,7 @@ const modules = [
     "./preview_animation.js",
     "./clone_with_connections.js",
     "./point_picker.js",
+    "./nv_workflow_svg_export.js",
 ];
 
 for (const mod of modules) {
