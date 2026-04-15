@@ -43,6 +43,7 @@ class NvWorkflowSvg {
             transform: app.canvas.canvas.getContext("2d").getTransform(),
             ctx: app.canvas.ctx,
             bgctx: app.canvas.bgctx,
+            realBgCanvas: app.canvas.bgcanvas, // used to recognize+skip the bg blit
         };
     }
 
@@ -73,12 +74,25 @@ class NvWorkflowSvg {
 
         const drawImage = svgCtx.drawImage;
         const debug = window.__NV_SVG_DEBUG === true;
-        const diag = { calls: 0, img: 0, video: 0, canvas: 0, skipped: 0, embedded: 0, failed: 0 };
+        const diag = { calls: 0, img: 0, video: 0, canvas: 0, skipped: 0, embedded: 0, failed: 0, blitSkipped: 0 };
         this._diag = diag;
+        const realBgCanvas = this.state.realBgCanvas;
         svgCtx.drawImage = function (...args) {
             diag.calls++;
             const image = args[0];
             const name = image && image.nodeName;
+
+            // Skip the drawFrontCanvas bg blit: when the new Comfy frontend
+            // finishes drawing to bgctx, drawFrontCanvas calls
+            // ctx.drawImage(this.bgcanvas, ...) to flatten bg onto fg. If we
+            // let that run against svgCtx we'd get one giant rasterized PNG
+            // of everything we just recorded as vector. Skip it — bg content
+            // is already in our SVG because we hijacked bgctx too.
+            if (image === realBgCanvas) {
+                diag.blitSkipped++;
+                if (debug) console.info("[NV_WorkflowSvg] skipped bg blit");
+                return;
+            }
 
             // Pre-bake <img>/<video>/<canvas> into a same-origin canvas whose
             // toDataURL we invoke here, so failures (CORS taint, 0-size, unloaded)
@@ -142,14 +156,22 @@ class NvWorkflowSvg {
         svgCtx.resetTransform = () => ctx.resetTransform();
         svgCtx.roundRect = svgCtx.rect;
 
-        // The new Comfy frontend renders node bodies, wires, groups, and image
-        // thumbnails into bgctx (background canvas), then drawFrontCanvas blits
-        // bgcanvas as a single drawImage onto ctx. If we only hijacked ctx, the
-        // SVG ended up with one rasterized PNG of the whole graph (~18MB) and
-        // zero vector content. Hijack bgctx too so bg drawing records to SVG.
-        // We skip drawFrontCanvas entirely during export (see export() below),
-        // so we don't need to hijack ctx — but do it anyway for any overlay
-        // draws that happen to target it.
+        // Suppress clearRect after the initial clear. drawFrontCanvas will call
+        // clearRect on ctx before blitting bgcanvas; we don't want that to wipe
+        // what drawBackCanvas just recorded.
+        const origClearRect = svgCtx.clearRect ? svgCtx.clearRect.bind(svgCtx) : null;
+        let clearCount = 0;
+        svgCtx.clearRect = function (...args) {
+            clearCount++;
+            if (clearCount <= 1 && origClearRect) return origClearRect(...args);
+            // swallow subsequent clears — they'd wipe our vector recording
+        };
+
+        // Hijack both foreground and background contexts. The new Comfy
+        // frontend draws node bodies, groups, and image thumbnails to bgctx
+        // during drawBackCanvas; slots, wires, and overlays go to ctx during
+        // drawFrontCanvas. Capturing both into the same svgCtx yields a full
+        // vector recording.
         app.canvas.ctx = svgCtx;
         app.canvas.bgctx = svgCtx;
     }
@@ -198,18 +220,7 @@ class NvWorkflowSvg {
         try {
             this.updateView(this.getBounds());
             getDrawTextConfig = this.getDrawTextConfig;
-            // Only render the background canvas — it contains nodes, wires,
-            // groups, and image thumbnails in the new Comfy frontend. Skipping
-            // drawFrontCanvas avoids its clearRect + drawImage(bgcanvas) blit
-            // that would wipe our SVG recording and/or flatten it to a PNG.
-            if (typeof app.canvas.drawBackCanvas === "function") {
-                // Force a fresh bg render (no cached snapshot).
-                app.canvas.dirty_bgcanvas = true;
-                app.canvas.drawBackCanvas();
-            } else {
-                // Fallback for older frontends.
-                app.canvas.draw(true, true);
-            }
+            app.canvas.draw(true, true);
 
             const blob = this.getBlob(includeWorkflow ? JSON.stringify(app.graph.serialize()) : undefined);
             console.info("[NV_WorkflowSvg] draw complete", this._diag, "svg bytes:", blob.size);
