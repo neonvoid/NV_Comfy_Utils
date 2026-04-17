@@ -66,7 +66,7 @@ _SAFETY_SETTINGS = [
 _MAX_RETRIES = 2
 _RETRY_BASE_DELAY = 5  # seconds, doubles each retry
 
-# Pricing per 1M tokens (USD, standard tier, <=200k context)
+# Direct-Gemini pricing per 1M tokens (USD, AI Studio tier 1, <=200k context).
 # Source: https://ai.google.dev/pricing
 _PRICING = {
     "gemini-2.0-flash":        {"input": 0.10,  "output": 0.40},
@@ -76,6 +76,32 @@ _PRICING = {
     "gemini-3-pro-preview":    {"input": 1.25,  "output": 10.00},
     "gemini-3.1-pro-preview":  {"input": 1.25,  "output": 10.00},
 }
+
+# OpenRouter pricing per 1M tokens (USD). OR often routes Gemini through Vertex which
+# carries different (usually higher) rates than AI Studio. Pulled live 2026-04-15 from
+# https://openrouter.ai/api/v1/models — verify periodically; OR prices change.
+# Non-Gemini video models likely ignore audio — see _OR_AUDIO_AWARE_PREFIXES below.
+_OR_PRICING = {
+    # Gemini (Vertex-routed — higher than AI Studio)
+    "google/gemini-2.0-flash-001":               {"input": 0.10,  "output": 0.40},
+    "google/gemini-2.5-flash-lite":              {"input": 0.10,  "output": 0.40},
+    "google/gemini-2.5-flash":                   {"input": 0.30,  "output": 2.50},
+    "google/gemini-3-flash-preview":             {"input": 0.50,  "output": 3.00},
+    "google/gemini-2.5-pro":                     {"input": 1.25,  "output": 10.00},
+    "google/gemini-3.1-pro-preview":             {"input": 2.00,  "output": 12.00},
+    "google/gemini-3.1-flash-lite-preview":      {"input": 0.25,  "output": 1.50},
+    # Qwen VL (no audio)
+    "qwen/qwen3.6-plus":                         {"input": 0.33,  "output": 1.95},
+    "qwen/qwen3.5-flash-02-23":                  {"input": 0.07,  "output": 0.26},
+    # Alternative providers (varies audio/video quality)
+    "bytedance-seed/seed-2.0-mini":              {"input": 0.10,  "output": 0.40},
+    "z-ai/glm-4.6v":                             {"input": 0.30,  "output": 0.90},
+    "amazon/nova-2-lite-v1":                     {"input": 0.30,  "output": 2.50},
+}
+
+# Non-Gemini prefixes — these models typically ignore audio in video. Warn at runtime
+# so users with voiceover-heavy content understand the quality hit before committing.
+_OR_NO_AUDIO_PREFIXES = ("qwen/", "bytedance-seed/", "z-ai/", "amazon/", "xiaomi/", "rekaai/")
 
 
 def _estimate_cost(model, prompt_tokens, response_tokens):
@@ -1203,24 +1229,34 @@ class NV_GeminiVideoExtractor:
                                "(direct-Gemini models) or OPENROUTER_API_KEY (provider/model dropdown entries).",
                 }),
                 "model": ([
-                    # Direct Gemini (Files API, large videos)
+                    # Direct Gemini (Files API, large videos, AI Studio pricing)
                     "gemini-2.5-pro",
                     "gemini-2.5-flash",
                     "gemini-3-pro-preview",
                     "gemini-3.1-pro-preview",
                     "gemini-3-flash-preview",
                     "gemini-2.0-flash",
-                    # OpenRouter (base64 inline, smaller videos — use optimize=auto)
-                    "google/gemini-2.5-pro",
-                    "google/gemini-2.5-flash",
+                    # OpenRouter — Gemini (Vertex-routed, base64 inline)
                     "google/gemini-3.1-pro-preview",
+                    "google/gemini-2.5-pro",
                     "google/gemini-3-flash-preview",
-                    "qwen/qwen3-vl-plus",
+                    "google/gemini-2.5-flash",
+                    "google/gemini-2.5-flash-lite",
+                    "google/gemini-3.1-flash-lite-preview",
+                    "google/gemini-2.0-flash-001",
+                    # OpenRouter — Qwen VL (cheap, likely no audio)
+                    "qwen/qwen3.6-plus",
+                    "qwen/qwen3.5-flash-02-23",
+                    # OpenRouter — Alternative providers (audio support varies)
+                    "bytedance-seed/seed-2.0-mini",
+                    "z-ai/glm-4.6v",
+                    "amazon/nova-2-lite-v1",
                 ], {
                     "default": "gemini-2.5-pro",
                     "tooltip": "Bare 'gemini-*' = direct Gemini Files API (best for long videos, rate-limited per your Google project). "
-                               "'provider/model' = OpenRouter (rate-limit escape valve, but base64-inline transport — auto-optimization helps). "
-                               "qwen/qwen3-vl-plus: note Qwen VL often ignores audio — not ideal for voiceover-carried lessons.",
+                               "'provider/model' = OpenRouter (rate-limit escape valve, base64-inline transport). "
+                               "Non-Gemini video models (qwen/*, bytedance-seed/*, z-ai/*, amazon/*) typically IGNORE AUDIO — "
+                               "not ideal for voiceover-carried tutorials. Use Gemini routes when narration matters.",
                 }),
                 "media_resolution": (["default", "low"], {
                     "default": "default",
@@ -1458,9 +1494,9 @@ class NV_GeminiVideoExtractor:
         send_path = None
 
         if video_path:
-            if model.startswith("qwen/"):
-                print(f"[NV_GeminiVideoExtractor] NOTE: {model} often ignores audio — "
-                      f"voiceover content may not be captured. Prefer google/gemini-* for "
+            if any(model.startswith(p) for p in _OR_NO_AUDIO_PREFIXES):
+                print(f"[NV_GeminiVideoExtractor] NOTE: {model} likely ignores audio — "
+                      f"voiceover content will not be captured. Prefer google/gemini-* for "
                       f"voiceover-heavy tutorials.")
             send_path, opt_info = _optimize_video_for_openrouter(video_path, mode=optimize)
             extra_source["optimization"] = opt_info
@@ -1745,15 +1781,23 @@ class NV_GeminiBatchExtractor:
                     "gemini-3.1-pro-preview",
                     "gemini-3-flash-preview",
                     "gemini-2.0-flash",
-                    "google/gemini-2.5-pro",
-                    "google/gemini-2.5-flash",
                     "google/gemini-3.1-pro-preview",
+                    "google/gemini-2.5-pro",
                     "google/gemini-3-flash-preview",
-                    "qwen/qwen3-vl-plus",
+                    "google/gemini-2.5-flash",
+                    "google/gemini-2.5-flash-lite",
+                    "google/gemini-3.1-flash-lite-preview",
+                    "google/gemini-2.0-flash-001",
+                    "qwen/qwen3.6-plus",
+                    "qwen/qwen3.5-flash-02-23",
+                    "bytedance-seed/seed-2.0-mini",
+                    "z-ai/glm-4.6v",
+                    "amazon/nova-2-lite-v1",
                 ], {
                     "default": "gemini-2.5-pro",
                     "tooltip": "Bare 'gemini-*' = direct Gemini Files API (large videos, your project's quota). "
-                               "'provider/model' = OpenRouter (base64-inline, auto-optimized).",
+                               "'provider/model' = OpenRouter (base64-inline). "
+                               "Non-Gemini video models typically IGNORE AUDIO — use Gemini routes for voiceover content.",
                 }),
                 "media_resolution": (["default", "low"], {
                     "default": "default",
@@ -1844,12 +1888,30 @@ class NV_GeminiBatchExtractor:
             total_est_cost = 0.0
             plan = []
 
+            # Pricing lookup: OR routes use _OR_PRICING (live Vertex/OR rates);
+            # direct-Gemini routes use _PRICING (AI Studio rates). Models not in either
+            # table (newer OR routes, tier changes) show "unknown" — cost is reported
+            # post-hoc by OR in usage.cost after the call.
+            if use_openrouter:
+                pricing_entry = _OR_PRICING.get(model)
+            else:
+                pricing_entry = _PRICING.get(model)
+            pricing_known = pricing_entry is not None
+
+            def _cost_from_entry(entry, dur_s, media_res):
+                if entry is None or dur_s is None:
+                    return None
+                tok_per_sec = 100 if media_res == "low" else 300
+                input_tokens = dur_s * tok_per_sec
+                output_tokens = 3000
+                c = (input_tokens / 1e6) * entry["input"] + (output_tokens / 1e6) * entry["output"]
+                return round(c, 4)
+
             for idx, vf in enumerate(video_files, 1):
                 dur = _get_video_duration(str(vf))
                 dur_str = _format_duration(dur)
                 size_mb = vf.stat().st_size / (1024 * 1024)
-                # OR path has no pricing table — cost is reported post-hoc by OR in usage.cost
-                est_cost = None if use_openrouter else (_estimate_video_cost(dur, model, media_resolution) or 0)
+                est_cost = _cost_from_entry(pricing_entry, dur, media_resolution) if pricing_known else None
                 cached = os.path.isfile(os.path.join(output_dir, f"{vf.stem}.json"))
                 status = "cached (skip)" if cached and skip_existing else "will extract"
 
@@ -1872,8 +1934,14 @@ class NV_GeminiBatchExtractor:
 
             print(f"\n  {'─' * 50}")
             print(f"  Total duration: {_format_duration(total_duration)}")
-            cost_summary = "unknown (reported post-hoc by OpenRouter)" if use_openrouter else f"${total_est_cost:.4f}"
+            if pricing_known:
+                source_note = " (OR live pricing)" if use_openrouter else " (AI Studio pricing)"
+                cost_summary = f"${total_est_cost:.4f}{source_note}"
+            else:
+                cost_summary = "unknown (model not in pricing table — reported post-hoc in usage.cost)"
             print(f"  Estimated cost: {cost_summary} ({model})")
+            if use_openrouter and any(model.startswith(p) for p in _OR_NO_AUDIO_PREFIXES):
+                print(f"  WARNING: {model} likely ignores audio — voiceover content will not be captured.")
             to_extract = sum(1 for p in plan if p["status"] == "will extract")
             to_skip = sum(1 for p in plan if "cached" in p["status"])
             print(f"  Will extract: {to_extract} | Will skip: {to_skip}")
@@ -1947,8 +2015,8 @@ class NV_GeminiBatchExtractor:
 
                 extra_source = {}
                 if use_openrouter:
-                    if model.startswith("qwen/"):
-                        print(f"    NOTE: {model} often ignores audio — voiceover may not be captured.")
+                    if any(model.startswith(p) for p in _OR_NO_AUDIO_PREFIXES):
+                        print(f"    NOTE: {model} likely ignores audio — voiceover may not be captured.")
                     send_path, opt_info = _optimize_video_for_openrouter(str(vf), mode=optimize)
                     extra_source["openrouter_optimize_mode"] = optimize
                     extra_source["optimization"] = opt_info

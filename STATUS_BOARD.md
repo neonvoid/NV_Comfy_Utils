@@ -1,20 +1,29 @@
 # Status Board — NV_Comfy_Utils
 
 > Auto-managed by `/handoff`. Content is never deleted — old entries move to ARCHIVE.md.
-> Last updated: 2026-04-15b
+> Last updated: 2026-04-15c
 
 ## Resume Context
 <!-- Rewritten each `/handoff` run. What does a cold-start agent need RIGHT NOW? -->
 
-- **Primary focus (when returning):** Build NV_VaceChunkedOrchestrator (workstream H, STAGED). Architecture locked, upstream pieces all runtime-validated. Phase 1 = `plan_chunks()` math helper with unit tests BEFORE sampler integration. Deep mental model established via 600-frame fight video walkthrough this session.
-- **Phase 1 math gate:** `plan_chunks(total, chunk_size, tail_overlap)` → `list[(start, end)]`. Must handle: WAN 4k+1 rule on control_video length (chunk_size + tail_overlap), last-chunk rollback (retract start never pad), zero-new-frames edge case, `prev_tail_trim` off-by-one (0 for chunk 1, tail_overlap for chunk 2+). 600-frame worked example: 7×81 + 33 runt, 41=4×10+1 valid, no rollback.
-- **Critical files:** `src/KNF_Utils/vace_latent_splice.py` (splice helper, built), `src/KNF_Utils/latent_guidance.py` (save/load with native dtype + weights_only=True), `src/KNF_Utils/vace_control_video_prep.py` (_apply_tail on all exits per D-021), future `src/KNF_Utils/vace_chunked_orchestrator.py`, future `node_notes/architecture/vace_chunked_orchestrator.md` (design doc).
-- **Also pending runtime verification:** NV_SAM3Preprocess v1 on known SAM3 failure frames (workstream J, conservative start `clahe_clip_limit=1.5`). TextureHarmonize V2 5-fix batch from 2026-04-12b (workstream I). Earlier TextureHarmonize V2 runtime test from 2026-04-13 Resume Context untouched.
-- **Visual tracking shipped this session:** `node_notes/diagrams/pipeline_architecture.excalidraw` (v4 wiring) + `workstream_map.excalidraw` (dependency graph). Open in VS Code Excalidraw extension. Audit doc `VACE_INPAINT_NODE_AUDIT.md` has 5 identified gaps — 3 new NODE sections needed (VaceLatentSplice, TextureHarmonize, VacePrePassReference) plus three-prepend intuition section.
-- **Environment notes:** 2 pre-existing uncommitted changes from prior session — `web/extensions.js` modified, new `web/nv_workflow_svg_export.js` + `web/assets/` untracked. Unrelated to today's work. Gemini API quota exceeded earlier (fallback to gemini-2.5-pro worked).
+- **Current focus:** Runtime test NV_GeminiVideoExtractor OpenRouter mode on 36-video VFX tutorial corpus (80,700s, ~8GB total). Cost differential across google/gemini-2.5-flash ($7.30 est.) vs gemini-3.1-pro-preview ($51 est.) vs direct gemini-2.5-pro ($33 est.).
+- **Also pending:** Phase 1 plan_chunks() math helper for orchestrator (workstream H, STAGED). NV_SAM3Preprocess v1 runtime test (workstream J). TextureHarmonize V2 5-fix batch runtime test (workstream I).
+- **Critical files:** `src/KNF_Utils/gemini_video_course.py` (OR mode, optimization, pricing), `src/KNF_Utils/api_keys.py` (OPENROUTER_API_KEY resolver), future `src/KNF_Utils/vace_chunked_orchestrator.py`
+- **Known blockers:** none
+- **Environment notes:** 2 pre-existing uncommitted changes (web/extensions.js, nv_workflow_svg_export.js). ffmpeg must be on PATH for auto-optimization. OPENROUTER_API_KEY required in env or .env for OR routes.
 
 ## Pulse
 <!-- Last 2 session summaries, newest first. Older entries roll to Workstream Details. -->
+
+### 2026-04-15c — Gemini Extractor gains OpenRouter mode + auto media optimization + expanded VLM catalog [coding]
+- **Done:**
+  - Multi-AI reviewed (Codex + Gemini) design for adding OpenRouter to NV_GeminiVideoExtractor / NV_GeminiBatchExtractor. Both critiques converged: base64-only insufficient (Cloudflare 100MB POST cap), reduce FPS not bitrate for screen recordings, need optimize knob, cache not next to source, pin Vertex via provider.order.
+  - Implemented full OR path: model dispatch on provider/ prefix, auto ffmpeg optimization (1fps / GOP=1 / CRF 26 / ≤1080p / 80kbps AAC — tuned for screen-recording tutorials + voiceover), optimize=auto|always|never knob, optional video_url input, json_schema→json_object fallback, 300s read timeout, 15s→30s jittered retries, provider routing (Vertex pinned for google/*, require_parameters, data_collection="deny").
+  - Built `_OR_PRICING` dict from live OpenRouter API query (35 video-capable models found). Expanded dropdown to 13 OR routes across 3 tiers: Gemini Vertex (audio-aware), Qwen VL (cheap, no audio), alternatives (Bytedance Seed, GLM 4.6v, Nova 2 Lite). Fixed dry-run cost estimation: separate pricing paths for direct-Gemini (AI Studio rates) vs OR (Vertex rates).
+  - Added audio-drop warning for all non-Gemini video prefixes. Cache to ComfyUI/temp/nv_video_cache/ with md5(path+mtime+profile).
+- **Decisions:** None new — design agreed in conversation and implemented directly.
+- **Blockers:** None — syntax verified. Awaiting runtime test with real video + API keys.
+- **Next:** Runtime test on the 36-video VFX tutorial corpus (80,700s, Chinese-language screen recordings + voiceover). Compare extraction quality across google/gemini-2.5-flash vs gemini-3.1-pro-preview vs direct gemini-2.5-pro. Cost differential analysis.
 
 ### 2026-04-15b — Orchestrator mental model + Excalidraw visual tracking infrastructure [research + tooling]
 - **Done:**
@@ -28,19 +37,6 @@
 - **Decisions:** Excalidraw selected for repo-committed pipeline/workstream visualization — VS Code extension, JSON files tracked in git, lives next to code not in a separate SaaS (D-042, PROVISIONAL). Orchestrator Phase 1 must land chunk-planning math (`plan_chunks` helper) with unit tests validated BEFORE touching sampler integration — the frame-count math is the gate (D-043, PROVISIONAL).
 - **Blockers:** None. All orchestrator upstream pieces runtime-validated (VaceLatentSplice, latent save/load, tail-as-control-video, CropColorFix hard-fail).
 - **Next:** Return to workstream H. Phase 1 scaffold: `plan_chunks(total, chunk_size, tail_overlap)` with tests covering 4k+1 validation, last-chunk rollback, zero-new-frames edge case, minimum viable chunk size. Consider capturing architecture in `node_notes/architecture/vace_chunked_orchestrator.md` before code lands (currently only lives in STATUS_BOARD workstream H details).
-
-### 2026-04-14/15 — Research arc: mask-domain editing → mocap+UE5 reframe → grade-the-plate SAM3 preprocess v1 shipped [coding + research]
-- **Done:**
-  - Researched mask-domain creative editing as control surface for VACE. Two parallel research agents concluded: nobody has shipped generalist mask-domain LoRA, every published mask-diffusion paper rebuilt the VAE, parametric body path is cheapest.
-  - Three new research docs landed in the tree: `research/pipeline_techniques/2026-04-11_mask_domain_diffusion_feasibility.md`, `research/models_and_papers/2026-04-11_human_body_representation_models_taxonomy.md` (8-family taxonomy, current 2025-2026 SOTA), `research/models_and_papers/2026-04-12_image_editing_models_sota_update.md` (FLUX.2 dev/klein, HunyuanImage 3.0, Qwen-Image 2.0, BAGEL landscape).
-  - Reframed approach after user disclosed **Vicon + UE5** access. Synthetic-render path (mocap → UE5 retarget → render alpha matte → VACE) dominates diffusion-based mask editing for body-swap use case. Saved as memory `mocap_and_game_engine_access.md`.
-  - Clarified matchmove (camera) vs rotomation (subjects). Discussed Animate+VACE cascade architectures. Validated that iterative multi-pass mask editing ("fix character → fix trees → fix clouds") is production-viable with existing VAE drift fixes (CropColorFix V2 + NV_VaceLatentSplice + TextureHarmonize MAD). Bottleneck moved from VAE drift to mask quality.
-  - TeleStyle deep dive (temporal propagation via positional encoding trick, NOT optical flow as secondary sources claimed). Current open-source image editing / gen SOTA survey.
-  - Pivoted to **grade-the-plate SAM3 preprocessing** after user correctly diagnosed iterative SAM3 refinement as a dead end (same region → same embedding → same mask). Literature search found CLAHE evidence (Huang 2024, MedSAM: IoU +0.081, Dice +0.050) but RobustSAM showed preprocessing alone insufficient for hard VNS cases.
-  - Multi-AI reviewed Phase 1 node design (Codex + Gemini). Implemented NV_SAM3Preprocess v1: guided filter denoise → gamma on luminance → CLAHE on Lab L (uint16-only L quantization, a/b stay float). Single output (not passthrough). Registered in `__init__.py`, passed `py_compile`.
-- **Decisions:** Mocap+UE5 synthetic-render path dominates mask-domain diffusion for body-swap use cases (D-038). Animate+VACE cannot merge at model level — Replacement Mode may be one-shot solution (D-039). Multi-pass mask editing is production-viable; envelope ≤6 passes, ≥64px working-crop masks (D-040). SAM3 preprocessing = guided filter (not bilateral, avoids staircasing) + gamma on luma + Lab-L CLAHE, single output, targeted-fix not always-on (D-041).
-- **Blockers:** None — code compiles, awaiting ComfyUI server restart + runtime test on known SAM3 failure frames.
-- **Next:** Runtime test NV_SAM3Preprocess on dark-hair-on-dark-bg / skin-vs-warm-bg / semi-transparent-fabric cases. Start conservative (clahe_clip_limit=1.5 only). Escalate to gamma + guided filter if needed. If VNS cases still fail, next step is MatAnyone second-opinion segmentor.
 
 
 ## Active Workstreams
@@ -57,6 +53,7 @@
 | H  | VACE Chunked Orchestrator | STAGED | 2026-04-15 | Architecture designed (4 multi-AI rounds). Deep mental model established with 600-frame walkthrough. Phase 1 = plan_chunks() math helper first. |
 | I  | Texture Harmonize + Aesthetic Conditioning | ACTIVE | 2026-04-12 | Multi-AI scope audit complete. 5 fixes: default→whole_crop, HB max→0.5 + denoise taper, grain match mode, full_frame DOF warning. Awaiting runtime test. |
 | J  | SAM3 Input Quality (Grade-the-Plate) | ACTIVE | 2026-04-15 | NV_SAM3Preprocess v1 shipped (CLAHE + gamma + guided filter). Multi-AI reviewed. Awaiting runtime test. |
+| K  | Gemini Course Extractor / OpenRouter | ACTIVE | 2026-04-15 | OR mode + auto ffmpeg optimization shipped. 13 VLM routes. Awaiting runtime test on 36-video corpus. |
 
 ### Status Tags
 - **ACTIVE** — Currently being worked on
@@ -105,7 +102,7 @@
 |----|------|--------|-----------|-------------|
 | D-001 | 2026-04-01 | ACTIVE | A | Prefixed naming convention: `cleanup_*`, `crop_*`, `vace_*` (not double-underscore) |
 | D-002 | 2026-04-01 | ACTIVE | A | One config node with categorized params (not split into multiple nodes, not modes/presets) |
-| D-003 | 2026-04-01 | SUPERSEDED → D-006 | A | `resolve_deprecated()` uses value equality — replaced by full removal of deprecated params |
+| D-003 | 2026-04-01 | SUPERSEDED → D-006 | A | → ARCHIVE.md |
 | D-004 | 2026-04-01 | ACTIVE | B | Crop clamped to frame bounds (no canvas extension). Isotropic shrink preserves aspect ratio. |
 | D-005 | 2026-04-01 | ACTIVE | B | Stitch inverse warp uses `zeros` padding (not reflection) — compositing is mask-gated so zeros are invisible |
 | D-006 | 2026-04-02 | ACTIVE | A | Remove all deprecated params — no backward compat for old workflows. Clean UI. |
@@ -114,7 +111,7 @@
 | D-009 | 2026-04-03 | ACTIVE | C | Use `crop_expand_px` for spatial coverage, NOT CropColorFix `blend_expansion` (causes dark borders) |
 | D-010 | 2026-04-06 | ACTIVE | E | Skip identity_anchor until color-normalized — raw Kling brightness differs from CropColorFix'd VACE output |
 | D-011 | 2026-04-06 | ACTIVE | E | Committed noise (Jan 2026) empirically failed for fine-detail drift; `reference_latents` dead code for WAN |
-| D-012 | 2026-04-06 | SUPERSEDED → D-016 | E | Use sampler latent output as tail source — superseded by tail-as-control-video approach |
+| D-012 | 2026-04-06 | SUPERSEDED → D-016 | E | → ARCHIVE.md |
 | D-013 | 2026-04-06 | ACTIVE | E | Latent tail: no frame_repeat (already natural temporal), no ref_strength scaling (preserve exact state) |
 | D-014 | 2026-04-06 | ACTIVE | E | VACE late-block skip connections (10/40 DiT blocks) confirmed as mechanism for fine-detail conditioning |
 | D-015 | 2026-04-07 | ACTIVE | E | Sampler-output latents ≠ VAE-encoder latents — different distributions cause artifacts when mixed |
@@ -130,11 +127,11 @@
 | D-025 | 2026-04-10 | PROVISIONAL | H | Orchestrator architecture: crop-space, CropColorFix inside loop, Kling refs chunk 0 only, last-chunk rollback, seed+chunk_idx |
 | D-026 | 2026-04-10 | ACTIVE | E | VacePrePassReference tail inputs removed — redundant with VaceControlVideoPrep + VaceLatentSplice |
 | D-027 | 2026-04-10 | ACTIVE | I | Texture harmonize must be post-decode only — VAE bottleneck prevents DiT-level grain/sharpness control |
-| D-028 | 2026-04-10 | SUPERSEDED → D-029 | I | Frequency-shaped noise (pixel-space FFT of full frame → shaped latent noise) as complementary aesthetic conditioning |
+| D-028 | 2026-04-10 | SUPERSEDED → D-029 | I | → ARCHIVE.md |
 | D-029 | 2026-04-10 | ACTIVE | I | NV_FrequencyShapedNoise SHELVED — flow-matching DiTs read init-noise covariance changes as content, not as priors. No usable operating window between "ignored" and "destabilizing". Post-processing (TextureHarmonize) is the right architectural answer. |
 | D-030 | 2026-04-10 | ACTIVE | I | TextureHarmonize defaults to MAD (Median Absolute Deviation) instead of std for texture spread — robust to single-pixel outliers (eyelashes/highlights) that caused temporal strobing in tight crops as masks wiggled |
 | D-031 | 2026-04-12 | ACTIVE | I | Per-stage estimator: std for Laplacian pyramid sharpness (edges ARE the signal), MAD for grain residual (edges are pollution). Using wrong estimator for sharpness causes blurriness. |
-| D-032 | 2026-04-12 | SUPERSEDED → D-035 | I | High-band reinjection (frequency separation) as primary fix for cross-model cartoon drift — grafts original HF onto AI LF inside mask |
+| D-032 | 2026-04-12 | SUPERSEDED → D-035 | I | → ARCHIVE.md |
 | D-033 | 2026-04-12 | ACTIVE | I | Pre-process HF boost is dead end — model's prior actively ignores structured HF in reference latent during denoising |
 | D-034 | 2026-04-12 | ACTIVE | I | Default context_scope=whole_crop — 14x more pixels than ring_only, same result, better temporal stability. ring_only for expert override only. |
 | D-035 | 2026-04-12 | ACTIVE | I | Highband reinjection max=0.5, auto-disabled above denoise 0.6 via smoothstep taper. Spatial HF transfer fundamentally unsafe when sampler repositions fine detail. |
@@ -273,10 +270,6 @@
   Outcome: Built chunk_mode on UploadPreview (auto-truncate + tail refs + next_chunk_start). Deprecated KlingStitchAdapter. Codex caught max_chunk_frames overshoot bug — fixed.
   Decision: No stitch-back (D-018), no crossfade (D-019). Hard cuts between chunks with ref-image consistency hints.
   Next: Runtime test on >10s video. Evaluate tail-frame ref effectiveness.
-- **2026-04-07b | coding**
-  Outcome: Built chunk_mode on UploadPreview (auto-truncate + tail refs + next_chunk_start). Deprecated KlingStitchAdapter. Codex caught max_chunk_frames bug.
-  Decision: No stitch-back (D-018), no crossfade (D-019).
-  Next: Runtime test >10s video. Evaluate tail-frame ref effectiveness.
 - **2026-04-09 | coding**
   Outcome: Implemented OmniParamImage.type="first_frame" hints on tail ref images. Multi-AI reviewed (Codex+Gemini approved, API compat flagged). Debug logging added.
   Decision: Tag last tail ref as type="first_frame" for chunk-start anchoring (D-022, PROVISIONAL).
@@ -419,6 +412,21 @@
   Decision: Guided filter over bilateral, Lab-L CLAHE with L-only quantization, single output (D-041). Evidence: Huang 2024 (MedSAM: IoU +0.081), RobustSAM CVPR 2024 (preprocessing alone insufficient for VNS cases).
   Next: Runtime test on known failure frames — start with clahe_clip_limit=1.5 only.
 
+### K. Gemini Course Extractor / OpenRouter
+**Current state:** ACTIVE — implemented, syntax verified, awaiting runtime test
+**Goal:** Multi-provider video extraction for tutorial course analysis — OpenRouter escape valve for Gemini rate limits, expanded model catalog for cost/quality comparison
+**Key files:** `src/KNF_Utils/gemini_video_course.py`, `src/KNF_Utils/api_keys.py`
+**Active constraints:** Non-Gemini models likely drop audio (voiceover not captured). OR video = base64 inline (Cloudflare gateway caps). Auto-optimize transcodes to 1fps which loses fast cursor/scroll motion — acceptable for screen recordings, not for action footage.
+
+**Milestones:**
+- 2026-04-15 — OR mode + auto media optimization + 13-model catalog shipped. Multi-AI reviewed.
+
+**History:**
+- **2026-04-15 | coding**
+  Outcome: Full OR path on both extractors. Auto ffmpeg optimization (1fps/CRF26/≤1080p/80kbps AAC). _OR_PRICING from live API. 13 OR routes. provider.order pins Vertex for google/*. json_schema fallback. 300s timeout. Cache to temp/nv_video_cache/.
+  Decision: FPS reduction (not bitrate) for screen recording optimization. Pin Vertex backend for google/* (AI Studio requires YouTube URLs). data_collection="deny" on all OR requests.
+  Next: Runtime test on 36-video VFX tutorial corpus. Cost differential analysis across models.
+
 ## Global Timeline
 <!-- Thin chronological index of project-wide events. NOT per-workstream progress. -->
 
@@ -435,6 +443,7 @@
 - **2026-04-10/12:** NV_TextureHarmonize major overhaul: per-stage estimator split (std/MAD), context_scope modes (ring_only/whole_crop/full_frame), OOM-safe full-frame precompute via stitcher, high-band reinjection (Stage 3 frequency separation). Multi-AI research on edit model architectures + AI-on-AI cartoon drift diagnosis. Foundations course created (4 intuition modules + README, multi-AI reviewed). RetimeRestore manual fallback inputs added.
 - **2026-04-12:** TextureHarmonize multi-AI scope audit: full_frame DOF contamination confirmed, 5 production fixes applied (scope default, HB cap+taper, grain match mode, DOF warning). Multi-AI consensus (Codex+Gemini) on all findings.
 - **2026-04-14/15:** Mask-domain editing research arc → mocap+UE5 reframe → grade-the-plate SAM3 preprocess v1 shipped. Three new research docs (mask-domain diffusion feasibility, body representation taxonomy, image editing SOTA update). Vicon+UE5 access disclosed — synthetic-render path now preferred over diffusion-based mask editing for body-swap cases. Multi-pass mask editing validated as production-viable (≤6 passes, ≥64px masks). New workstream J: SAM3 Input Quality.
+- **2026-04-15:** NV_GeminiVideoExtractor / NV_GeminiBatchExtractor gain OpenRouter mode with auto media optimization (1fps/CRF26 ffmpeg, tuned for screen-recording tutorials). 13 OR video-capable model routes added with live pricing. New workstream K: Gemini Course Extractor / OpenRouter.
 - **2026-04-15:** Orchestrator (workstream H) deep mental model established — 600-frame fight video walkthrough documents chunk planning, two-rails-for-tail-continuity intuition, three-prepend systems. Excalidraw visual tracking infrastructure shipped to `node_notes/diagrams/` (D-042). VACE_INPAINT_NODE_AUDIT.md gap analysis: 5 missing sections flagged. Phase 1 design principle locked: math-first before sampler integration (D-043).
 
 ## Archived Workstreams Index
