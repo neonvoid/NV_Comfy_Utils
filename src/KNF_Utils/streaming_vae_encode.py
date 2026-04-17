@@ -20,19 +20,7 @@ This node replicates that pattern but streams each chunk's latent to CPU immedia
 import torch
 import comfy.model_management as model_management
 
-
-def count_conv3d(model):
-    """Count CausalConv3d modules in model for feat_cache initialization.
-
-    Note: Native WAN VAE uses decoder count for BOTH encode and decode operations.
-    This matches the behavior in comfy/ldm/wan/vae.py line 472.
-    """
-    from comfy.ldm.wan.vae import CausalConv3d
-    count = 0
-    for m in model.modules():
-        if isinstance(m, CausalConv3d):
-            count += 1
-    return count
+from .streaming_vace_to_video import streaming_vae_encode
 
 
 class NV_StreamingVAEEncode:
@@ -78,144 +66,23 @@ class NV_StreamingVAEEncode:
     DESCRIPTION = "Encodes video frames to latents in streaming fashion, freeing GPU memory progressively. Use before WAN sampling on long upscaled videos."
 
     def encode_streaming(self, vae, pixels, cache_clear_interval=4):
-        """
-        Encode pixel frames to latents in streaming fashion.
+        """Encode pixel frames to latents via shared streaming_vae_encode helper.
 
-        Follows WAN VAE's temporal chunking pattern:
-        - Chunk 0: frame 0 alone
-        - Chunk 1: frames 1-4
-        - Chunk 2: frames 5-8
-        - etc.
+        Delegates the core encode loop to `streaming_vace_to_video.streaming_vae_encode`
+        so this node and VacePrePassReference / NV_WanVaceToVideoStreaming / ReferenceFramePrep
+        all share a single implementation.
         """
         total_pixel_frames = pixels.shape[0]
+        print(f"[NV_StreamingVAEEncode] Encoding {total_pixel_frames} pixel frames (shape {tuple(pixels.shape)})")
 
-        print(f"[NV_StreamingVAEEncode] Starting encode of {total_pixel_frames} pixel frames")
-        print(f"[NV_StreamingVAEEncode] Input shape: {pixels.shape}")
-
-        # Get the actual WAN VAE model from ComfyUI's wrapper
-        wan_vae = vae.first_stage_model
-
-        # Get device and dtype
-        device = vae.device
-        vae_dtype = vae.vae_dtype
-
-        # Load the VAE model to GPU
-        model_management.load_model_gpu(vae.patcher)
-
-        # Preprocess pixels: [T, H, W, C] -> [1, C, T, H, W]
-        # First crop to valid encode size
-        pixels = vae.vae_encode_crop_pixels(pixels)
-
-        # Convert format: [T, H, W, C] -> [T, C, H, W] -> [1, C, T, H, W]
-        x = pixels.movedim(-1, 1)  # [T, H, W, C] -> [T, C, H, W]
-        x = x.movedim(1, 0).unsqueeze(0)  # [T, C, H, W] -> [1, C, T, H, W]
-
-        # CRITICAL: Apply process_input to scale pixels from [0,1] to [-1,1]
-        # Native encode (comfy/sd.py line 781) does: self.process_input(pixel_samples)
-        # Default process_input is: image * 2.0 - 1.0
-        # Without this, colors are completely wrong (washed out)!
-        x = vae.process_input(x)
-
-        # Move to VAE device and dtype
-        x = x.to(vae_dtype).to(device)
-
-        t = x.shape[2]  # Number of frames
-        num_chunks = 1 + (t - 1) // 4  # WAN pattern: 1 + ceil((t-1)/4)
-
-        print(f"[NV_StreamingVAEEncode] Processing in {num_chunks} chunks (WAN temporal pattern)")
-
-        # Initialize feat_cache for causal convolutions
-        # IMPORTANT: Native WAN VAE uses DECODER count for both encode and decode!
-        # See comfy/ldm/wan/vae.py line 472: feat_map = [None] * count_conv3d(self.decoder)
-        feat_map = [None] * count_conv3d(wan_vae.decoder)
-
-        # Store ENCODER outputs (not latents!) on CPU
-        # We must apply conv1 to the FULL accumulated tensor, not per-chunk
-        # conv1 is CausalConv3d which needs temporal context for correct color
-        encoder_outputs = []
-
-        for i in range(num_chunks):
-            conv_idx = [0]
-
-            if i == 0:
-                # First chunk: frame 0 alone
-                chunk_input = x[:, :, :1, :, :]
-                frame_range = "0"
-            else:
-                # Subsequent chunks: groups of 4 frames
-                start_idx = 1 + 4 * (i - 1)
-                end_idx = min(1 + 4 * i, t)
-                chunk_input = x[:, :, start_idx:end_idx, :, :]
-                frame_range = f"{start_idx}-{end_idx-1}"
-
-            # Encode this chunk
-            chunk_out = wan_vae.encoder(
-                chunk_input,
-                feat_cache=feat_map,
-                feat_idx=conv_idx
-            )
-
-            # Move encoder output to CPU (NOT latent - we apply conv1 later)
-            encoder_outputs.append(chunk_out.cpu())
-
-            # Free GPU memory from this chunk
-            del chunk_out
-            del chunk_input
-
-            # Periodic cache clear
-            if (i + 1) % cache_clear_interval == 0:
-                torch.cuda.empty_cache()
-                print(f"[NV_StreamingVAEEncode] Encoded chunk {i+1}/{num_chunks} (frames {frame_range})")
-
-        # Final progress message
-        if num_chunks % cache_clear_interval != 0:
-            print(f"[NV_StreamingVAEEncode] Encoded {num_chunks}/{num_chunks} chunks")
-
-        # Free the input tensor from GPU
-        del x
-        torch.cuda.empty_cache()
-
-        # Concatenate encoder outputs on CPU
-        print(f"[NV_StreamingVAEEncode] Concatenating {num_chunks} encoder outputs on CPU...")
-        full_encoder_out = torch.cat(encoder_outputs, dim=2)
-        del encoder_outputs
-
-        # Move back to GPU for conv1 (must apply to full temporal tensor for correct color)
-        print(f"[NV_StreamingVAEEncode] Applying conv1 to full tensor...")
-        full_encoder_out = full_encoder_out.to(vae_dtype).to(device)
-
-        # Apply conv1 ONCE to full tensor (matches native WAN VAE behavior)
-        # This is critical - conv1 is CausalConv3d which needs full temporal context
-        mu, _ = wan_vae.conv1(full_encoder_out).chunk(2, dim=1)
-        del full_encoder_out
-        torch.cuda.empty_cache()
-
-        # IMPORTANT: Convert to float32 to match ComfyUI's standard VAE.encode() behavior
-        # ComfyUI's sd.py line 782 calls .float() on encoder output
-        # Without this, downstream nodes (sampler sigmas) get dtype mismatches
-        output = mu.cpu().float()
-        del mu
-
-        # CRITICAL: Clean up feat_map to free GPU memory from CausalConv3d caching
-        # Without this, cached tensors accumulate across multiple encode calls
-        # Note: Set to None first (deleting by index shifts list), then clear
-        for i in range(len(feat_map)):
-            feat_map[i] = None
-        feat_map.clear()
-        del feat_map
-        torch.cuda.empty_cache()
-
-        # Move to VAE's output_device to match native VAE.encode() behavior
-        # Native VAE.encode() uses: out.to(self.output_device).float()
-        output = output.to(vae.output_device)
-
-        print(f"[NV_StreamingVAEEncode] Done. Output latent shape: {output.shape}")
-
-        # Calculate memory savings
         pixel_bytes = pixels.numel() * pixels.element_size()
+        output = streaming_vae_encode(vae, pixels, cache_clear_interval=cache_clear_interval)
+
         latent_bytes = output.numel() * output.element_size()
         savings_ratio = pixel_bytes / latent_bytes if latent_bytes > 0 else 0
-        print(f"[NV_StreamingVAEEncode] Memory: {pixel_bytes / 1024**3:.2f} GB pixels -> {latent_bytes / 1024**2:.1f} MB latents ({savings_ratio:.0f}x reduction)")
+        print(f"[NV_StreamingVAEEncode] Done. Output latent shape: {tuple(output.shape)}")
+        print(f"[NV_StreamingVAEEncode] Memory: {pixel_bytes / 1024**3:.2f} GB pixels -> "
+              f"{latent_bytes / 1024**2:.1f} MB latents ({savings_ratio:.0f}x reduction)")
 
         return ({"samples": output},)
 

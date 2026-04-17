@@ -1,7 +1,7 @@
 # Status Board — NV_Comfy_Utils
 
 > Auto-managed by `/handoff`. Content is never deleted — old entries move to ARCHIVE.md.
-> Last updated: 2026-04-15c
+> Last updated: 2026-04-17
 
 ## Resume Context
 <!-- Rewritten each `/handoff` run. What does a cold-start agent need RIGHT NOW? -->

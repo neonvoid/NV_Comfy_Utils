@@ -14,15 +14,7 @@ Memory Comparison (200 frames @ 1080p):
 import torch
 import comfy.model_management as model_management
 
-
-def count_conv3d(model):
-    """Count CausalConv3d modules in model for feat_cache initialization."""
-    from comfy.ldm.wan.vae import CausalConv3d
-    count = 0
-    for m in model.modules():
-        if isinstance(m, CausalConv3d):
-            count += 1
-    return count
+from .streaming_vace_to_video import _cache_layer_count
 
 
 class NV_StreamingVAEDecode:
@@ -139,9 +131,11 @@ class NV_StreamingVAEDecode:
         # STREAMING DECODE PATH (uses manual conv2 + decoder with feat_cache)
         # ============================================================
 
-        # Initialize the causal convolution cache
-        # This is critical for temporal coherence - each CausalConv3d needs cache state
-        feat_map = [None] * count_conv3d(wan_vae.decoder)
+        # Initialize feat_cache for causal convolutions.
+        # Native decode uses count_cache_layers(decoder) (not the old count_conv3d) —
+        # covers CausalConv3d AND Resample(downsample3d), matching the newer WAN VAE API.
+        # Feat_map is only needed when iter_ > 1; native code gates it the same way.
+        feat_map = [None] * _cache_layer_count(wan_vae.decoder)
 
         # ============================================================
         # MEMORY-EFFICIENT conv2 PREPROCESSING
@@ -175,47 +169,65 @@ class NV_StreamingVAEDecode:
         print(f"[NV_StreamingVAEDecode] conv2 complete. Decoding frames...")
 
         # ============================================================
-        # FRAME-BY-FRAME DECODING
+        # CHUNKED DECODING — matches native _decode in comfy/ldm/wan/vae.py
         # ============================================================
+        # Native pattern: iter_ = 1 + total_frames // 2
+        #   iter 0: decoder(x[0:1])
+        #   iter i>0: decoder(x[1+2(i-1) : 1+2i])
+        # Decoder now returns a LIST of output chunks (not a tensor); we
+        # accumulate all chunks across iterations and torch.cat at the end.
 
-        decoded_frames = []  # Store on CPU
+        iter_ = 1 + total_frames // 2
+        decoded_chunks = []  # list of CPU tensors, each [B, C, T_out, H*8, W*8]
 
-        for i in range(total_frames):
-            # Reset conv index for each frame (same as original)
+        for i in range(iter_):
             conv_idx = [0]
 
-            # Load conv2 output for this frame
-            x_frame = conv2_outputs[i].to(device)
+            if i == 0:
+                frame_indices = [0] if total_frames >= 1 else []
+            else:
+                start = 1 + 2 * (i - 1)
+                end = min(1 + 2 * i, total_frames)
+                frame_indices = list(range(start, end))
 
-            # Decode single frame with causal cache
-            # The feat_cache maintains temporal context between frames
-            frame = wan_vae.decoder(
-                x_frame,
-                feat_cache=feat_map,
-                feat_idx=conv_idx
-            )
+            if not frame_indices:
+                continue
 
-            # Move to CPU immediately - this is the key memory savings
-            decoded_frames.append(frame.cpu())
+            # Stitch the right conv2 outputs into a single GPU tensor for this chunk
+            chunk_parts = [conv2_outputs[f].to(device) for f in frame_indices]
+            x_chunk = torch.cat(chunk_parts, dim=2) if len(chunk_parts) > 1 else chunk_parts[0]
+            del chunk_parts
 
-            # Free GPU memory from this frame
-            del frame, x_frame
+            out = wan_vae.decoder(x_chunk, feat_cache=feat_map, feat_idx=conv_idx)
+            del x_chunk
 
-            # Periodic cache clear to prevent memory fragmentation
+            # Decoder returns a list of tensors (upsample stages). Move each to CPU.
+            if isinstance(out, (list, tuple)):
+                for chunk in out:
+                    decoded_chunks.append(chunk.cpu())
+            else:
+                # Defensive: older WAN VAE cores returned a bare tensor
+                decoded_chunks.append(out.cpu())
+            del out
+
             if (i + 1) % cache_clear_interval == 0:
                 torch.cuda.empty_cache()
-                print(f"[NV_StreamingVAEDecode] Decoded {i+1}/{total_frames} frames")
+                print(f"[NV_StreamingVAEDecode] Decoded chunk {i+1}/{iter_}")
 
-        # Final progress message
-        if total_frames % cache_clear_interval != 0:
-            print(f"[NV_StreamingVAEDecode] Decoded {total_frames}/{total_frames} frames")
+        if iter_ % cache_clear_interval != 0:
+            print(f"[NV_StreamingVAEDecode] Decoded {iter_}/{iter_} chunks")
 
-        # Clean up conv2 outputs
         del conv2_outputs
 
-        # Concatenate on CPU (RAM is typically much larger than VRAM)
-        print(f"[NV_StreamingVAEDecode] Concatenating {total_frames} frames on CPU...")
-        output = torch.cat(decoded_frames, dim=2)
+        if not decoded_chunks:
+            raise RuntimeError(
+                "[NV_StreamingVAEDecode] decoder produced no output chunks — "
+                "check that the latent has a valid temporal dimension"
+            )
+
+        print(f"[NV_StreamingVAEDecode] Concatenating {len(decoded_chunks)} output chunks on CPU...")
+        output = torch.cat(decoded_chunks, dim=2)
+        decoded_frames = decoded_chunks  # keep downstream variable name for `del` below
 
         # Free decoded_frames BEFORE creating float32 copy to reduce peak RAM
         del decoded_frames
