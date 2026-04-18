@@ -76,14 +76,21 @@ def streaming_vae_encode(vae, pixels, cache_clear_interval=4):
     wan_vae = vae.first_stage_model
     device = vae.device
     vae_dtype = vae.vae_dtype
+    is_cuda = getattr(device, "type", str(device)).startswith("cuda")
+
+    def _maybe_empty_cache():
+        if is_cuda:
+            torch.cuda.empty_cache()
 
     comfy.model_management.load_model_gpu(vae.patcher)
 
     pixels = vae.vae_encode_crop_pixels(pixels)
+    # Keep x on CPU — slicing happens on CPU, only chunks move to GPU per iteration.
+    # If we moved the whole x to GPU here, a 400-frame 1080p input would consume
+    # 5-10 GB before we started the streaming loop, defeating the point.
     x = pixels.movedim(-1, 1)            # [T, H, W, C] -> [T, C, H, W]
     x = x.movedim(1, 0).unsqueeze(0)     # -> [1, C, T, H, W]
-    x = vae.process_input(x)             # [0, 1] -> [-1, 1]
-    x = x.to(vae_dtype).to(device)
+    x = vae.process_input(x)             # [0, 1] -> [-1, 1], CPU float32
 
     # Native encode clamps input length to 4k+1 before chunking.
     # See comfy/ldm/wan/vae.py _encode: t = 1 + ((t - 1) // 4) * 4
@@ -91,6 +98,9 @@ def streaming_vae_encode(vae, pixels, cache_clear_interval=4):
     t = 1 + ((t_raw - 1) // 4) * 4 if t_raw > 0 else 0
     if t <= 0:
         raise ValueError(f"streaming_vae_encode: empty input (T={t_raw})")
+    if t_raw != t:
+        print(f"[streaming_vae_encode] Input clamped from {t_raw} to {t} frames "
+              f"to satisfy WAN 4k+1 boundary (trailing {t_raw - t} frames dropped).")
 
     iter_ = 1 + (t - 1) // 2  # 2-frame chunks after first 1-frame primer
     feat_map = [None] * _cache_layer_count(wan_vae.encoder) if iter_ > 1 else None
@@ -100,12 +110,12 @@ def streaming_vae_encode(vae, pixels, cache_clear_interval=4):
     for i in range(iter_):
         conv_idx = [0]
         if i == 0:
-            chunk = x[:, :, :1, :, :]
+            chunk = x[:, :, :1, :, :].to(device).to(vae_dtype)
             out = wan_vae.encoder(chunk, feat_cache=feat_map, feat_idx=conv_idx)
         else:
             start = 1 + 2 * (i - 1)
             end = 1 + 2 * i
-            chunk = x[:, :, start:end, :, :]
+            chunk = x[:, :, start:end, :, :].to(device).to(vae_dtype)
             out = wan_vae.encoder(
                 chunk,
                 feat_cache=feat_map,
@@ -121,10 +131,10 @@ def streaming_vae_encode(vae, pixels, cache_clear_interval=4):
         del out, chunk
 
         if (i + 1) % cache_clear_interval == 0:
-            torch.cuda.empty_cache()
+            _maybe_empty_cache()
 
     del x
-    torch.cuda.empty_cache()
+    _maybe_empty_cache()
 
     if not encoder_outputs:
         raise RuntimeError(
@@ -132,13 +142,15 @@ def streaming_vae_encode(vae, pixels, cache_clear_interval=4):
             "input may be too short for WAN VAE streaming path"
         )
 
-    # conv1 applied once over the full temporal tensor — CausalConv3d needs full context
+    # conv1 applied once over the full temporal tensor — CausalConv3d needs full context.
+    # Encoder output is ~1/64 the spatial size of pixel input, so moving the concatenated
+    # result back to GPU here is cheap compared to the input footprint.
     full = torch.cat(encoder_outputs, dim=2).to(vae_dtype).to(device)
     del encoder_outputs
 
     mu, _ = wan_vae.conv1(full).chunk(2, dim=1)
     del full
-    torch.cuda.empty_cache()
+    _maybe_empty_cache()
 
     output = mu.cpu().float()
     del mu
@@ -149,7 +161,7 @@ def streaming_vae_encode(vae, pixels, cache_clear_interval=4):
         for j in range(len(feat_map)):
             feat_map[j] = None
         feat_map.clear()
-    torch.cuda.empty_cache()
+    _maybe_empty_cache()
 
     return output.to(vae.output_device)
 

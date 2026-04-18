@@ -177,6 +177,11 @@ class NV_StreamingVAEDecode:
         # Decoder now returns a LIST of output chunks (not a tensor); we
         # accumulate all chunks across iterations and torch.cat at the end.
 
+        if total_frames == 0:
+            raise RuntimeError(
+                "[NV_StreamingVAEDecode] cannot decode empty latent (total_frames=0)"
+            )
+
         iter_ = 1 + total_frames // 2
         decoded_chunks = []  # list of CPU tensors, each [B, C, T_out, H*8, W*8]
 
