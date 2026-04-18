@@ -141,6 +141,30 @@ def _format_duration(seconds):
     return f"{m}:{s:02d}"
 
 
+def _scale_max_tokens_by_duration(duration_s, manual_floor=8192, abs_max=65536):
+    """Compute output token budget from video duration.
+
+    Empirical heuristic for the curriculum extraction schema: ~280 output tokens per
+    minute of tutorial content (≈1 segment per 1-2 min × 6-8 fields × ~30 tok/field,
+    plus global fields and 25% safety margin). A 90-min video at this rate budgets
+    ~32k output tokens, which fits the densest segment graphs without truncation.
+
+    Args:
+        duration_s: Video duration in seconds. None or non-positive → return manual_floor.
+        manual_floor: User-specified floor (acts as a minimum, useful for short videos
+                      where the schema overhead dominates).
+        abs_max: Hard cap (model output context limit).
+
+    Returns:
+        int max_tokens, clamped to [manual_floor, abs_max].
+    """
+    if not duration_s or duration_s <= 0:
+        return manual_floor
+    duration_min = duration_s / 60.0
+    estimated = int((1024 + duration_min * 280) * 1.25)
+    return max(manual_floor, min(abs_max, estimated))
+
+
 def _estimate_video_cost(duration_s, model, media_resolution="default"):
     """Estimate extraction cost from video duration and model pricing.
 
@@ -161,6 +185,10 @@ def _estimate_video_cost(duration_s, model, media_resolution="default"):
 # ---------------------------------------------------------------------------
 # Extraction JSON Schema (for Gemini responseSchema enforcement)
 # ---------------------------------------------------------------------------
+
+# Schema/prompt version. Bump whenever _EXTRACTION_SCHEMA or _EXTRACTION_PROMPT
+# changes shape — invalidates cached extractions so re-runs pick up the new shape.
+_EXTRACTION_SCHEMA_VERSION = 2
 
 _EXTRACTION_SCHEMA = {
     "type": "OBJECT",
@@ -625,6 +653,13 @@ def _generate_content(api_key, model, contents, system_instruction=None,
         if not candidates:
             raise RuntimeError("Gemini API returned no candidates")
 
+        # Gemini surfaces termination as `finishReason` enum. MAX_TOKENS = output budget hit
+        # → JSON will be truncated and parse will fail. Surface to caller for forensics.
+        finish_reason = candidates[0].get("finishReason", "")
+        if finish_reason == "MAX_TOKENS":
+            print(f"[Gemini] Warning: finishReason=MAX_TOKENS — output truncated at max_tokens ({max_tokens}). "
+                  f"JSON will likely fail to parse. Re-run with a higher cap or split the input.")
+
         parts = candidates[0].get("content", {}).get("parts", [])
         text_parts = [p["text"] for p in parts if "text" in p and not p.get("thought", False)]
         if not text_parts:
@@ -641,6 +676,7 @@ def _generate_content(api_key, model, contents, system_instruction=None,
             "thinking_tokens": thinking_tokens,
             "estimated_cost_usd": cost,
             "response_time_s": round(req_time, 1),
+            "finish_reason": finish_reason,
         }
 
     # All retries exhausted
@@ -652,6 +688,106 @@ def _generate_content(api_key, model, contents, system_instruction=None,
 # ---------------------------------------------------------------------------
 
 _OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+_OPENROUTER_GENERATION_URL = "https://openrouter.ai/api/v1/generation"
+_OPENROUTER_CREDITS_URL = "https://openrouter.ai/api/v1/credits"
+
+
+def _or_get_generation(api_key, generation_id, max_attempts=4, initial_delay_s=1.5):
+    """Fetch authoritative generation metadata after a chat completion.
+
+    Best-effort: never raises. Returns the `data` dict on success or None on failure.
+    The endpoint is eventually-consistent and usually takes 1-3s to populate, so we
+    poll with exponential backoff.
+
+    Useful fields in the returned dict:
+      - provider_name: which upstream actually served the call (e.g. "Alibaba" for qwen/*)
+      - total_cost: settled cost in USD (more accurate than inline usage.cost)
+      - native_tokens_prompt / native_tokens_completion: tokenizer-native counts
+      - native_tokens_cached: cache-discounted prompt tokens (if any)
+      - generation_time / latency: ms timings (latency = first-token, generation_time = total)
+      - finish_reason / native_finish_reason: why the model stopped
+      - cancelled / is_byok: provenance flags
+    """
+    if not api_key or not generation_id:
+        return None
+    headers = {"Authorization": f"Bearer {api_key}"}
+    for attempt in range(max_attempts):
+        if attempt > 0:
+            time.sleep(initial_delay_s * (2 ** (attempt - 1)))
+        try:
+            resp = requests.get(
+                _OPENROUTER_GENERATION_URL,
+                params={"id": generation_id},
+                headers=headers,
+                timeout=15,
+            )
+        except requests.exceptions.RequestException:
+            continue
+        if resp.status_code == 200:
+            try:
+                payload = resp.json()
+            except (json.JSONDecodeError, ValueError):
+                return None
+            data = payload.get("data") if isinstance(payload, dict) else None
+            if isinstance(data, dict):
+                return data
+            return None
+        # 404 = not yet indexed, 5xx = transient → retry. 4xx-other = give up.
+        if resp.status_code != 404 and resp.status_code < 500:
+            return None
+    return None
+
+
+def _or_check_credits(api_key):
+    """Best-effort pre-flight balance check.
+
+    Returns a structured result so callers can distinguish failure modes for diagnostics:
+      {"ok": True, "available_usd": ..., "total_credits": ..., "total_usage": ...}
+      {"ok": False, "kind": "no_api_key"|"unauthorized"|"forbidden"|"server_error"
+                            |"timeout"|"network_error"|"non_200"|"bad_json"|"missing_data",
+       "status_code": int|None, "detail": str}
+
+    Project-scoped keys may legitimately lack credits-read permission — callers should
+    treat `unauthorized`/`forbidden` as informational rather than blocking.
+    """
+    if not api_key:
+        return {"ok": False, "kind": "no_api_key", "status_code": None, "detail": "api_key empty"}
+    try:
+        resp = requests.get(
+            _OPENROUTER_CREDITS_URL,
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=10,
+        )
+    except requests.exceptions.Timeout:
+        return {"ok": False, "kind": "timeout", "status_code": None, "detail": "credits request timed out"}
+    except requests.exceptions.RequestException as e:
+        return {"ok": False, "kind": "network_error", "status_code": None, "detail": str(e)[:200]}
+    if resp.status_code == 401:
+        return {"ok": False, "kind": "unauthorized", "status_code": 401, "detail": "API key rejected"}
+    if resp.status_code == 403:
+        return {"ok": False, "kind": "forbidden", "status_code": 403,
+                "detail": "key lacks credits-read permission (likely project-scoped)"}
+    if resp.status_code >= 500:
+        return {"ok": False, "kind": "server_error", "status_code": resp.status_code,
+                "detail": resp.text[:200]}
+    if resp.status_code != 200:
+        return {"ok": False, "kind": "non_200", "status_code": resp.status_code,
+                "detail": resp.text[:200]}
+    try:
+        data = resp.json().get("data") or {}
+    except (json.JSONDecodeError, ValueError):
+        return {"ok": False, "kind": "bad_json", "status_code": 200, "detail": "credits response not JSON"}
+    if not data:
+        return {"ok": False, "kind": "missing_data", "status_code": 200,
+                "detail": "credits response missing data block"}
+    total_credits = float(data.get("total_credits", 0) or 0)
+    total_usage = float(data.get("total_usage", 0) or 0)
+    return {
+        "ok": True,
+        "available_usd": total_credits - total_usage,
+        "total_credits": total_credits,
+        "total_usage": total_usage,
+    }
 
 # Synthesis model list: Gemini (direct) + OpenRouter providers
 _SYNTHESIS_MODELS = [
@@ -1156,13 +1292,54 @@ def _generate_content_openrouter_video(api_key, model, prompt, video_path=None, 
               f"{prompt_tokens or '?'} prompt tokens, {response_tokens or '?'} response tokens, "
               f"cost ${cost:.4f}")
 
-        return text.strip(), {
+        # Best-effort post-call lookup for authoritative cost + provider attribution.
+        # The endpoint is eventually-consistent (1-3s lag); if it fails we keep the
+        # inline `usage.cost` we already have. Settled cost takes precedence when present.
+        # Note: settled_cost == 0 is VALID (cached/free generation) and must override the
+        # inline estimate, not be ignored.
+        gen_id = result.get("id") or ""
+        if gen_id:
+            print(f"[OpenRouter] Polling /generation for audit metadata (id={gen_id})...")
+        gen_data = _or_get_generation(api_key, gen_id) if gen_id else None
+
+        usage_meta = {
             "prompt_tokens": prompt_tokens,
             "response_tokens": response_tokens,
             "thinking_tokens": 0,
             "estimated_cost_usd": cost,
             "response_time_s": round(req_time, 1),
+            "finish_reason": finish_reason,
+            "or_generation_id": gen_id or None,
+            "or_generation_lookup_status": (
+                "skipped_no_id" if not gen_id
+                else "hit" if gen_data
+                else "miss"
+            ),
         }
+        if gen_data:
+            settled_cost = gen_data.get("total_cost")
+            if isinstance(settled_cost, (int, float)) and settled_cost >= 0:
+                usage_meta["inline_cost_usd"] = cost  # preserve original for comparison
+                usage_meta["settled_cost_usd"] = round(float(settled_cost), 6)
+                usage_meta["estimated_cost_usd"] = round(float(settled_cost), 6)
+            usage_meta.update({
+                "or_provider_name": gen_data.get("provider_name"),
+                "or_native_tokens_prompt": gen_data.get("native_tokens_prompt"),
+                "or_native_tokens_completion": gen_data.get("native_tokens_completion"),
+                "or_native_tokens_cached": gen_data.get("native_tokens_cached"),
+                "or_cache_discount": gen_data.get("cache_discount"),
+                "or_generation_time_ms": gen_data.get("generation_time"),
+                "or_latency_ms": gen_data.get("latency"),
+                "or_native_finish_reason": gen_data.get("native_finish_reason"),
+                "or_cancelled": gen_data.get("cancelled"),
+                "or_is_byok": gen_data.get("is_byok"),
+            })
+            print(f"[OpenRouter] Audited via /generation: provider={gen_data.get('provider_name')} "
+                  f"settled_cost=${usage_meta['estimated_cost_usd']:.6f} "
+                  f"native_tokens={gen_data.get('native_tokens_prompt')}+{gen_data.get('native_tokens_completion')}")
+        elif gen_id:
+            print(f"[OpenRouter] /generation lookup miss after polling — keeping inline cost ${cost:.4f}")
+        return text.strip(), usage_meta
 
     raise RuntimeError(f"OpenRouter video call failed after {_MAX_RETRIES + 1} attempts: {last_error}")
 
@@ -1202,6 +1379,47 @@ def _atomic_write_text(path, text):
     with open(tmp_path, "w", encoding="utf-8") as f:
         f.write(text)
     os.replace(tmp_path, path)
+
+
+# Gemini's MAX_TOKENS and OpenRouter's "length" both mean the same thing:
+# the model hit the output budget mid-response. JSON will be unclosed and parse will fail.
+_TRUNCATION_FINISH_REASONS = {"MAX_TOKENS", "length"}
+
+
+def _check_extraction_health(extraction, usage_meta):
+    """Inspect an extraction result and classify its health for caching/forensics.
+
+    Returns (status, forensics_dict):
+      - status: "ok" | "length_truncated" | "parse_error" | "schema_invalid"
+      - forensics: dict with finish_reason, parse_error (if any), short reason
+
+    A "length_truncated" or "parse_error" extraction must NOT be written to the
+    main cache path — it should go to a sibling `_partial.json` so the next run
+    re-attempts instead of returning the broken result from cache.
+    """
+    finish_reason = (usage_meta or {}).get("finish_reason", "") or ""
+    forensics = {"finish_reason": finish_reason}
+
+    if finish_reason in _TRUNCATION_FINISH_REASONS:
+        forensics["parse_status_reason"] = f"output truncated at max_tokens (finish_reason={finish_reason})"
+        return ("length_truncated", forensics)
+
+    if isinstance(extraction, dict) and "parse_error" in extraction:
+        forensics["parse_error"] = extraction.get("parse_error", "")
+        forensics["parse_status_reason"] = "model returned non-JSON or malformed JSON"
+        return ("parse_error", forensics)
+
+    # Required top-level fields per _EXTRACTION_SCHEMA. If model returned valid JSON
+    # but missing a required key, treat as schema_invalid — same handling as parse_error.
+    if isinstance(extraction, dict):
+        required_top = {"overall_topic", "video_summary", "segments"}
+        missing = required_top - set(extraction.keys())
+        if missing:
+            forensics["missing_required_fields"] = sorted(missing)
+            forensics["parse_status_reason"] = f"valid JSON but missing required fields: {sorted(missing)}"
+            return ("schema_invalid", forensics)
+
+    return ("ok", forensics)
 
 
 # ---------------------------------------------------------------------------
@@ -1295,14 +1513,23 @@ class NV_GeminiVideoExtractor:
                     "tooltip": "Custom extraction prompt. Leave empty to use the built-in "
                                "structured extraction prompt.",
                 }),
+                "max_tokens_mode": (["auto_by_duration", "manual"], {
+                    "default": "auto_by_duration",
+                    "tooltip": "How to set the output token budget. "
+                               "'auto_by_duration' (recommended): scale ~280 tok/min from probed video duration "
+                               "(7min→8K, 30min→9.4K, 60min→17.8K, 90min→26K, capped at 64K). "
+                               "Uses `max_tokens` as a floor. Required for heterogeneous batches. "
+                               "'manual': use `max_tokens` verbatim (legacy behavior).",
+                }),
                 "max_tokens": ("INT", {
-                    "default": 16384,
+                    "default": 8192,
                     "min": 1024,
                     "max": 65536,
                     "step": 1024,
-                    "tooltip": "Maximum output tokens. Dense 20-min videos with many segments "
-                               "can need 8K-12K tokens; 16384 provides headroom. "
-                               "If you see 'finish_reason=length' in logs, bump this.",
+                    "tooltip": "Output token budget. In 'auto_by_duration' mode this is the floor "
+                               "(short videos get at least this many tokens). In 'manual' mode this is "
+                               "the absolute value. If you see 'finish_reason=length' / 'MAX_TOKENS' "
+                               "in logs, switch to auto_by_duration or raise this.",
                 }),
                 "trigger": ("*", {
                     "tooltip": "Optional trigger input for sequencing multiple extractions.",
@@ -1325,7 +1552,7 @@ class NV_GeminiVideoExtractor:
     def extract(self, video_path, api_key="", model="gemini-2.5-pro",
                 media_resolution="default", optimize="auto", video_url="",
                 skip_existing=True, output_dir="", prompt_override="",
-                max_tokens=16384, trigger=None):
+                max_tokens_mode="auto_by_duration", max_tokens=8192, trigger=None):
         use_openrouter = _is_openrouter_model(model)
         api_key = resolve_api_key(api_key, provider="openrouter" if use_openrouter else "gemini")
 
@@ -1359,8 +1586,10 @@ class NV_GeminiVideoExtractor:
             )
         os.makedirs(output_dir, exist_ok=True)
 
-        # Cache key: include model so direct-Gemini and OR extractions don't collide
+        # Cache key: include model AND schema_version so old extractions get invalidated
+        # when the schema/prompt shape changes (otherwise stale cache silently shadows new shape).
         json_path = os.path.join(output_dir, f"{video_name}.json")
+        partial_path = os.path.join(output_dir, f"{video_name}_partial.json")
         if skip_existing and os.path.isfile(json_path):
             try:
                 with open(json_path, "r", encoding="utf-8") as f:
@@ -1372,13 +1601,16 @@ class NV_GeminiVideoExtractor:
                     src.get("model") == model
                     and src.get("media_resolution") == media_resolution
                     and cached_path_ref == expected_ref
+                    and src.get("schema_version") == _EXTRACTION_SCHEMA_VERSION
                 )
                 if config_match:
                     print(f"[NV_GeminiVideoExtractor] Cached extraction found: {json_path}")
                     extraction_str = json.dumps(cached, indent=2, ensure_ascii=False)
                     return (extraction_str, json_path, video_name)
                 else:
-                    print(f"[NV_GeminiVideoExtractor] Cache stale (config changed), re-extracting")
+                    reason = "config changed" if src.get("schema_version") == _EXTRACTION_SCHEMA_VERSION \
+                        else f"schema_version {src.get('schema_version')} != {_EXTRACTION_SCHEMA_VERSION}"
+                    print(f"[NV_GeminiVideoExtractor] Cache stale ({reason}), re-extracting")
             except (json.JSONDecodeError, ValueError, OSError):
                 print(f"[NV_GeminiVideoExtractor] Cache corrupt, re-extracting")
 
@@ -1393,10 +1625,24 @@ class NV_GeminiVideoExtractor:
             "If any portion was not fully processed, add an entry to 'uncertainties' naming the timestamp range."
         )
 
+        # Resolve effective output token budget. auto_by_duration probes the local file
+        # (URL inputs fall back to the manual floor since we can't probe remotely).
+        effective_max_tokens = max_tokens
+        scaling_note = "manual"
+        if max_tokens_mode == "auto_by_duration":
+            duration_s = _get_video_duration(video_path) if video_path else None
+            effective_max_tokens = _scale_max_tokens_by_duration(
+                duration_s, manual_floor=max_tokens
+            )
+            if duration_s:
+                scaling_note = f"auto_by_duration ({_format_duration(duration_s)} → {effective_max_tokens})"
+            else:
+                scaling_note = f"auto_by_duration (no duration → floor {max_tokens})"
+
         print(f"\n{'=' * 60}")
         print(f"[NV_GeminiVideoExtractor] Processing: {video_name}")
         print(f"  Model: {model} ({'OpenRouter' if use_openrouter else 'Gemini direct'})")
-        print(f"  Max tokens: {max_tokens}")
+        print(f"  Max tokens: {effective_max_tokens} [{scaling_note}]")
         print(f"{'=' * 60}")
 
         if use_openrouter:
@@ -1407,7 +1653,7 @@ class NV_GeminiVideoExtractor:
                 model=model,
                 api_key=api_key,
                 prompt=prompt,
-                max_tokens=max_tokens,
+                max_tokens=effective_max_tokens,
                 optimize=optimize,
             )
         else:
@@ -1418,22 +1664,38 @@ class NV_GeminiVideoExtractor:
                 model=model,
                 api_key=api_key,
                 prompt=prompt,
-                max_tokens=max_tokens,
+                max_tokens=effective_max_tokens,
                 media_resolution=media_resolution,
             )
 
-        # Source metadata for traceability
+        # Defensive: parser SHOULD always return a dict, but if a future refactor
+        # ever returns a raw string/list, mutating .[_source] on it would crash the run.
+        # Wrap non-dict outputs so the rest of the pipeline still records what happened.
+        if not isinstance(extraction, dict):
+            extraction = {"raw_output": extraction, "parse_error": "non-dict response from parser"}
+
+        # Health check before caching — truncated/malformed extractions go to a
+        # `_partial.json` sibling instead of poisoning the main cache. A partial-only
+        # write means the next run will retry rather than return broken cached data.
+        parse_status, forensics = _check_extraction_health(extraction, usage_meta)
+
+        # Source metadata for traceability + forensics
         source = {
             "video_file": video_name,
             "model": model,
             "media_resolution": media_resolution,
             "extracted_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "schema_version": _EXTRACTION_SCHEMA_VERSION,
+            "max_tokens_mode": max_tokens_mode,
+            "max_tokens_effective": effective_max_tokens,
             "prompt_tokens": usage_meta.get("prompt_tokens"),
             "response_tokens": usage_meta.get("response_tokens"),
             "estimated_cost_usd": usage_meta.get("estimated_cost_usd"),
             "response_time_s": usage_meta.get("response_time_s"),
             "transport": "openrouter" if use_openrouter else "gemini_files_api",
+            "parse_status": parse_status,
         }
+        source.update(forensics)
         if video_path:
             source["video_path"] = video_path
         if video_url:
@@ -1441,7 +1703,26 @@ class NV_GeminiVideoExtractor:
         source.update(extra_source)
         extraction["_source"] = source
 
-        _atomic_write_json(json_path, extraction)
+        if parse_status == "ok":
+            _atomic_write_json(json_path, extraction)
+            saved_path = json_path
+            # Clean up any stale partial from a previous failed attempt
+            if os.path.isfile(partial_path):
+                try:
+                    os.remove(partial_path)
+                except OSError:
+                    pass
+        else:
+            # Save the broken extraction as `_partial.json` for forensic review,
+            # then raise so callers can record the failure. Do NOT touch json_path.
+            _atomic_write_json(partial_path, extraction)
+            reason = forensics.get("parse_status_reason", parse_status)
+            print(f"[NV_GeminiVideoExtractor] Extraction failed ({parse_status}): {reason}")
+            print(f"  Partial response saved for review: {partial_path}")
+            raise RuntimeError(
+                f"Extraction failed ({parse_status}): {reason}. "
+                f"See {partial_path} for the partial response."
+            )
 
         extraction_str = json.dumps(extraction, indent=2, ensure_ascii=False)
 
@@ -1452,10 +1733,10 @@ class NV_GeminiVideoExtractor:
         print(f"  Segments: {len(segments)} | Type: {extraction.get('content_type', 'N/A')}")
         print(f"  Topic: {extraction.get('overall_topic', 'N/A')}")
         print(f"  Level: {extraction.get('target_level', 'N/A')}{cost_str}")
-        print(f"  Saved: {json_path}")
+        print(f"  Saved: {saved_path}")
         print(f"{'=' * 60}\n")
 
-        return (extraction_str, json_path, video_name)
+        return (extraction_str, saved_path, video_name)
 
     # -- Transport branches ---------------------------------------------------
 
@@ -1823,12 +2104,23 @@ class NV_GeminiBatchExtractor:
                     "tooltip": "Directory to save extraction JSONs. "
                                "Empty = ComfyUI output/gemini_course/extractions/",
                 }),
+                "max_tokens_mode": (["auto_by_duration", "manual"], {
+                    "default": "auto_by_duration",
+                    "tooltip": "How to set the per-video output token budget. "
+                               "'auto_by_duration' (recommended for batches): scale ~280 tok/min from "
+                               "probed duration (7min→8K, 30min→9.4K, 60min→17.8K, 90min→26K, capped 64K). "
+                               "Uses `max_tokens` as a floor for short videos. "
+                               "'manual': apply `max_tokens` to all videos (legacy behavior, prone to "
+                               "truncation on long videos in heterogeneous batches).",
+                }),
                 "max_tokens": ("INT", {
-                    "default": 16384,
+                    "default": 8192,
                     "min": 1024,
                     "max": 65536,
                     "step": 1024,
-                    "tooltip": "Maximum output tokens per extraction.",
+                    "tooltip": "Output token budget per extraction. In 'auto_by_duration' mode this is "
+                               "the floor (short videos guaranteed at least this many tokens). In 'manual' "
+                               "mode this is applied verbatim to all videos.",
                 }),
                 "trigger": ("*", {
                     "tooltip": "Optional trigger input for sequencing.",
@@ -1849,7 +2141,8 @@ class NV_GeminiBatchExtractor:
 
     def extract_batch(self, video_folder, api_key="", model="gemini-2.5-pro",
                       media_resolution="default", optimize="auto", dry_run=False,
-                      skip_existing=True, output_dir="", max_tokens=16384, trigger=None):
+                      skip_existing=True, output_dir="",
+                      max_tokens_mode="auto_by_duration", max_tokens=8192, trigger=None):
         use_openrouter = _is_openrouter_model(model)
         video_folder = video_folder.strip()
         if not video_folder:
@@ -1915,13 +2208,21 @@ class NV_GeminiBatchExtractor:
                 cached = os.path.isfile(os.path.join(output_dir, f"{vf.stem}.json"))
                 status = "cached (skip)" if cached and skip_existing else "will extract"
 
+                # Per-video output budget preview — visible in dry-run so users can see
+                # the spread before committing.
+                if max_tokens_mode == "auto_by_duration":
+                    per_video_max_tokens = _scale_max_tokens_by_duration(dur, manual_floor=max_tokens)
+                else:
+                    per_video_max_tokens = max_tokens
+
                 if dur:
                     total_duration += dur
                 if not (cached and skip_existing) and est_cost is not None:
                     total_est_cost += est_cost
 
                 cost_cell = "unknown" if est_cost is None else f"~${est_cost:.4f}"
-                line = f"  [{idx:2d}/{total}] {vf.name:<45s} {dur_str:>7s}  {size_mb:6.1f} MB  {cost_cell:>10s}  {status}"
+                line = (f"  [{idx:2d}/{total}] {vf.name:<45s} {dur_str:>7s}  {size_mb:6.1f} MB  "
+                        f"{cost_cell:>10s}  out_max={per_video_max_tokens:>6d}  {status}")
                 print(line)
                 plan.append({
                     "video": vf.name,
@@ -1929,6 +2230,7 @@ class NV_GeminiBatchExtractor:
                     "duration_str": dur_str,
                     "size_mb": round(size_mb, 1),
                     "estimated_cost_usd": est_cost,
+                    "max_tokens_effective": per_video_max_tokens,
                     "status": status,
                 })
 
@@ -1940,8 +2242,31 @@ class NV_GeminiBatchExtractor:
             else:
                 cost_summary = "unknown (model not in pricing table — reported post-hoc in usage.cost)"
             print(f"  Estimated cost: {cost_summary} ({model})")
+            print(f"  max_tokens mode: {max_tokens_mode} (floor={max_tokens})")
             if use_openrouter and any(model.startswith(p) for p in _OR_NO_AUDIO_PREFIXES):
                 print(f"  WARNING: {model} likely ignores audio — voiceover content will not be captured.")
+
+            # OR balance preview — best-effort, never blocks
+            credits_info = None
+            if use_openrouter:
+                resolved_key = resolve_api_key(api_key, provider="openrouter")
+                credits_info = _or_check_credits(resolved_key)
+                if credits_info.get("ok"):
+                    avail = credits_info["available_usd"]
+                    total_credits = credits_info["total_credits"]
+                    total_usage = credits_info["total_usage"]
+                    margin = avail - total_est_cost if pricing_known else None
+                    margin_str = (f" (margin ${margin:+.2f})" if margin is not None else "")
+                    print(f"  OR balance: ${avail:.2f} available "
+                          f"(${total_credits:.2f} purchased − ${total_usage:.2f} used){margin_str}")
+                    if pricing_known and margin is not None and margin < 0:
+                        print(f"  WARNING: estimated cost exceeds available balance by ${-margin:.2f} "
+                              f"(may still succeed via prompt caching or upstream discounts)")
+                else:
+                    kind = credits_info.get("kind", "unknown")
+                    detail = credits_info.get("detail", "")
+                    print(f"  OR balance: unable to query — {kind} ({detail})")
+
             to_extract = sum(1 for p in plan if p["status"] == "will extract")
             to_skip = sum(1 for p in plan if "cached" in p["status"])
             print(f"  Will extract: {to_extract} | Will skip: {to_skip}")
@@ -1956,22 +2281,77 @@ class NV_GeminiBatchExtractor:
                 "estimated_total_cost_usd": round(total_est_cost, 4),
                 "model": model,
                 "media_resolution": media_resolution,
+                "max_tokens_mode": max_tokens_mode,
+                "max_tokens_floor": max_tokens,
                 "videos": plan,
             }
+            if credits_info is not None:
+                if credits_info.get("ok"):
+                    summary["openrouter_credits"] = {
+                        "status": "ok",
+                        "available_usd": round(credits_info["available_usd"], 4),
+                        "total_credits_usd": round(credits_info["total_credits"], 4),
+                        "total_usage_usd": round(credits_info["total_usage"], 4),
+                    }
+                else:
+                    summary["openrouter_credits"] = {
+                        "status": "unavailable",
+                        "kind": credits_info.get("kind"),
+                        "detail": credits_info.get("detail"),
+                    }
             return (json.dumps(summary, indent=2, ensure_ascii=False), output_dir, 0)
 
         # --- EXTRACTION MODE ---
         api_key = resolve_api_key(api_key, provider="openrouter" if use_openrouter else "gemini")
         os.makedirs(output_dir, exist_ok=True)
 
+        # OR pre-flight: estimate batch cost from durations and check balance.
+        # Skip videos that will hit cache. Always warn-only — never block. The pre-estimate
+        # uses Gemini-frame tokenization for ALL routes (rough for non-Gemini) and ignores
+        # prompt caching, so a "deficit" can still complete fine. If balance is truly
+        # exhausted, OR returns 402 on the specific call and we capture the partial there.
+        if use_openrouter:
+            credits_info = _or_check_credits(api_key)
+            if credits_info is not None and credits_info.get("ok"):
+                pricing_entry = _OR_PRICING.get(model)
+                pre_est_cost = 0.0
+                pre_pricing_known = pricing_entry is not None
+                if pre_pricing_known:
+                    for vf in video_files:
+                        cached_jp = os.path.join(output_dir, f"{vf.stem}.json")
+                        if skip_existing and os.path.isfile(cached_jp):
+                            continue
+                        dur = _get_video_duration(str(vf))
+                        if dur is None:
+                            continue
+                        tok_per_sec = 100 if media_resolution == "low" else 300
+                        pre_est_cost += (
+                            (dur * tok_per_sec / 1e6) * pricing_entry["input"]
+                            + (3000 / 1e6) * pricing_entry["output"]
+                        )
+                avail = credits_info["available_usd"]
+                print(f"  OR balance: ${avail:.2f} available")
+                if pre_pricing_known:
+                    margin = avail - pre_est_cost
+                    print(f"  Estimated batch cost: ${pre_est_cost:.4f} (margin ${margin:+.2f})")
+                    if margin < 0:
+                        print(f"  WARNING: estimated cost exceeds balance by ${-margin:.2f}. "
+                              f"Proceeding anyway (caching/discounts often make actual cost much lower). "
+                              f"If you want to abort, Ctrl+C now or run with dry_run=True to plan.")
+            elif credits_info is not None:
+                kind = credits_info.get("kind", "unknown")
+                print(f"  OR balance: skipping check ({kind}) — extraction proceeds")
+
         print(f"\n{'=' * 60}")
         print(f"[NV_GeminiBatchExtractor] Found {total} videos in {video_folder}")
         print(f"  Model: {model} | Resolution: {media_resolution}")
+        print(f"  max_tokens mode: {max_tokens_mode} (floor={max_tokens})")
         print(f"  Output: {output_dir}")
         print(f"{'=' * 60}")
 
         results = []
-        total_cost = 0.0
+        cost_succeeded = 0.0
+        cost_failed = 0.0
         cached_count = 0
         extracted_count = 0
         failed_count = 0
@@ -1980,7 +2360,8 @@ class NV_GeminiBatchExtractor:
             video_name = vf.stem
             json_path = os.path.join(output_dir, f"{video_name}.json")
 
-            # Check cache (validate config matches before reuse)
+            # Check cache (validate config + schema_version matches before reuse)
+            partial_path = os.path.join(output_dir, f"{video_name}_partial.json")
             if skip_existing and os.path.isfile(json_path):
                 cache_valid = False
                 try:
@@ -1991,6 +2372,7 @@ class NV_GeminiBatchExtractor:
                         src.get("model") == model
                         and src.get("media_resolution") == media_resolution
                         and src.get("video_path") == str(vf)
+                        and src.get("schema_version") == _EXTRACTION_SCHEMA_VERSION
                     )
                 except (json.JSONDecodeError, ValueError, OSError):
                     pass  # corrupt cache — re-extract
@@ -2004,8 +2386,18 @@ class NV_GeminiBatchExtractor:
                     continue
                 print(f"  [{idx}/{total}] {vf.name} — cache stale, re-extracting")
 
+            # Per-video output budget. auto_by_duration probes the file via ffprobe and
+            # scales; manual mode applies the user value uniformly.
+            if max_tokens_mode == "auto_by_duration":
+                _dur = _get_video_duration(str(vf))
+                effective_max_tokens = _scale_max_tokens_by_duration(_dur, manual_floor=max_tokens)
+                _budget_note = f"out_max={effective_max_tokens} (auto, {_format_duration(_dur)})"
+            else:
+                effective_max_tokens = max_tokens
+                _budget_note = f"out_max={effective_max_tokens} (manual)"
+
             # Process video — dispatch on model prefix
-            print(f"\n  [{idx}/{total}] {vf.name} — extracting...")
+            print(f"\n  [{idx}/{total}] {vf.name} — extracting... [{_budget_note}]")
             try:
                 mime = _get_mime_type(str(vf))
                 prompt = _EXTRACTION_PROMPT + (
@@ -2023,7 +2415,7 @@ class NV_GeminiBatchExtractor:
                     raw_response, usage_meta = _generate_content_openrouter_video(
                         api_key=api_key, model=model, prompt=prompt,
                         video_path=send_path, mime=mime,
-                        temperature=1.0, max_tokens=max_tokens,
+                        temperature=1.0, max_tokens=effective_max_tokens,
                         response_schema=_EXTRACTION_SCHEMA,
                     )
                     extraction = _parse_extraction_json(raw_response)
@@ -2041,7 +2433,7 @@ class NV_GeminiBatchExtractor:
                         ]
                         raw_response, usage_meta = _generate_content(
                             api_key=api_key, model=model, contents=contents,
-                            temperature=1.0, max_tokens=max_tokens,
+                            temperature=1.0, max_tokens=effective_max_tokens,
                             json_mode=True, response_schema=_EXTRACTION_SCHEMA,
                             media_resolution=media_resolution,
                         )
@@ -2050,37 +2442,71 @@ class NV_GeminiBatchExtractor:
                         if file_name:
                             _delete_file(file_name, api_key)
 
+                # Defensive: parser SHOULD always return a dict, but if a future refactor
+                # ever returns a raw string/list, mutating .[_source] on it would crash the
+                # whole batch mid-loop. Wrap non-dict outputs to keep the loop alive.
+                if not isinstance(extraction, dict):
+                    extraction = {"raw_output": extraction, "parse_error": "non-dict response from parser"}
+
                 cost = usage_meta.get("estimated_cost_usd") or 0
+                parse_status, forensics = _check_extraction_health(extraction, usage_meta)
+
                 source = {
                     "video_file": vf.name,
                     "video_path": str(vf),
                     "model": model,
                     "media_resolution": media_resolution,
                     "extracted_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "schema_version": _EXTRACTION_SCHEMA_VERSION,
+                    "max_tokens_mode": max_tokens_mode,
+                    "max_tokens_effective": effective_max_tokens,
                     "prompt_tokens": usage_meta.get("prompt_tokens"),
                     "response_tokens": usage_meta.get("response_tokens"),
                     "estimated_cost_usd": usage_meta.get("estimated_cost_usd"),
                     "response_time_s": usage_meta.get("response_time_s"),
                     "transport": "openrouter" if use_openrouter else "gemini_files_api",
+                    "parse_status": parse_status,
                 }
+                source.update(forensics)
                 source.update(extra_source)
                 extraction["_source"] = source
 
-                _atomic_write_json(json_path, extraction)
-
-                total_cost += cost
-                extracted_count += 1
-                segs = len(extraction.get("segments", []))
-                ctype = extraction.get("content_type", "?")
-                print(f"  [{idx}/{total}] {vf.name} — {segs} segments, {ctype}, ${cost:.4f}")
-
-                results.append({
-                    "video": vf.name, "status": "extracted",
-                    "json_path": json_path,
-                    "segments": segs,
-                    "content_type": ctype,
-                    "cost_usd": cost,
-                })
+                if parse_status == "ok":
+                    _atomic_write_json(json_path, extraction)
+                    # Clean up stale partial from a previous failed attempt on this video
+                    if os.path.isfile(partial_path):
+                        try:
+                            os.remove(partial_path)
+                        except OSError:
+                            pass
+                    cost_succeeded += cost
+                    extracted_count += 1
+                    segs = len(extraction.get("segments", []))
+                    ctype = extraction.get("content_type", "?")
+                    print(f"  [{idx}/{total}] {vf.name} — {segs} segments, {ctype}, ${cost:.4f}")
+                    results.append({
+                        "video": vf.name, "status": "extracted",
+                        "json_path": json_path,
+                        "segments": segs,
+                        "content_type": ctype,
+                        "cost_usd": cost,
+                    })
+                else:
+                    # Persist partial output for forensic review; do NOT touch json_path
+                    # so the next run will retry instead of returning broken cache.
+                    _atomic_write_json(partial_path, extraction)
+                    failed_count += 1
+                    cost_failed += cost  # we still paid for the failed call
+                    reason = forensics.get("parse_status_reason", parse_status)
+                    print(f"  [{idx}/{total}] {vf.name} — FAILED ({parse_status}): {reason}")
+                    print(f"    Partial saved: {partial_path} | Cost: ${cost:.4f}")
+                    results.append({
+                        "video": vf.name, "status": "failed",
+                        "parse_status": parse_status,
+                        "error": reason,
+                        "partial_json_path": partial_path,
+                        "cost_usd": cost,
+                    })
 
             except Exception as e:
                 failed_count += 1
@@ -2089,12 +2515,16 @@ class NV_GeminiBatchExtractor:
                     "video": vf.name, "status": "failed", "error": str(e),
                 })
 
-        # Summary
+        # Summary — split successful vs failed cost so users can see what they paid for
+        # parsing failures vs usable extractions
+        total_cost = cost_succeeded + cost_failed
         summary = {
             "total_videos": total,
             "extracted": extracted_count,
             "cached": cached_count,
             "failed": failed_count,
+            "cost_succeeded_usd": round(cost_succeeded, 4),
+            "cost_failed_usd": round(cost_failed, 4),
             "total_cost_usd": round(total_cost, 4),
             "model": model,
             "output_dir": output_dir,
@@ -2105,7 +2535,10 @@ class NV_GeminiBatchExtractor:
         print(f"\n{'=' * 60}")
         print(f"[NV_GeminiBatchExtractor] Complete!")
         print(f"  Extracted: {extracted_count} | Cached: {cached_count} | Failed: {failed_count}")
-        print(f"  Total cost: ${total_cost:.4f}")
+        if failed_count > 0:
+            print(f"  Cost: ${cost_succeeded:.4f} successful + ${cost_failed:.4f} failed = ${total_cost:.4f} total")
+        else:
+            print(f"  Total cost: ${total_cost:.4f}")
         print(f"  Output: {output_dir}")
         print(f"{'=' * 60}\n")
 
