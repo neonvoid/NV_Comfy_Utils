@@ -30,6 +30,15 @@ import folder_paths
 
 from .api_keys import resolve_api_key
 
+# ComfyUI's interrupt mechanism — calling this raises if the user pressed the Cancel
+# button (the X icon in the queue widget). Insert at any natural pause point in long
+# operations so cancel is responsive instead of waiting for the whole call to finish.
+try:
+    from comfy.model_management import throw_exception_if_processing_interrupted as _check_interrupt
+except ImportError:
+    def _check_interrupt():
+        pass
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -121,7 +130,7 @@ def _get_video_duration(file_path):
         result = subprocess.run(
             ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", str(file_path)],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, encoding="utf-8", errors="replace", timeout=10,
         )
         if result.returncode == 0 and result.stdout.strip():
             return float(result.stdout.strip())
@@ -713,7 +722,15 @@ def _or_get_generation(api_key, generation_id, max_attempts=4, initial_delay_s=1
     headers = {"Authorization": f"Bearer {api_key}"}
     for attempt in range(max_attempts):
         if attempt > 0:
-            time.sleep(initial_delay_s * (2 ** (attempt - 1)))
+            # Make the backoff sleep cancellable in chunks so Comfy's Cancel button is
+            # responsive during the up-to-12s wait on the longest backoff step.
+            sleep_total = initial_delay_s * (2 ** (attempt - 1))
+            sleep_step = 0.5
+            slept = 0.0
+            while slept < sleep_total:
+                _check_interrupt()
+                time.sleep(min(sleep_step, sleep_total - slept))
+                slept += sleep_step
         try:
             resp = requests.get(
                 _OPENROUTER_GENERATION_URL,
@@ -950,7 +967,7 @@ def _ffprobe_streams(file_path):
     try:
         result = subprocess.run(
             ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", "-show_format", str(file_path)],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, encoding="utf-8", errors="replace", timeout=15,
         )
         if result.returncode != 0:
             return (None, None, None, False)
@@ -991,20 +1008,56 @@ def _should_optimize(mode, file_size, width, height, duration):
     return (False, f"under thresholds ({file_size / 1024 / 1024:.1f}MB, {height}p, {duration}s)")
 
 
-# Transcode profile tuned for screen-recording tutorials with voiceover:
-#  - 1fps: VLMs sample at ~1fps anyway, near-static screen content compresses 90%+
-#  - GOP=1: every frame a keyframe → no P-frame decode glitches on provider side
-#  - CRF 26: preserves small IDE/terminal font edges (text legibility floor for OCR)
-#  - max_height 1080: keeps full-screen code readable (720p smears tabs/line numbers)
-#  - 80 kbps AAC stereo: voiceover clarity without bloat (speech is the lesson)
+# Transcode profile tuned for screen-recording tutorials with voiceover.
+# REWRITE 2026-04-18: previous profile (GOP=1, CRF=26, 1080p, 80kbps stereo) failed to
+# shrink files because GOP=1 disables inter-frame compression — at 1fps, every frame
+# became a standalone keyframe and the encoder couldn't exploit the 95%+ static-content
+# redundancy of screen recordings. Some files actually GREW. The OpenRouter base64
+# ceiling (~64MB ≈ 48MB raw) was unreachable for 60+ min videos.
+#
+# New defaults:
+#  - fps=1: VLMs sample at ~1fps anyway, screen content compresses well at this rate
+#  - gop=60: P-frames between keyframes every 60s — exploits screen-recording stillness
+#  - max_height=720: IDE/terminal text stays readable; halves pixel count vs 1080p
+#  - crf=30: still legible for code/terminal text, ~50% smaller than CRF 26
+#  - audio_kbps=32 mono: speech-only intelligibility (voiceover, not music)
+# These produce ~3-8 KB/frame video + ~22MB audio for a 90-min source, fitting under
+# the 48MB raw / 64MB base64 ceiling with safety margin.
 _OR_TRANSCODE_PROFILE = {
     "fps": 1,
-    "gop": 1,
-    "max_height": 1080,
-    "crf": 26,
+    "gop": 60,
+    "max_height": 720,
+    "crf": 30,
     "preset": "medium",
-    "audio_kbps": 80,
+    "audio_kbps": 32,
+    "audio_channels": 1,
 }
+
+# OpenRouter chat-completions enforces a base64 payload ceiling. We treat 48MB raw
+# (≈64MB base64) as the hard upper bound — anything above this is not worth attempting
+# even with maximum compression. The error message in the OR call site gates here too.
+_OR_BASE64_RAW_CEILING_BYTES = 48 * 1024 * 1024
+
+
+def _estimate_transcoded_size(duration_s, profile, has_audio):
+    """Predict post-transcode size in bytes given a profile.
+
+    Empirical model for screen-recording tutorials:
+    - Video: 8 KB/frame at CRF 26 / 1080p baseline. CRF +6 ≈ halves bitrate,
+      resolution scales quadratically.
+    - Audio: linear with bitrate × duration.
+
+    Conservative — actual sizes are usually 30-50% smaller. Use this as a "fits" gate,
+    not an exact prediction.
+    """
+    if duration_s is None or duration_s <= 0:
+        return 0
+    crf_factor = 2.0 ** ((26 - profile["crf"]) / 6.0)
+    res_factor = (profile["max_height"] / 1080.0) ** 2
+    video_bytes_per_frame = 8 * 1024 * crf_factor * res_factor
+    video_bytes = int(duration_s * profile["fps"] * video_bytes_per_frame)
+    audio_bytes = int(duration_s * profile["audio_kbps"] * 1000 / 8) if has_audio else 0
+    return video_bytes + audio_bytes
 
 
 def _transcode_cache_key(src_path, profile):
@@ -1043,6 +1096,23 @@ def _optimize_video_for_openrouter(src_path, mode="auto"):
     if not should:
         return (src_path, info)
 
+    # Predictive gate: estimate post-transcode size BEFORE running ffmpeg. If even the
+    # aggressive profile won't fit under OR's 48MB raw ceiling, fail fast with a clear
+    # message instead of burning 30s of ffmpeg only to fail at upload.
+    p = _OR_TRANSCODE_PROFILE
+    predicted_bytes = _estimate_transcoded_size(duration, p, has_audio)
+    if predicted_bytes > _OR_BASE64_RAW_CEILING_BYTES:
+        predicted_mb = predicted_bytes / 1024 / 1024
+        ceiling_mb = _OR_BASE64_RAW_CEILING_BYTES / 1024 / 1024
+        raise RuntimeError(
+            f"Video too long for OpenRouter base64 transport: predicted post-transcode "
+            f"size {predicted_mb:.0f}MB exceeds {ceiling_mb:.0f}MB raw ceiling (~64MB base64). "
+            f"Source duration {duration / 60:.1f}min. "
+            f"Alternatives: (1) switch model to direct 'gemini-2.5-flash' (Files API, no size limit, "
+            f"may hit your account rate limits), (2) use video_url input with a public CDN URL, "
+            f"(3) split the video into shorter segments before extraction."
+        )
+
     cache_dir = _get_nv_video_cache_dir()
     cache_key = _transcode_cache_key(src_path, _OR_TRANSCODE_PROFILE)
     out_path = os.path.join(cache_dir, f"{cache_key}.mp4")
@@ -1054,9 +1124,9 @@ def _optimize_video_for_openrouter(src_path, mode="auto"):
               f"({src_bytes / 1024 / 1024:.1f}MB → {out_bytes / 1024 / 1024:.1f}MB)")
         return (out_path, info)
 
-    # Build ffmpeg command — FPS reduction + keyframe-every-frame + CRF
-    p = _OR_TRANSCODE_PROFILE
-    # Downscale only if source exceeds max_height; preserve aspect ratio; even dims
+    # Build ffmpeg command. GOP=60 lets libx264 emit P-frames between keyframes —
+    # critical for static screen content where most frames differ minimally.
+    # Downscale only if source exceeds max_height; preserve aspect ratio; even dims.
     vf = f"scale='min(iw,trunc(iw*{p['max_height']}/ih/2)*2)':'min(ih,{p['max_height']})':flags=bicubic"
     cmd = [
         "ffmpeg", "-y", "-i", str(src_path),
@@ -1070,7 +1140,8 @@ def _optimize_video_for_openrouter(src_path, mode="auto"):
         "-profile:v", "high",
     ]
     if has_audio:
-        cmd += ["-c:a", "aac", "-b:a", f"{p['audio_kbps']}k", "-ac", "2"]
+        cmd += ["-c:a", "aac", "-b:a", f"{p['audio_kbps']}k",
+                "-ac", str(p.get("audio_channels", 2))]
     else:
         cmd += ["-an"]
     cmd += ["-movflags", "+faststart", "-loglevel", "error", str(out_path)]
@@ -1078,11 +1149,18 @@ def _optimize_video_for_openrouter(src_path, mode="auto"):
     # Give ffmpeg generous runtime budget: ~1s per source second, min 60s, max 1200s
     budget = max(60, min(1200, int((duration or 60) * 1.5)))
     print(f"[NV_GeminiVideoExtractor] Optimizing for OpenRouter ({reason})...")
-    print(f"  Profile: {p['fps']}fps, keyframe-every-frame, <={p['max_height']}p, CRF {p['crf']}")
+    print(f"  Profile: {p['fps']}fps, GOP={p['gop']}, <={p['max_height']}p, "
+          f"CRF {p['crf']}, audio {p['audio_kbps']}kbps "
+          f"{'mono' if p.get('audio_channels', 2) == 1 else 'stereo'} "
+          f"(predicted ~{predicted_bytes / 1024 / 1024:.0f}MB)")
 
     t0 = time.time()
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=budget)
+        # encoding="utf-8", errors="replace" avoids Windows cp1252 UnicodeDecodeError
+        # when ffmpeg emits non-ASCII progress output (Chinese filenames, special chars).
+        result = subprocess.run(
+            cmd, capture_output=True, encoding="utf-8", errors="replace", timeout=budget
+        )
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"ffmpeg transcode timed out after {budget}s on {Path(src_path).name}")
 
@@ -2305,6 +2383,40 @@ class NV_GeminiBatchExtractor:
         api_key = resolve_api_key(api_key, provider="openrouter" if use_openrouter else "gemini")
         os.makedirs(output_dir, exist_ok=True)
 
+        # OR pre-flight: detect any video that won't fit through OR's base64 ceiling
+        # BEFORE starting expensive work. Hard-fails the entire batch with a manifest of
+        # offenders so the user can take action (split, video_url, or direct API) without
+        # discovering the problem mid-run. Skips cached videos from the check.
+        if use_openrouter:
+            oversized = []
+            for vf in video_files:
+                cached_jp = os.path.join(output_dir, f"{vf.stem}.json")
+                if skip_existing and os.path.isfile(cached_jp):
+                    continue
+                width, height, dur, has_audio = _ffprobe_streams(str(vf))
+                predicted = _estimate_transcoded_size(dur, _OR_TRANSCODE_PROFILE, has_audio)
+                if predicted > _OR_BASE64_RAW_CEILING_BYTES:
+                    oversized.append((vf.name, dur, predicted))
+            if oversized:
+                lines = [
+                    f"  - {name} ({dur/60:.1f}min, predicted ~{pb/1024/1024:.0f}MB after transcode)"
+                    for name, dur, pb in oversized
+                ]
+                raise RuntimeError(
+                    f"\n\nOpenRouter pre-flight FAILED — {len(oversized)} video(s) exceed the "
+                    f"~64MB base64 transport ceiling even after aggressive ffmpeg compression "
+                    f"(1fps/720p/CRF30/32kbps mono audio). The audio track alone caps OR-viable "
+                    f"video length at ~75min.\n\n"
+                    f"Oversized videos:\n" + "\n".join(lines) +
+                    f"\n\nResolutions:\n"
+                    f"  1. Switch model to direct 'gemini-2.5-flash' (Files API handles 2GB; may "
+                    f"hit your account rate limits — manageable at this batch size).\n"
+                    f"  2. Use the video_url input with a public CDN URL (R2/S3/GCS) — no size cap.\n"
+                    f"  3. Pre-split offenders into <60min chunks via ffmpeg before extraction.\n"
+                    f"  4. (Future) Use the upcoming split-pipeline node (Whisper audio + sampled "
+                    f"frames) to bypass the limit entirely."
+                )
+
         # OR pre-flight: estimate batch cost from durations and check balance.
         # Skip videos that will hit cache. Always warn-only — never block. The pre-estimate
         # uses Gemini-frame tokenization for ALL routes (rough for non-Gemini) and ignores
@@ -2357,6 +2469,11 @@ class NV_GeminiBatchExtractor:
         failed_count = 0
 
         for idx, vf in enumerate(video_files, 1):
+            # Honor the ComfyUI Cancel button (X in queue widget) at the top of each
+            # iteration. Pressing Cancel mid-video doesn't kill the in-flight API call
+            # immediately, but the next video won't start.
+            _check_interrupt()
+
             video_name = vf.stem
             json_path = os.path.join(output_dir, f"{video_name}.json")
 

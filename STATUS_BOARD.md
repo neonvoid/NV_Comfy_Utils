@@ -1,19 +1,32 @@
 # Status Board — NV_Comfy_Utils
 
 > Auto-managed by `/handoff`. Content is never deleted — old entries move to ARCHIVE.md.
-> Last updated: 2026-04-17
+> Last updated: 2026-04-18
 
 ## Resume Context
 <!-- Rewritten each `/handoff` run. What does a cold-start agent need RIGHT NOW? -->
 
-- **Current focus:** Open two pending PRs — AVM `feat/openrouter-provider` and SAM3_nvFork `fix/widget-value-scramble-on-reload` (now Option A', prompt_mode dropdown removed, mode auto-inferred from inputs). Teammates need ComfyUI core update (Evan hit SeeDance 2.0 ImportError).
-- **Next dev focus:** Runtime test workstream K on 36-video VFX corpus. Workstream H Phase 1 (plan_chunks math). Workstream J runtime test post-SAM3-fix.
-- **Critical files:** `src/KNF_Utils/streaming_vace_to_video.py` (rewritten today — matches new WAN VAE API), `src/KNF_Utils/gemini_video_course.py`, `src/KNF_Utils/prompt_refiner.py` (authoritative OR slug list)
-- **Known blockers:** `gh` CLI not auth'd locally — PRs open via GitHub web URLs. Teammate machines must run ComfyUI core `git pull` for SeeDance 2.0 symbols.
-- **Environment notes:** OPENROUTER_API_KEY required for OR routes. Users of SAM3VideoSegmentation must delete/recreate nodes after A' fix (prompt_mode removed from schema).
+- **Current focus:** Run 36-video corpus dry-run with the rebuilt `gemini_video_course.py` (Phase 2 + auto-token + OR audit endpoints all shipped today, syntax-verified, NOT runtime-tested). Dry-run is free and surfaces per-video `out_max=` budget + OR balance + cost split.
+- **Decision pending:** Model choice for actual run — current corpus is `qwen/qwen3.6-plus` (NO AUDIO = bad for Chinese voiceover). Multi-AI consensus: switch to `gemini-2.5-flash` direct (audio-aware, 1M context, accurate cost, no payload bomb). Or run 2-video Flash-vs-Pro A/B (~$0.50) before committing.
+- **Next dev focus:** Runtime test workstream K end-to-end. Then workstream H Phase 1 (plan_chunks math). Then workstream J runtime test post-SAM3-fix.
+- **Critical files:** `src/KNF_Utils/gemini_video_course.py` (heavily edited today — Phase 2 length safety + auto-token + OR endpoints + multi-AI review fixes), `src/KNF_Utils/prompt_refiner.py` (authoritative OR slug list), `src/KNF_Utils/streaming_vace_to_video.py` (yesterday's WAN VAE rewrite)
+- **Known blockers:** `gh` CLI not auth'd locally — two pending PRs (AVM `feat/openrouter-provider`, SAM3_nvFork `fix/widget-value-scramble-on-reload`) still need to be opened via web. ComfyUI restart needed to pick up today's Python edits.
+- **Environment notes:** Course pipeline production path = extract (Comfy node) → folder of JSONs → `/course-synth` skill (5-stage stateful). Synth NODE is optional smoke test only. OPENROUTER_API_KEY required for OR routes; credit balance now checked pre-flight (warn-only, never blocks).
 
 ## Pulse
 <!-- Last 2 session summaries, newest first. Older entries roll to Workstream Details. -->
+
+### 2026-04-18 — NV_GeminiBatchExtractor hardened: Phase 2 length safety + auto-token scaling + OR audit endpoints + multi-AI review fixes [coding + refactor]
+- **Done:**
+  - **Phase 2 length safety + observability**: `_EXTRACTION_SCHEMA_VERSION=2` constant invalidates stale cache on schema changes. `_check_extraction_health()` classifies as `ok`/`length_truncated`/`parse_error`/`schema_invalid`. `finish_reason` normalized across Gemini direct (`MAX_TOKENS`) and OR (`length`). Truncated/malformed extractions now write to `<video>_partial.json` (not main cache) — broken results no longer poison cache. Stale partials cleaned up on later success. `_source` block extended with `schema_version`, `parse_status`, `parse_status_reason`, `parse_error`, `missing_required_fields`.
+  - **Auto-token scaling**: `_scale_max_tokens_by_duration()` formula `int((1024 + duration_min × 280) × 1.25)` clamped to `[floor, 65536]`. New `max_tokens_mode` dropdown on both extractors (`auto_by_duration` default, `manual` legacy). `max_tokens` field default 16384→8192 (now floor in auto mode). Per-video `out_max=` column in dry-run preview. Effective values recorded in `_source`.
+  - **OR audit endpoints**: `_or_get_generation()` post-call lookup with exponential backoff (1.5→3→6→12s). `_or_check_credits()` returns structured `{ok, kind, status_code, detail}` distinguishing 401/403/500/timeout. `usage_meta` now includes `or_provider_name`, `or_native_tokens_*`, `or_cache_discount`, `or_generation_time_ms`, `or_latency_ms`, settled vs inline cost (settled `total_cost >= 0` overrides inline `usage.cost`). Credit pre-flight in dry-run (informational) and extract mode (warn-only, never blocks).
+  - **Multi-AI review caught + fixed 7 bugs**: settled_cost ≥ 0 (free/cached generations valid — was rejecting 0 as nodata), defensive `isinstance(extraction, dict)` wrap before mutation in BOTH extractors (would've crashed batch mid-run on parser refactor), soft-warn on insufficient credit (was hard `raise`, blocked users with cache discounts), stale `_partial.json` cleanup, structured credits errors, `or_generation_lookup_status: "hit"|"miss"|"skipped_no_id"` surfaced, batch summary splits `cost_succeeded_usd` vs `cost_failed_usd`.
+  - **Multi-AI consultation** produced consensus that `gemini-2.5-flash` direct dissolves 4 problems at once (audio loss + payload bomb + cost-estimate accuracy + context window) — recommended workflow shift away from `qwen/qwen3.6-plus`. Identified `gh`-not-auth'd-credit-pre-flight blocking risk that Codex+Gemini both flagged.
+  - **Pipeline architecture clarified**: Documented synth NODE vs `/course-synth` SKILL difference. Production path = extract → SKILL (5-stage stateful with golden-sample voice calibration + 4-critic adversarial QA). Node is one-shot dump-all-into-prompt — useful as smoke test or model A/B only.
+- **Decisions:** D-048 (partial-on-failure cache pattern + schema versioning), D-049 (auto-token formula 280 tok/min × 1.25 safety margin), D-050 (OR `/generation/{id}` is cost ground truth, settled `total_cost >= 0` valid), D-051 (credit pre-flight is warn-only, never raises — caching makes pre-estimates unreliable), D-052 (extract→SKILL is course production path, synth NODE is smoke test only).
+- **Blockers:** All shipped code is syntax-verified, NOT runtime-tested. ComfyUI restart needed. Two PRs from yesterday still pending web open.
+- **Next:** Restart ComfyUI → run dry-run on 36-video corpus (verify per-video `out_max=` + OR balance + max_tokens_mode summary). Then 2-video Flash vs Pro calibration (~$0.50). Then commit full batch with chosen model. Defer schema-migration policy + `segments[]` deep validation + concurrency to next round.
 
 ### 2026-04-17 — OpenRouter slug alignment, SAM3 auto-detect refactor, WAN VAE streaming API-drift fix [coding + refactor]
 - **Done:**
@@ -25,16 +38,6 @@
 - **Decisions:** D-044 (OR slug alignment), D-045 (ComfyUI widget hide pattern — superseded by D-047), D-046 (streaming VAE must mirror native chunk pattern exactly — API drift surface), D-047 (SAM3 auto-detect mode inference — supersedes D-045 for this node).
 - **Blockers:** `gh` unauthenticated → PRs via web. Runtime test of streaming VAE fix pending restart.
 - **Next:** Restart ComfyUI server + hard-refresh browser. Delete/recreate SAM3VideoSegmentation node. Runtime test VacePrePassReference (40-frame encode). Open two pending PRs. Return to K runtime test + H Phase 1.
-
-### 2026-04-15c — Gemini Extractor gains OpenRouter mode + auto media optimization + expanded VLM catalog [coding]
-- **Done:**
-  - Multi-AI reviewed (Codex + Gemini) design for adding OpenRouter to NV_GeminiVideoExtractor / NV_GeminiBatchExtractor. Both critiques converged: base64-only insufficient (Cloudflare 100MB POST cap), reduce FPS not bitrate for screen recordings, need optimize knob, cache not next to source, pin Vertex via provider.order.
-  - Implemented full OR path: model dispatch on provider/ prefix, auto ffmpeg optimization (1fps / GOP=1 / CRF 26 / ≤1080p / 80kbps AAC — tuned for screen-recording tutorials + voiceover), optimize=auto|always|never knob, optional video_url input, json_schema→json_object fallback, 300s read timeout, 15s→30s jittered retries, provider routing (Vertex pinned for google/*, require_parameters, data_collection="deny").
-  - Built `_OR_PRICING` dict from live OpenRouter API query (35 video-capable models found). Expanded dropdown to 13 OR routes across 3 tiers: Gemini Vertex (audio-aware), Qwen VL (cheap, no audio), alternatives (Bytedance Seed, GLM 4.6v, Nova 2 Lite). Fixed dry-run cost estimation: separate pricing paths for direct-Gemini (AI Studio rates) vs OR (Vertex rates).
-  - Added audio-drop warning for all non-Gemini video prefixes. Cache to ComfyUI/temp/nv_video_cache/ with md5(path+mtime+profile).
-- **Decisions:** None new — design agreed in conversation and implemented directly.
-- **Blockers:** None — syntax verified. Awaiting runtime test with real video + API keys.
-- **Next:** Runtime test on the 36-video VFX tutorial corpus (80,700s, Chinese-language screen recordings + voiceover). Compare extraction quality across google/gemini-2.5-flash vs gemini-3.1-pro-preview vs direct gemini-2.5-pro. Cost differential analysis.
 
 ## Active Workstreams
 
@@ -50,7 +53,7 @@
 | H  | VACE Chunked Orchestrator | STAGED | 2026-04-15 | Architecture designed (4 multi-AI rounds). Deep mental model established with 600-frame walkthrough. Phase 1 = plan_chunks() math helper first. |
 | I  | Texture Harmonize + Aesthetic Conditioning | ACTIVE | 2026-04-12 | Multi-AI scope audit complete. 5 fixes: default→whole_crop, HB max→0.5 + denoise taper, grain match mode, full_frame DOF warning. Awaiting runtime test. |
 | J  | SAM3 Input Quality (Grade-the-Plate) | ACTIVE | 2026-04-17 | NV_SAM3Preprocess v1 + SAM3VideoSegmentation auto-detect refactor (A') done. Awaiting runtime test. |
-| K  | Gemini Course Extractor / OpenRouter | ACTIVE | 2026-04-17 | Slug-aligned across 3 repos + shipped OR mode. Awaiting 36-video runtime test. |
+| K  | Gemini Course Extractor / OpenRouter | ACTIVE | 2026-04-18 | Phase 2 (length-safe + partial cache) + auto-token scaling (280 tok/min) + OR audit endpoints (/generation, /credits) shipped. Multi-AI reviewed, 7 bugs fixed. Syntax verified, awaiting dry-run. |
 
 ### Status Tags
 - **ACTIVE** — Currently being worked on
@@ -94,6 +97,12 @@
 - OpenRouter does NOT publish `google/gemini-3-pro-preview` — use `google/gemini-3.1-pro-preview`, `google/gemini-3-flash-preview`, or `google/gemini-3.1-flash-lite-preview`. Authoritative list: `src/KNF_Utils/prompt_refiner.py:455-457`.
 - ComfyUI dynamic widget hide/show is a serialization hazard. If a node needs mode-dependent inputs, prefer **input-presence auto-detection** (Option A' pattern in SAM3VideoSegmentation) over JS hide/show. Splicing `node.widgets` corrupts `widgets_values` on reload; even the correct type-swap pattern accumulates risk.
 - WAN VAE `Encoder3d` / `Decoder3d` API changed (2026-04-ish core): encoder uses 2-frame chunks with `final=` flag and may return None for intermediate chunks; decoder now returns a list of output chunks (not a tensor); `count_cache_layers()` replaces `count_conv3d()` for feat_map sizing. Any streaming/chunked VAE helper must mirror native `_encode` / `_decode` exactly or break silently. See `streaming_vace_to_video.py` for the canonical helper.
+- OR `/api/v1/generation/{id}` is eventually-consistent (1-3s lag) — must poll with exponential backoff. Audit lookup must be best-effort, NEVER block extraction success. Returns `or_generation_lookup_status: "hit"|"miss"|"skipped_no_id"` for diagnostics.
+- OR settled `total_cost == 0` is VALID (cached/free generation). Gate with `>= 0`, NOT `> 0`. Otherwise legitimate free calls keep stale inline estimates and cost accounting drifts upward.
+- `_parse_extraction_json` returns dict today, but ANY mutation of `extraction[…]` MUST be guarded by `isinstance(extraction, dict)` first. A future refactor returning a string/list crashes the entire batch mid-loop with `TypeError`. Pattern: wrap non-dict in `{"raw_output": extraction, "parse_error": "…"}` before mutating.
+- Schema/prompt changes to `_EXTRACTION_PROMPT` or `_EXTRACTION_SCHEMA` MUST bump `_EXTRACTION_SCHEMA_VERSION`. Otherwise cached extractions silently shadow the new shape and downstream consumers receive stale-shape data.
+- OR credit pre-flight is informational only — NEVER hard-raise on insufficient balance. Prompt caching + upstream discounts make pre-estimates unreliable; OR's 402 on the actual call is the real failure signal. Pattern: warn loudly + proceed.
+- Truncated/malformed extractions MUST go to `<video>_partial.json` (not main `<video>.json`) so the next run retries instead of returning broken cached data. Clean up stale partials on later success.
 
 ## Project Decisions Index
 <!-- Numbered decisions with lifecycle status. Never renumber IDs. -->
@@ -147,6 +156,12 @@
 | D-045 | 2026-04-17 | SUPERSEDED → D-047 | tooling | → ARCHIVE.md |
 | D-046 | 2026-04-17 | ACTIVE | tooling | Streaming WAN VAE helpers must mirror native `_encode`/`_decode` exactly: 2-frame chunks, `final=(i==iter_-1)` flag, None-skip for intermediate encoder chunks, list-of-tensors for decoder output, `count_cache_layers()` for feat_map. API drifts silently — test after every ComfyUI core pull. |
 | D-047 | 2026-04-17 | ACTIVE | J,tooling | SAM3VideoSegmentation uses input-presence auto-detection instead of a `prompt_mode` dropdown. Mutual exclusion of text+points raises ValueError. Supersedes D-045 (widget-hide patch) — structural fix over JS patch. Debated with multi-AI (Codex+Gemini converged on A'). |
+| D-048 | 2026-04-18 | ACTIVE | K | Partial-on-failure cache pattern. Truncated/malformed extractions write to `<video>_partial.json` (sibling), NEVER to main `<video>.json`. Schema_version cache-invalidates on `_EXTRACTION_SCHEMA_VERSION` bumps. Stale partials cleaned on later success. |
+| D-048a | 2026-04-18 | ACTIVE | K | Defensive `isinstance(extraction, dict)` wrap before mutating `extraction[_source]` — `_parse_extraction_json` returns dict today, but a refactor returning non-dict would crash the whole batch mid-run. Caught in multi-AI review. |
+| D-049 | 2026-04-18 | ACTIVE | K | Auto-token formula: `int((1024 + duration_min × 280) × 1.25)` clamped to `[floor, 65536]`. Empirical 280 tok/min for curriculum schema (1 segment per 1-2 min × 6-8 fields × ~30 tok/field + 25% safety margin). 90-min video budgets ~33K tokens. |
+| D-050 | 2026-04-18 | ACTIVE | K | OR `/api/v1/generation/{id}` post-call lookup is cost ground truth. Settled `total_cost >= 0` (including 0 for cached/free) overrides inline `usage.cost`. Inline preserved as `inline_cost_usd` for comparison. Best-effort polling 1.5→12s exponential backoff. |
+| D-051 | 2026-04-18 | ACTIVE | K | OR credit pre-flight is warn-only, NEVER raises. Prompt caching + upstream discounts make pre-estimates unreliable; OR 402 on the actual call is the real signal. `_or_check_credits()` returns structured `{ok, kind, status_code, detail}` distinguishing 401/403/500/timeout. |
+| D-052 | 2026-04-18 | ACTIVE | K,course | Course pipeline production path = extract (Comfy node) → folder of JSONs → `/course-synth` skill (5-stage stateful with golden-sample voice calibration + 4-critic adversarial QA). Synth NODE is one-shot smoke test only — useful for coherence check + model A/B, not deliverable production. |
 
 ### Decision Statuses
 - **ACTIVE** — Currently in effect
@@ -424,13 +439,22 @@
   Next: Runtime test NV_SAM3Preprocess pipeline end-to-end with fixed SAM3VideoSegmentation.
 
 ### K. Gemini Course Extractor / OpenRouter
-**Current state:** ACTIVE — implemented, syntax verified, awaiting runtime test
-**Goal:** Multi-provider video extraction for tutorial course analysis — OpenRouter escape valve for Gemini rate limits, expanded model catalog for cost/quality comparison
-**Key files:** `src/KNF_Utils/gemini_video_course.py`, `src/KNF_Utils/api_keys.py`
-**Active constraints:** Non-Gemini models likely drop audio (voiceover not captured). OR video = base64 inline (Cloudflare gateway caps). Auto-optimize transcodes to 1fps which loses fast cursor/scroll motion — acceptable for screen recordings, not for action footage.
+**Current state:** ACTIVE — Phase 2 + auto-token + OR endpoints all shipped, multi-AI reviewed (7 bugs caught and fixed), syntax verified, awaiting dry-run on 36-video corpus
+**Goal:** Multi-provider video extraction for tutorial course analysis — OpenRouter escape valve for Gemini rate limits, expanded model catalog for cost/quality comparison, length-safe + audit-rich
+**Key files:** `src/KNF_Utils/gemini_video_course.py` (~2300 lines), `src/KNF_Utils/api_keys.py`
+**Active constraints:** Non-Gemini models drop audio (D-052 → use Gemini routes for Chinese voiceover). OR video = base64 inline (~200MB+ for 90-min videos at 1fps could trigger 413 — flagged by reviewers but not yet hit). Auto-optimize transcodes to 1fps. Length-safe via `_check_extraction_health()` + partial-on-failure cache. Schema-version cache invalidation. OR settled cost is ground truth via `/generation/{id}`. Credit pre-flight warn-only.
+
+**Architecture (production):**
+- Two extractors: single-video `NV_GeminiVideoExtractor` + batch `NV_GeminiBatchExtractor`
+- Two transports: direct Gemini Files API (upload→poll→generate→delete) OR OpenRouter (optional ffmpeg transcode → base64 inline → /generation lookup)
+- Per-video output budget scales with duration via `_scale_max_tokens_by_duration()` (default `auto_by_duration` mode, `manual` legacy fallback)
+- Cache validated by model + media_resolution + video_path + schema_version; broken extractions go to `_partial.json` not main path
+- `_source` block records: schema_version, max_tokens_mode/effective, parse_status, finish_reason, OR provider/native tokens/cache discount/timing/settled cost
 
 **Milestones:**
 - 2026-04-15 — OR mode + auto media optimization + 13-model catalog shipped. Multi-AI reviewed.
+- 2026-04-17 — Slug alignment across 3 repos (D-044).
+- 2026-04-18 — Phase 2 length safety (D-048, D-048a) + auto-token scaling (D-049) + OR audit endpoints (D-050, D-051) + course pipeline workflow clarified (D-052). Multi-AI review caught 7 bugs all fixed in same session.
 
 **History:**
 - **2026-04-15 | coding**
@@ -441,6 +465,10 @@
   Outcome: Fixed invalid `google/gemini-3-pro-preview` slug. Aligned with authoritative prompt_refiner.py list across 3 repos. Cross-repo: AVM gained OpenRouter provider.
   Decision: Canonical slug list enforced across repos (D-044).
   Next: Runtime test on 36-video VFX corpus unchanged.
+- **2026-04-18 | coding + refactor**
+  Outcome: Three layered hardening passes — Phase 2 length safety (`_check_extraction_health()`, schema_version cache, partial-on-failure caching, `finish_reason` capture across both transports), auto-token scaling (~280 tok/min × 1.25 safety margin, `max_tokens_mode` dropdown, per-video `out_max=` in dry-run), OR audit endpoints (`/generation/{id}` for settled cost + provider attribution + native tokens, `/credits` warn-only pre-flight). Multi-AI review caught 7 bugs all fixed in same session: settled_cost ≥ 0 (free generations valid), defensive `isinstance(dict)` before mutation, soft-warn vs hard-raise on credit shortfall, stale partial cleanup, structured credits errors, `or_generation_lookup_status` surfaced, batch summary splits succeeded/failed cost.
+  Decision: Partial-on-failure cache (D-048), defensive isinstance wrap (D-048a), 280-tok/min auto-token formula (D-049), settled `total_cost >= 0` overrides inline (D-050), credit pre-flight is warn-only (D-051), course production path = extract→SKILL not extract→synth-node (D-052).
+  Next: ComfyUI restart + dry-run on 36-video corpus. Then 2-video Flash vs Pro calibration (~$0.50). Then commit full batch with chosen model.
 
 ## Global Timeline
 <!-- Thin chronological index of project-wide events. NOT per-workstream progress. -->
@@ -461,6 +489,7 @@
 - **2026-04-15:** NV_GeminiVideoExtractor / NV_GeminiBatchExtractor gain OpenRouter mode with auto media optimization (1fps/CRF26 ffmpeg, tuned for screen-recording tutorials). 13 OR video-capable model routes added with live pricing. New workstream K: Gemini Course Extractor / OpenRouter.
 - **2026-04-15:** Orchestrator (workstream H) deep mental model established — 600-frame fight video walkthrough documents chunk planning, two-rails-for-tail-continuity intuition, three-prepend systems. Excalidraw visual tracking infrastructure shipped to `node_notes/diagrams/` (D-042). VACE_INPAINT_NODE_AUDIT.md gap analysis: 5 missing sections flagged. Phase 1 design principle locked: math-first before sampler integration (D-043).
 - **2026-04-17:** Triple-repo cross-cutting day. (1) Slug alignment across gemini_video_course.py + nodes.py + AVM vlm_sam3_bridge.py (D-044). (2) AVM OpenRouter provider feature branch pushed. (3) SAM3VideoSegmentation widget bug solved structurally via Option A' — prompt_mode dropdown removed, input-presence auto-detection (D-047, supersedes D-045). (4) WAN VAE streaming helpers rewritten against current core API — encoder 2-frame chunks with `final=` flag, decoder list-of-chunks return (D-046). Unblocks VacePrePassReference and all other streaming-VAE callers.
+- **2026-04-18:** NV_GeminiBatchExtractor production hardening. Three layered passes shipped + multi-AI reviewed in one session: (1) Phase 2 length safety + observability (`_check_extraction_health()`, schema_version cache invalidation, partial-on-failure caching to `_partial.json`, `finish_reason` normalized across Gemini direct + OR — D-048/048a). (2) Auto-token scaling (`_scale_max_tokens_by_duration()` formula 280 tok/min × 1.25, new `max_tokens_mode` dropdown, per-video `out_max=` in dry-run preview — D-049). (3) OR audit endpoints (`/api/v1/generation/{id}` post-call lookup with exponential backoff for settled cost + provider attribution + native tokens, `/api/v1/credits` warn-only pre-flight — D-050/051). Multi-AI review caught 7 critical bugs all fixed (settled_cost ≥ 0 vs > 0, defensive isinstance(dict) before mutation, soft-warn vs hard-raise on credit shortfall, stale partial cleanup, structured credits errors, lookup status surfaced, succeeded/failed cost split). Course pipeline workflow clarified (D-052): extract→SKILL is production, synth NODE is smoke test only.
 
 ## Archived Workstreams Index
 <!-- Pointers to workstreams moved to ARCHIVE.md. -->
