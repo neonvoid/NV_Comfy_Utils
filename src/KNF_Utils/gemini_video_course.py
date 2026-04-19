@@ -930,6 +930,80 @@ def _is_openrouter_model(model):
     return "/" in model
 
 
+_YOUTUBE_ID_RE = re.compile(r"[A-Za-z0-9_-]{11}")
+
+
+def _extract_youtube_video_id(url):
+    """Pull the canonical 11-char YouTube video ID from any supported URL form.
+
+    Returns the ID string (case-preserved!) or None. Used by both `_is_youtube_url`
+    and `_canonicalize_youtube_url` so detection and canonicalization stay aligned.
+
+    YouTube IDs are case-sensitive (`dQw4w9WgXcQ` ≠ `dqw4w9wgxcq`) — never lowercase.
+    """
+    if not isinstance(url, str):
+        return None
+    s = url.strip()
+    if not s:
+        return None
+    # Lowercase a SEPARATE COPY only for host detection — never touch the original
+    # for ID extraction.
+    host_lc = s.lower()
+    youtube_hosts = (
+        "https://www.youtube.com/", "https://youtube.com/", "https://m.youtube.com/",
+        "http://www.youtube.com/", "http://youtube.com/",
+        "https://youtu.be/", "http://youtu.be/",
+    )
+    if not host_lc.startswith(youtube_hosts):
+        return None
+    # /watch?v=<ID>  — also handles &v= and v= as second param. Accept even with &list=
+    # (per multi-AI review: a watch URL with v= is a single video regardless of list= context).
+    m = re.search(r"[?&]v=([A-Za-z0-9_-]{11})", s)
+    if m:
+        return m.group(1)
+    # youtu.be/<ID>
+    m = re.search(r"youtu\.be/([A-Za-z0-9_-]{11})", s, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    # /shorts/<ID> or /live/<ID>
+    m = re.search(r"/(?:shorts|live)/([A-Za-z0-9_-]{11})", s, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _is_youtube_url(url):
+    """Detect YouTube URLs that Gemini's direct API can ingest natively as `file_data`.
+
+    Gemini fetches public YouTube videos server-side at NO INPUT TOKEN COST (preview
+    feature as of 2026-04). You only pay output tokens. Caveats:
+      - Public videos only (not private, not unlisted)
+      - 8h/day cap on free tier; no length cap on paid tier
+      - Up to 10 videos per request on Gemini 2.5+
+      - Pricing/limits "likely to change" per Google docs
+      - Direct Gemini API only — OpenRouter cannot pass this primitive through
+
+    Matches when a valid 11-char video ID can be extracted. Pure playlist URLs (no v=)
+    and channel URLs (no ID) correctly fail. Returns bool only — never mutates `url`.
+    """
+    return _extract_youtube_video_id(url) is not None
+
+
+def _canonicalize_youtube_url(url):
+    """Strip tracking/playlist params; return canonical https://www.youtube.com/watch?v=<ID>.
+
+    Used as the cache identity key AND as the URL sent to Gemini's API — ensures that
+    `youtu.be/ID`, `youtu.be/ID?si=tracking`, `m.youtube.com/watch?v=ID&list=PL...`,
+    `youtube.com/shorts/ID`, etc. all dedupe to one cache entry per unique video.
+
+    Returns the canonical URL or None if no ID could be extracted.
+    """
+    vid = _extract_youtube_video_id(url)
+    if not vid:
+        return None
+    return f"https://www.youtube.com/watch?v={vid}"
+
+
 # ---------------------------------------------------------------------------
 # Helpers: OpenRouter video path — cache dir, optimization, schema conversion
 # ---------------------------------------------------------------------------
@@ -1571,8 +1645,13 @@ class NV_GeminiVideoExtractor:
                 }),
                 "video_url": ("STRING", {
                     "default": "",
-                    "tooltip": "Optional public URL to the video (OpenRouter path only). If set, bypasses base64 encoding entirely. "
-                               "For google/gemini-* this must be a YouTube URL if OpenRouter routes to AI Studio. "
+                    "tooltip": "Optional video URL — bypasses local file upload. Two paths:\n"
+                               "(1) DIRECT GEMINI + PUBLIC YOUTUBE URL (RECOMMENDED — FREE INPUT TOKENS): "
+                               "use a bare 'gemini-*' model + a youtube.com / youtu.be / shorts / live URL. "
+                               "Gemini fetches server-side at NO input token cost (preview, output tokens only). "
+                               "Public videos only. 8h/day free tier cap; no length cap on paid tier. "
+                               "(2) OPENROUTER + ANY URL: use a 'provider/model' entry + any public CDN URL. "
+                               "OR fetches and base64-inlines (full input cost, may hit 64MB ceiling). "
                                "Leave empty to use video_path instead.",
                 }),
                 "skip_existing": ("BOOLEAN", {
@@ -1636,13 +1715,46 @@ class NV_GeminiVideoExtractor:
 
         video_url = (video_url or "").strip()
         video_path = (video_path or "").strip()
+        is_youtube = _is_youtube_url(video_url)
 
-        # Validate inputs — URL path requires OpenRouter and no file
+        # Validate inputs — three valid paths:
+        #  1. OR + video_url (any URL EXCEPT YouTube): OR fetches and base64-inlines
+        #  2. Direct Gemini + YouTube URL: Gemini fetches server-side, FREE input tokens
+        #  3. Direct Gemini OR OR + video_path: local file via Files API or base64
         if video_url:
-            if not use_openrouter:
-                raise RuntimeError("video_url is only supported on the OpenRouter path. Pick a 'provider/model' entry.")
-            video_name = Path(video_url).stem or "url_video"
-            mime = "video/mp4"  # best-guess; OpenRouter infers from URL
+            if is_youtube and use_openrouter:
+                # OR's `video_url` mode does an HTTP GET on the URL — for a YouTube
+                # URL that returns the watch-page HTML, not video bytes. The upstream
+                # call would fail confusingly. Force the user to pick the right path.
+                raise RuntimeError(
+                    "OpenRouter cannot ingest YouTube URLs natively (it would fetch the watch-page "
+                    "HTML, not video bytes). YouTube ingestion is a Gemini-direct API primitive only. "
+                    "Switch the model dropdown to a bare 'gemini-*' entry (e.g., 'gemini-2.5-pro' or "
+                    "'gemini-2.5-flash') to use the free YouTube URL path."
+                )
+            if use_openrouter:
+                # OR path accepts any non-YouTube video URL (CDN, S3, etc.)
+                video_name = Path(video_url).stem or "url_video"
+                mime = "video/mp4"  # best-guess; OR infers from URL
+            elif is_youtube:
+                # Direct Gemini YouTube primitive — `file_data.file_uri = canonical_url`.
+                # No upload, no Files API, no input token cost (preview, free).
+                # Canonicalize: strip tracking params (?si, ?t, &list, etc.) so cache
+                # identity is keyed on video ID, not request-specific URL noise.
+                canonical_url = _canonicalize_youtube_url(video_url)
+                if not canonical_url:
+                    raise RuntimeError(f"Could not extract YouTube video ID from URL: {video_url}")
+                video_url = canonical_url  # use canonical form for both API + cache
+                video_name = self._youtube_video_name(video_url)
+                mime = None  # FileData.mimeType is optional and `video/*` is not a clean
+                             # contractual guarantee per Gemini docs — official REST YouTube
+                             # example omits it entirely. None → don't send the field.
+            else:
+                raise RuntimeError(
+                    "video_url with a direct-Gemini model only supports public YouTube URLs "
+                    "(youtube.com/watch, youtu.be, shorts, live). For other URLs use an "
+                    "OpenRouter 'provider/model' entry. For local files use video_path."
+                )
         else:
             if not video_path:
                 raise RuntimeError("video_path is empty (and no video_url provided)")
@@ -1705,15 +1817,21 @@ class NV_GeminiVideoExtractor:
 
         # Resolve effective output token budget. auto_by_duration probes the local file
         # (URL inputs fall back to the manual floor since we can't probe remotely).
+        # YouTube URLs: duration unknown, so we raise the floor to a safe-for-long-videos
+        # value (24K ≈ ~80min equivalent budget). Output tokens cost normally even when
+        # YouTube input is free, but under-budgeting on a long YT video silently truncates.
         effective_max_tokens = max_tokens
         scaling_note = "manual"
         if max_tokens_mode == "auto_by_duration":
             duration_s = _get_video_duration(video_path) if video_path else None
+            youtube_safe_floor = max(max_tokens, 24000) if is_youtube else max_tokens
             effective_max_tokens = _scale_max_tokens_by_duration(
-                duration_s, manual_floor=max_tokens
+                duration_s, manual_floor=youtube_safe_floor
             )
             if duration_s:
                 scaling_note = f"auto_by_duration ({_format_duration(duration_s)} → {effective_max_tokens})"
+            elif is_youtube:
+                scaling_note = f"auto_by_duration (youtube, duration unknown → safe floor {effective_max_tokens})"
             else:
                 scaling_note = f"auto_by_duration (no duration → floor {max_tokens})"
 
@@ -1736,7 +1854,8 @@ class NV_GeminiVideoExtractor:
             )
         else:
             extraction, usage_meta, extra_source = self._extract_via_gemini(
-                video_path=video_path,
+                video_path=video_path if not is_youtube else None,
+                youtube_url=video_url if is_youtube else None,
                 video_name=video_name,
                 mime=mime,
                 model=model,
@@ -1758,6 +1877,12 @@ class NV_GeminiVideoExtractor:
         parse_status, forensics = _check_extraction_health(extraction, usage_meta)
 
         # Source metadata for traceability + forensics
+        if use_openrouter:
+            transport = "openrouter"
+        elif is_youtube:
+            transport = "gemini_youtube_url"
+        else:
+            transport = "gemini_files_api"
         source = {
             "video_file": video_name,
             "model": model,
@@ -1770,7 +1895,7 @@ class NV_GeminiVideoExtractor:
             "response_tokens": usage_meta.get("response_tokens"),
             "estimated_cost_usd": usage_meta.get("estimated_cost_usd"),
             "response_time_s": usage_meta.get("response_time_s"),
-            "transport": "openrouter" if use_openrouter else "gemini_files_api",
+            "transport": transport,
             "parse_status": parse_status,
         }
         source.update(forensics)
@@ -1818,9 +1943,76 @@ class NV_GeminiVideoExtractor:
 
     # -- Transport branches ---------------------------------------------------
 
+    @staticmethod
+    def _youtube_video_name(url):
+        """Extract a stable filename-safe identifier from a YouTube URL for cache keys.
+
+        Delegates to module-level `_extract_youtube_video_id` so detection,
+        canonicalization, and naming all agree. Falls back to a SHA-256 hash of the URL
+        only if no ID can be parsed (rare — would mean the URL passed `_is_youtube_url`
+        but doesn't match any ID pattern, which shouldn't happen).
+        """
+        vid = _extract_youtube_video_id(url)
+        if vid:
+            return f"youtube_{vid}"
+        # Defensive fallback — wider hash to minimize collision risk
+        import hashlib
+        return f"youtube_{hashlib.sha256(url.encode('utf-8')).hexdigest()[:16]}"
+
     def _extract_via_gemini(self, video_path, video_name, mime, model, api_key,
-                             prompt, max_tokens, media_resolution):
-        """Direct Gemini Files API path — unchanged from original behavior."""
+                             prompt, max_tokens, media_resolution, youtube_url=None):
+        """Direct Gemini path — Files API for local files, native YouTube primitive for YT URLs.
+
+        YouTube URL path (when youtube_url is set): pass `file_data.file_uri = youtube_url`
+        directly. Google fetches server-side. NO Files API upload, NO input token cost
+        (preview, free as of 2026-04). Caveats documented in `_is_youtube_url()` docstring.
+        """
+        # YouTube URL fast path — skip upload, poll, delete entirely
+        if youtube_url:
+            print(f"[NV_GeminiVideoExtractor] Using direct YouTube URL primitive (no upload, free input tokens)")
+            print(f"  URL: {youtube_url}")
+            # Per Gemini docs FileData.mimeType is optional; the official REST example for
+            # YouTube URLs omits it entirely. Send only when explicitly provided (None → omit).
+            file_data = {"file_uri": youtube_url}
+            if mime:
+                file_data["mime_type"] = mime
+            contents = [
+                {"file_data": file_data},
+                {"text": prompt},
+            ]
+            try:
+                raw_response, usage_meta = _generate_content(
+                    api_key=api_key, model=model, contents=contents,
+                    temperature=1.0, max_tokens=max_tokens,
+                    json_mode=True, response_schema=_EXTRACTION_SCHEMA,
+                    media_resolution=media_resolution,
+                )
+            except RuntimeError as e:
+                # Map common Gemini error codes to YouTube-specific guidance. The
+                # underlying _generate_content raises with the status code in the message.
+                msg = str(e)
+                if "400" in msg:
+                    raise RuntimeError(
+                        f"Gemini rejected YouTube URL ({youtube_url}). Common causes: "
+                        f"video is private/unlisted/age-gated/region-locked, or scheduled/upcoming. "
+                        f"YouTube URL ingestion requires PUBLIC videos only. Original error: {msg}"
+                    ) from e
+                if "404" in msg:
+                    raise RuntimeError(
+                        f"Gemini could not find the YouTube video ({youtube_url}). The video may be "
+                        f"deleted, private, or the URL may be malformed. Original error: {msg}"
+                    ) from e
+                if "429" in msg:
+                    raise RuntimeError(
+                        f"Gemini rate limit hit. On free tier, YouTube ingestion is capped at 8h/day. "
+                        f"Wait or upgrade to a paid tier. Original error: {msg}"
+                    ) from e
+                raise
+            extraction = _parse_extraction_json(raw_response)
+            return (extraction, usage_meta, {"transport_detail": "gemini_youtube_url",
+                                             "youtube_url": youtube_url})
+
+        # Local-file path — Files API upload + poll + delete
         file_info = _upload_file(video_path, api_key, display_name=video_name)
         file_name = file_info.get("name", "")
         file_uri = file_info.get("uri", "")
@@ -1841,7 +2033,7 @@ class NV_GeminiVideoExtractor:
                 media_resolution=media_resolution,
             )
             extraction = _parse_extraction_json(raw_response)
-            return (extraction, usage_meta, {})
+            return (extraction, usage_meta, {"transport_detail": "gemini_files_api"})
         finally:
             if file_name:
                 _delete_file(file_name, api_key)
