@@ -1,149 +1,112 @@
 import { app } from "../../scripts/app.js";
 
-// Clone With Connections — Alt+Shift+Drag to clone a node while preserving input connections.
-// Normal Alt+Drag behavior is unchanged (clone without connections).
+// Clone With Connections — Shift+Alt+Drag to clone a node while preserving external input
+// connections. Normal Alt+Drag behavior (clone without connections) is unchanged.
 //
-// How it works:
-//   The ComfyUI Vue frontend handles Alt+Drag cloning via LGraphCanvas.cloneNodes() →
-//   _deserializeItems() → graph.add(). We use a capture-phase pointerdown listener to
-//   detect Alt+Shift, capture the original node's input connections, then temporarily
-//   hook graph.add so that when the clone is added, we re-establish those connections.
+// Strategy: patch LGraphCanvas.prototype._deserializeItems, the chokepoint BOTH clone paths
+// go through (classic canvas Alt-drag AND Vue-mode cloneNodes). When shift is held, we
+// enable the native `connectInputs` option and its gating setting, which tells the
+// deserializer to fall back to graph.getNodeById() for origin_ids that weren't in the
+// cloned selection. No manual connect() calls needed — we reuse native infrastructure,
+// which means the restored connections live inside the same beforeChange/afterChange
+// undo unit as the clone itself (single Ctrl+Z fully undoes).
 
 const LOG_PREFIX = "[CloneWithConnections]";
 
-// Look up a link object, handling both Map (_links) and plain-object (links) access
-function getLink(graph, linkId) {
-    if (graph._links && typeof graph._links.get === "function") {
-        return graph._links.get(linkId);
-    }
-    if (graph.links) {
-        return graph.links[linkId];
-    }
-    return null;
-}
+// Track shift independently — event.shiftKey isn't reliable on every event source,
+// and menu-triggered clones have no keyboard event at all.
+let shiftHeld = false;
+document.addEventListener("keydown", (e) => { if (e.key === "Shift") shiftHeld = true; }, true);
+document.addEventListener("keyup", (e) => { if (e.key === "Shift") shiftHeld = false; }, true);
+window.addEventListener("blur", () => { shiftHeld = false; });
+// Resync on every pointerdown — focused inputs can swallow keyup and leave shiftHeld stuck.
+document.addEventListener("pointerdown", (e) => { shiftHeld = e.shiftKey; }, true);
 
-// Capture input connections from a node: [{slot, origin_id, origin_slot}, ...]
-function captureInputConnections(node, graph) {
-    const connections = [];
-    if (!node.inputs) return connections;
+let firstCallLogged = false;
 
-    for (let i = 0; i < node.inputs.length; i++) {
-        const input = node.inputs[i];
-        if (input.link != null) {
-            const link = getLink(graph, input.link);
-            if (link) {
-                connections.push({
-                    slot: i,
-                    origin_id: link.origin_id,
-                    origin_slot: link.origin_slot,
-                });
+function patchDeserializeItems(LGC) {
+    if (!LGC?.prototype || typeof LGC.prototype._deserializeItems !== "function") return false;
+    if (LGC.prototype.__nvCloneWithConnectionsPatched) return true;
+
+    const orig = LGC.prototype._deserializeItems;
+    const Lite = window.LiteGraph || window.Lite || null;
+
+    LGC.prototype._deserializeItems = function (data, opts = {}) {
+        if (!firstCallLogged) {
+            firstCallLogged = true;
+            console.warn(LOG_PREFIX, `_deserializeItems intercepted (first call). shiftHeld=${shiftHeld}`);
+        }
+        if (!shiftHeld) return orig.call(this, data, opts);
+
+        // Native gating: the deserializer only falls back to external node lookup when
+        // BOTH connectInputs is true AND the setting is enabled. Force both, restore after.
+        const prevSetting = Lite?.ctrl_shift_v_paste_connect_unselected_outputs;
+        if (Lite) Lite.ctrl_shift_v_paste_connect_unselected_outputs = true;
+        try {
+            const result = orig.call(this, data, { ...opts, connectInputs: true });
+            const created = result?.created?.length ?? 0;
+            if (created > 0) console.warn(LOG_PREFIX, `Shift-clone: restored external inputs for ${created} item(s)`);
+            return result;
+        } finally {
+            if (Lite && prevSetting !== undefined) {
+                Lite.ctrl_shift_v_paste_connect_unselected_outputs = prevSetting;
             }
         }
-    }
-    return connections;
+    };
+
+    LGC.prototype.__nvCloneWithConnectionsPatched = true;
+    return true;
 }
 
-// Re-establish input connections on a cloned node
-function restoreInputConnections(clone, connections, graph) {
-    let restored = 0;
-    for (const conn of connections) {
-        const sourceNode = graph.getNodeById(conn.origin_id);
-        if (sourceNode) {
-            try {
-                sourceNode.connect(conn.origin_slot, clone, conn.slot);
-                restored++;
-            } catch (err) {
-                console.warn(LOG_PREFIX, "Failed to connect slot", conn.slot, err);
-            }
-        } else {
-            console.warn(LOG_PREFIX, "Source node not found:", conn.origin_id);
-        }
-    }
-    console.log(LOG_PREFIX, `Restored ${restored}/${connections.length} input connections`);
-}
-
-// Convert pointer event to canvas-space coordinates
-function eventToCanvasPos(e, canvas) {
-    // Method 1: Use graph_mouse (set by processMouseMove, very close to click position)
-    if (canvas.graph_mouse) {
-        return canvas.graph_mouse;
-    }
-    // Method 2: Manual conversion via DragAndScale
-    const ds = canvas.ds;
-    const canvasEl = canvas.canvas;
-    if (ds && canvasEl) {
-        const rect = canvasEl.getBoundingClientRect();
-        const x = (e.clientX - rect.left - ds.offset[0]) / ds.scale;
-        const y = (e.clientY - rect.top - ds.offset[1]) / ds.scale;
-        return [x, y];
-    }
-    return null;
+function resolveLGraphCanvas() {
+    return (
+        app.canvas?.constructor ||
+        window.LGraphCanvas ||
+        window.LiteGraph?.LGraphCanvas ||
+        null
+    );
 }
 
 app.registerExtension({
     name: "NV_Comfy_Utils.CloneWithConnections",
 
     setup() {
-        // Track shift key state independently (pointerdown event doesn't always
-        // reflect shiftKey reliably across all browsers/compositors)
-        let shiftHeld = false;
-        document.addEventListener("keydown", (e) => { if (e.key === "Shift") shiftHeld = true; }, true);
-        document.addEventListener("keyup", (e) => { if (e.key === "Shift") shiftHeld = false; }, true);
-        window.addEventListener("blur", () => { shiftHeld = false; });
+        const tryPatch = () => {
+            const LGC = resolveLGraphCanvas();
+            if (patchDeserializeItems(LGC)) {
+                console.warn(LOG_PREFIX, "Shift+Alt+Drag clone-with-connections ready");
+                window.__nvCloneDiag = () => ({
+                    patched: LGC.prototype.__nvCloneWithConnectionsPatched === true,
+                    shiftHeld,
+                    canvasCtorName: app.canvas?.constructor?.name,
+                    liteGraphSettingAvailable: typeof (window.LiteGraph?.ctrl_shift_v_paste_connect_unselected_outputs) !== "undefined",
+                    LGCSource: LGC === app.canvas?.constructor ? "app.canvas.constructor"
+                        : LGC === window.LGraphCanvas ? "window.LGraphCanvas"
+                        : LGC === window.LiteGraph?.LGraphCanvas ? "window.LiteGraph.LGraphCanvas"
+                        : "unknown",
+                });
+                return true;
+            }
+            return false;
+        };
 
-        // Capture-phase pointerdown fires BEFORE the Vue handler that triggers cloneNodes.
-        // We use it to detect Alt+Shift, find the node, and hook graph.add.
-        document.addEventListener("pointerdown", function (e) {
-            if (!e.altKey || !shiftHeld || e.ctrlKey) return;
+        if (tryPatch()) return;
 
-            const canvas = app.canvas;
-            const graph = app.graph;
-            if (!canvas || !graph) return;
-
-            // Find the node under the cursor
-            const pos = eventToCanvasPos(e, canvas);
-            if (!pos) return;
-
-            const node = graph.getNodeOnPos(pos[0], pos[1]);
-            if (!node) return;
-
-            const connections = captureInputConnections(node, graph);
-            if (connections.length === 0) return;
-
-            console.log(
-                LOG_PREFIX,
-                `Captured ${connections.length} input connections from "${node.type}" (id=${node.id})`
-            );
-
-            // Hook graph.add — the clone path (cloneNodes → _deserializeItems) calls
-            // graph.add(node) synchronously for each deserialized node.
-            const origAdd = graph.add;
-            const nodeType = node.type;
-
-            const hookFn = function (newNode, ...args) {
-                const result = origAdd.call(graph, newNode, ...args);
-
-                // Only restore connections if this is actually the clone (matching type)
-                if (newNode.type === nodeType) {
-                    console.log(LOG_PREFIX, "Clone detected, restoring input connections...");
-                    restoreInputConnections(newNode, connections, graph);
-                    graph.setDirtyCanvas(true, true);
+        console.log(LOG_PREFIX, "Canvas not ready, deferring patch...");
+        let tries = 0;
+        const iv = setInterval(() => {
+            tries++;
+            if (tryPatch() || tries > 120) {
+                clearInterval(iv);
+                if (tries > 120) {
+                    console.warn(
+                        LOG_PREFIX,
+                        "Gave up after 2s — LGraphCanvas.prototype._deserializeItems not found.",
+                        "Shift+Alt+Drag clone-with-connections is DISABLED for this session.",
+                        "Likely cause: ComfyUI frontend refactored the deserialize path — check the bundle for the new method name."
+                    );
                 }
-
-                return result;
-            };
-
-            graph.add = hookFn;
-
-            // Clean up after the current event loop tick — all synchronous graph.add
-            // calls from _deserializeItems will have completed by then.
-            setTimeout(() => {
-                if (graph.add === hookFn) {
-                    graph.add = origAdd;
-                }
-            }, 0);
-        }, true); // capture phase — fires before Vue component handlers
-
-        console.log(LOG_PREFIX, "Alt+Shift+Drag clone-with-connections ready");
+            }
+        }, 16);
     },
 });

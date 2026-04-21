@@ -150,6 +150,28 @@ def _format_duration(seconds):
     return f"{m}:{s:02d}"
 
 
+# Windows is the strictest common filesystem: NTFS rejects < > : " / \ | ? * and
+# control chars, and strips trailing spaces + dots. NFC normalize so emoji/CJK
+# survive reliably across Python filesystem APIs.
+_FILENAME_ILLEGAL_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_FILENAME_MAX_STEM_LEN = 120
+
+
+def _sanitize_filename_stem(s, max_len=_FILENAME_MAX_STEM_LEN):
+    """Turn an arbitrary string into a filesystem-safe filename stem.
+
+    Keeps spaces, Unicode (emoji, CJK), punctuation other than Windows-illegal
+    chars. Returns "" if the input is empty or sanitizes to nothing — callers
+    must have a fallback naming scheme for that case.
+    """
+    if not s or not isinstance(s, str):
+        return ""
+    cleaned = _FILENAME_ILLEGAL_CHARS_RE.sub("", s)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    cleaned = cleaned.rstrip(". ")  # Windows silently strips these
+    return cleaned[:max_len]
+
+
 def _scale_max_tokens_by_duration(duration_s, manual_floor=8192, abs_max=65536):
     """Compute output token budget from video duration.
 
@@ -584,11 +606,24 @@ def _generate_content(api_key, model, contents, system_instruction=None,
         mapped = _MEDIA_RES_MAP.get(media_resolution, f"MEDIA_RESOLUTION_{media_resolution.upper()}")
         gen_config["mediaResolution"] = mapped
 
-    # Gemini 3+ thinking config — BUT thinking is incompatible with JSON mode
-    # (responseMimeType + thinkingConfig = 400 error). Only enable for non-JSON requests.
-    use_thinking = is_gemini3 and not json_mode
-    if use_thinking:
-        gen_config["thinkingConfig"] = {"thinkingLevel": "medium"}
+    # Gemini 3+ thinking config. Empirical (2026-04-19): models think by default
+    # even when thinkingConfig is unset, producing thoughtsTokenCount > 0 that
+    # gets billed at output rate. For json_mode extractions thoughts are stripped
+    # from the JSON output anyway — so we minimize thinking to save output cost.
+    #
+    # ThinkingLevel enum note: older preview checkpoints accepted "disabled", but
+    # gemini-3.1-pro-preview (and likely other 3.x minor-revs) reject it as
+    # INVALID_ARGUMENT. "low" is the documented minimum and is accepted across
+    # all Gemini 3.x variants — same cost-saving intent, broader compatibility.
+    if is_gemini3:
+        if json_mode:
+            gen_config["thinkingConfig"] = {"thinkingLevel": "low"}
+            use_thinking = False
+        else:
+            gen_config["thinkingConfig"] = {"thinkingLevel": "medium"}
+            use_thinking = True
+    else:
+        use_thinking = False
 
     payload["generationConfig"] = gen_config
 
@@ -603,9 +638,11 @@ def _generate_content(api_key, model, contents, system_instruction=None,
     api_version = "v1alpha" if use_v1alpha else "v1beta"
     url = f"{_API_BASE}/{api_version}/models/{model}:generateContent?key={api_key}"
 
+    thinking_level = gen_config.get("thinkingConfig", {}).get("thinkingLevel")
+    thinking_str = f", thinking={thinking_level}" if thinking_level else ""
     print(f"[Gemini] Calling {model} (max_tokens={max_tokens}, temp={temperature}, "
           f"json={json_mode}, schema={'yes' if response_schema else 'no'}, "
-          f"api={api_version}{', thinking=medium' if use_thinking else ''})")
+          f"api={api_version}{thinking_str})")
 
     # Retry loop for transient errors (429, 5xx)
     last_error = None
@@ -1002,6 +1039,44 @@ def _canonicalize_youtube_url(url):
     if not vid:
         return None
     return f"https://www.youtube.com/watch?v={vid}"
+
+
+def _fetch_youtube_metadata(url, timeout=10):
+    """Fetch public metadata (title, author) for a YouTube URL via oEmbed.
+
+    No API key required — YouTube's /oembed endpoint is public and unauthenticated.
+    Used to generate human-readable JSON filenames instead of bare video IDs.
+
+    Returns a dict `{id, title, author}` on success, or None on any failure
+    (private/age-gated video, network timeout, geo-block, upstream 5xx). Callers
+    MUST fall back to ID-only naming — never raise on metadata fetch failures,
+    since the actual Gemini extraction is the expensive/important call.
+
+    Docs: https://oembed.com; endpoint: https://www.youtube.com/oembed
+    """
+    vid = _extract_youtube_video_id(url)
+    if not vid:
+        return None
+    canonical = f"https://www.youtube.com/watch?v={vid}"
+    try:
+        r = requests.get(
+            "https://www.youtube.com/oembed",
+            params={"url": canonical, "format": "json"},
+            timeout=timeout,
+        )
+    except requests.RequestException:
+        return None
+    if r.status_code != 200:
+        return None
+    try:
+        data = r.json()
+    except ValueError:
+        return None
+    return {
+        "id": vid,
+        "title": data.get("title"),
+        "author": data.get("author_name"),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1716,6 +1791,7 @@ class NV_GeminiVideoExtractor:
         video_url = (video_url or "").strip()
         video_path = (video_path or "").strip()
         is_youtube = _is_youtube_url(video_url)
+        yt_meta = None  # populated only on YouTube path, added to _source later
 
         # Validate inputs — three valid paths:
         #  1. OR + video_url (any URL EXCEPT YouTube): OR fetches and base64-inlines
@@ -1745,7 +1821,12 @@ class NV_GeminiVideoExtractor:
                 if not canonical_url:
                     raise RuntimeError(f"Could not extract YouTube video ID from URL: {video_url}")
                 video_url = canonical_url  # use canonical form for both API + cache
-                video_name = self._youtube_video_name(video_url)
+                # Fetch public oEmbed metadata for a human-readable filename.
+                # None on any failure (private video, network error) — fall through
+                # to ID-only naming so the extraction itself still runs.
+                yt_meta = _fetch_youtube_metadata(video_url)
+                yt_title = (yt_meta or {}).get("title")
+                video_name = self._youtube_video_name(video_url, title=yt_title)
                 mime = None  # FileData.mimeType is optional and `video/*` is not a clean
                              # contractual guarantee per Gemini docs — official REST YouTube
                              # example omits it entirely. None → don't send the field.
@@ -1775,6 +1856,13 @@ class NV_GeminiVideoExtractor:
                 folder_paths.get_output_directory(), "gemini_course", "extractions"
             )
         os.makedirs(output_dir, exist_ok=True)
+
+        # YouTube path: rename any legacy `youtube_<id>.json` → new title-based name
+        # so cache lookup (below) finds it under the new filename. Idempotent; no-op
+        # if legacy file doesn't exist or if names already match (e.g., oEmbed failed
+        # and we fell back to the legacy ID-only scheme).
+        if is_youtube:
+            self._migrate_legacy_youtube_cache(output_dir, video_url, video_name)
 
         # Cache key: include model AND schema_version so old extractions get invalidated
         # when the schema/prompt shape changes (otherwise stale cache silently shadows new shape).
@@ -1903,6 +1991,10 @@ class NV_GeminiVideoExtractor:
             source["video_path"] = video_path
         if video_url:
             source["video_url"] = video_url
+        if yt_meta:
+            source["youtube_video_id"] = yt_meta.get("id")
+            source["youtube_title"] = yt_meta.get("title")
+            source["youtube_author"] = yt_meta.get("author")
         source.update(extra_source)
         extraction["_source"] = source
 
@@ -1944,20 +2036,59 @@ class NV_GeminiVideoExtractor:
     # -- Transport branches ---------------------------------------------------
 
     @staticmethod
-    def _youtube_video_name(url):
-        """Extract a stable filename-safe identifier from a YouTube URL for cache keys.
+    def _youtube_video_name(url, title=None):
+        """Build a stable filename stem from a YouTube URL for cache keys.
 
-        Delegates to module-level `_extract_youtube_video_id` so detection,
-        canonicalization, and naming all agree. Falls back to a SHA-256 hash of the URL
-        only if no ID can be parsed (rare — would mean the URL passed `_is_youtube_url`
-        but doesn't match any ID pattern, which shouldn't happen).
+        With a title supplied (from `_fetch_youtube_metadata`): returns
+        `{sanitized_title}_{video_id}` — human-readable, collision-free even when
+        titles collide, since the ID suffix is unique per video.
+
+        Without a title (oEmbed failed / private video / skipped): falls back to
+        `youtube_{video_id}` — the legacy format. Stable cache identity either way
+        because the video_id is always present.
+
+        Final fallback (URL matched the host pattern but no ID extractable — should
+        not happen in practice): SHA-256 hash of the URL.
         """
         vid = _extract_youtube_video_id(url)
         if vid:
+            if title:
+                stem = _sanitize_filename_stem(title)
+                if stem:
+                    return f"{stem}_{vid}"
             return f"youtube_{vid}"
         # Defensive fallback — wider hash to minimize collision risk
         import hashlib
         return f"youtube_{hashlib.sha256(url.encode('utf-8')).hexdigest()[:16]}"
+
+    @staticmethod
+    def _migrate_legacy_youtube_cache(output_dir, canonical_url, new_stem):
+        """Rename legacy `youtube_<id>.json` (and `_partial.json`) → new title-based
+        name, so cache lookup for this URL finds the old extraction under the new
+        filename instead of redoing the API call.
+
+        Idempotent. Non-fatal on OSError (logs + proceeds — fresh extraction just
+        overwrites). Returns the list of (old_stem, new_stem) pairs renamed.
+        """
+        vid = _extract_youtube_video_id(canonical_url)
+        if not vid:
+            return []
+        legacy_stem = f"youtube_{vid}"
+        if legacy_stem == new_stem or not os.path.isdir(output_dir):
+            return []
+        renamed = []
+        for suffix in (".json", "_partial.json"):
+            old_path = os.path.join(output_dir, f"{legacy_stem}{suffix}")
+            new_path = os.path.join(output_dir, f"{new_stem}{suffix}")
+            if os.path.isfile(old_path) and not os.path.isfile(new_path):
+                try:
+                    os.rename(old_path, new_path)
+                    renamed.append((legacy_stem + suffix, new_stem + suffix))
+                    print(f"[NV_GeminiVideoExtractor] Renamed legacy cache: "
+                          f"{legacy_stem}{suffix} → {new_stem}{suffix}")
+                except OSError as exc:
+                    print(f"[NV_GeminiVideoExtractor] Could not rename {old_path}: {exc}")
+        return renamed
 
     def _extract_via_gemini(self, video_path, video_name, mime, model, api_key,
                              prompt, max_tokens, media_resolution, youtube_url=None):
@@ -1990,10 +2121,18 @@ class NV_GeminiVideoExtractor:
             except RuntimeError as e:
                 # Map common Gemini error codes to YouTube-specific guidance. The
                 # underlying _generate_content raises with the status code in the message.
+                # ONLY remap 400 when keywords match — generic config 400s (invalid
+                # enum values, bad payload shape) must surface their real message.
                 msg = str(e)
-                if "400" in msg:
+                msg_lc = msg.lower()
+                yt_privacy_keywords = (
+                    "private", "unlisted", "age", "region", "unavailable",
+                    "restricted", "blocked", "deleted", "not found", "scheduled",
+                )
+                is_yt_privacy_400 = "400" in msg and any(k in msg_lc for k in yt_privacy_keywords)
+                if is_yt_privacy_400:
                     raise RuntimeError(
-                        f"Gemini rejected YouTube URL ({youtube_url}). Common causes: "
+                        f"Gemini rejected YouTube URL ({youtube_url}) as inaccessible. Common causes: "
                         f"video is private/unlisted/age-gated/region-locked, or scheduled/upcoming. "
                         f"YouTube URL ingestion requires PUBLIC videos only. Original error: {msg}"
                     ) from e
@@ -2009,6 +2148,30 @@ class NV_GeminiVideoExtractor:
                     ) from e
                 raise
             extraction = _parse_extraction_json(raw_response)
+
+            # YouTube preview pricing: input tokens are FREE per Google docs (verified
+            # empirically 2026-04-19 — billing showed ~$0.06/call vs ~$0.23 if input
+            # were billed). Recompute estimate as output-only. Preserve full-pay
+            # estimate as `inline_cost_usd_full_pay` for forensics in case Google
+            # changes pricing (preview status — "likely to change" per docs).
+            pricing = _PRICING.get(model)
+            if pricing and usage_meta.get("estimated_cost_usd") is not None:
+                full_pay_estimate = usage_meta["estimated_cost_usd"]
+                output_tokens = (
+                    (usage_meta.get("response_tokens") or 0)
+                    + (usage_meta.get("thinking_tokens") or 0)
+                )
+                youtube_cost = round((output_tokens / 1_000_000) * pricing["output"], 6)
+                usage_meta["estimated_cost_usd"] = youtube_cost
+                usage_meta["inline_cost_usd_full_pay"] = full_pay_estimate
+                usage_meta["cost_estimate_caveat"] = (
+                    "youtube preview free input pricing assumed (verified 2026-04-19); "
+                    "preview status per Google docs — verify via billing dashboard. "
+                    "full-pay estimate preserved as inline_cost_usd_full_pay."
+                )
+                print(f"[Gemini] YouTube preview pricing applied: "
+                      f"${full_pay_estimate:.4f} → ${youtube_cost:.4f} (output-only)")
+
             return (extraction, usage_meta, {"transport_detail": "gemini_youtube_url",
                                              "youtube_url": youtube_url})
 
@@ -2855,6 +3018,524 @@ class NV_GeminiBatchExtractor:
 
 
 # ---------------------------------------------------------------------------
+# Node 4: YouTube Batch Extractor
+# ---------------------------------------------------------------------------
+
+# YouTube-safe output token floor. YT duration is not cheaply probeable without
+# yt-dlp, and undershooting causes silent truncation on long videos — so in
+# auto_by_duration mode we raise the floor here. Matches the single extractor's
+# youtube_safe_floor (`max(max_tokens, 24000)`).
+_YT_AUTO_TOKEN_FLOOR = 24000
+
+
+class NV_GeminiYoutubeBatchExtractor:
+    """Extract structured learning content from a list of YouTube URLs.
+
+    Uses Gemini's direct YouTube URL primitive — NO upload, NO input token cost
+    (preview; output tokens billed normally). Fetches public oEmbed titles so
+    each JSON is named after the video instead of an opaque ID.
+
+    INPUT FORMAT — multiline string, one URL per line:
+        https://youtu.be/dQw4w9WgXcQ
+        # comments start with '#' and are skipped; blank lines ignored
+        https://www.youtube.com/watch?v=...
+        https://www.youtube.com/shorts/...
+
+    OpenRouter is NOT supported on this node (OR fetches the watch-page HTML,
+    not video bytes). Non-YouTube URLs raise up-front; use NV_GeminiVideoExtractor
+    (single) or NV_GeminiBatchExtractor (local folder) for those paths.
+
+    Gemini YouTube primitive caveats:
+      - Public videos only (not private, unlisted, age-gated, or scheduled/upcoming)
+      - Free-tier cap: 8h/day of YouTube ingestion. No length cap on paid tier.
+      - Up to 10 videos per single request on Gemini 2.5+ (we issue one request
+        per video, so the per-request cap is not relevant here)
+      - "Likely to change" per Google docs — verify pricing via billing dashboard
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "urls": ("STRING", {
+                    "default": "",
+                    "multiline": True,
+                    "tooltip": "One YouTube URL per line. Accepted forms: youtube.com/watch?v=..., "
+                               "youtu.be/..., youtube.com/shorts/..., youtube.com/live/.... "
+                               "Lines starting with '#' are treated as comments. Blank lines skipped. "
+                               "Non-YouTube URLs cause the batch to fail up-front.",
+                }),
+            },
+            "optional": {
+                "api_key": ("STRING", {
+                    "default": "",
+                    "tooltip": "Optional. Leave blank to use GEMINI_API_KEY / GOOGLE_API_KEY. "
+                               "OpenRouter keys are NOT used here (OR cannot ingest YouTube URLs).",
+                }),
+                "model": ([
+                    # Direct Gemini only — OR cannot fetch YouTube bytes
+                    "gemini-2.5-pro",
+                    "gemini-2.5-flash",
+                    "gemini-3-pro-preview",
+                    "gemini-3.1-pro-preview",
+                    "gemini-3-flash-preview",
+                    "gemini-2.0-flash",
+                ], {
+                    "default": "gemini-2.5-flash",
+                    "tooltip": "Direct-Gemini models only. YouTube input tokens are FREE (preview), "
+                               "so Flash vs Pro only affects output-token cost (~$0.60/M vs $10/M). "
+                               "Flash is usually the right choice for extraction.",
+                }),
+                "media_resolution": (["default", "low"], {
+                    "default": "default",
+                    "tooltip": "Frame token density. 'default' (~300 tok/s) for code/slides/demos, "
+                               "'low' (~100 tok/s) for talking-head content. Input is free on the "
+                               "YouTube primitive regardless, but resolution still affects how many "
+                               "frames Gemini 'sees' and thus extraction fidelity.",
+                }),
+                "dry_run": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "If True, list all URLs with titles + cache status — no API calls. "
+                               "Use to preview the batch and catch bad URLs / rate-limit risk early.",
+                }),
+                "skip_existing": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Skip URLs that already have a matching extraction JSON on disk "
+                               "(same model + media_resolution + schema_version).",
+                }),
+                "output_dir": ("STRING", {
+                    "default": "",
+                    "tooltip": "Directory to save extraction JSONs. "
+                               "Empty = ComfyUI output/gemini_course/extractions/",
+                }),
+                "max_tokens_mode": (["auto_by_duration", "manual"], {
+                    "default": "auto_by_duration",
+                    "tooltip": "Output budget strategy. 'auto_by_duration': YouTube durations are "
+                               f"not probed remotely, so the floor is raised to {_YT_AUTO_TOKEN_FLOOR} tokens "
+                               "(enough for ~90min tutorials without truncation). 'manual': uses "
+                               "max_tokens verbatim — safer if you know your videos are short.",
+                }),
+                "max_tokens": ("INT", {
+                    "default": 24576,
+                    "min": 1024,
+                    "max": 65536,
+                    "step": 1024,
+                    "tooltip": "Output token budget per extraction. In 'auto_by_duration' this is "
+                               f"a floor (raised to at least {_YT_AUTO_TOKEN_FLOOR}). In 'manual' it is "
+                               "the absolute value applied to all videos.",
+                }),
+                "trigger": ("*", {
+                    "tooltip": "Optional trigger input for sequencing.",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "INT")
+    RETURN_NAMES = ("summary_json", "output_folder", "videos_processed")
+    FUNCTION = "extract_batch"
+    CATEGORY = "NV_Utils/Course"
+    OUTPUT_NODE = True
+    DESCRIPTION = (
+        "Batch-extract structured learning content from a list of YouTube URLs via the "
+        "Gemini YouTube primitive (free input tokens). Saves one JSON per video, named "
+        "by the public video title. Skips already-extracted URLs when skip_existing is True."
+    )
+
+    # -- URL list parsing ------------------------------------------------------
+
+    @staticmethod
+    def _parse_url_list(text):
+        """Parse multiline URL input into a list of canonical YouTube URLs.
+
+        Line rules:
+          - blank lines → skipped
+          - lines starting with '#' → comment, skipped
+          - inline '#' → split, keep pre-'#' portion
+          - matched YouTube URL → added
+          - anything else → collected as rejected, raises after full parse
+
+        Returns [(raw_line, canonical_url), ...]. Deduplicates by canonical URL
+        (first occurrence wins). Raises RuntimeError with a line-by-line
+        rejected-URL manifest if ANY line fails to parse — one bad line
+        shouldn't silently drop a video from the batch.
+        """
+        lines = (text or "").splitlines()
+        out = []
+        seen = set()
+        rejected = []
+        for lineno, raw in enumerate(lines, 1):
+            ln = raw.strip()
+            if not ln or ln.startswith("#"):
+                continue
+            # Inline comment support: "url # note"
+            if "#" in ln:
+                ln = ln.split("#", 1)[0].strip()
+                if not ln:
+                    continue
+            canonical = _canonicalize_youtube_url(ln)
+            if canonical is None:
+                rejected.append((lineno, raw.rstrip()))
+                continue
+            if canonical in seen:
+                continue
+            seen.add(canonical)
+            out.append((ln, canonical))
+        if rejected:
+            reject_lines = "\n".join(f"  line {n}: {s}" for n, s in rejected)
+            raise RuntimeError(
+                "Non-YouTube URLs in input — this node only supports public YouTube URLs "
+                "(youtube.com/watch, youtu.be, shorts, live). For other URLs use "
+                "NV_GeminiVideoExtractor (single, OpenRouter). For local files use "
+                "NV_GeminiBatchExtractor (folder).\n\nRejected lines:\n" + reject_lines
+            )
+        return out
+
+    # -- Main batch loop -------------------------------------------------------
+
+    def extract_batch(self, urls, api_key="", model="gemini-2.5-flash",
+                      media_resolution="default", dry_run=False,
+                      skip_existing=True, output_dir="",
+                      max_tokens_mode="auto_by_duration", max_tokens=24576, trigger=None):
+        # Guard: OR models can't fetch YouTube bytes. Surface early, clearly.
+        if _is_openrouter_model(model):
+            raise RuntimeError(
+                f"NV_GeminiYoutubeBatchExtractor requires a direct-Gemini model (bare 'gemini-*'). "
+                f"OpenRouter cannot ingest YouTube URLs natively. Got: {model!r}. "
+                f"Switch the model dropdown to 'gemini-2.5-flash' or similar."
+            )
+
+        api_key = resolve_api_key(api_key, provider="gemini")
+
+        parsed = self._parse_url_list(urls)
+        if not parsed:
+            raise RuntimeError("urls input is empty (no valid YouTube URLs found after stripping comments/blanks)")
+
+        # Resolve output directory early so legacy-rename pass has somewhere to operate on.
+        if not output_dir or not output_dir.strip():
+            output_dir = os.path.join(
+                folder_paths.get_output_directory(), "gemini_course", "extractions"
+            )
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Fetch oEmbed metadata for every URL up-front. Title lookups are cheap
+        # (~100ms each, no auth) and failures are soft — a None title just means
+        # the JSON falls back to `youtube_<id>.json` for that URL. Doing this
+        # before the extraction loop means the dry-run preview shows titles.
+        total = len(parsed)
+        print(f"\n[NV_GeminiYoutubeBatchExtractor] Fetching titles for {total} URLs via oEmbed...")
+        entries = []
+        for idx, (raw, canonical) in enumerate(parsed, 1):
+            _check_interrupt()
+            vid = _extract_youtube_video_id(canonical)
+            meta = _fetch_youtube_metadata(canonical)
+            title = (meta or {}).get("title")
+            author = (meta or {}).get("author")
+            stem = NV_GeminiVideoExtractor._youtube_video_name(canonical, title=title)
+            entries.append({
+                "raw": raw, "url": canonical, "id": vid,
+                "title": title, "author": author, "stem": stem,
+            })
+            if title:
+                print(f"  [{idx}/{total}] {vid} → {title[:70]}")
+            else:
+                print(f"  [{idx}/{total}] {vid} → (no title — oEmbed failed, using legacy name)")
+
+        # Migrate any legacy `youtube_<id>.json` to the new title-based name
+        # before the cache-hit check below, so previously-extracted videos
+        # reuse instead of re-running.
+        for e in entries:
+            if e["title"]:
+                NV_GeminiVideoExtractor._migrate_legacy_youtube_cache(
+                    output_dir, e["url"], e["stem"]
+                )
+
+        # --- DRY RUN MODE ---
+        if dry_run:
+            print(f"\n{'=' * 60}")
+            print(f"[NV_GeminiYoutubeBatchExtractor] DRY RUN — {total} URLs")
+            print(f"  Model: {model} | Resolution: {media_resolution}")
+            print(f"  Output: {output_dir}")
+            print(f"{'=' * 60}")
+
+            pricing = _PRICING.get(model)
+            # YT preview: input tokens are FREE (as of 2026-04-19), only output billed.
+            # Estimate output at ~3K tokens per extraction (same as folder batch).
+            est_per_video = None
+            if pricing:
+                est_per_video = round((3000 / 1_000_000) * pricing["output"], 6)
+            to_extract = 0
+            plan = []
+            for idx, e in enumerate(entries, 1):
+                json_path = os.path.join(output_dir, f"{e['stem']}.json")
+                cached = os.path.isfile(json_path)
+                status = "cached (skip)" if cached and skip_existing else "will extract"
+                if not (cached and skip_existing):
+                    to_extract += 1
+                title_cell = (e["title"] or "(no title)")[:60]
+                cost_cell = "free-input" if est_per_video is None else f"~${est_per_video:.4f} output"
+                print(f"  [{idx:2d}/{total}] {e['id']:12s}  {title_cell:<60s}  {cost_cell}  {status}")
+                plan.append({
+                    "url": e["url"],
+                    "video_id": e["id"],
+                    "title": e["title"],
+                    "author": e["author"],
+                    "stem": e["stem"],
+                    "status": status,
+                })
+
+            total_est = (est_per_video * to_extract) if est_per_video is not None else None
+            print(f"\n  {'─' * 50}")
+            print(f"  Will extract: {to_extract} | Will skip: {total - to_extract}")
+            if total_est is not None:
+                print(f"  Estimated total cost: ~${total_est:.4f} (output tokens only; "
+                      f"YouTube input is free on {model} preview)")
+            else:
+                print(f"  Model {model} not in pricing table — cost reported post-hoc in usage.cost")
+            print(f"{'=' * 60}\n")
+
+            summary = {
+                "dry_run": True,
+                "total_urls": total,
+                "will_extract": to_extract,
+                "will_skip": total - to_extract,
+                "estimated_total_cost_usd": round(total_est, 6) if total_est is not None else None,
+                "cost_note": "YouTube preview pricing assumed (input free, output billed). Verify via billing dashboard.",
+                "model": model,
+                "media_resolution": media_resolution,
+                "max_tokens_mode": max_tokens_mode,
+                "max_tokens_floor": max_tokens,
+                "videos": plan,
+            }
+            return (json.dumps(summary, indent=2, ensure_ascii=False), output_dir, 0)
+
+        # --- EXTRACTION MODE ---
+        print(f"\n{'=' * 60}")
+        print(f"[NV_GeminiYoutubeBatchExtractor] Extracting {total} YouTube videos")
+        print(f"  Model: {model} | Resolution: {media_resolution}")
+        print(f"  max_tokens mode: {max_tokens_mode} (floor={max_tokens})")
+        print(f"  Output: {output_dir}")
+        print(f"{'=' * 60}")
+
+        results = []
+        cost_succeeded = 0.0
+        cost_failed = 0.0
+        cached_count = 0
+        extracted_count = 0
+        failed_count = 0
+
+        # Build prompt once — same shape used by single extractor + folder batch
+        prompt = _EXTRACTION_PROMPT + (
+            "\n\nCOVERAGE REQUIREMENT: Analyze the ENTIRE video from 00:00 through the final second. "
+            "If any portion was not fully processed, add an entry to 'uncertainties' naming the timestamp range."
+        )
+
+        for idx, e in enumerate(entries, 1):
+            _check_interrupt()
+            json_path = os.path.join(output_dir, f"{e['stem']}.json")
+            partial_path = os.path.join(output_dir, f"{e['stem']}_partial.json")
+
+            # Cache check — validate model, media_resolution, schema_version, and
+            # video_url all match before reuse. Stale config → re-extract.
+            if skip_existing and os.path.isfile(json_path):
+                cache_valid = False
+                try:
+                    with open(json_path, "r", encoding="utf-8") as f:
+                        cached = json.load(f)
+                    src = cached.get("_source", {})
+                    cache_valid = (
+                        src.get("model") == model
+                        and src.get("media_resolution") == media_resolution
+                        and src.get("video_url") == e["url"]
+                        and src.get("schema_version") == _EXTRACTION_SCHEMA_VERSION
+                    )
+                except (json.JSONDecodeError, ValueError, OSError):
+                    pass
+                if cache_valid:
+                    print(f"  [{idx}/{total}] {e['id']} — cached ({e['stem']}.json)")
+                    cached_count += 1
+                    results.append({
+                        "url": e["url"], "video_id": e["id"], "title": e["title"],
+                        "status": "cached", "json_path": json_path,
+                    })
+                    continue
+                print(f"  [{idx}/{total}] {e['id']} — cache stale, re-extracting")
+
+            # Per-video output budget. YT duration isn't cheaply probed without
+            # yt-dlp, so auto_by_duration just raises the floor to the safe
+            # long-video value (~90min).
+            if max_tokens_mode == "auto_by_duration":
+                effective_max_tokens = max(max_tokens, _YT_AUTO_TOKEN_FLOOR)
+                budget_note = f"out_max={effective_max_tokens} (auto, yt floor)"
+            else:
+                effective_max_tokens = max_tokens
+                budget_note = f"out_max={effective_max_tokens} (manual)"
+
+            title_short = (e["title"] or e["id"])[:60]
+            print(f"\n  [{idx}/{total}] {title_short} — extracting... [{budget_note}]")
+            try:
+                # Gemini YouTube primitive: `file_data.file_uri = canonical_url`,
+                # mimeType omitted per official REST example.
+                contents = [
+                    {"file_data": {"file_uri": e["url"]}},
+                    {"text": prompt},
+                ]
+                try:
+                    raw_response, usage_meta = _generate_content(
+                        api_key=api_key, model=model, contents=contents,
+                        temperature=1.0, max_tokens=effective_max_tokens,
+                        json_mode=True, response_schema=_EXTRACTION_SCHEMA,
+                        media_resolution=media_resolution,
+                    )
+                except RuntimeError as api_err:
+                    # Map common Gemini errors to YouTube-specific guidance, but ONLY
+                    # when the message actually matches the error class — otherwise
+                    # generic config errors (invalid enum values, bad payload shape)
+                    # would be misattributed to video availability. Check keywords in
+                    # the error body first, fall back to surfacing the raw error.
+                    msg = str(api_err)
+                    msg_lc = msg.lower()
+                    yt_privacy_keywords = (
+                        "private", "unlisted", "age", "region", "unavailable",
+                        "restricted", "blocked", "deleted", "not found", "scheduled",
+                    )
+                    is_yt_privacy_400 = "400" in msg and any(k in msg_lc for k in yt_privacy_keywords)
+                    if is_yt_privacy_400:
+                        raise RuntimeError(
+                            f"Gemini rejected URL ({e['url']}) as inaccessible — likely private/"
+                            f"unlisted/age-gated/region-locked. Original: {msg}"
+                        ) from api_err
+                    if "404" in msg:
+                        raise RuntimeError(
+                            f"Gemini could not find video ({e['url']}). Deleted, private, or malformed URL. "
+                            f"Original: {msg}"
+                        ) from api_err
+                    if "429" in msg:
+                        raise RuntimeError(
+                            f"Gemini rate limit hit. Free tier caps YouTube ingestion at 8h/day. "
+                            f"Original: {msg}"
+                        ) from api_err
+                    # Any other error (invalid config, schema violation, 5xx) — let the
+                    # raw message through. The caller log already shows the video ID/title.
+                    raise
+
+                extraction = _parse_extraction_json(raw_response)
+
+                # Defensive: parser SHOULD always return a dict, but non-dict
+                # output would crash the _source mutation below. Wrap to keep
+                # the batch loop alive.
+                if not isinstance(extraction, dict):
+                    extraction = {"raw_output": extraction, "parse_error": "non-dict response from parser"}
+
+                # YT preview pricing: input tokens are FREE (verified 2026-04-19).
+                # Recompute estimate as output-only; preserve full-pay as forensic.
+                pricing = _PRICING.get(model)
+                if pricing and usage_meta.get("estimated_cost_usd") is not None:
+                    full_pay = usage_meta["estimated_cost_usd"]
+                    output_tokens = (
+                        (usage_meta.get("response_tokens") or 0)
+                        + (usage_meta.get("thinking_tokens") or 0)
+                    )
+                    yt_cost = round((output_tokens / 1_000_000) * pricing["output"], 6)
+                    usage_meta["estimated_cost_usd"] = yt_cost
+                    usage_meta["inline_cost_usd_full_pay"] = full_pay
+                    usage_meta["cost_estimate_caveat"] = (
+                        "youtube preview free input pricing assumed (verified 2026-04-19); "
+                        "preview status per Google docs — verify via billing dashboard."
+                    )
+
+                cost = usage_meta.get("estimated_cost_usd") or 0
+                parse_status, forensics = _check_extraction_health(extraction, usage_meta)
+
+                source = {
+                    "video_url": e["url"],
+                    "youtube_video_id": e["id"],
+                    "youtube_title": e["title"],
+                    "youtube_author": e["author"],
+                    "model": model,
+                    "media_resolution": media_resolution,
+                    "extracted_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "schema_version": _EXTRACTION_SCHEMA_VERSION,
+                    "max_tokens_mode": max_tokens_mode,
+                    "max_tokens_effective": effective_max_tokens,
+                    "prompt_tokens": usage_meta.get("prompt_tokens"),
+                    "response_tokens": usage_meta.get("response_tokens"),
+                    "estimated_cost_usd": usage_meta.get("estimated_cost_usd"),
+                    "inline_cost_usd_full_pay": usage_meta.get("inline_cost_usd_full_pay"),
+                    "response_time_s": usage_meta.get("response_time_s"),
+                    "transport": "gemini_youtube_url",
+                    "parse_status": parse_status,
+                }
+                source.update(forensics)
+                extraction["_source"] = source
+
+                if parse_status == "ok":
+                    _atomic_write_json(json_path, extraction)
+                    if os.path.isfile(partial_path):
+                        try:
+                            os.remove(partial_path)
+                        except OSError:
+                            pass
+                    cost_succeeded += cost
+                    extracted_count += 1
+                    segs = len(extraction.get("segments", []))
+                    ctype = extraction.get("content_type", "?")
+                    print(f"  [{idx}/{total}] OK — {segs} segments, {ctype}, ${cost:.4f} → {e['stem']}.json")
+                    results.append({
+                        "url": e["url"], "video_id": e["id"], "title": e["title"],
+                        "status": "extracted", "json_path": json_path,
+                        "segments": segs, "content_type": ctype, "cost_usd": cost,
+                    })
+                else:
+                    _atomic_write_json(partial_path, extraction)
+                    failed_count += 1
+                    cost_failed += cost
+                    reason = forensics.get("parse_status_reason", parse_status)
+                    print(f"  [{idx}/{total}] FAILED ({parse_status}): {reason}")
+                    print(f"    Partial: {partial_path} | Cost: ${cost:.4f}")
+                    results.append({
+                        "url": e["url"], "video_id": e["id"], "title": e["title"],
+                        "status": "failed", "parse_status": parse_status, "error": reason,
+                        "partial_json_path": partial_path, "cost_usd": cost,
+                    })
+
+            except Exception as exc:
+                failed_count += 1
+                print(f"  [{idx}/{total}] FAILED: {exc}")
+                results.append({
+                    "url": e["url"], "video_id": e["id"], "title": e["title"],
+                    "status": "failed", "error": str(exc),
+                })
+
+        total_cost = cost_succeeded + cost_failed
+        summary = {
+            "total_urls": total,
+            "extracted": extracted_count,
+            "cached": cached_count,
+            "failed": failed_count,
+            "cost_succeeded_usd": round(cost_succeeded, 4),
+            "cost_failed_usd": round(cost_failed, 4),
+            "total_cost_usd": round(total_cost, 4),
+            "cost_note": "YouTube preview pricing: input free, output billed. Figures reflect output-only.",
+            "model": model,
+            "output_dir": output_dir,
+            "results": results,
+        }
+        summary_str = json.dumps(summary, indent=2, ensure_ascii=False)
+
+        print(f"\n{'=' * 60}")
+        print(f"[NV_GeminiYoutubeBatchExtractor] Complete!")
+        print(f"  Extracted: {extracted_count} | Cached: {cached_count} | Failed: {failed_count}")
+        if failed_count > 0:
+            print(f"  Cost: ${cost_succeeded:.4f} succeeded + ${cost_failed:.4f} failed = ${total_cost:.4f} total")
+        else:
+            print(f"  Total cost: ${total_cost:.4f} (output tokens only)")
+        print(f"  Output: {output_dir}")
+        print(f"{'=' * 60}\n")
+
+        return (summary_str, output_dir, extracted_count + cached_count)
+
+
+# ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
 
@@ -2862,10 +3543,12 @@ NODE_CLASS_MAPPINGS = {
     "NV_GeminiVideoExtractor": NV_GeminiVideoExtractor,
     "NV_GeminiCourseSynthesizer": NV_GeminiCourseSynthesizer,
     "NV_GeminiBatchExtractor": NV_GeminiBatchExtractor,
+    "NV_GeminiYoutubeBatchExtractor": NV_GeminiYoutubeBatchExtractor,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "NV_GeminiVideoExtractor": "NV Gemini Video Extractor",
     "NV_GeminiCourseSynthesizer": "NV Gemini Course Synthesizer",
     "NV_GeminiBatchExtractor": "NV Gemini Batch Extractor",
+    "NV_GeminiYoutubeBatchExtractor": "NV Gemini YouTube Batch Extractor",
 }

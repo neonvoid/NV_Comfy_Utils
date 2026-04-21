@@ -118,9 +118,13 @@ class NV_CoTrackerBridge:
                 "stitcher": ("STITCHER",),
                 "cropped_image": ("IMAGE",),
                 "strength": ("FLOAT", {
-                    "default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
+                    "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
                     "tooltip": "Stabilization strength. 1.0 = full lock to reference. "
-                               "<1.0 = partial correction. >1.0 = overcorrect."
+                               "<1.0 = partial correction. Capped at 1.0: values above "
+                               "1.0 are motion inversion (not overcorrection) and push "
+                               "the grid sampler past the canvas boundary where image "
+                               "and mask padding modes diverge, reintroducing the "
+                               "source-space mismatch."
                 }),
             },
             "optional": {
@@ -383,27 +387,65 @@ class NV_CoTrackerBridge:
                                     padding_mode='reflection', align_corners=False)
                 wi = wi[:, :, trim_top:trim_top + H, trim_left:trim_left + W]
 
-                # Warp masks if provided
+                # Warp masks if provided.
+                # Source-space equivalence: prefer stitcher['canvas_mask'] /
+                # ['canvas_mask_processed'] (full-frame, stored by InpaintCrop2 alongside
+                # canvas_image) so masks are sampled from the same source space as the
+                # image under the same transform. Falls back to legacy zero-pad path
+                # if the stitcher was built by an older InpaintCrop2 lacking canvas masks.
+                canvas_mask_list = stitcher.get('canvas_mask') or []
+                canvas_mask_proc_list = stitcher.get('canvas_mask_processed') or []
+
+                # One-time warning per call if stitcher lacks canvas masks — user is on
+                # a legacy InpaintCrop2 and will hit the buggy zero-pad fallback below.
+                if b == 0 and not canvas_mask_list and not canvas_mask_proc_list and (
+                        cropped_mask is not None or cropped_mask_processed is not None):
+                    print("[NV_CoTrackerBridge] WARNING: stitcher has no 'canvas_mask' — "
+                          "falling back to zero-pad mask warp (source-space mismatch bug). "
+                          "Update NV_InpaintCrop2 to the version that stores canvas_mask "
+                          "in the stitcher to get the fix.")
+
+                def _warp_from_canvas(canvas_m_2d):
+                    cm = canvas_m_2d.to(device)
+                    if cm.dim() == 2:
+                        cm = cm.unsqueeze(0).unsqueeze(0)
+                    elif cm.dim() == 3:
+                        cm = cm.unsqueeze(0)
+                    exp_m = cm[:, :, ey:ey2, ex:ex2]
+                    exp_m = TF.interpolate(exp_m, size=(expanded_h_b, expanded_w_b),
+                                           mode='bilinear', align_corners=False)
+                    w = TF.grid_sample(exp_m, grid, mode='bilinear',
+                                       padding_mode='reflection', align_corners=False)
+                    return w[:, :, trim_top:trim_top + H, trim_left:trim_left + W]
+
                 if cropped_mask is not None:
-                    pad_right = max(0, expanded_w_b - trim_left - W)
-                    pad_bottom = max(0, expanded_h_b - trim_top - H)
-                    mo_4d = TF.pad(cropped_mask[b].unsqueeze(0).unsqueeze(0),
-                                   (trim_left, pad_right, trim_top, pad_bottom),
-                                   mode='constant', value=0)
-                    wmo = TF.grid_sample(mo_4d.to(device), grid, mode='bilinear',
-                                         padding_mode='zeros', align_corners=False)
-                    wmo = wmo[:, :, trim_top:trim_top + H, trim_left:trim_left + W]
+                    if len(canvas_mask_list) > b:
+                        wmo = _warp_from_canvas(canvas_mask_list[b])
+                    else:
+                        # Legacy fallback: zero-pad crop-local mask (asymmetric with image)
+                        pad_right = max(0, expanded_w_b - trim_left - W)
+                        pad_bottom = max(0, expanded_h_b - trim_top - H)
+                        mo_4d = TF.pad(cropped_mask[b].unsqueeze(0).unsqueeze(0),
+                                       (trim_left, pad_right, trim_top, pad_bottom),
+                                       mode='constant', value=0)
+                        wmo = TF.grid_sample(mo_4d.to(device), grid, mode='bilinear',
+                                             padding_mode='zeros', align_corners=False)
+                        wmo = wmo[:, :, trim_top:trim_top + H, trim_left:trim_left + W]
                     warped_mo.append(wmo.squeeze(0).squeeze(0).to(intermediate))
 
                 if cropped_mask_processed is not None:
-                    pad_right = max(0, expanded_w_b - trim_left - W)
-                    pad_bottom = max(0, expanded_h_b - trim_top - H)
-                    mp_4d = TF.pad(cropped_mask_processed[b].unsqueeze(0).unsqueeze(0),
-                                   (trim_left, pad_right, trim_top, pad_bottom),
-                                   mode='constant', value=0)
-                    wmp = TF.grid_sample(mp_4d.to(device), grid, mode='bilinear',
-                                         padding_mode='zeros', align_corners=False)
-                    wmp = wmp[:, :, trim_top:trim_top + H, trim_left:trim_left + W]
+                    if len(canvas_mask_proc_list) > b:
+                        wmp = _warp_from_canvas(canvas_mask_proc_list[b])
+                    else:
+                        # Legacy fallback
+                        pad_right = max(0, expanded_w_b - trim_left - W)
+                        pad_bottom = max(0, expanded_h_b - trim_top - H)
+                        mp_4d = TF.pad(cropped_mask_processed[b].unsqueeze(0).unsqueeze(0),
+                                       (trim_left, pad_right, trim_top, pad_bottom),
+                                       mode='constant', value=0)
+                        wmp = TF.grid_sample(mp_4d.to(device), grid, mode='bilinear',
+                                             padding_mode='zeros', align_corners=False)
+                        wmp = wmp[:, :, trim_top:trim_top + H, trim_left:trim_left + W]
                     warped_mp.append(wmp.squeeze(0).squeeze(0).to(intermediate))
             else:
                 # No expansion available — pass through unchanged

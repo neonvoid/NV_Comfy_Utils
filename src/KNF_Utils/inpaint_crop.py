@@ -403,6 +403,8 @@ class NV_InpaintCrop:
             'canvas_to_orig_w': [],
             'canvas_to_orig_h': [],
             'canvas_image': [],
+            'canvas_mask': [],
+            'canvas_mask_processed': [],
             'cropped_to_canvas_x': [],
             'cropped_to_canvas_y': [],
             'cropped_to_canvas_w': [],
@@ -529,6 +531,13 @@ class NV_InpaintCrop:
             stitcher['canvas_to_orig_w'].append(cto_w)
             stitcher['canvas_to_orig_h'].append(cto_h)
             stitcher['canvas_image'].append(canvas_image.squeeze(0).to(intermediate))
+            # Store full-frame masks alongside canvas_image so content-stabilization
+            # nodes (NV_CoTrackerBridge, NV_AETrackingBridge) can warp masks through
+            # the same source-space pipeline as the image — prevents the padding
+            # asymmetry bug where mask beyond crop boundary is zero-padded while
+            # image is pulled from real canvas pixels.
+            stitcher['canvas_mask'].append(original_mask.squeeze(0).to(intermediate))
+            stitcher['canvas_mask_processed'].append(processed_mask.squeeze(0).to(intermediate))
             stitcher['cropped_to_canvas_x'].append(ctc_x)
             stitcher['cropped_to_canvas_y'].append(ctc_y)
             stitcher['cropped_to_canvas_w'].append(ctc_w)
