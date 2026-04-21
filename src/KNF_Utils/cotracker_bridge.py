@@ -167,6 +167,15 @@ class NV_CoTrackerBridge:
         intermediate = comfy.model_management.intermediate_device()
         B, H, W, C = cropped_image.shape
 
+        # Shallow-copy the stitcher dict so our mutations (content_warp_mode,
+        # content_warp_data) don't leak back into the shared InpaintCrop2 output.
+        # When this node is wired into multiple downstream branches (e.g. main
+        # sampler path + a PromptRefiner preview path that feeds a different
+        # frame count), each branch must see its own warp_data — otherwise the
+        # last-to-run branch overwrites the other's warp entries and downstream
+        # InpaintStitch hits a length mismatch.
+        stitcher = dict(stitcher)
+
         # Single frame — nothing to stabilize
         if B <= 1:
             info = "Single frame — passed through unchanged."
