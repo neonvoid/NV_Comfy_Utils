@@ -416,6 +416,12 @@ class NV_CoTrackerBridge:
 
                 def _warp_from_canvas(canvas_m_2d):
                     cm = canvas_m_2d.to(device)
+                    # Canvas masks are stored as uint8 (0-255) by InpaintCrop2 to save
+                    # CPU RAM. Cast back to float [0, 1] before interpolate/grid_sample.
+                    if cm.dtype == torch.uint8:
+                        cm = cm.float() / 255.0
+                    elif cm.dtype != torch.float32:
+                        cm = cm.float()
                     if cm.dim() == 2:
                         cm = cm.unsqueeze(0).unsqueeze(0)
                     elif cm.dim() == 3:

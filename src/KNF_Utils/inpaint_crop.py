@@ -536,8 +536,13 @@ class NV_InpaintCrop:
             # the same source-space pipeline as the image — prevents the padding
             # asymmetry bug where mask beyond crop boundary is zero-padded while
             # image is pulled from real canvas pixels.
-            stitcher['canvas_mask'].append(original_mask.squeeze(0).to(intermediate))
-            stitcher['canvas_mask_processed'].append(processed_mask.squeeze(0).to(intermediate))
+            # Stored as uint8 (0-255) to keep CPU RAM cost manageable — 4x smaller than
+            # fp32. For a 277-frame 1936x1072 video this drops 4.58 GB → 1.14 GB.
+            # Consumers must cast back to float and divide by 255 before use.
+            _cm_orig = (original_mask.squeeze(0).clamp(0, 1) * 255).round().to(torch.uint8)
+            _cm_proc = (processed_mask.squeeze(0).clamp(0, 1) * 255).round().to(torch.uint8)
+            stitcher['canvas_mask'].append(_cm_orig.to(intermediate))
+            stitcher['canvas_mask_processed'].append(_cm_proc.to(intermediate))
             stitcher['cropped_to_canvas_x'].append(ctc_x)
             stitcher['cropped_to_canvas_y'].append(ctc_y)
             stitcher['cropped_to_canvas_w'].append(ctc_w)
