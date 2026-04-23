@@ -5,3 +5,7 @@ slack-sdk>=3.0.0
 
 # .env file support (optional but recommended)
 python-dotenv>=1.0.0
+
+# YouTube playlist expansion for NV_GeminiYoutubeBatchExtractor (playlist_urls field).
+# Lazy-imported — only required when playlist_urls is non-empty.
+yt-dlp>=2024.1.0

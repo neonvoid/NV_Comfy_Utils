@@ -3041,6 +3041,13 @@ class NV_GeminiYoutubeBatchExtractor:
         https://www.youtube.com/watch?v=...
         https://www.youtube.com/shorts/...
 
+    PLAYLIST INPUT (separate field) — multiline, one playlist URL per line:
+        https://www.youtube.com/playlist?list=PLxxxxxx
+    Playlists are expanded via yt-dlp (metadata-only, no download). Individual
+    video URLs must go in the 'urls' field, NOT 'playlist_urls' — mixing them
+    there raises a parse error. Manual URLs take precedence over playlist
+    duplicates on dedupe.
+
     OpenRouter is NOT supported on this node (OR fetches the watch-page HTML,
     not video bytes). Non-YouTube URLs raise up-front; use NV_GeminiVideoExtractor
     (single) or NV_GeminiBatchExtractor (local folder) for those paths.
@@ -3067,6 +3074,17 @@ class NV_GeminiYoutubeBatchExtractor:
                 }),
             },
             "optional": {
+                "playlist_urls": ("STRING", {
+                    "default": "",
+                    "multiline": True,
+                    "tooltip": "OPTIONAL. One YouTube PLAYLIST URL per line "
+                               "(youtube.com/playlist?list=..., or any watch URL with &list=). "
+                               "Playlists are expanded into their individual video URLs via "
+                               "yt-dlp (metadata-only, fast). No cap on playlist size — the "
+                               "node always prints a pre-flight cost estimate before extraction "
+                               "so you can Ctrl+C a runaway batch. Individual video URLs go in "
+                               "the 'urls' field above, not here. Requires yt-dlp: pip install yt-dlp.",
+                }),
                 "api_key": ("STRING", {
                     "default": "",
                     "tooltip": "Optional. Leave blank to use GEMINI_API_KEY / GOOGLE_API_KEY. "
@@ -3190,9 +3208,96 @@ class NV_GeminiYoutubeBatchExtractor:
             )
         return out
 
+    # -- Playlist expansion ----------------------------------------------------
+
+    @staticmethod
+    def _expand_playlists(text):
+        """Expand multiline YouTube playlist URLs into individual video entries.
+
+        Returns a list of `(raw_line, canonical_url, source_label)` tuples where
+        `source_label` is `"playlist: <title>"`. Lazy-imports `yt_dlp` and hard-fails
+        with an install hint if the field is non-empty and the dep is missing.
+        Per-playlist hard-fail on empty entries (private / non-playlist URL).
+
+        Line rules match `_parse_url_list` (`#` comments, blanks, inline `#` split).
+        """
+        lines = (text or "").splitlines()
+        playlist_urls = []
+        for raw in lines:
+            ln = raw.strip()
+            if not ln or ln.startswith("#"):
+                continue
+            if "#" in ln:
+                ln = ln.split("#", 1)[0].strip()
+                if not ln:
+                    continue
+            playlist_urls.append(ln)
+        if not playlist_urls:
+            return []
+
+        try:
+            import yt_dlp
+        except ImportError as exc:
+            raise RuntimeError(
+                "playlist_urls is non-empty but yt-dlp is not installed. "
+                "Install with: pip install yt-dlp (from the ComfyUI python env)."
+            ) from exc
+
+        ydl_opts = {
+            "extract_flat": True,      # metadata only, no per-video info probe
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "ignoreerrors": False,     # raise on a bad playlist rather than silently skip
+        }
+
+        expanded = []
+        for pl_url in playlist_urls:
+            _check_interrupt()
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(pl_url, download=False)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to expand playlist {pl_url!r}: {exc}. "
+                    f"Check that the playlist URL is public and well-formed."
+                ) from exc
+
+            entries = info.get("entries") if info else None
+            if not entries:
+                raise RuntimeError(
+                    f"Playlist {pl_url!r} yielded zero entries — it may be private, "
+                    f"empty, or a non-playlist URL. Single video URLs belong in the "
+                    f"'urls' field, not 'playlist_urls'."
+                )
+            # yt-dlp returns a generator in some versions; materialize so len() works.
+            entries = list(entries)
+
+            pl_title = info.get("title") or "(untitled playlist)"
+            source_label = f'playlist: "{pl_title}"'
+
+            added = 0
+            for entry in entries:
+                if not entry:
+                    continue
+                # In flat mode, entries typically carry only id + minimal metadata.
+                vid_id = entry.get("id")
+                if not vid_id:
+                    continue
+                url = f"https://www.youtube.com/watch?v={vid_id}"
+                canonical = _canonicalize_youtube_url(url)
+                if canonical is None:
+                    continue
+                expanded.append((url, canonical, source_label))
+                added += 1
+
+            print(f"[NV_GeminiYoutubeBatchExtractor] Playlist {pl_title!r} → {added} videos")
+
+        return expanded
+
     # -- Main batch loop -------------------------------------------------------
 
-    def extract_batch(self, urls, api_key="", model="gemini-2.5-flash",
+    def extract_batch(self, urls, playlist_urls="", api_key="", model="gemini-2.5-flash",
                       media_resolution="default", dry_run=False,
                       skip_existing=True, output_dir="",
                       max_tokens_mode="auto_by_duration", max_tokens=24576, trigger=None):
@@ -3207,8 +3312,22 @@ class NV_GeminiYoutubeBatchExtractor:
         api_key = resolve_api_key(api_key, provider="gemini")
 
         parsed = self._parse_url_list(urls)
-        if not parsed:
-            raise RuntimeError("urls input is empty (no valid YouTube URLs found after stripping comments/blanks)")
+        # Tag manual URLs, then expand playlists and merge. Manual URLs are
+        # encoded first in the `seen` set, so on dedupe collision they win —
+        # preserves "explicit beats implicit" on overlap with a playlist.
+        merged = [(raw, canon, "manual") for (raw, canon) in parsed]
+        seen = {canon for (_, canon, _) in merged}
+        for (raw, canon, source) in self._expand_playlists(playlist_urls):
+            if canon in seen:
+                continue
+            seen.add(canon)
+            merged.append((raw, canon, source))
+
+        if not merged:
+            raise RuntimeError(
+                "Both 'urls' and 'playlist_urls' inputs are empty (no valid "
+                "YouTube URLs after stripping comments/blanks)."
+            )
 
         # Resolve output directory early so legacy-rename pass has somewhere to operate on.
         if not output_dir or not output_dir.strip():
@@ -3221,10 +3340,10 @@ class NV_GeminiYoutubeBatchExtractor:
         # (~100ms each, no auth) and failures are soft — a None title just means
         # the JSON falls back to `youtube_<id>.json` for that URL. Doing this
         # before the extraction loop means the dry-run preview shows titles.
-        total = len(parsed)
+        total = len(merged)
         print(f"\n[NV_GeminiYoutubeBatchExtractor] Fetching titles for {total} URLs via oEmbed...")
         entries = []
-        for idx, (raw, canonical) in enumerate(parsed, 1):
+        for idx, (raw, canonical, source) in enumerate(merged, 1):
             _check_interrupt()
             vid = _extract_youtube_video_id(canonical)
             meta = _fetch_youtube_metadata(canonical)
@@ -3234,6 +3353,7 @@ class NV_GeminiYoutubeBatchExtractor:
             entries.append({
                 "raw": raw, "url": canonical, "id": vid,
                 "title": title, "author": author, "stem": stem,
+                "source": source,
             })
             if title:
                 print(f"  [{idx}/{total}] {vid} → {title[:70]}")
@@ -3249,50 +3369,57 @@ class NV_GeminiYoutubeBatchExtractor:
                     output_dir, e["url"], e["stem"]
                 )
 
-        # --- DRY RUN MODE ---
+        # --- PRE-FLIGHT COST PREVIEW (always on) ---
+        # Prints the same table dry_run shows, then on live runs continues to
+        # extraction. No playlist cap — this preview is the safety net for
+        # accidentally kicking off a 300-video playlist batch. Cancel button
+        # (D-055) is wired so Ctrl+C / queue-X interrupts the extraction loop.
+        header = "DRY RUN" if dry_run else "PRE-FLIGHT ESTIMATE"
+        print(f"\n{'=' * 60}")
+        print(f"[NV_GeminiYoutubeBatchExtractor] {header} — {total} URLs")
+        print(f"  Model: {model} | Resolution: {media_resolution}")
+        print(f"  Output: {output_dir}")
+        print(f"{'=' * 60}")
+
+        pricing = _PRICING.get(model)
+        # YT preview: input tokens are FREE (as of 2026-04-19), only output billed.
+        # Estimate output at ~3K tokens per extraction (same as folder batch).
+        est_per_video = None
+        if pricing:
+            est_per_video = round((3000 / 1_000_000) * pricing["output"], 6)
+        to_extract = 0
+        plan = []
+        for idx, e in enumerate(entries, 1):
+            json_path = os.path.join(output_dir, f"{e['stem']}.json")
+            cached = os.path.isfile(json_path)
+            status = "cached (skip)" if cached and skip_existing else "will extract"
+            if not (cached and skip_existing):
+                to_extract += 1
+            title_cell = (e["title"] or "(no title)")[:50]
+            src_cell = (e.get("source") or "manual")[:28]
+            cost_cell = "free-input" if est_per_video is None else f"~${est_per_video:.4f}"
+            print(f"  [{idx:3d}/{total}] {e['id']:12s}  {title_cell:<50s}  {src_cell:<28s}  {cost_cell}  {status}")
+            plan.append({
+                "url": e["url"],
+                "video_id": e["id"],
+                "title": e["title"],
+                "author": e["author"],
+                "stem": e["stem"],
+                "source": e.get("source", "manual"),
+                "status": status,
+            })
+
+        total_est = (est_per_video * to_extract) if est_per_video is not None else None
+        print(f"\n  {'─' * 50}")
+        print(f"  Will extract: {to_extract} | Will skip: {total - to_extract}")
+        if total_est is not None:
+            print(f"  Estimated total cost: ~${total_est:.4f} (output tokens only; "
+                  f"YouTube input is free on {model} preview)")
+        else:
+            print(f"  Model {model} not in pricing table — cost reported post-hoc in usage.cost")
+        print(f"{'=' * 60}\n")
+
         if dry_run:
-            print(f"\n{'=' * 60}")
-            print(f"[NV_GeminiYoutubeBatchExtractor] DRY RUN — {total} URLs")
-            print(f"  Model: {model} | Resolution: {media_resolution}")
-            print(f"  Output: {output_dir}")
-            print(f"{'=' * 60}")
-
-            pricing = _PRICING.get(model)
-            # YT preview: input tokens are FREE (as of 2026-04-19), only output billed.
-            # Estimate output at ~3K tokens per extraction (same as folder batch).
-            est_per_video = None
-            if pricing:
-                est_per_video = round((3000 / 1_000_000) * pricing["output"], 6)
-            to_extract = 0
-            plan = []
-            for idx, e in enumerate(entries, 1):
-                json_path = os.path.join(output_dir, f"{e['stem']}.json")
-                cached = os.path.isfile(json_path)
-                status = "cached (skip)" if cached and skip_existing else "will extract"
-                if not (cached and skip_existing):
-                    to_extract += 1
-                title_cell = (e["title"] or "(no title)")[:60]
-                cost_cell = "free-input" if est_per_video is None else f"~${est_per_video:.4f} output"
-                print(f"  [{idx:2d}/{total}] {e['id']:12s}  {title_cell:<60s}  {cost_cell}  {status}")
-                plan.append({
-                    "url": e["url"],
-                    "video_id": e["id"],
-                    "title": e["title"],
-                    "author": e["author"],
-                    "stem": e["stem"],
-                    "status": status,
-                })
-
-            total_est = (est_per_video * to_extract) if est_per_video is not None else None
-            print(f"\n  {'─' * 50}")
-            print(f"  Will extract: {to_extract} | Will skip: {total - to_extract}")
-            if total_est is not None:
-                print(f"  Estimated total cost: ~${total_est:.4f} (output tokens only; "
-                      f"YouTube input is free on {model} preview)")
-            else:
-                print(f"  Model {model} not in pricing table — cost reported post-hoc in usage.cost")
-            print(f"{'=' * 60}\n")
-
             summary = {
                 "dry_run": True,
                 "total_urls": total,
@@ -3309,12 +3436,8 @@ class NV_GeminiYoutubeBatchExtractor:
             return (json.dumps(summary, indent=2, ensure_ascii=False), output_dir, 0)
 
         # --- EXTRACTION MODE ---
-        print(f"\n{'=' * 60}")
-        print(f"[NV_GeminiYoutubeBatchExtractor] Extracting {total} YouTube videos")
-        print(f"  Model: {model} | Resolution: {media_resolution}")
-        print(f"  max_tokens mode: {max_tokens_mode} (floor={max_tokens})")
-        print(f"  Output: {output_dir}")
-        print(f"{'=' * 60}")
+        print(f"[NV_GeminiYoutubeBatchExtractor] Starting extraction — "
+              f"max_tokens mode: {max_tokens_mode} (floor={max_tokens})")
 
         results = []
         cost_succeeded = 0.0

@@ -65,6 +65,7 @@ def _load_dotenv_once():
 _PROVIDER_ENV_VARS = {
     "gemini": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
     "openrouter": ("OPENROUTER_API_KEY",),
+    "volcengine": ("VOLCENGINE_ARK_API_KEY", "ARK_API_KEY"),
 }
 
 
