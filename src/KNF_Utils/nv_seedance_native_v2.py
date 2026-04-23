@@ -113,11 +113,31 @@ def _classify_http_error(status_code: int, body_text: str) -> str:
     return " | ".join(hints) if hints else f"HTTP {status_code}"
 
 
-def _build_api_content(config: dict, final_prompt: str) -> list[dict]:
-    """Convert v2 SEEDANCE_UPLOAD_CONFIG_V2 → API-ready `content` array."""
+def _build_api_content(config: dict, final_prompt: str, ref_priority: str = "as_config") -> list[dict]:
+    """Convert v2 SEEDANCE_UPLOAD_CONFIG_V2 → API-ready `content` array.
+
+    `ref_priority` controls the order of image vs video items in the content
+    array. The hypothesis (Codex multi-AI 2026-04-23) is that earlier-positioned
+    refs may receive higher attention weight in the model's vision encoder.
+
+      - `as_config`:    keep config order (default — image then video)
+      - `image_first`:  explicitly put image refs before video refs
+      - `video_first`:  put video refs before image refs (test for image-dominance fix)
+    """
+    items = config.get("content", [])
+    images = [c for c in items if c.get("kind") == "image"]
+    videos = [c for c in items if c.get("kind") == "video"]
+
+    if ref_priority == "image_first":
+        ordered = images + videos
+    elif ref_priority == "video_first":
+        ordered = videos + images
+    else:  # as_config
+        ordered = items
+
     content: list[dict] = [{"type": "text", "text": final_prompt}]
-    for item in config.get("content", []):
-        kind = item["kind"]
+    for item in ordered:
+        kind = item.get("kind")
         if kind == "image":
             content.append({
                 "type": "image_url",
@@ -259,13 +279,23 @@ class NV_SeedanceNativeRefVideo_V2(IO.ComfyNode):
                     default="adaptive",
                     tooltip="adaptive = model picks based on refs.",
                 ),
+                IO.Combo.Input(
+                    "duration_mode",
+                    options=["manual", "auto_from_ref_video"],
+                    default="auto_from_ref_video",
+                    tooltip=(
+                        "'auto_from_ref_video' = match ref video duration (ceil, clamped 4-15s). "
+                        "Falls back to the duration slider if upload_config has no ref video. "
+                        "'manual' = always use the slider below."
+                    ),
+                ),
                 IO.Int.Input(
                     "duration",
                     default=5,
                     min=-1,
                     max=15,
                     step=1,
-                    tooltip="Output seconds. 4-15 or -1 for auto. 24fps always.",
+                    tooltip="Output seconds. 4-15 or -1 for model-auto. Used when duration_mode='manual' or no ref video.",
                     display_mode=IO.NumberDisplay.slider,
                 ),
                 IO.Boolean.Input(
@@ -302,6 +332,16 @@ class NV_SeedanceNativeRefVideo_V2(IO.ComfyNode):
                     "web_search",
                     default=False,
                     tooltip="Enable web_search tool — model decides per-prompt.",
+                ),
+                IO.Combo.Input(
+                    "ref_priority",
+                    options=["as_config", "image_first", "video_first"],
+                    default="as_config",
+                    tooltip=(
+                        "Order of refs in the API content array. as_config = default Prep order. "
+                        "video_first = put video refs before image refs (test fix for Mode C "
+                        "image-dominance issue — earlier-positioned refs may attention-weigh higher)."
+                    ),
                 ),
                 IO.Float.Input(
                     "poll_interval_s",
@@ -346,12 +386,14 @@ class NV_SeedanceNativeRefVideo_V2(IO.ComfyNode):
         model: str,
         resolution: str,
         ratio: str,
+        duration_mode: str,
         duration: int,
         generate_audio: bool,
         watermark: bool,
         seed: int,
         return_last_frame: bool,
         web_search: bool,
+        ref_priority: str,
         poll_interval_s: float,
         poll_timeout_s: float,
         api_key: str = "",
@@ -382,14 +424,28 @@ class NV_SeedanceNativeRefVideo_V2(IO.ComfyNode):
         resolved_key = resolve_api_key(api_key, provider="volcengine")
         model_id = _MODELS[model]
 
-        api_content = _build_api_content(upload_config, final_prompt)
+        # --- resolve duration ---
+        import math
+        ref_dur = (upload_config.get("provenance") or {}).get("ref_video_duration_s")
+        if duration_mode == "auto_from_ref_video" and ref_dur:
+            api_duration = max(4, min(15, math.ceil(float(ref_dur))))
+            duration_source = f"auto (from ref video {ref_dur:.2f}s → ceil → {api_duration}s, clamped 4-15)"
+        else:
+            api_duration = duration
+            if duration_mode == "auto_from_ref_video":
+                duration_source = f"auto-fallback to manual ({duration}s) — no ref video duration in config"
+            else:
+                duration_source = f"manual ({duration}s)"
+        print(f"[NV_SeedanceNative_V2] Duration: {duration_source}")
+
+        api_content = _build_api_content(upload_config, final_prompt, ref_priority=ref_priority)
 
         payload: dict = {
             "model": model_id,
             "content": api_content,
             "resolution": resolution,
             "ratio": ratio,
-            "duration": duration,
+            "duration": api_duration,
             "generate_audio": generate_audio,
             "watermark": watermark,
             "return_last_frame": return_last_frame,
@@ -482,12 +538,16 @@ class NV_SeedanceNativeRefVideo_V2(IO.ComfyNode):
                 "model": model_id,
                 "resolution": resolution,
                 "ratio": ratio,
-                "duration": duration,
+                "duration_mode": duration_mode,
+                "duration_requested": duration,
+                "duration_used": api_duration,
+                "duration_source": duration_source,
                 "generate_audio": generate_audio,
                 "watermark": watermark,
                 "seed": seed,
                 "return_last_frame": return_last_frame,
                 "web_search": web_search,
+                "ref_priority": ref_priority,
                 "n_reference_images": n_images,
                 "has_reference_video": has_video,
                 "prompt_length": len(final_prompt),
