@@ -185,17 +185,26 @@ def validate_mode(
 ) -> tuple[bool, str]:
     """Check that the wiring corresponds to one of the 3 legal image modes.
 
+    Per Volcengine docs, the 3 modes are STRICTLY mutually exclusive — Mode A
+    (first_frame) and Mode B (first+last_frame) cannot include ANY reference
+    media (no reference_video, no reference_audio, no reference_images).
+    Multimodal mode (Mode C) is the only mode that combines image + video + audio.
+
     Returns (ok, message). Used in both Prep VALIDATE_INPUTS and as a safety
     net in the native caller.
     """
     has_ref_imgs = reference_images_count > 0
+    in_first_or_last = has_first_frame or has_last_frame
 
-    # Mode C + A/B conflict
-    if has_ref_imgs and (has_first_frame or has_last_frame):
+    # Mode A/B (first/last frame) cannot include ANY reference media
+    if in_first_or_last and (has_ref_imgs or has_reference_video):
         return False, (
-            "Seedance image modes are mutually exclusive: reference_images cannot be wired "
-            "alongside first_frame / last_frame. Wire EITHER reference_images (multimodal mode) "
-            "OR first_frame [+ last_frame] (i2v / bridge mode)."
+            "Seedance first/last_frame modes (i2v / bridge) CANNOT include reference_video "
+            "or reference_images. The 3 image-content modes (first_frame / first+last_frame / "
+            "multimodal-reference) are strictly mutually exclusive per Volcengine docs — "
+            "multimodal mode is the only mode that combines image + video refs.\n"
+            "To use a reference_video alongside an identity anchor image: wire your image to "
+            "reference_images (multimodal mode), NOT to first_frame."
         )
 
     # Mode B requires both frames
@@ -212,10 +221,7 @@ def validate_mode(
             f"(got batch size {reference_images_count})."
         )
 
-    # Audio-alone rule: API rejects any request with audio but no image/video.
-    # We don't accept audio in V2 yet, so this branch is here only for v3 readiness.
-
-    # Text-only + video-only + image-only + combined are all legal API-wise.
+    # Text-only + video-only + image-only + combined-multimodal are all legal API-wise.
     return True, "ok"
 
 

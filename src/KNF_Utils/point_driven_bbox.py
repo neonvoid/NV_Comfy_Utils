@@ -38,7 +38,7 @@ import torch.nn.functional as F
 import comfy.model_management
 
 from .cotracker_bridge import _get_cotracker_model, _interpolate_invisible
-from .bbox_ops import extract_bboxes, build_bbox_masks
+from .bbox_ops import extract_bboxes, build_bbox_masks, print_bbox_trajectory_debug
 from .mask_ops import mask_smooth
 
 
@@ -101,6 +101,13 @@ class NV_PointDrivenBBox:
                     "tooltip": "CoTracker visibility threshold for trusting a frame's position. "
                                "Frames below threshold are interpolated from neighbors."
                 }),
+                "verbose_debug": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Print per-frame bbox trajectory stats: frame-to-frame motion, "
+                               "spike frames (unusually large moves), tracker-vs-mask-centroid "
+                               "divergence, cumulative displacement. Useful for diagnosing "
+                               "whether residual crop jitter is from the tracker or elsewhere."
+                }),
             }
         }
 
@@ -117,7 +124,8 @@ class NV_PointDrivenBBox:
 
     def execute(self, image, mask, tracking_points, bbox_expand_pct,
                 size_mode="lock_largest", downsample_for_tracking=2,
-                output_feather=0, clamp_to_image=True, min_visibility=0.5):
+                output_feather=0, clamp_to_image=True, min_visibility=0.5,
+                verbose_debug=False):
         device = comfy.model_management.get_torch_device()
         intermediate = comfy.model_management.intermediate_device()
         info_lines = []
@@ -260,6 +268,23 @@ class NV_PointDrivenBBox:
             ref_h = float(max(heights))
 
         info_lines.append(f"Reference size ({size_mode}): {ref_w:.0f}x{ref_h:.0f}px")
+
+        # ── Optional: verbose trajectory debug ─────────────────────────────────
+        if verbose_debug and B > 1:
+            mask_centroids = [
+                ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+                for x1, x2, y1, y2 in zip(x1s_m, x2s_m, y1s_m, y2s_m)
+            ]
+            print_bbox_trajectory_debug(
+                positions=positions,
+                compare_positions=mask_centroids,
+                compare_label="Tracker ↔ mask-centroid divergence "
+                              "(large is USUALLY fine — tracker follows a rigid feature, "
+                              "centroid shifts with silhouette shape)",
+                visibility=visibility,
+                min_visibility=min_visibility,
+                log_prefix=LOG_PREFIX,
+            )
 
         # ── Step 6: Build tight per-frame bboxes at tracker positions ──────────
         x1s = []

@@ -39,6 +39,7 @@ import torch
 from .mask_ops import mask_erode_dilate, mask_blur
 from .bbox_ops import (
     extract_bboxes, smooth_coordinates, build_bbox_masks,
+    print_bbox_trajectory_debug,
 )
 
 
@@ -155,6 +156,14 @@ class NV_MaskTrackingBBox:
                                "Higher = more stable bbox dimensions. "
                                "Default 25.0 = 5px standard deviation."
                 }),
+                "verbose_debug": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Print per-frame bbox trajectory stats: frame-to-frame motion "
+                               "of the SMOOTHED bbox center, spike frames, smoothed-vs-raw "
+                               "centroid divergence (shows how much the filter is doing), "
+                               "and cumulative displacement. Shares output format with "
+                               "NV_PointDrivenBBox for A/B comparison."
+                }),
             },
         }
 
@@ -175,7 +184,8 @@ class NV_MaskTrackingBBox:
                 ema_alpha=0.3, smooth_strength=1.0,
                 threshold=False, output_erode=0, output_feather=0,
                 kalman_q_pos=4.0, kalman_q_dim=1.0,
-                kalman_r_pos=9.0, kalman_r_dim=25.0):
+                kalman_r_pos=9.0, kalman_r_dim=25.0,
+                verbose_debug=False):
 
         if mask.dim() == 2:
             mask = mask.unsqueeze(0)
@@ -203,6 +213,14 @@ class NV_MaskTrackingBBox:
             tight_out = (mask > 0.5).float() if threshold else mask.clone()
             return (torch.zeros_like(mask), tight_out, info)
 
+        # Snapshot raw centroids before smoothing (for verbose_debug comparison)
+        raw_centroids = None
+        if verbose_debug:
+            raw_centroids = [
+                ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+                for x1, x2, y1, y2 in zip(x1s, x2s, y1s, y2s)
+            ]
+
         # --- Smooth ---
         x1s, y1s, x2s, y2s = smooth_coordinates(
             x1s, y1s, x2s, y2s,
@@ -214,6 +232,22 @@ class NV_MaskTrackingBBox:
             r_pos=kalman_r_pos, r_dim=kalman_r_dim,
             ema_alpha=ema_alpha, smooth_strength=smooth_strength
         )
+
+        # --- Verbose trajectory debug (after smoothing, using smoothed centers as primary) ---
+        if verbose_debug and B > 1:
+            smoothed_centroids = [
+                ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+                for x1, x2, y1, y2 in zip(x1s, x2s, y1s, y2s)
+            ]
+            print_bbox_trajectory_debug(
+                positions=smoothed_centroids,
+                compare_positions=raw_centroids,
+                compare_label="Smoothed ↔ raw centroid divergence "
+                              "(large = filter is doing a lot of work; small = raw was already clean)",
+                visibility=None,  # MaskTrackingBBox has no per-frame tracker visibility
+                min_visibility=0.5,
+                log_prefix="[NV_MaskTrackingBBox]",
+            )
 
         # --- Build output bbox masks ---
         bbox_mask = build_bbox_masks(x1s, y1s, x2s, y2s, bbox_expand_pct, H, W, info_lines)

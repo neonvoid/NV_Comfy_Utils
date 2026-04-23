@@ -591,3 +591,120 @@ def expand_crop_trim(canvas, ctc_x, ctc_y, ctc_w, ctc_h,
     exp_img = rescale_image(exp_img, expanded_w, expanded_h, resize_algorithm)
 
     return exp_img, trim_left, trim_top, expanded_w, expanded_h, dx, dy
+
+
+# =============================================================================
+# Trajectory Debug (shared between bbox-driving nodes)
+# =============================================================================
+
+def print_bbox_trajectory_debug(positions, compare_positions=None, compare_label="",
+                                visibility=None, min_visibility=0.5, log_prefix="[debug]",
+                                top_spikes=10):
+    """Print diagnostic stats about a bbox-center trajectory.
+
+    Shared across NV_MaskTrackingBBox, NV_PointDrivenBBox, and any other node
+    that drives a crop bbox from a per-frame (x, y) trajectory. Provides A/B
+    parity when comparing different bbox sources.
+
+    Blocks printed:
+      1. Per-frame motion distribution (mean/median/max/std/p95/p99 of |Δ|)
+      2. Spike frames where |Δ| > mean + 2σ (top N by magnitude)
+      3. Optional divergence block — if compare_positions is provided,
+         prints mean/max distance between the two trajectories at each frame.
+         Useful for:
+           - NV_PointDrivenBBox: tracker vs mask-centroid (are they consistent?)
+           - NV_MaskTrackingBBox: smoothed vs raw centroid (how much work is the filter doing?)
+      4. Cumulative displacement (start, end, arc-length, arc/line ratio)
+
+    Args:
+        positions: list of (x, y) floats per frame — primary trajectory
+        compare_positions: optional list of (x, y) — second trajectory for divergence
+        compare_label: section heading for the divergence block (e.g. "Smoothed ↔ Raw")
+        visibility: optional list of floats [0,1] per frame — flags interpolated frames
+        min_visibility: threshold below which a frame is marked interpolated
+        log_prefix: line prefix for console output (e.g. "[NV_MaskTrackingBBox]")
+        top_spikes: how many spike frames to print (default 10)
+    """
+    import math as _math
+
+    B = len(positions)
+    if B < 2:
+        print(f"{log_prefix} [debug] Single frame — no trajectory to analyze.")
+        return
+
+    # ── Frame-to-frame delta magnitudes ────────────────────────────────────────
+    deltas = []
+    for i in range(1, B):
+        dx = positions[i][0] - positions[i - 1][0]
+        dy = positions[i][1] - positions[i - 1][1]
+        mag = _math.sqrt(dx * dx + dy * dy)
+        deltas.append((i, dx, dy, mag))
+
+    mags = [d[3] for d in deltas]
+    mean_mag = sum(mags) / len(mags)
+    var_mag = sum((m - mean_mag) ** 2 for m in mags) / len(mags)
+    std_mag = _math.sqrt(var_mag)
+    max_mag = max(mags)
+    sorted_mags = sorted(mags)
+    median_mag = sorted_mags[len(sorted_mags) // 2]
+    p95_mag = sorted_mags[min(len(sorted_mags) - 1, int(0.95 * len(sorted_mags)))]
+    p99_mag = sorted_mags[min(len(sorted_mags) - 1, int(0.99 * len(sorted_mags)))]
+
+    print(f"\n{log_prefix} === VERBOSE DEBUG: BBox Trajectory ({B} frames) ===")
+    print(f"{log_prefix} Frame-to-frame Δ magnitude (bbox center):")
+    print(f"{log_prefix}   mean   = {mean_mag:.3f} px")
+    print(f"{log_prefix}   median = {median_mag:.3f} px")
+    print(f"{log_prefix}   max    = {max_mag:.3f} px")
+    print(f"{log_prefix}   std    = {std_mag:.3f} px")
+    print(f"{log_prefix}   p95    = {p95_mag:.3f} px")
+    print(f"{log_prefix}   p99    = {p99_mag:.3f} px")
+
+    # ── Spike frames (|Δ| > mean + 2σ) ─────────────────────────────────────────
+    spike_threshold = mean_mag + 2.0 * std_mag
+    spikes = [d for d in deltas if d[3] > spike_threshold]
+    spikes_sorted = sorted(spikes, key=lambda d: -d[3])[:top_spikes]
+    print(f"{log_prefix} Spike frames (|Δ| > {spike_threshold:.2f} = mean + 2σ): "
+          f"{len(spikes)} total, showing top {len(spikes_sorted)}")
+    for (i, dx, dy, mag) in spikes_sorted:
+        vis_tag = ""
+        if visibility is not None:
+            v = visibility[i] if i < len(visibility) else 1.0
+            if v < min_visibility:
+                vis_tag = f" [INTERPOLATED: vis={v:.2f}]"
+        print(f"{log_prefix}   Frame {i - 1}→{i}: Δ=({dx:+.2f}, {dy:+.2f}) "
+              f"|Δ|={mag:.2f} px{vis_tag}")
+
+    # ── Optional: divergence between two trajectories ──────────────────────────
+    if compare_positions is not None and len(compare_positions) == B:
+        divergences = []
+        for b in range(B):
+            px, py = positions[b]
+            cx, cy = compare_positions[b]
+            dx = px - cx
+            dy = py - cy
+            divergences.append(_math.sqrt(dx * dx + dy * dy))
+
+        mean_div = sum(divergences) / len(divergences)
+        max_div = max(divergences)
+        max_div_frame = divergences.index(max_div)
+        label = compare_label or "Trajectory divergence"
+        print(f"{log_prefix} {label}:")
+        print(f"{log_prefix}   mean = {mean_div:.2f} px")
+        print(f"{log_prefix}   max  = {max_div:.2f} px (frame {max_div_frame})")
+
+    # ── Cumulative displacement ────────────────────────────────────────────────
+    start_x, start_y = positions[0]
+    end_x, end_y = positions[-1]
+    total_dx = end_x - start_x
+    total_dy = end_y - start_y
+    straight_line = _math.sqrt(total_dx * total_dx + total_dy * total_dy)
+    arc_length = sum(mags)
+    print(f"{log_prefix} Cumulative displacement:")
+    print(f"{log_prefix}   start   = ({start_x:.1f}, {start_y:.1f})")
+    print(f"{log_prefix}   end     = ({end_x:.1f}, {end_y:.1f})")
+    print(f"{log_prefix}   straight-line: {straight_line:.1f} px")
+    print(f"{log_prefix}   arc length:    {arc_length:.1f} px")
+    ratio = arc_length / max(straight_line, 1e-6)
+    print(f"{log_prefix}   arc/line ratio: {ratio:.2f}x "
+          f"(high ratio = lots of wobble relative to net motion)")
+    print(f"{log_prefix} === END DEBUG ===\n")
