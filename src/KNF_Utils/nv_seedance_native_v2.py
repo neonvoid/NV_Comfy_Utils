@@ -372,12 +372,13 @@ class NV_SeedanceNativeRefVideo_V2(IO.ComfyNode):
                     "poll_timeout_s",
                     default=1500.0,
                     min=60.0,
-                    max=3600.0,
+                    max=7200.0,
                     step=30.0,
                     tooltip=(
-                        "Max seconds to wait for task completion. 5s Pro 720p ≈ 5 min; "
-                        "15s Mode C Pro with 5 refs + ref_video ≈ 15-25 min. Bump up for "
-                        "long shots or heavy multi-ref configs."
+                        "Max seconds to wait for task completion. Benchmarks: 5s Pro 720p ≈ 5min, "
+                        "15s Mode C Pro with 5 refs + ref_video ≈ 75min (measured 2026-04-24). "
+                        "On timeout, task_id is logged — use NV_SeedanceFetchTask later to retrieve "
+                        "the finished video without re-running the generation."
                     ),
                 ),
                 IO.String.Input(

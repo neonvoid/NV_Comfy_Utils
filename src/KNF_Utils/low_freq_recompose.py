@@ -86,6 +86,39 @@ def _gaussian_blur_2d(x, sigma):
 
 
 # =============================================================================
+# Bidirectional temporal EMA (zero-phase smoothing across frames)
+# =============================================================================
+
+def _temporal_ema_bidir(x, alpha):
+    """Forward + backward EMA pass across batch dim 0 (time).
+
+    alpha in [0, 1]:
+      0.0 = no smoothing (passthrough)
+      0.3 = moderate (matches CropColorFix default)
+      0.5 = heavy smoothing
+      0.8+ = extreme, content becomes temporally blurry
+
+    Bidirectional pass produces zero phase lag (no trailing delay from a purely
+    causal filter). Applied to the final recomposed output to dampen per-frame
+    texture variance from both the plate's natural temporal noise (grain,
+    rolling shutter) and VACE's intrinsic per-frame generation variance.
+    """
+    if alpha <= 0 or x.shape[0] < 2:
+        return x
+    one_minus = 1.0 - alpha
+
+    fwd = x.clone()
+    for t in range(1, x.shape[0]):
+        fwd[t] = alpha * fwd[t - 1] + one_minus * x[t]
+
+    bwd = fwd.clone()
+    for t in range(x.shape[0] - 2, -1, -1):
+        bwd[t] = alpha * bwd[t + 1] + one_minus * fwd[t]
+
+    return bwd
+
+
+# =============================================================================
 # Mask feather (for soft blend at tight-mask boundary)
 # =============================================================================
 
@@ -211,6 +244,15 @@ class NV_LowFreqRecompose:
                                "keeping generated's L (luminance). Use if VACE's lighting is "
                                "correct but skin tone/hue is off. lab color_space only."
                 }),
+                "temporal_smoothing": ("FLOAT", {
+                    "default": 0.3, "min": 0.0, "max": 0.9, "step": 0.05,
+                    "tooltip": "Bidirectional EMA across frames applied to the recomposed output. "
+                               "Dampens per-frame temporal variance from both the plate's natural "
+                               "noise (grain, rolling shutter) and VACE's intrinsic per-frame "
+                               "generation variance. 0.0 = off (may flicker), 0.3 = moderate "
+                               "(default, matches CropColorFix), 0.5 = heavy (clean but slightly "
+                               "softer detail over time). Zero phase lag — no trailing delay."
+                }),
             },
         }
 
@@ -227,7 +269,8 @@ class NV_LowFreqRecompose:
     def execute(self, original_crop, generated_crop, mask,
                 lf_sigma_px,
                 recompose_strength=1.0, edge_falloff_px=8,
-                color_space="lab", preserve_luminance=False):
+                color_space="lab", preserve_luminance=False,
+                temporal_smoothing=0.3):
         info_lines = []
 
         # Shape validation
@@ -293,6 +336,14 @@ class NV_LowFreqRecompose:
                 f"full recomposition ({color_space}, sigma={lf_sigma_px:.0f}px, "
                 f"strength={recompose_strength:.2f})"
             )
+
+        # Apply bidirectional temporal EMA to dampen per-frame variance before
+        # blending with original. Only smooths the RECOMPOSED content — the
+        # original pixels outside the mask already have natural plate temporal
+        # behavior and should pass through unchanged.
+        if temporal_smoothing > 0 and recomposed.shape[0] >= 2:
+            recomposed = _temporal_ema_bidir(recomposed, float(temporal_smoothing))
+            info_lines.append(f"temporal EMA: alpha={temporal_smoothing:.2f} bidir")
 
         # Blend recomposed (inside mask) with original (outside mask)
         # output = soft_mask * recomposed + (1 - soft_mask) * original_crop
