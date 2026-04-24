@@ -370,11 +370,15 @@ class NV_SeedanceNativeRefVideo_V2(IO.ComfyNode):
                 ),
                 IO.Float.Input(
                     "poll_timeout_s",
-                    default=600.0,
+                    default=1500.0,
                     min=60.0,
-                    max=1800.0,
+                    max=3600.0,
                     step=30.0,
-                    tooltip="Max seconds to wait for task completion.",
+                    tooltip=(
+                        "Max seconds to wait for task completion. 5s Pro 720p ≈ 5 min; "
+                        "15s Mode C Pro with 5 refs + ref_video ≈ 15-25 min. Bump up for "
+                        "long shots or heavy multi-ref configs."
+                    ),
                 ),
                 IO.String.Input(
                     "api_key",
@@ -473,7 +477,7 @@ class NV_SeedanceNativeRefVideo_V2(IO.ComfyNode):
             payload["tools"] = [{"type": "web_search"}]
 
         print(f"[NV_SeedanceNative_V2] Mode: {mode} | Model: {model_id} | res={resolution} "
-              f"ratio={ratio} dur={duration}s")
+              f"ratio={ratio} dur={api_duration}s")
         print(f"[NV_SeedanceNative_V2] Refs: images={n_images} video={'y' if has_video else 'n'}")
         print(f"[NV_SeedanceNative_V2] seed={seed} gen_audio={generate_audio} "
               f"return_last_frame={return_last_frame} web_search={web_search}"

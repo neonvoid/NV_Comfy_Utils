@@ -619,8 +619,10 @@ class NV_KlingUploadPreview(IO.ComfyNode):
         if upload_duration_exact > 10.5 and not chunk_mode:
             raise ValueError(
                 f"Upload video too long: {num_frames} frames at {encode_fps}fps = "
-                f"{upload_duration_exact:.2f}s (maximum ~10s). "
-                f"Enable chunk_mode to auto-truncate long videos."
+                f"{upload_duration_exact:.2f}s. Base refer_type caps at 10s. Options: "
+                f"(a) switch refer_type to 'reference (feature)' for 15s cap; "
+                f"(b) enable chunk_mode to auto-truncate; "
+                f"(c) shorten source to ≤240 frames at 24fps (or 8k+1 aligned: 233/241)."
             )
         if w > 2160 or h > 2160:
             raise ValueError(f"Dimensions {w}x{h} too large (maximum 2160x2160).")
