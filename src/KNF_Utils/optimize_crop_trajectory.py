@@ -170,7 +170,10 @@ def _solve_axis(centers, lower, upper,
 
     # Hard-clip in case solver tolerance left a tiny violation
     smoothed = np.clip(res.x, lower, upper)
-    return smoothed, float(res.fun), bool(res.success), int(res.nit), n_infeas
+    # OptimizeResult fields vary across scipy versions; `.get()` with default
+    # avoids AttributeError on builds where `nit` isn't populated.
+    nit = int(res.get('nit', -1)) if hasattr(res, 'get') else int(getattr(res, 'nit', -1))
+    return smoothed, float(res.fun), bool(res.success), nit, n_infeas
 
 
 # =============================================================================
