@@ -285,10 +285,13 @@ class NV_OptimizeCropTrajectory:
                 }),
                 "containment_margin_px": ("INT", {
                     "default": 16, "min": 0, "max": 256, "step": 1,
-                    "tooltip": "Required padding between subject extents and crop edge. "
-                               "Larger = more freedom for crop to drift away from subject = "
-                               "smoother trajectory possible. Smaller = subject can press against "
-                               "crop edge during fast motion."
+                    "tooltip": "Extra space added to each side of the subject for the output "
+                               "crop. Output crop size = locked subject size + 2 × margin. "
+                               "This margin is also the QP's smoothing slack — larger = more "
+                               "freedom for crop to drift away from subject trajectory (smoother "
+                               "crop path). Smaller = subject can press against crop edge during "
+                               "fast motion. Set to 0 only if upstream bbox already has enough "
+                               "expansion and you want zero additional crop growth."
                 }),
             },
             "optional": {
@@ -400,55 +403,83 @@ class NV_OptimizeCropTrajectory:
         cx_raw  = 0.5 * (x1s + x2s)
         cy_raw  = 0.5 * (y1s + y2s)
 
-        # ── Determine locked size (only over PRESENT frames) ───────────────────
+        # ── Determine locked SUBJECT size (across PRESENT frames) ──────────────
+        # Subject size = the per-frame input bbox dims (already includes upstream
+        # padding like PointDrivenBBox's bbox_expand_pct). The output CROP size
+        # = subject_size + 2*margin, which guarantees per-frame slack of at least
+        # 2*margin even at the worst-case frame.
+        m = float(containment_margin_px)
         widths_p  = widths[present]
         heights_p = heights[present]
+
         if size_mode == "follow_input":
-            target_w = widths.copy()
-            target_h = heights.copy()
-            info_lines.append("Size: follow_input (per-frame variable)")
+            # Per-frame variable subject; output crop matches subject per frame.
+            # Margin is injected equally around each per-frame subject.
+            subj_w = widths.copy()
+            subj_h = heights.copy()
+            info_lines.append(
+                f"Subject size: follow_input (per-frame variable). "
+                f"Crop size = subject + 2×{m:.0f}px margin, also per-frame."
+            )
         elif size_mode == "lock_largest":
-            tw, th = float(widths_p.max()), float(heights_p.max())
-            target_w = np.full(B, tw)
-            target_h = np.full(B, th)
-            info_lines.append(f"Size locked (lock_largest): {tw:.0f}x{th:.0f}")
+            sw, sh = float(widths_p.max()), float(heights_p.max())
+            subj_w = np.full(B, sw)
+            subj_h = np.full(B, sh)
+            info_lines.append(
+                f"Subject size locked (lock_largest): {sw:.0f}x{sh:.0f}. "
+                f"Crop size: {sw + 2*m:.0f}x{sh + 2*m:.0f} (subject + 2×{m:.0f}px margin)."
+            )
         elif size_mode == "lock_median":
-            tw, th = float(np.median(widths_p)), float(np.median(heights_p))
-            target_w = np.full(B, tw)
-            target_h = np.full(B, th)
-            info_lines.append(f"Size locked (lock_median): {tw:.0f}x{th:.0f}")
+            sw, sh = float(np.median(widths_p)), float(np.median(heights_p))
+            subj_w = np.full(B, sw)
+            subj_h = np.full(B, sh)
+            info_lines.append(
+                f"Subject size locked (lock_median): {sw:.0f}x{sh:.0f}. "
+                f"Crop size: {sw + 2*m:.0f}x{sh + 2*m:.0f}."
+            )
         elif size_mode == "lock_first":
-            first_idx = int(np.argmax(present))  # first present frame
-            tw, th = float(widths[first_idx]), float(heights[first_idx])
-            target_w = np.full(B, tw)
-            target_h = np.full(B, th)
-            info_lines.append(f"Size locked (lock_first, frame {first_idx}): {tw:.0f}x{th:.0f}")
+            first_idx = int(np.argmax(present))
+            sw, sh = float(widths[first_idx]), float(heights[first_idx])
+            subj_w = np.full(B, sw)
+            subj_h = np.full(B, sh)
+            info_lines.append(
+                f"Subject size locked (lock_first, frame {first_idx}): {sw:.0f}x{sh:.0f}. "
+                f"Crop size: {sw + 2*m:.0f}x{sh + 2*m:.0f}."
+            )
         else:
             raise ValueError(f"Unknown size_mode: {size_mode}")
 
+        # Output crop dims = subject + 2*margin (uniform margin on all sides).
+        target_w = subj_w + 2.0 * m
+        target_h = subj_h + 2.0 * m
+
         if np.any(target_w > W) or np.any(target_h > H):
             info_lines.append(
-                f"WARNING: locked crop size ({target_w.max():.0f}x{target_h.max():.0f}) "
-                f"exceeds frame ({W}x{H}). Containment is impossible; results will be "
-                f"midpoint-clamped on affected frames."
+                f"WARNING: output crop size ({target_w.max():.0f}x{target_h.max():.0f}) "
+                f"exceeds frame ({W}x{H}). Reduce containment_margin_px or choose a smaller "
+                f"size_mode. Affected frames will be midpoint-clamped (containment not preserved)."
             )
 
         # ── Containment bounds per frame ───────────────────────────────────────
-        # For PRESENT frames with margin m and crop size W_t:
-        #   s_t.x - W_t/2 + m  <=  subject_xmin_t
-        #   s_t.x + W_t/2 - m  >=  subject_xmax_t
-        # i.e. lower = subject_xmax_t + m - W_t/2,  upper = subject_xmin_t + W_t/2 - m
-        # Plus frame bounds: W_t/2 <= s_t.x <= frame_W - W_t/2
-        # For MISSING frames: relax to frame bounds only (no subject containment).
-        m = float(containment_margin_px)
+        # Output crop size W_out = subj_w + 2m already includes the margin as
+        # physical crop padding. Containment bounds then simply require that the
+        # subject fits inside the crop — no additional `-m` clearance (that would
+        # double-count the margin, canceling all QP slack):
+        #   s_t.x - W_out/2  <=  subject_xmin_t
+        #   s_t.x + W_out/2  >=  subject_xmax_t
+        # ⇒ lower = subject_xmax_t - W_out/2
+        #   upper = subject_xmin_t + W_out/2
+        # Worst-case frame (w_t = subj_w_locked): slack = ±m around cx_t.
+        # Narrower frames: slack widens by (subj_w_locked - w_t) / 2 on each side.
+        # For MISSING frames: relax to frame bounds only.
         half_w = 0.5 * target_w
         half_h = 0.5 * target_h
 
         # Subject-containment bounds (only meaningful where present)
-        sub_lower_x = x2s + m - half_w
-        sub_upper_x = x1s + half_w - m
-        sub_lower_y = y2s + m - half_h
-        sub_upper_y = y1s + half_h - m
+        sub_lower_x = x2s - half_w
+        sub_upper_x = x1s + half_w
+        sub_lower_y = y2s - half_h
+        sub_upper_y = y1s + half_h
 
         # Frame-only bounds (always valid)
         frame_lower_x = half_w
