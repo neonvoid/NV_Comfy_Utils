@@ -631,11 +631,23 @@ class NV_CropColorFix:
         output = output.clamp(0, 1)
 
         # --- Final residual measurement ---
+        # Memory-efficient: per-frame masked sum, avoids materializing the full
+        # [B,H,W,3] expanded bool tensor that boolean indexing would create
+        # (previously hit 5+ GB allocations on 277-frame 1080p full-frame buffers).
         ref_zone = m < ref_threshold
-        if ref_zone.sum() > 0:
+        ref_count = int(ref_zone.sum().item())
+        if ref_count > 0:
             residual = (output[..., :3] - orig[..., :3]).abs()
-            ref_residual = residual[ref_zone.unsqueeze(-1).expand_as(residual)].mean().item()
+            total_sum = 0.0
+            for t in range(residual.shape[0]):
+                zt = ref_zone[t]
+                if bool(zt.any()):
+                    # residual[t][zt] returns [N_t, 3] — peak ~one frame of residual
+                    total_sum += float(residual[t][zt].sum().item())
+            denom = ref_count * residual.shape[-1]
+            ref_residual = total_sum / max(denom, 1)
             info_lines.append(f"  Final residual in ref zone: {ref_residual * 255:.2f}/255")
+            del residual
         else:
             info_lines.append("  No reference zone pixels to measure residual")
 
