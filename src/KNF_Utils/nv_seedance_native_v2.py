@@ -72,16 +72,33 @@ _PRICE_PER_1K_TOKENS = {
 # ---------------------------------------------------------------------------
 
 def _auto_inject_tags(prompt: str, n_images: int, has_video: bool) -> str:
-    """Mirror V1 auto-injection: @Image1..N @Video1 prefix if absent."""
+    """Mirror V1 auto-injection: @Image1..N @Video1 prefix if absent.
+
+    Detects BOTH English `@Image1`/`@Video1` AND Chinese `[图1]`/`[视频1]`/`[音频1]`
+    bracket tags. If either form is present in the prompt, no auto-injection.
+    Prevents duplicate-tag pollution when the prompt has been translated to CN.
+
+    When auto-injecting (prompt has neither tag form), uses Chinese brackets if the
+    prompt contains any CJK characters (heuristic for "this is a CN-prompt context");
+    otherwise uses English @ tags.
+    """
     if not prompt:
         return prompt
-    has_image_tag = bool(re.search(r"@Image\s?\d+", prompt))
-    has_video_tag = bool(re.search(r"@Video\s?\d+", prompt))
+
+    has_image_tag = bool(re.search(r"@Image\s?\d+", prompt)) or bool(re.search(r"\[图\s?\d+\]", prompt))
+    has_video_tag = bool(re.search(r"@Video\s?\d+", prompt)) or bool(re.search(r"\[视频\s?\d+\]", prompt))
+
+    # Heuristic: prompt contains CJK ideographs → use CN bracket form for any injection
+    has_cjk = bool(re.search(r"[\u4e00-\u9fff]", prompt))
+
     parts: list[str] = []
     if has_video and not has_video_tag:
-        parts.append("@Video1")
+        parts.append("[视频1]" if has_cjk else "@Video1")
     if n_images > 0 and not has_image_tag:
-        parts.extend(f"@Image{i}" for i in range(1, n_images + 1))
+        if has_cjk:
+            parts.extend(f"[图{i}]" for i in range(1, n_images + 1))
+        else:
+            parts.extend(f"@Image{i}" for i in range(1, n_images + 1))
     if not parts:
         return prompt
     return f"{' '.join(parts)} {prompt}"
