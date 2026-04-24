@@ -25,6 +25,41 @@ from .guided_filter import refine_mask
 
 
 # =============================================================================
+# Memory-efficient stack
+# =============================================================================
+
+def _memory_efficient_stack(tensor_list, dim=0):
+    """Pre-allocate output and copy frame-by-frame, releasing inputs as we go.
+
+    torch.stack builds the output AND keeps all inputs alive simultaneously —
+    peak memory = 2 × output_size. For 277-frame 1080p RGB that's ~13.8 GB
+    during the stack call alone, which triggers Windows access violations
+    under RAM pressure (e.g. during back-to-back param sweeps).
+
+    This variant allocates the output once, copies each input into its slot,
+    then nulls the list entry to release the reference. Peak ≈ output_size +
+    one frame. Safe because the caller immediately `del`s the list after
+    the stack call (see NV_InpaintStitch.stitch).
+
+    Only supports dim=0 (the only case we hit). Falls back to torch.stack
+    for other dims.
+    """
+    if not tensor_list:
+        raise RuntimeError("Cannot stack empty list")
+    if dim != 0:
+        return torch.stack(tensor_list, dim=dim)
+
+    first = tensor_list[0]
+    n = len(tensor_list)
+    out_shape = (n,) + tuple(first.shape)
+    out = torch.empty(out_shape, dtype=first.dtype, device=first.device)
+    for i in range(n):
+        out[i] = tensor_list[i]
+        tensor_list[i] = None  # release reference so GC can reclaim
+    return out
+
+
+# =============================================================================
 # Inverse Content Warp
 # =============================================================================
 
@@ -514,8 +549,11 @@ class NV_InpaintStitch:
 
                     inpainted_idx += 1
 
-        result_batch = torch.stack(results, dim=0)
-        stitch_mask_batch = torch.stack(mask_results, dim=0)
+        # Pre-allocate + frame-by-frame copy to halve peak RAM during stack.
+        # See _memory_efficient_stack for rationale (Windows access violation on
+        # back-to-back sweep renders was the trigger).
+        result_batch = _memory_efficient_stack(results, dim=0)
+        stitch_mask_batch = _memory_efficient_stack(mask_results, dim=0)
 
         # Free intermediate lists + reclaim GPU memory before returning
         del results, mask_results

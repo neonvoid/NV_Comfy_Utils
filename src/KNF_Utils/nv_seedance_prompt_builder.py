@@ -242,8 +242,14 @@ class NV_SeedancePromptBuilder:
                 }),
                 "target_subject": ("STRING", {
                     "multiline": True,
-                    "default": "the person from @Image1",
-                    "tooltip": "Who to REPLACE WITH. For multimodal, use generic like 'the subject from the reference images'.",
+                    "default": "a medieval knight",
+                    "tooltip": (
+                        "Who to REPLACE WITH — bare noun phrase, NO '@Image1' reference. "
+                        "single_ref_swap template already prepends 'from @Image1' after this "
+                        "slot, so including it here produces a double reference. "
+                        "Examples: 'a medieval knight', 'a businesswoman', "
+                        "'the subject from the reference images'."
+                    ),
                 }),
                 "target_details": ("STRING", {
                     "multiline": True,
@@ -379,10 +385,16 @@ class NV_SeedancePromptBuilder:
             template_str = _TEMPLATES[resolved]
 
         # --- build composed clauses ---
-        # target_details_clause: ", wearing X" or " (X)" style — prepend comma if present
+        # target_details_clause: prepend "wearing" connector for bare descriptors;
+        # keep just ", " when the user-supplied text already leads with a verb
+        # (wearing/in/with/dressed/clad/sporting/holding/carrying/armored).
+        # Default: bare descriptors get ", wearing X" — matches what the Subject
+        # Extractor emits (comma-separated phrases like "chainmail, surcoat, helm").
         target_details_clause = _clause(", wearing ", target_details)
-        # If target_details starts with non-clothing word, use " — " instead
-        if target_details and not re.match(r"^(wear|in|with|dressed)", target_details.lower()):
+        if target_details and re.match(
+            r"^(wearing|wears|wear|dressed|sporting|holding|carrying|clad|armored|in|with)\b",
+            target_details.lower(),
+        ):
             target_details_clause = _clause(", ", target_details)
 
         # target_motion_clause: describes how the target should move
