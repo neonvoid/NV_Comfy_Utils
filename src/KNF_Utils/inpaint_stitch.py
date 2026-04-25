@@ -410,8 +410,25 @@ class NV_InpaintStitch:
             gc.collect()
             torch.cuda.empty_cache()
 
-        results = []
-        mask_results = []
+        # --- Pre-allocate output batch (replaces the list-append-then-stack pattern).
+        # Rationale: the prior code built `results = [...]` per-frame by calling
+        # `.to(intermediate)` each iteration, which allocated a fresh CPU tensor
+        # per frame (~25MB at 1080p) and accumulated N references in the list.
+        # On back-to-back InpaintStitch calls (two parallel workflow branches),
+        # aggregate RAM across both calls hit a Windows virtual-memory limit
+        # and triggered a native access violation mid-loop (see 2026-04-24
+        # crash log — frame 239/277 in second call).
+        #
+        # Fix: allocate ONE contiguous output tensor up-front and write into
+        # pre-existing slots with `.copy_()`. No per-frame tensor-object churn,
+        # no list-to-stack copy at the end, peak RAM during loop = `output_batch`
+        # size alone (not + in-flight list references).
+        peek_canvas = stitcher['canvas_image'][0]
+        out_H, out_W = peek_canvas.shape[0], peek_canvas.shape[1]
+        out_C = peek_canvas.shape[2] if peek_canvas.dim() == 3 else 3
+        out_dtype = peek_canvas.dtype
+        result_batch = torch.empty((total_frames, out_H, out_W, out_C), dtype=out_dtype, device=intermediate)
+        stitch_mask_batch = torch.empty((total_frames, out_H, out_W), dtype=out_dtype, device=intermediate)
 
         if len(skipped_indices) == 0:
             # Simple path: all frames were inpainted
@@ -456,7 +473,9 @@ class NV_InpaintStitch:
                         guided_eps=guided_eps,
                         guided_strength=guided_strength,
                     )
-                    results.append(out.squeeze(0).to(intermediate))
+                    # Direct GPU -> pre-allocated CPU slot. No intermediate CPU tensor
+                    # is created; `copy_` streams straight into `result_batch[b]`.
+                    result_batch[b].copy_(out.squeeze(0), non_blocking=False)
                     sm = _build_stitch_mask(
                         final_mask,
                         stitcher['cropped_to_canvas_x'][idx], stitcher['cropped_to_canvas_y'][idx],
@@ -465,7 +484,7 @@ class NV_InpaintStitch:
                         stitcher['canvas_to_orig_w'][idx], stitcher['canvas_to_orig_h'][idx],
                         resize_algorithm,
                     )
-                    mask_results.append(sm.to(intermediate))
+                    stitch_mask_batch[b].copy_(sm, non_blocking=False)
                 except Exception as e:
                     inp_shape = list(inpainted_image[b:b+1].shape)
                     raise RuntimeError(
@@ -487,9 +506,9 @@ class NV_InpaintStitch:
 
             for frame_idx in range(total_frames):
                 if frame_idx in skipped_indices:
-                    orig = original_frames[original_idx].to(intermediate)
-                    results.append(orig)
-                    mask_results.append(torch.zeros(orig.shape[0], orig.shape[1], device=intermediate))
+                    # Pass-through original frame; zero stitch mask to mark un-inpainted
+                    result_batch[frame_idx].copy_(original_frames[original_idx], non_blocking=False)
+                    stitch_mask_batch[frame_idx].zero_()
                     original_idx += 1
                 else:
                     warp_entry = content_warp_data[inpainted_idx] if content_warp_data else None
@@ -526,7 +545,7 @@ class NV_InpaintStitch:
                             guided_eps=guided_eps,
                             guided_strength=guided_strength,
                         )
-                        results.append(out.squeeze(0).to(intermediate))
+                        result_batch[frame_idx].copy_(out.squeeze(0), non_blocking=False)
                         sm = _build_stitch_mask(
                             final_mask,
                             stitcher['cropped_to_canvas_x'][inpainted_idx], stitcher['cropped_to_canvas_y'][inpainted_idx],
@@ -535,7 +554,7 @@ class NV_InpaintStitch:
                             stitcher['canvas_to_orig_w'][inpainted_idx], stitcher['canvas_to_orig_h'][inpainted_idx],
                             resize_algorithm,
                         )
-                        mask_results.append(sm.to(intermediate))
+                        stitch_mask_batch[frame_idx].copy_(sm, non_blocking=False)
                     except Exception as e:
                         inp_shape = list(inpainted_image[inpainted_idx:inpainted_idx+1].shape)
                         raise RuntimeError(
@@ -549,14 +568,7 @@ class NV_InpaintStitch:
 
                     inpainted_idx += 1
 
-        # Pre-allocate + frame-by-frame copy to halve peak RAM during stack.
-        # See _memory_efficient_stack for rationale (Windows access violation on
-        # back-to-back sweep renders was the trigger).
-        result_batch = _memory_efficient_stack(results, dim=0)
-        stitch_mask_batch = _memory_efficient_stack(mask_results, dim=0)
-
-        # Free intermediate lists + reclaim GPU memory before returning
-        del results, mask_results
+        # Reclaim GPU memory before returning
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

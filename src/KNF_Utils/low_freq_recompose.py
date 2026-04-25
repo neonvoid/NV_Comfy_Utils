@@ -85,6 +85,69 @@ def _gaussian_blur_2d(x, sigma):
     return x
 
 
+def _masked_gaussian_blur_2d(x, mask, sigma, support_tau=1e-3):
+    """Normalized (mask-gated) Gaussian blur on [B, C, H, W] with support-
+    threshold fallback to unmasked blur where the mask support is too weak.
+
+    Implements:
+        masked_blur(x, m) = {
+            blur(x*m) / blur(m)       where blur(m) >= support_tau
+            blur(x)                    where blur(m) <  support_tau  (fallback)
+        }
+
+    Gives a weighted mean inside the mask region with zero contamination from
+    out-of-mask pixels. Critical for extracting low-frequency color/tone fields
+    inside a subject mask when the crop also contains background — without the
+    masking, the Gaussian pulls BG colors (wood paneling, curtains) into the
+    subject's low-frequency field, producing visible color contamination at
+    the boundary.
+
+    The support_tau threshold (v4 per multi-AI Codex review 2026-04-24) prevents
+    the denominator from going vanishing — `clamp_min(eps=1e-6)` was numerically
+    safe but semantically meaningless outside the mask support tail. Below
+    support_tau, we fall back to the unmasked blur (the "best guess" when no
+    in-mask info is available locally). These regions are always outside the
+    final composite mask anyway, so fallback values get discarded downstream.
+
+    Args:
+        x:    [B, C, H, W] signal (e.g., Lab/RGB image)
+        mask: [B, 1, H, W] in [0, 1]; regions where mask~1 are "inside"
+        sigma: Gaussian std in pixels
+        support_tau: threshold on blurred mask below which we fall back to
+            unmasked blur. 1e-3 empirically gives smooth transition without
+            numerical instability. Pass tau=0 to disable fallback (v3 behavior).
+    """
+    if sigma <= 0:
+        return x
+    masked_x = x * mask
+    num = _gaussian_blur_2d(masked_x, sigma)
+    den = _gaussian_blur_2d(mask, sigma)
+
+    if support_tau > 0:
+        # Blend between masked ratio and unmasked blur based on support
+        # confidence. Smoothly transitions across the tau threshold.
+        unmasked = _gaussian_blur_2d(x, sigma)
+        safe_den = den.clamp_min(support_tau)
+        masked = num / safe_den
+        # Where support is clearly strong (den >> tau), use masked; where
+        # weak (den << tau), use unmasked fallback.
+        confidence = (den / support_tau).clamp(0.0, 1.0)
+        return confidence * masked + (1.0 - confidence) * unmasked
+    else:
+        return num / den.clamp_min(1e-6)
+
+
+def _erode_mask_2d(mask, radius):
+    """Erode a [B, 1, H, W] mask by `radius` pixels using min-pooling of the
+    mask (equivalent to morphological erosion for binary; soft erode for
+    continuous-valued masks)."""
+    if radius <= 0:
+        return mask
+    r = int(radius)
+    # Min-pool = -MaxPool(-mask)
+    return -F.max_pool2d(-mask, kernel_size=2 * r + 1, stride=1, padding=r)
+
+
 # =============================================================================
 # Bidirectional temporal EMA (zero-phase smoothing across frames)
 # =============================================================================
@@ -135,17 +198,33 @@ def _feather_mask(mask, falloff_px):
 # Core recomposition
 # =============================================================================
 
-def _recompose_lf(orig_bchw, gen_bchw, sigma_px, recompose_strength, color_space):
-    """Apply low-frequency recomposition: out = LP(orig) + HP(gen).
+def _recompose_lf(orig_bchw, gen_bchw, mask_bchw, sigma_px, recompose_strength,
+                  color_space, erode_px=2, support_tau=1e-3):
+    """Apply low-frequency recomposition: out = LP_masked(orig) + HP_masked(gen).
+
+    v4 fix (per multi-AI Codex review 2026-04-24): BOTH LP(orig) AND LP(gen)
+    use masked normalized Gaussian on a slightly eroded mask. v3 had
+    asymmetric decomposition (masked LP orig + unmasked LP gen), which left
+    HP(gen) = gen - LP_unmasked(gen) carrying boundary contamination from
+    wherever VACE touched BG. v4 symmetrizes — both LP terms see only the
+    in-mask region.
+
+    Erode the decomposition-support mask by ~2 px (configurable) so normalized
+    convolution has clean interior support, then use the original mask for
+    final compositing with feather.
 
     Args:
         orig_bchw, gen_bchw: [B, 3, H, W] in [0, 1] RGB
+        mask_bchw: [B, 1, H, W] subject mask (1=subject, 0=BG)
         sigma_px: gaussian sigma for low-freq extraction
         recompose_strength: 0..1 lerp between generated (0) and recomposed (1)
         color_space: 'lab' (perceptual, recommended) or 'rgb' (faster, simpler)
+        erode_px: mask erosion radius for decomposition support
+        support_tau: threshold on blur(mask) below which masked_blur falls
+            back to unmasked blur (1e-3 default; 0 = v3 behavior)
 
     Returns:
-        [B, 3, H, W] in [0, 1] RGB, fully recomposed (no mask blending yet).
+        [B, 3, H, W] in [0, 1] RGB, recomposed inside mask (no feather blend yet).
     """
     if color_space == 'lab':
         orig = _rgb_to_lab(orig_bchw)
@@ -154,11 +233,19 @@ def _recompose_lf(orig_bchw, gen_bchw, sigma_px, recompose_strength, color_space
         orig = orig_bchw
         gen = gen_bchw
 
-    lp_orig = _gaussian_blur_2d(orig, sigma_px)
-    lp_gen = _gaussian_blur_2d(gen, sigma_px)
+    # Slightly erode the mask to create clean interior support for the
+    # normalized convolution. Final feather blend uses the ORIGINAL mask
+    # (done by caller), so we don't lose edge softness — we just avoid
+    # boundary pixels in the pyramid decomposition support.
+    mask_support = _erode_mask_2d(mask_bchw, erode_px) if erode_px > 0 else mask_bchw
+
+    # v4: BOTH LP terms via masked normalized convolution with the same support.
+    # Prevents HP(gen) from carrying edge terms induced by BG contrast.
+    lp_orig = _masked_gaussian_blur_2d(orig, mask_support, sigma_px, support_tau=support_tau)
+    lp_gen  = _masked_gaussian_blur_2d(gen,  mask_support, sigma_px, support_tau=support_tau)
     hp_gen = gen - lp_gen
 
-    # The core algorithm: original's low-freq + generated's high-freq
+    # Core algorithm: original's low-freq + generated's high-freq
     recomposed = lp_orig + hp_gen
 
     # Optional strength lerp (1.0 = full recompose, 0.0 = no change)
@@ -305,13 +392,20 @@ class NV_LowFreqRecompose:
         # Feather the mask for soft edge blending
         soft_mask = _feather_mask(mask_bchw, edge_falloff_px)
 
-        # Recompose (always in Lab if color_space=='lab', regardless of luma-preserve)
+        # v4: BOTH LP(orig) AND LP(gen) via masked Gaussian on an eroded
+        # support mask. Prevents the HP(gen) = gen - LP(gen) term from
+        # carrying boundary contamination when VACE touched BG (v3 left
+        # LP(gen) unmasked — fixed here).
+        erode_px = 2  # default decomposition-support erosion
+        support_tau = 1e-3  # confidence threshold for masked-blur fallback
+
         if preserve_luminance and color_space == "lab":
-            # Recompose chroma only: L = gen_L, a = LP(orig_a) + HP(gen_a), same for b
+            # Recompose chroma only: L = gen_L, a/b = LP_masked(orig_a/b) + HP_masked(gen_a/b)
             orig_lab = _rgb_to_lab(orig_bchw)
             gen_lab = _rgb_to_lab(gen_bchw)
-            lp_orig = _gaussian_blur_2d(orig_lab, lf_sigma_px)
-            lp_gen = _gaussian_blur_2d(gen_lab, lf_sigma_px)
+            mask_support = _erode_mask_2d(mask_bchw, erode_px)
+            lp_orig = _masked_gaussian_blur_2d(orig_lab, mask_support, lf_sigma_px, support_tau=support_tau)
+            lp_gen  = _masked_gaussian_blur_2d(gen_lab,  mask_support, lf_sigma_px, support_tau=support_tau)
             hp_gen = gen_lab - lp_gen
             recomposed_lab = gen_lab.clone()
             # Only replace low-freq a, b (chroma)
@@ -323,31 +417,34 @@ class NV_LowFreqRecompose:
                 )
             recomposed = _lab_to_rgb(recomposed_lab).clamp(0.0, 1.0)
             info_lines.append(
-                f"luma-preserved (L=gen, a/b recomposed at sigma={lf_sigma_px:.0f}px)"
+                f"luma-preserved (L=gen, a/b recomposed at sigma={lf_sigma_px:.0f}px, both LPs masked)"
             )
         else:
             recomposed = _recompose_lf(
-                orig_bchw, gen_bchw,
+                orig_bchw, gen_bchw, mask_bchw,
                 sigma_px=lf_sigma_px,
                 recompose_strength=recompose_strength,
                 color_space=color_space,
+                erode_px=erode_px,
+                support_tau=support_tau,
             )
             info_lines.append(
                 f"full recomposition ({color_space}, sigma={lf_sigma_px:.0f}px, "
-                f"strength={recompose_strength:.2f})"
+                f"strength={recompose_strength:.2f}, both LPs masked, erode={erode_px}px, tau={support_tau:.0e})"
             )
-
-        # Apply bidirectional temporal EMA to dampen per-frame variance before
-        # blending with original. Only smooths the RECOMPOSED content — the
-        # original pixels outside the mask already have natural plate temporal
-        # behavior and should pass through unchanged.
-        if temporal_smoothing > 0 and recomposed.shape[0] >= 2:
-            recomposed = _temporal_ema_bidir(recomposed, float(temporal_smoothing))
-            info_lines.append(f"temporal EMA: alpha={temporal_smoothing:.2f} bidir")
 
         # Blend recomposed (inside mask) with original (outside mask)
         # output = soft_mask * recomposed + (1 - soft_mask) * original_crop
         output_bchw = soft_mask * recomposed + (1.0 - soft_mask) * orig_bchw
+
+        # v4: apply bidirectional temporal EMA to the FINAL blended output
+        # (moved from pre-blend). Ensures temporal coherence is a property of
+        # the shipped frames, not intermediate patches. Matches CropColorFix's
+        # stage ordering and improves seam stability when the plate has
+        # natural exposure/WB drift over time.
+        if temporal_smoothing > 0 and output_bchw.shape[0] >= 2:
+            output_bchw = _temporal_ema_bidir(output_bchw, float(temporal_smoothing))
+            info_lines.append(f"temporal EMA: alpha={temporal_smoothing:.2f} bidir (post-blend)")
 
         # Measure the shift magnitude for diagnostic output
         with torch.no_grad():
