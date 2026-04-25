@@ -447,14 +447,41 @@ class NV_BboxAlignedMaskStabilizer:
                     valid_counts[t] = k
 
         # ── Diagnostics computed BEFORE binarization ───────────────────────
-        # If we measured after binarization, a soft 0.49 -> 0.51 wiggle would
-        # report as a 1.0 frame-to-frame delta — meaningless artifact.
+        # Two metrics: whole-frame (legacy) AND in-mask. For typical face shots
+        # at 15-25% mask occupancy, whole-frame delta is dominated by the
+        # 75-85% zero region and reads ~0.05-0.15/255 even when the boundary
+        # is wiggling visibly. The in-mask metric uses the union of
+        # (raw_mask[t-1] | raw_mask[t]) > 0.1 as the relevance mask, so the
+        # average reflects what's happening AT the silhouette boundary —
+        # which is where SAM3 jitter actually lives.
         with torch.no_grad():
+            # Whole-frame (legacy — kept for backward-compat)
             raw_delta = (work_mask[1:] - work_mask[:-1]).abs().mean().item() * 255
             out_delta = (out[1:] - out[:-1]).abs().mean().item() * 255
             reduction = (
                 (1.0 - out_delta / max(raw_delta, 1e-12)) * 100.0 if raw_delta > 0 else 0.0
             )
+
+            # In-mask boundary delta — the metric that actually shows whether
+            # the stabilizer is doing useful work
+            union = (
+                (work_mask[1:].clamp(0.0, 1.0) > 0.1)
+                | (work_mask[:-1].clamp(0.0, 1.0) > 0.1)
+            ).float()
+            union_count = union.sum().clamp_min(1.0)
+            raw_delta_inmask = (
+                ((work_mask[1:] - work_mask[:-1]).abs() * union).sum().item()
+                / union_count.item() * 255
+            )
+            out_delta_inmask = (
+                ((out[1:] - out[:-1]).abs() * union).sum().item()
+                / union_count.item() * 255
+            )
+            reduction_inmask = (
+                (1.0 - out_delta_inmask / max(raw_delta_inmask, 1e-12)) * 100.0
+                if raw_delta_inmask > 0 else 0.0
+            )
+            mask_occupancy = float(union.mean().item())
 
         # ── Output mode (after diagnostics) ─────────────────────────────────
         if output_mode == "binary":
@@ -464,7 +491,12 @@ class NV_BboxAlignedMaskStabilizer:
             info_lines.append(f"raw passthrough: {n_passthrough}/{T} frames")
 
         info_lines.append(
-            f"frame-to-frame mask delta: raw={raw_delta:.2f}/255 -> "
+            f"in-mask delta (boundary jitter, occupancy={mask_occupancy*100:.0f}%): "
+            f"raw={raw_delta_inmask:.2f}/255 -> smoothed={out_delta_inmask:.2f}/255 "
+            f"(reduction {reduction_inmask:.0f}%)"
+        )
+        info_lines.append(
+            f"whole-frame delta (diluted by zero-BG): raw={raw_delta:.2f}/255 -> "
             f"smoothed={out_delta:.2f}/255 (reduction {reduction:.0f}%)"
         )
 
