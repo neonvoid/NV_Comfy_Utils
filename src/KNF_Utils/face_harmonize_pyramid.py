@@ -30,6 +30,19 @@ Key corrections vs. the initial MVP (2026-04-24 review response):
     gen_spread is near zero) so near-constant bands can't hide failures
   - Batch chunking in execute() prevents VRAM blowup for long T
 
+2026-04-25 update — base-band tone source decoupled from boundary-jitter:
+  When the silhouette mask jitters frame-to-frame (head rotation, SAM3 flicker,
+  rotation-misaligned consensus output), the MNC formula blur(orig*m)/blur(m)
+  reads a different "global face color" each frame because the boundary
+  transiently sweeps across plate pixels OUTSIDE the intended face region —
+  chin shadow, neck shadow, hair, collar. The base-band tone target then drifts
+  toward those values, producing dark blotches in the harmonized output.
+
+  Fix: a separate, more-aggressively-eroded CORE mask is used as the support
+  weight for the BASE-BAND plate pyramid only. Mid + top bands keep the
+  standard mask (they need boundary signal — mid for ring lock, top for
+  texture stats). Param: core_erode_px (default 8 px on top of mask_erode_px).
+
 Reused primitives:
   - low_freq_recompose._erode_mask_2d (min-pool erosion)
   - low_freq_recompose._feather_mask (edge feather)
@@ -386,7 +399,7 @@ def _process_batch_chunk(
     match_strength, tone_mode,
     texture_strength, grain_strength,
     edge_protection,
-    pyramid_levels, mask_erode_px, support_tau, ring_px_finest,
+    pyramid_levels, mask_erode_px, core_erode_px, support_tau, ring_px_finest,
     kernel,
 ):
     """Harmonize one batch chunk end-to-end. Returns a [B, 3, H, W] linear-RGB
@@ -395,8 +408,30 @@ def _process_batch_chunk(
     """
     B, C, H, W = orig_bchw.shape
 
-    # Decomposition-support mask
+    # Decomposition-support mask (used for mid + top bands and the gen pyramid)
     mask_support = _erode_mask_2d(mask_bchw, mask_erode_px) if mask_erode_px > 0 else mask_bchw
+
+    # Core-support mask: additional erosion for the BASE-BAND tone source. Decouples
+    # the MNC normalizer denominator from the jittery silhouette boundary so the
+    # global face-tone target stays stable across frames where the silhouette mask
+    # transiently sweeps across boundary plate pixels (chin shadow, neck shadow,
+    # hair, collar). Without this, blur(orig*m)/blur(m) at coarsest band reads a
+    # different "global face color" each time the boundary moves a few pixels.
+    #
+    # Fallback is computed PER-FRAME, not per-chunk: a chunk-global sum can hide
+    # near-empty masks behind larger ones in the same window, leaving a few bad
+    # frames going through with degenerate stats. Per-frame torch.where ensures
+    # each item in the batch independently picks its own support.
+    if core_erode_px > 0:
+        core_support_eroded = _erode_mask_2d(mask_support, core_erode_px)
+        ms_sum = mask_support.sum(dim=(1, 2, 3), keepdim=True).clamp_min(1.0)
+        cs_sum = core_support_eroded.sum(dim=(1, 2, 3), keepdim=True)
+        # Per-frame fallback: where core eroded below 5% of mask_support's mass,
+        # use mask_support directly. torch.where broadcasts the [B,1,1,1] gate.
+        use_fallback = cs_sum < (0.05 * ms_sum)
+        core_support = torch.where(use_fallback, mask_support, core_support_eroded)
+    else:
+        core_support = mask_support
 
     # Finest-scale ring, then pyramid-downsampled
     num_levels = _plan_pyramid_levels(H, W, pyramid_levels)
@@ -407,8 +442,19 @@ def _process_batch_chunk(
     orig_lin = _srgb_to_linear(orig_bchw)
     gen_lin = _srgb_to_linear(gen_bchw)
 
+    # Standard pyramid (mask_support) — used for mid + top bands.
     lap_orig, _ = _build_masked_laplacian_pyramid(orig_lin, mask_support, num_levels, kernel, support_tau)
     lap_gen, gauss_m = _build_masked_laplacian_pyramid(gen_lin, mask_support, num_levels, kernel, support_tau)
+
+    # Core pyramid for the PLATE only (core_support) — used at base bands so the
+    # tone-replacement source and stat-matching mask are jitter-immune. Built only
+    # if core_erode_px actually narrowed the mask; otherwise reuses standard.
+    if core_erode_px > 0 and not torch.equal(core_support, mask_support):
+        lap_orig_core, gauss_m_core = _build_masked_laplacian_pyramid(
+            orig_lin, core_support, num_levels, kernel, support_tau
+        )
+    else:
+        lap_orig_core, gauss_m_core = lap_orig, gauss_m
 
     # Release tensors we no longer need for pyramid build
     del orig_lin, gen_lin
@@ -417,19 +463,22 @@ def _process_batch_chunk(
 
     pyr_out = [None] * num_levels
 
-    # Base (tone replacement)
+    # Base (tone replacement) — uses core pyramid so boundary jitter does not
+    # contaminate the global face-tone target.
     for lvl in base_levels:
         pyr_out[lvl] = _process_base_band(
-            lap_gen[lvl], lap_orig[lvl], gauss_m[lvl],
+            lap_gen[lvl], lap_orig_core[lvl], gauss_m_core[lvl],
             mask_occupancy, tone_mode, match_strength,
         )
 
-    # Mid (preserve gen + boundary ring lock)
+    # Mid (preserve gen + boundary ring lock) — uses standard pyramid so the
+    # boundary signal is preserved (we WANT plate structure at the seam here).
     for lvl in mid_levels:
         ring_lvl = ring_pyramid[lvl] if ring_pyramid is not None else torch.zeros_like(lap_gen[lvl][:, :1])
         pyr_out[lvl] = _process_mid_band(lap_gen[lvl], lap_orig[lvl], ring_lvl, edge_protection)
 
-    # Top (stat matching)
+    # Top (stat matching) — uses standard pyramid; texture/grain stats benefit
+    # from full-mask coverage, and the [0.7, 1.43] scale clamp guards outliers.
     num_top = len(top_levels)
     for idx_in_top, lvl in enumerate(top_levels):
         pyr_out[lvl] = _process_top_band(
@@ -439,7 +488,7 @@ def _process_batch_chunk(
         )
 
     # Release source pyramids now that pyr_out is built
-    del lap_orig, lap_gen, gauss_m
+    del lap_orig, lap_gen, gauss_m, lap_orig_core, gauss_m_core
 
     result_lin = _collapse_pyramid(pyr_out, kernel)
     return result_lin, num_levels, (top_levels, mid_levels, base_levels)
@@ -524,6 +573,18 @@ class NV_FaceHarmonizePyramid:
                                "numerator/denominator away from boundary pixels whose value could "
                                "bleed into the band stats. 2 px default."
                 }),
+                "core_erode_px": ("INT", {
+                    "default": 8, "min": 0, "max": 32, "step": 1,
+                    "tooltip": "Additional erosion on top of mask_erode_px to derive a jitter-immune "
+                               "CORE mask used only for BASE-BAND tone replacement. Decouples the "
+                               "global face-tone target from silhouette boundary jitter (head nods, "
+                               "rotation, SAM3 flicker). Without this, plate pixels just outside the "
+                               "intended face region (chin/neck shadow, hair, collar) drift into the "
+                               "MNC numerator when the mask boundary moves, producing dark blotches "
+                               "in the harmonized output. 0 = legacy behavior. 8 px default ≈ 1.5%% "
+                               "of a 512-px crop. Auto-falls-back to mask_support if erosion empties "
+                               "the core."
+                }),
                 "support_tau": ("FLOAT", {
                     "default": 0.001, "min": 0.0, "max": 0.1, "step": 0.0005,
                     "tooltip": "MNC fallback threshold. Where blurred-mask support drops below this, "
@@ -554,7 +615,7 @@ class NV_FaceHarmonizePyramid:
                 texture_strength=1.0, grain_strength=1.0,
                 edge_protection=0.5, edge_falloff_px=8,
                 pyramid_levels="auto",
-                mask_erode_px=2, support_tau=0.001,
+                mask_erode_px=2, core_erode_px=8, support_tau=0.001,
                 chunk_size=16):
         info_lines = []
 
@@ -610,7 +671,8 @@ class NV_FaceHarmonizePyramid:
         top_preview, mid_preview, base_preview = _assign_band_groups(num_levels_preview)
         info_lines.append(
             f"levels={num_levels_preview} | top={top_preview} mid={mid_preview} base={base_preview} | "
-            f"mask_occupancy={mask_occupancy:.2f} (smooth gate) | ring_px_finest={ring_px_finest:.1f}"
+            f"mask_occupancy={mask_occupancy:.2f} (smooth gate) | ring_px_finest={ring_px_finest:.1f} | "
+            f"mask_erode={mask_erode_px}px core_erode={core_erode_px}px (base-band)"
         )
 
         # Output accumulator (pre-allocated; avoids a list-and-cat spike for large B)
@@ -630,6 +692,7 @@ class NV_FaceHarmonizePyramid:
                 edge_protection=edge_protection,
                 pyramid_levels=pyramid_levels,
                 mask_erode_px=mask_erode_px,
+                core_erode_px=core_erode_px,
                 support_tau=support_tau,
                 ring_px_finest=ring_px_finest,
                 kernel=kernel,
