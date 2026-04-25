@@ -1001,7 +1001,7 @@ class CustomVideoSaver:
             # ComfyUI tensors are typically [0,1] but can have slight overflow from processing
             # Use threshold of 2.0 to distinguish: if max < 2.0, assume [0,1] data
             is_normalized = original_max < 2.0
-            is_float = original_dtype == np.float32 or original_dtype == np.float64
+            is_float = original_dtype in (np.float16, np.float32, np.float64)
 
             # Get video dimensions
             num_frames, height, width, channels = video_array.shape
@@ -1301,7 +1301,7 @@ class CustomVideoSaver:
 
             # Determine conversion parameters (actual conversion done per-frame to save memory)
             is_normalized = original_max < 2.0
-            is_float = original_dtype == np.float32 or original_dtype == np.float64
+            is_float = original_dtype in (np.float16, np.float32, np.float64)
             is_16bit = original_dtype in [np.uint16, np.int16]
             scale_16bit = is_16bit and original_max > 255
 
