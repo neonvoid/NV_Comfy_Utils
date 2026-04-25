@@ -322,6 +322,17 @@ class NV_InpaintStitch:
                                "0.7 = safe default that prevents mask erosion from misleading gradients. "
                                "1.0 = fully trust the guided filter. 0.0 = no refinement."
                 }),
+                "output_dtype": (["fp16", "fp32"], {
+                    "default": "fp16",
+                    "tooltip": "Output tensor dtype. fp16 (default, since 2026-04-24): halves CPU "
+                               "RAM (3.45 GB instead of 6.86 GB for 277-frame 1080p). Output goes "
+                               "to video encoder which converts to uint8 anyway, so fp16 has zero "
+                               "visible impact on final delivery. fp32: legacy behavior — only "
+                               "needed if downstream nodes require fp32 precision (e.g., feeding "
+                               "into another high-precision color operation before video save). "
+                               "If you OOM with fp32 (allocator can't allocate ~6.9 GB twice for "
+                               "back-to-back stitches), drop to fp16."
+                }),
             },
         }
 
@@ -336,10 +347,13 @@ class NV_InpaintStitch:
     )
 
     def stitch(self, stitcher, inpainted_image, blend_mode="multiband", multiband_levels=5,
-               guided_refine=False, guided_radius=8, guided_eps=0.001, guided_strength=0.7):
+               guided_refine=False, guided_radius=8, guided_eps=0.001, guided_strength=0.7,
+               output_dtype="fp16"):
         device = comfy.model_management.get_torch_device()
         intermediate = comfy.model_management.intermediate_device()
         resize_algorithm = _get_resize_algorithm(stitcher)
+        # Resolve output dtype (default fp16 — see pre-allocation block below for why)
+        output_dtype_torch = torch.float16 if output_dtype == "fp16" else torch.float32
 
         skipped_indices_raw = stitcher.get('skipped_indices', [])
         skipped_indices = set(skipped_indices_raw)
@@ -410,23 +424,35 @@ class NV_InpaintStitch:
             gc.collect()
             torch.cuda.empty_cache()
 
-        # --- Pre-allocate output batch (replaces the list-append-then-stack pattern).
-        # Rationale: the prior code built `results = [...]` per-frame by calling
-        # `.to(intermediate)` each iteration, which allocated a fresh CPU tensor
-        # per frame (~25MB at 1080p) and accumulated N references in the list.
-        # On back-to-back InpaintStitch calls (two parallel workflow branches),
-        # aggregate RAM across both calls hit a Windows virtual-memory limit
-        # and triggered a native access violation mid-loop (see 2026-04-24
-        # crash log — frame 239/277 in second call).
+        # --- Pre-allocate output batch in fp16 (replaces the list-append-then-stack pattern).
+        # Two-stage history of this code path:
         #
-        # Fix: allocate ONE contiguous output tensor up-front and write into
-        # pre-existing slots with `.copy_()`. No per-frame tensor-object churn,
-        # no list-to-stack copy at the end, peak RAM during loop = `output_batch`
-        # size alone (not + in-flight list references).
+        #   v1 (original): `results = []` list grown per-frame via `.to(intermediate)`.
+        #     Failure: Windows native access violation mid-loop on back-to-back stitch
+        #     calls — accumulating ~6 GB list of CPU tensors collided with downstream
+        #     held outputs (D-105 crash log, frame 239/277 in second call).
+        #
+        #   v2 (D-105 fix): pre-allocate one contiguous output tensor at peek_canvas
+        #     dtype (fp32 in practice) and `.copy_()` per-frame. Fixed the access
+        #     violation but a SECOND OOM appeared 2026-04-24 (night) — when two
+        #     InpaintStitch calls produce 1936x1072 fp32 outputs, both held by
+        #     downstream branches simultaneously: 277 × 1936 × 1072 × 3 × 4 bytes
+        #     = 6.86 GB × 2 = 13.7 GB, hitting the system RAM ceiling on the
+        #     SECOND `torch.empty` call.
+        #
+        #   v3 (this version): default output dtype to fp16. The output goes to a
+        #     video encoder which converts to uint8 anyway — fp16 has zero visible
+        #     impact on final delivery. Cuts per-stitch RAM in half (3.45 GB at
+        #     1080p × 277 frames). Two parallel stitches now total ~6.9 GB instead
+        #     of 13.7 GB — fits comfortably on a 32 GB system. fp32 still available
+        #     via the `output_dtype` widget for users who specifically need it
+        #     (e.g., feeding into another high-precision color operation).
         peek_canvas = stitcher['canvas_image'][0]
         out_H, out_W = peek_canvas.shape[0], peek_canvas.shape[1]
         out_C = peek_canvas.shape[2] if peek_canvas.dim() == 3 else 3
-        out_dtype = peek_canvas.dtype
+        # Output dtype: fp16 default for RAM efficiency. Resolved from the
+        # widget value below (passed via execute() default).
+        out_dtype = output_dtype_torch
         result_batch = torch.empty((total_frames, out_H, out_W, out_C), dtype=out_dtype, device=intermediate)
         stitch_mask_batch = torch.empty((total_frames, out_H, out_W), dtype=out_dtype, device=intermediate)
 
