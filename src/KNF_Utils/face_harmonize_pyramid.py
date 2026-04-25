@@ -230,7 +230,7 @@ def _masked_mean_abs_dev(t, m, mean=None):
 
 
 def _match_band_stats(gen_band, orig_band, mask_band, use_robust_spread,
-                      scale_clamp=(0.5, 2.0)):
+                      scale_clamp=(0.7, 1.43)):
     """Re-scale gen_band so its in-mask (mean, spread) matches orig_band's.
 
     Flat-band fallback: when gen_spread is within FLAT_BAND_REL_TOL of the
@@ -277,7 +277,14 @@ def _assign_band_groups(num_levels):
     """Partition level indices into top / mid / base groups.
 
     Convention: level 0 is finest Laplacian residual, num_levels-1 is base
-    Gaussian. top = finest 1-2 levels; base = coarsest 2 levels; mid = between.
+    Gaussian. top = finest 1-2 levels; base = coarsest 1 level; mid = between.
+
+    Narrowed base to single coarsest level (was 2 levels) on 2026-04-24 after
+    real-footage testing showed dual base-band replacement at sigma~32 + sigma~64
+    over-injects plate shadows into the gen face when mask_occupancy is low and
+    tone_mode=replace is active. LFR v4's single-sigma replacement (~sigma=32)
+    didn't have this issue. Narrowing to coarsest-only matches LFR's footprint
+    while preserving the multi-band stat-matching benefits at top.
     """
     if num_levels <= 3:
         top = [0]
@@ -285,11 +292,11 @@ def _assign_band_groups(num_levels):
         mid = [i for i in range(num_levels) if i not in top and i not in base]
     elif num_levels == 4:
         top = [0]
-        mid = [1]
-        base = [2, 3]
+        base = [3]
+        mid = [1, 2]
     else:  # 5, 6
         top = [0, 1]
-        base = [num_levels - 2, num_levels - 1]
+        base = [num_levels - 1]
         mid = [i for i in range(num_levels) if i not in top and i not in base]
     return top, mid, base
 
@@ -468,10 +475,12 @@ class NV_FaceHarmonizePyramid:
                                "a soft edge falloff. Outside the mask, original pixels pass through."
                 }),
                 "match_strength": ("FLOAT", {
-                    "default": 0.75, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05,
                     "tooltip": "Master intensity. Drives base-band tone replacement. "
                                "0 = passthrough of generated; 1 = full plate-anchored recomposition. "
-                               "Start at 0.75."
+                               "Default lowered to 0.5 (was 0.75) on 2026-04-24 after real-footage "
+                               "testing — pure 0.75 replace pulled plate shadows into gen face. "
+                               "Raise toward 1.0 only if tone match is undershooting."
                 }),
             },
             "optional": {
