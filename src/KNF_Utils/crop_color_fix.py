@@ -27,6 +27,34 @@ import torch
 import torch.nn.functional as F
 
 from .boundary_color_match import _rgb_to_lab, _lab_to_rgb
+
+
+def _chunked_rgb_to_lab(rgb_bchw, chunk_size=16):
+    """Memory-bounded Lab conversion. The single-shot _rgb_to_lab on a 277-frame
+    1080p batch allocates ~1-1.3 GB transient peak (multiple intermediate
+    pow/multiply tensors at full batch size) which can produce Windows access
+    violations under back-to-back queue RAM pressure (observed 2026-04-26).
+    Chunking caps peak memory at chunk_size frames worth of Lab math."""
+    B = rgb_bchw.shape[0]
+    if B <= chunk_size:
+        return _rgb_to_lab(rgb_bchw)
+    out = torch.empty_like(rgb_bchw)
+    for s in range(0, B, chunk_size):
+        e = min(s + chunk_size, B)
+        out[s:e] = _rgb_to_lab(rgb_bchw[s:e])
+    return out
+
+
+def _chunked_lab_to_rgb(lab_bchw, chunk_size=16):
+    """Memory-bounded inverse. See _chunked_rgb_to_lab for context."""
+    B = lab_bchw.shape[0]
+    if B <= chunk_size:
+        return _lab_to_rgb(lab_bchw)
+    out = torch.empty_like(lab_bchw)
+    for s in range(0, B, chunk_size):
+        e = min(s + chunk_size, B)
+        out[s:e] = _lab_to_rgb(lab_bchw[s:e])
+    return out
 from .multiband_blend_stitch import multiband_blend
 
 
@@ -326,8 +354,8 @@ class NV_CropColorFix:
             orig_nchw = orig.permute(0, 3, 1, 2)
 
             if use_lab:
-                gen_work = _rgb_to_lab(gen_nchw[:, :3])   # [B, 3, H, W] in Lab
-                orig_work = _rgb_to_lab(orig_nchw[:, :3])
+                gen_work = _chunked_rgb_to_lab(gen_nchw[:, :3])   # [B, 3, H, W] in Lab
+                orig_work = _chunked_rgb_to_lab(orig_nchw[:, :3])
                 work_channels = 3
             else:
                 gen_work = gen_nchw[:, :3]
@@ -402,7 +430,7 @@ class NV_CropColorFix:
 
             # Convert back from Lab to RGB if needed
             if use_lab:
-                corrected_nchw = _lab_to_rgb(corrected_work).clamp(0, 1)
+                corrected_nchw = _chunked_lab_to_rgb(corrected_work).clamp(0, 1)
                 # Preserve alpha if present
                 if C > 3:
                     corrected_nchw = torch.cat([corrected_nchw, gen_nchw[:, 3:]], dim=1)

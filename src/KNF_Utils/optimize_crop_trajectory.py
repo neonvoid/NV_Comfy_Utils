@@ -275,7 +275,10 @@ class NV_OptimizeCropTrajectory:
                     "default": 30.0, "min": 0.0, "max": 10000.0, "step": 1.0,
                     "tooltip": "Penalty on bobbing / direction reversal (2nd derivative). "
                                "Higher = kills oscillation. Primary weight for damping head-bob. "
-                               "Try 30-60 for walking shots with painful vertical bob."
+                               "SHOT-TYPE PRESETS (pair with λy_mult and λ_pos consistently):\n"
+                               "  Walking subject: 30-60 (with λy_mult=3-4, λp=0.25)\n"
+                               "  Head-tilt / static: 15-25 (with λy_mult=1-2, λp=0.5)\n"
+                               "Mixing values from different presets over-damps intentional motion."
                 }),
                 "lambda_jerk": ("FLOAT", {
                     "default": 1.0, "min": 0.0, "max": 10000.0, "step": 0.5,
@@ -307,8 +310,11 @@ class NV_OptimizeCropTrajectory:
                     "default": 3.0, "min": 0.5, "max": 20.0, "step": 0.5,
                     "tooltip": "Multiplier on Y-axis smoothing weights (vel + acc + jerk). "
                                ">1 damps vertical head-bob harder than horizontal pan — "
-                               "perceptually correct for walking subjects. 1.0 = isotropic. "
-                               "Try 3-5 for walking shots, 1-2 for static or panning shots."
+                               "perceptually correct for walking subjects. 1.0 = isotropic.\n"
+                               "SHOT-TYPE PRESETS (pair with λ_acc and λ_pos consistently):\n"
+                               "  Walking subject: 3-5 (with λ_acc=30-60, λp=0.25)\n"
+                               "  Head-tilt / static: 1-2 (with λ_acc=15-25, λp=0.5)\n"
+                               "Mixing values from different presets over-damps intentional motion."
                 }),
                 "deadband_radius_px": ("INT", {
                     "default": 0, "min": 0, "max": 64, "step": 1,
@@ -317,11 +323,16 @@ class NV_OptimizeCropTrajectory:
                                "corrective moves. 0 = disabled. Try 2-4 for ultra-stable holds."
                 }),
                 "lambda_position": ("FLOAT", {
-                    "default": 0.5, "min": 0.0, "max": 100.0, "step": 0.05,
+                    "default": 0.25, "min": 0.0, "max": 100.0, "step": 0.05,
                     "tooltip": "Pull toward raw input centers. Higher = follows raw motion more "
                                "closely (good for panning shots). Lower = trusts smoothness terms "
                                "(good for static-camera walking shots). Set to 0 to anchor purely "
-                               "via constraints. Per-frame weight is auto-zeroed for missing frames."
+                               "via constraints. Per-frame weight is auto-zeroed for missing frames.\n"
+                               "SHOT-TYPE PRESETS (pair with λ_acc and λy_mult consistently):\n"
+                               "  Walking subject: 0.25 (with λ_acc=30-60, λy_mult=3-4)\n"
+                               "  Head-tilt / static: 0.5 (with λ_acc=15-25, λy_mult=1-2)\n"
+                               "Default lowered 0.5 → 0.25 (2026-04-26) to align with walking-shot\n"
+                               "preset since most face-refinement work is on walking subjects."
                 }),
                 "lambda_x_multiplier": ("FLOAT", {
                     "default": 1.0, "min": 0.1, "max": 20.0, "step": 0.1,
