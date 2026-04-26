@@ -118,13 +118,16 @@ class NV_CoTrackerBridge:
                 "stitcher": ("STITCHER",),
                 "cropped_image": ("IMAGE",),
                 "strength": ("FLOAT", {
-                    "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "Stabilization strength. 1.0 = full lock to reference. "
-                               "<1.0 = partial correction. Capped at 1.0: values above "
-                               "1.0 are motion inversion (not overcorrection) and push "
-                               "the grid sampler past the canvas boundary where image "
-                               "and mask padding modes diverge, reintroducing the "
-                               "source-space mismatch."
+                    "default": 0.85, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Stabilization strength. RECOMMENDED RANGE: 0.6-0.9. "
+                               "1.0 = full lock to reference but causes texture/skin blur "
+                               "from grid_sample interpolation accumulating across the "
+                               "warped neighborhood. 0.85 is the empirically-validated "
+                               "sweet spot for face shots — enough motion compensation to "
+                               "fix jitter, not enough to introduce visible texture blur. "
+                               "0.0 = passthrough (no stabilization, jitter retained). "
+                               "Capped at 1.0: above-1 inverts motion and pushes the grid "
+                               "sampler past canvas where image/mask padding modes diverge."
                 }),
             },
             "optional": {

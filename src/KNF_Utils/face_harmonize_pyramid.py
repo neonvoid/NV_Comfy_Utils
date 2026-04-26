@@ -604,10 +604,14 @@ class NV_FaceHarmonizePyramid:
     FUNCTION = "execute"
     CATEGORY = "NV_Utils/Color"
     DESCRIPTION = (
-        "Unified spatial harmonizer replacing CropColorFix + LowFreqRecompose + "
-        "TextureHarmonize via masked-normalized-convolution Laplacian pyramid in "
-        "linear RGB. Single match_strength driver + targeted overrides. No temporal "
-        "logic — pair with NV_FrameTemporalStabilize downstream."
+        "EXPERIMENTAL — multi-AI calibration review (2026-04-25) found this node "
+        "regresses color quality vs the proven CCF + TH combo on dynamic-lighting "
+        "face shots. Use NV_CropColorFix + NV_TextureHarmonize for production face "
+        "refinement; this node loses per-component decoupling that makes the 3-node "
+        "stack tunable. Kept in tree as experimental architecture. "
+        "Mechanism: unified spatial harmonizer via masked-normalized-convolution "
+        "Laplacian pyramid in linear RGB, single match_strength driver + targeted "
+        "overrides. No temporal logic — pair with NV_FrameTemporalStabilize."
     )
 
     def execute(self, original_crop, generated_crop, mask, match_strength,

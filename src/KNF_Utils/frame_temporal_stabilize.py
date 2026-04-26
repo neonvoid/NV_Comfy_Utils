@@ -372,8 +372,15 @@ class NV_FrameTemporalStabilize:
     FUNCTION = "execute"
     CATEGORY = "NV_Utils/Color"
     DESCRIPTION = (
-        "Motion-adaptive bidirectional EMA with correct fwd+bwd fusion and "
-        "optional Farneback flow warp. Post-spatial temporal coherence pass."
+        "WARNING — DO NOT USE on shots with dynamic lighting (sun/cloud changes, "
+        "subject walking through varying indoor light, exposure shifts). Multi-AI "
+        "calibration review (2026-04-25) found bidirectional EMA at strength=0.3 "
+        "smears legitimate per-frame illumination changes into perceptual flicker "
+        "while only producing ~3% delta reduction (vanity metric). Best for "
+        "static-lighting shots where remaining frame-to-frame variance is sampler "
+        "noise. Mechanism: motion-adaptive bidirectional EMA with correct fwd+bwd "
+        "fusion (each pass on raw frames, averaged) and optional Farneback flow "
+        "warp. Post-spatial temporal coherence pass."
     )
 
     def execute(self, frames, temporal_strength,

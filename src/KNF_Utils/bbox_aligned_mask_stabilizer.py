@@ -500,15 +500,17 @@ class NV_BboxAlignedMaskStabilizer:
                 }),
                 "rotation_mode": (["off", "pca"], {
                     "default": "off",
-                    "tooltip": "off (default): translation-only alignment (legacy D-106 behavior, "
-                               "general-purpose, known-safe across any mask type). "
-                               "pca: derive per-frame orientation from PCA on the silhouette "
-                               "mass (eigenvector of mass-weighted covariance). Promotes alignment "
-                               "from translation (dx, dy) to similarity (dx, dy, theta). Opt in "
-                               "for shots where the subject ROTATES between frames — face nods, "
-                               "body twists, rolling objects. For non-rotating subjects, the "
-                               "translation-only default is faster and incurs no risk. "
-                               "Confidence-gated by per-frame eccentricity (>=0.35)."
+                    "tooltip": "off (default, RECOMMENDED): translation-only alignment (legacy "
+                               "D-106 behavior, general-purpose, known-safe across any mask type). "
+                               "pca (EXPERIMENTAL — known issue): derives per-frame θ from PCA on "
+                               "the silhouette mass. Multi-AI calibration review (2026-04-25) "
+                               "found PCA on jittery SAM3 boundaries causes warp shimmer at the "
+                               "stitch seam — even small per-frame θ variation produces visible "
+                               "noise after grid_sample interpolation. The right rotation source "
+                               "is rigid point-tracking (e.g. CoTracker3 on 2-3 face landmarks), "
+                               "NOT silhouette-mass PCA. PCA stays here as experimental scaffolding "
+                               "until a CoTracker-based θ source is wired. Use only on shots where "
+                               "the head-nod failure is visibly worse than the resulting flicker."
                 }),
                 "max_rotation_deg": ("FLOAT", {
                     "default": 30.0, "min": 0.0, "max": 90.0, "step": 1.0,
