@@ -5,13 +5,26 @@ Replaces the slow animated WebP approach (PIL save_all) with per-frame JPEG enco
 (~50-100x faster) and a custom frontend canvas widget that animates them.
 """
 
+import gc
 import os
 import random
 
 import numpy as np
+import torch
 from PIL import Image
 
 import folder_paths
+
+
+def _tensor_to_uint8_np(t):
+    """Convert a [H, W, C] or [H, W] image/mask tensor in [0, 1] to a uint8
+    numpy array. Conversion happens on the SOURCE device, so the only CPU
+    allocation is the final uint8 buffer — avoids the 3× intermediate fp16
+    numpy arrays that the legacy `(t.cpu().numpy() * 255).clip(0,255).astype`
+    path produces (~36 MB per 1080p frame in transient allocations, which
+    cumulatively starves the system on back-to-back queue runs).
+    """
+    return (t.clamp(0.0, 1.0) * 255.0).round().to(torch.uint8).cpu().numpy()
 
 
 class NV_PreviewAnimation:
@@ -60,37 +73,40 @@ class NV_PreviewAnimation:
         full_output_folder, filename, counter, subfolder, _ = \
             folder_paths.get_save_image_path(filename_prefix, self.output_dir)
 
-        results = []
-        pil_images = []
-
-        # Build PIL image list with optional mask compositing
-        if images is not None and masks is not None:
-            for i in range(images.shape[0]):
-                img_np = (images[i].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-                pil_img = Image.fromarray(img_np)
-                if i < masks.shape[0]:
-                    mask_np = (masks[i].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-                    mask_pil = Image.fromarray(mask_np, mode='L')
-                    pil_img = pil_img.convert("RGBA")
-                    pil_img.putalpha(mask_pil)
-                pil_images.append(pil_img)
-
-        elif images is not None:
-            for i in range(images.shape[0]):
-                img_np = (images[i].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-                pil_images.append(Image.fromarray(img_np))
-
+        if images is not None:
+            num_frames = images.shape[0]
         elif masks is not None:
-            for i in range(masks.shape[0]):
-                mask_np = (masks[i].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-                pil_images.append(Image.fromarray(mask_np))
-
+            num_frames = masks.shape[0]
         else:
             return {"ui": {"frames": [], "fps": [fps], "frame_count": [0]}}
 
-        # Save each frame as individual JPEG
-        num_frames = len(pil_images)
-        for i, pil_img in enumerate(pil_images):
+        # Stream-process: convert each frame on its source device to uint8,
+        # save immediately, release before processing the next frame. Avoids
+        # two failure modes that surface under CPU RAM pressure on back-to-
+        # back queue runs:
+        #   (1) fp16 input → intermediate fp16 numpy array allocations (~12 MB
+        #       per 1080p frame × 3 stages) that fail when system is starved.
+        #       The on-device conversion in _tensor_to_uint8_np produces a
+        #       single uint8 buffer, eliminating the fp16 numpy intermediates.
+        #   (2) accumulating all PIL frames before save (~2 GB for 277f@1080p).
+        #       Streaming saves keep peak memory bounded by one frame.
+        results = []
+        width = height = 0
+
+        for i in range(num_frames):
+            if images is not None:
+                pil_img = Image.fromarray(_tensor_to_uint8_np(images[i]))
+                if masks is not None and i < masks.shape[0]:
+                    mask_pil = Image.fromarray(_tensor_to_uint8_np(masks[i]), mode='L')
+                    pil_img = pil_img.convert("RGBA")
+                    pil_img.putalpha(mask_pil)
+                    del mask_pil
+            else:
+                pil_img = Image.fromarray(_tensor_to_uint8_np(masks[i]), mode='L')
+
+            if i == 0:
+                width, height = pil_img.size
+
             # JPEG doesn't support alpha — flatten RGBA onto black background
             if pil_img.mode == "RGBA":
                 background = Image.new("RGB", pil_img.size, (0, 0, 0))
@@ -109,8 +125,15 @@ class NV_PreviewAnimation:
                 "subfolder": subfolder,
                 "type": self.type,
             })
+            # Explicit release of per-frame intermediates so they're reclaimed
+            # before the next iteration's allocations under RAM pressure.
+            del pil_img
 
-        width, height = pil_images[0].size
+        # Hint the allocator to release after a long video; cheap on a
+        # short batch, helpful when this node runs during back-to-back queue
+        # cycles where the scheduler doesn't naturally trigger collection.
+        gc.collect()
+
         return {
             "ui": {
                 "frames": results,
