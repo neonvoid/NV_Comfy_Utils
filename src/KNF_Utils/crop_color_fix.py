@@ -97,6 +97,25 @@ def _gaussian_blur_reflect(tensor, sigma):
     return F.conv2d(padded, kv, groups=C)
 
 
+def _chunked_gaussian_blur_reflect(tensor, sigma, chunk_size=16):
+    """Memory-bounded full-batch Gaussian blur. Single-shot _gaussian_blur_reflect
+    on a 277-frame [B, 3, 512, 512] batch at lf_sigma=10 (kernel ~61) allocates
+    ~1.5 GB in reflect-padded conv intermediates — crashes on back-to-back queue
+    RAM pressure (the same access-violation pattern as the Lab→RGB path that was
+    chunked 2026-04-26). Chunking caps peak at chunk_size frames worth of pad+conv.
+    """
+    if sigma <= 0:
+        return tensor
+    B = tensor.shape[0]
+    if B <= chunk_size:
+        return _gaussian_blur_reflect(tensor, sigma)
+    out = torch.empty_like(tensor)
+    for s in range(0, B, chunk_size):
+        e = min(s + chunk_size, B)
+        out[s:e] = _gaussian_blur_reflect(tensor[s:e], sigma)
+    return out
+
+
 def _compute_mask_centroids_and_velocity(mask):
     """Compute per-frame mask centroids and inter-frame velocity.
 
@@ -363,10 +382,12 @@ class NV_CropColorFix:
                 work_channels = 3
 
             if use_lf_decomp:
-                # Decompose into low/high frequency
-                gen_low = _gaussian_blur_reflect(gen_work, lf_sigma)
+                # Decompose into low/high frequency. Blurs chunked to bound
+                # transient memory (full-batch reflect-padded conv at sigma=10
+                # allocates ~1.5 GB peak — see _chunked_gaussian_blur_reflect docstring).
+                gen_low = _chunked_gaussian_blur_reflect(gen_work, lf_sigma)
                 gen_high = gen_work - gen_low
-                orig_low = _gaussian_blur_reflect(orig_work, lf_sigma)
+                orig_low = _chunked_gaussian_blur_reflect(orig_work, lf_sigma)
                 # We'll correct gen_low to match orig_low, then recombine with gen_high
                 work_src = gen_low
                 work_tgt = orig_low
@@ -487,7 +508,7 @@ class NV_CropColorFix:
             # Propagate correction into interior with distance decay
             if ring_pixel_count.sum() > 0:
                 # Smooth the inner band to create gradient falloff
-                inner_weight = _gaussian_blur_reflect(
+                inner_weight = _chunked_gaussian_blur_reflect(
                     inner_band.unsqueeze(1), boundary_ring * boundary_decay * 10
                 ).squeeze(1).clamp(0, 1)  # [B, H, W]
 
@@ -597,7 +618,7 @@ class NV_CropColorFix:
                 # Batch mode: all frames use same blend width (fast path)
                 mask_nchw = comp_mask.unsqueeze(1)  # [B, 1, H, W]
                 if blend_pixels > 0:
-                    mask_nchw = _gaussian_blur_reflect(mask_nchw, blend_pixels / 3.0)
+                    mask_nchw = _chunked_gaussian_blur_reflect(mask_nchw, blend_pixels / 3.0)
                 blended_nchw = multiband_blend(corr_nchw, orig_nchw, mask_nchw, num_levels=multiband_levels)
                 del corr_nchw, orig_nchw
                 output = blended_nchw.clamp(0, 1).permute(0, 2, 3, 1)  # [B, H, W, C]
@@ -624,7 +645,7 @@ class NV_CropColorFix:
                 # Batch mode
                 feathered = comp_mask
                 if blend_pixels > 0:
-                    feathered = _gaussian_blur_reflect(
+                    feathered = _chunked_gaussian_blur_reflect(
                         feathered.unsqueeze(1), blend_pixels / 3.0
                     ).squeeze(1).clamp(0, 1)
                 alpha = feathered.unsqueeze(-1)  # [B, H, W, 1]
