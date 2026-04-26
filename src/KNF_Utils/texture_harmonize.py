@@ -48,6 +48,24 @@ def _gaussian_blur_sep(tensor, sigma):
     return F.conv2d(padded, kv, groups=C)
 
 
+def _chunked_gaussian_blur_sep(tensor, sigma, chunk_size=16):
+    """Memory-bounded full-batch Gaussian blur — same access-violation pattern
+    as CCF's _chunked_gaussian_blur_reflect. Full-batch reflect-padded conv on
+    a 277-frame [B, 3, 512, 512] tensor allocates 1+ GB transient peak via the
+    pad+conv intermediates. Crashes on back-to-back queue RAM pressure.
+    Chunking caps peak at chunk_size frames worth of pad+conv work (2026-04-26)."""
+    if sigma <= 0:
+        return tensor
+    B = tensor.shape[0]
+    if B <= chunk_size:
+        return _gaussian_blur_sep(tensor, sigma)
+    out = torch.empty_like(tensor)
+    for s in range(0, B, chunk_size):
+        e = min(s + chunk_size, B)
+        out[s:e] = _gaussian_blur_sep(tensor[s:e], sigma)
+    return out
+
+
 def _masked_std(tensor, mask_4d, min_pixels=100):
     """Compute per-channel std over masked region. Returns [B, C, 1, 1] or None.
 
@@ -220,7 +238,7 @@ def _compute_full_frame_ctx_stats(stitcher, device, dtype, kernel, pyramid_level
 
         # === GRAIN: native-resolution per-channel MAD ===
         if do_grain:
-            ff_blur = _gaussian_blur_sep(full_frame_nchw, grain_blur_sigma)
+            ff_blur = _chunked_gaussian_blur_sep(full_frame_nchw, grain_blur_sigma)
             ff_grain = full_frame_nchw - ff_blur
             del ff_blur
 
@@ -541,10 +559,14 @@ class NV_TextureHarmonize:
 
                 effective = (1.0 + sharpness_strength * (ratio - 1.0)).clamp(min=0.1)
 
-                # Apply only to generated region
-                gen_region = gen_pyr[lvl] * effective * lvl_gen
-                ctx_region = gen_pyr[lvl] * (1.0 - lvl_gen)
-                gen_pyr[lvl] = ctx_region + gen_region
+                # Apply only to generated region.
+                # Math: gen_pyr[lvl] = gen_pyr[lvl] * (1 - lvl_gen) + (gen_pyr[lvl] * effective) * lvl_gen
+                # Equivalent to torch.lerp(gen_pyr[lvl], gen_pyr[lvl] * effective, lvl_gen).
+                # Saves ~4 transient [B, C, lh, lw] tensors at level 0 (~217 MB each at
+                # 277f×512×512×fp32) — same access-violation pattern as line 644 and CCF.
+                scaled = gen_pyr[lvl] * effective
+                gen_pyr[lvl] = torch.lerp(gen_pyr[lvl], scaled, lvl_gen)
+                del scaled
 
                 ratios.append(f"{ratio.mean().item():.2f}")
 
@@ -574,14 +596,14 @@ class NV_TextureHarmonize:
         if grain_strength > 0:
             # Generated grain — always computed from the crop result (it's where
             # we apply the noise back).
-            gen_blur = _gaussian_blur_sep(result, grain_blur_sigma)
+            gen_blur = _chunked_gaussian_blur_sep(result, grain_blur_sigma)
             gen_grain = result - gen_blur
 
             # CTX grain residual — only needed when NOT in full_frame mode.
             # full_frame mode has precomputed CTX MAD values from native-resolution
             # full frames in ff_stats['grain_ctx_mads'].
             if effective_scope != "full_frame":
-                orig_blur = _gaussian_blur_sep(orig, grain_blur_sigma)
+                orig_blur = _chunked_gaussian_blur_sep(orig, grain_blur_sigma)
                 ctx_grain = orig - orig_blur
 
             grain_added = []
@@ -641,7 +663,17 @@ class NV_TextureHarmonize:
                         # Reconstruct: blur + dampened grain (only in mask region)
                         gen_blur_ch = gen_blur[:, c:c+1, :, :]
                         new_vals = gen_blur_ch + dampened
-                        result[:, c:c+1, :, :] = result[:, c:c+1, :, :] * (1.0 - gen_4d) + new_vals * gen_4d
+                        # torch.lerp(a, b, w) = a*(1-w) + b*w — single fused kernel,
+                        # eliminates the 4 transient [B, 1, H, W] tensors the original
+                        # `result*(1-gen_4d) + new_vals*gen_4d` allocated per channel
+                        # (~1.2 GB transient at 277f×512×512×fp32, repeated per channel).
+                        # Same access-violation pattern as CCF Lab/blur sites — see
+                        # crop_color_fix.py chunked wrappers (2026-04-26).
+                        torch.lerp(
+                            result[:, c:c+1, :, :], new_vals, gen_4d,
+                            out=result[:, c:c+1, :, :]
+                        )
+                        del dampened, new_vals
                         grain_added.append(f"-{1.0 - effective_scale:.2f}x({gen_val:.4f}>{ctx_val:.4f})")
                     else:
                         # add_only mode: AI is already noisier, do nothing
@@ -675,19 +707,25 @@ class NV_TextureHarmonize:
         #   orig_hf  = original_crop - orig_lf      ← the texture layer
         #   result  += orig_hf * strength * mask     ← graft onto AI output
         if effective_highband > 0:
-            orig_lf = _gaussian_blur_sep(orig, highband_sigma)
+            orig_lf = _chunked_gaussian_blur_sep(orig, highband_sigma)
             orig_hf = orig - orig_lf
 
             # Also extract the AI result's existing HF to see what we're replacing.
             # This lets us do a WEIGHTED replacement rather than blind addition:
             # we subtract the AI's HF and add the original's HF, scaled by strength.
             # At strength=0.5 it's a 50/50 blend of both HF layers.
-            result_lf = _gaussian_blur_sep(result, highband_sigma)
+            result_lf = _chunked_gaussian_blur_sep(result, highband_sigma)
             result_hf = result - result_lf
 
             # Blend: result_lf + lerp(result_hf, orig_hf, effective_strength)
-            blended_hf = result_hf + effective_highband * (orig_hf - result_hf)
-            result = result_lf + blended_hf * gen_4d + result_hf * (1.0 - gen_4d)
+            # torch.lerp eliminates the (orig_hf - result_hf) and the multiply
+            # transients vs the manual a + w * (b - a) form. Same access-violation
+            # mitigation as line 644 / 547.
+            blended_hf = torch.lerp(result_hf, orig_hf, effective_highband)
+            # result = result_lf + blended_hf * gen_4d + result_hf * (1 - gen_4d)
+            #        = result_lf + lerp(result_hf, blended_hf, gen_4d)
+            result = result_lf + torch.lerp(result_hf, blended_hf, gen_4d)
+            del blended_hf
 
             # Diagnostic: measure how much HF energy changed
             orig_hf_energy = (orig_hf * gen_4d).abs().mean().item()
