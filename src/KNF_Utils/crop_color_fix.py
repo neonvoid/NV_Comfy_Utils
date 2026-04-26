@@ -680,23 +680,26 @@ class NV_CropColorFix:
         output = output.clamp(0, 1)
 
         # --- Final residual measurement ---
-        # Memory-efficient: per-frame masked sum, avoids materializing the full
-        # [B,H,W,3] expanded bool tensor that boolean indexing would create
-        # (previously hit 5+ GB allocations on 277-frame 1080p full-frame buffers).
+        # Per-frame subtraction AND per-frame masked sum. The earlier comment
+        # claimed memory-efficiency by chunking the boolean indexing, but the
+        # full-batch (output - orig).abs() ALSO allocates ~290 MB transient on
+        # 277f×512×512×fp32 — same access-violation pattern as the Lab/blur
+        # sites we chunked elsewhere. Now genuinely per-frame: peak ~3 MB
+        # transient (one frame's [H, W, 3] residual).
         ref_zone = m < ref_threshold
         ref_count = int(ref_zone.sum().item())
         if ref_count > 0:
-            residual = (output[..., :3] - orig[..., :3]).abs()
+            B_out = output.shape[0]
             total_sum = 0.0
-            for t in range(residual.shape[0]):
+            for t in range(B_out):
                 zt = ref_zone[t]
                 if bool(zt.any()):
-                    # residual[t][zt] returns [N_t, 3] — peak ~one frame of residual
-                    total_sum += float(residual[t][zt].sum().item())
-            denom = ref_count * residual.shape[-1]
+                    rt = (output[t][..., :3] - orig[t][..., :3]).abs()  # [H, W, 3]
+                    total_sum += float(rt[zt].sum().item())
+                    del rt
+            denom = ref_count * output.shape[-1]
             ref_residual = total_sum / max(denom, 1)
             info_lines.append(f"  Final residual in ref zone: {ref_residual * 255:.2f}/255")
-            del residual
         else:
             info_lines.append("  No reference zone pixels to measure residual")
 
