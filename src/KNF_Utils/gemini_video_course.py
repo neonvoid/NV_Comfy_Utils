@@ -18,6 +18,7 @@ Pricing reference (per 20-min video):
   - Low resolution: ~100 tok/s (~120K tokens for 20 min)
 """
 
+import hashlib
 import json
 import os
 import re
@@ -356,6 +357,42 @@ RULES:
 - For visible_artifacts: describe content specifics, not just "presentation slide" — what is ON the slide?
 - The video_summary should capture the pedagogical narrative, not just list topics.
 - For topic_coverage: distinguish "mentioned" (named in passing), "explained" (taught conceptually), and "demonstrated" (shown hands-on). This is critical for detecting when two videos both cover the same topic at different depths."""
+
+
+def _focus_cache_suffix(extra_instructions):
+    """Filename suffix that namespaces cache by user focus prompt.
+
+    Empty/whitespace input → "" (back-compat: no suffix, files stay at `{stem}.json`).
+    Non-empty input → `__focus-{hash8}` so different focuses produce separate JSONs
+    instead of silently overwriting each other or returning a stale-prompt cache hit.
+    """
+    if not extra_instructions or not extra_instructions.strip():
+        return ""
+    h = hashlib.sha256(extra_instructions.strip().encode("utf-8")).hexdigest()[:8]
+    return f"__focus-{h}"
+
+
+def _build_extraction_prompt(base_prompt, extra_instructions):
+    """Compose the final prompt: base + (optional user focus) + coverage clause.
+
+    Schema-safe append — user emphasis rides on top of the structured prompt
+    without touching the JSON shape spec. Coverage clause stays last so it has
+    the final word.
+    """
+    prompt = base_prompt
+    if extra_instructions and extra_instructions.strip():
+        prompt += (
+            "\n\nADDITIONAL FOCUS INSTRUCTIONS (user-provided):\n"
+            f"{extra_instructions.strip()}\n\n"
+            "Apply these as emphasis on top of the structured schema above. "
+            "Do NOT change the JSON shape — every required field must still be present."
+        )
+    prompt += (
+        "\n\nCOVERAGE REQUIREMENT: Analyze the ENTIRE video from 00:00 through the final second. "
+        "If any portion was not fully processed, add an entry to 'uncertainties' naming the timestamp range."
+    )
+    return prompt
+
 
 # ---------------------------------------------------------------------------
 # Phase 2: Course plan synthesis prompt
@@ -1743,7 +1780,21 @@ class NV_GeminiVideoExtractor:
                     "default": "",
                     "multiline": True,
                     "tooltip": "Custom extraction prompt. Leave empty to use the built-in "
-                               "structured extraction prompt.",
+                               "structured extraction prompt. ADVANCED — replaces the entire schema spec, "
+                               "so downstream JSON consumers may break. For per-video emphasis without "
+                               "schema risk, use 'extra_instructions' instead.",
+                }),
+                "extra_instructions": ("STRING", {
+                    "default": "",
+                    "multiline": True,
+                    "tooltip": "Optional. User-provided focus emphasis appended AFTER the built-in "
+                               "extraction prompt (or after prompt_override). Schema-safe: JSON shape "
+                               "stays the same, but the model is asked to pay extra attention to your "
+                               "topic. Cache filename includes a hash of this text — different focus = "
+                               "separate JSON file (no silent overwrite).\n\n"
+                               "Example: 'Pay special attention to lighting setup and camera framing. "
+                               "Treat any mention of color theory as a key concept worth a dedicated "
+                               "segment, even if the instructor only touches it briefly.'",
                 }),
                 "max_tokens_mode": (["auto_by_duration", "manual"], {
                     "default": "auto_by_duration",
@@ -1784,6 +1835,7 @@ class NV_GeminiVideoExtractor:
     def extract(self, video_path, api_key="", model="gemini-2.5-pro",
                 media_resolution="default", optimize="auto", video_url="",
                 skip_existing=True, output_dir="", prompt_override="",
+                extra_instructions="",
                 max_tokens_mode="auto_by_duration", max_tokens=8192, trigger=None):
         use_openrouter = _is_openrouter_model(model)
         api_key = resolve_api_key(api_key, provider="openrouter" if use_openrouter else "gemini")
@@ -1866,8 +1918,11 @@ class NV_GeminiVideoExtractor:
 
         # Cache key: include model AND schema_version so old extractions get invalidated
         # when the schema/prompt shape changes (otherwise stale cache silently shadows new shape).
-        json_path = os.path.join(output_dir, f"{video_name}.json")
-        partial_path = os.path.join(output_dir, f"{video_name}_partial.json")
+        # Focus suffix namespaces files by user-provided extra_instructions hash so different
+        # focuses produce separate JSONs instead of overwriting each other.
+        focus_suffix = _focus_cache_suffix(extra_instructions)
+        json_path = os.path.join(output_dir, f"{video_name}{focus_suffix}.json")
+        partial_path = os.path.join(output_dir, f"{video_name}{focus_suffix}_partial.json")
         if skip_existing and os.path.isfile(json_path):
             try:
                 with open(json_path, "r", encoding="utf-8") as f:
@@ -1892,16 +1947,14 @@ class NV_GeminiVideoExtractor:
             except (json.JSONDecodeError, ValueError, OSError):
                 print(f"[NV_GeminiVideoExtractor] Cache corrupt, re-extracting")
 
-        # Build prompt (shared across both paths). Append explicit full-coverage instruction
-        # because OR-routed providers have been observed to silently summarize only the first
-        # portion of long videos without throwing.
+        # Build prompt (shared across both paths). Append optional user focus emphasis +
+        # explicit full-coverage instruction. OR-routed providers have been observed to
+        # silently summarize only the first portion of long videos without throwing —
+        # the coverage clause stays last so it has the final word on the model.
         base_prompt = (prompt_override.strip()
                        if prompt_override and prompt_override.strip()
                        else _EXTRACTION_PROMPT)
-        prompt = base_prompt + (
-            "\n\nCOVERAGE REQUIREMENT: Analyze the ENTIRE video from 00:00 through the final second. "
-            "If any portion was not fully processed, add an entry to 'uncertainties' naming the timestamp range."
-        )
+        prompt = _build_extraction_prompt(base_prompt, extra_instructions)
 
         # Resolve effective output token budget. auto_by_duration probes the local file
         # (URL inputs fall back to the manual floor since we can't probe remotely).
@@ -1995,6 +2048,10 @@ class NV_GeminiVideoExtractor:
             source["youtube_video_id"] = yt_meta.get("id")
             source["youtube_title"] = yt_meta.get("title")
             source["youtube_author"] = yt_meta.get("author")
+        if extra_instructions and extra_instructions.strip():
+            ei = extra_instructions.strip()
+            source["extra_instructions_hash"] = hashlib.sha256(ei.encode("utf-8")).hexdigest()[:8]
+            source["extra_instructions_preview"] = ei[:500]
         source.update(extra_source)
         extraction["_source"] = source
 
@@ -2537,6 +2594,18 @@ class NV_GeminiBatchExtractor:
                     "tooltip": "Directory to save extraction JSONs. "
                                "Empty = ComfyUI output/gemini_course/extractions/",
                 }),
+                "extra_instructions": ("STRING", {
+                    "default": "",
+                    "multiline": True,
+                    "tooltip": "Optional. User-provided focus emphasis appended to the built-in "
+                               "extraction prompt for EVERY video in the batch. Schema-safe: JSON "
+                               "shape stays the same. Cache filenames include a hash of this text — "
+                               "different focus = separate JSON files (no silent overwrite of a prior "
+                               "extraction with different emphasis).\n\n"
+                               "Example: 'Pay special attention to compositing techniques and node "
+                               "graph structure. Treat any color theory mention as a key concept "
+                               "deserving its own segment.'",
+                }),
                 "max_tokens_mode": (["auto_by_duration", "manual"], {
                     "default": "auto_by_duration",
                     "tooltip": "How to set the per-video output token budget. "
@@ -2574,9 +2643,10 @@ class NV_GeminiBatchExtractor:
 
     def extract_batch(self, video_folder, api_key="", model="gemini-2.5-pro",
                       media_resolution="default", optimize="auto", dry_run=False,
-                      skip_existing=True, output_dir="",
+                      skip_existing=True, output_dir="", extra_instructions="",
                       max_tokens_mode="auto_by_duration", max_tokens=8192, trigger=None):
         use_openrouter = _is_openrouter_model(model)
+        focus_suffix = _focus_cache_suffix(extra_instructions)
         video_folder = video_folder.strip()
         if not video_folder:
             raise RuntimeError("video_folder is empty")
@@ -2638,7 +2708,7 @@ class NV_GeminiBatchExtractor:
                 dur_str = _format_duration(dur)
                 size_mb = vf.stat().st_size / (1024 * 1024)
                 est_cost = _cost_from_entry(pricing_entry, dur, media_resolution) if pricing_known else None
-                cached = os.path.isfile(os.path.join(output_dir, f"{vf.stem}.json"))
+                cached = os.path.isfile(os.path.join(output_dir, f"{vf.stem}{focus_suffix}.json"))
                 status = "cached (skip)" if cached and skip_existing else "will extract"
 
                 # Per-video output budget preview — visible in dry-run so users can see
@@ -2745,7 +2815,7 @@ class NV_GeminiBatchExtractor:
         if use_openrouter:
             oversized = []
             for vf in video_files:
-                cached_jp = os.path.join(output_dir, f"{vf.stem}.json")
+                cached_jp = os.path.join(output_dir, f"{vf.stem}{focus_suffix}.json")
                 if skip_existing and os.path.isfile(cached_jp):
                     continue
                 width, height, dur, has_audio = _ffprobe_streams(str(vf))
@@ -2785,7 +2855,7 @@ class NV_GeminiBatchExtractor:
                 pre_pricing_known = pricing_entry is not None
                 if pre_pricing_known:
                     for vf in video_files:
-                        cached_jp = os.path.join(output_dir, f"{vf.stem}.json")
+                        cached_jp = os.path.join(output_dir, f"{vf.stem}{focus_suffix}.json")
                         if skip_existing and os.path.isfile(cached_jp):
                             continue
                         dur = _get_video_duration(str(vf))
@@ -2830,10 +2900,10 @@ class NV_GeminiBatchExtractor:
             _check_interrupt()
 
             video_name = vf.stem
-            json_path = os.path.join(output_dir, f"{video_name}.json")
+            json_path = os.path.join(output_dir, f"{video_name}{focus_suffix}.json")
 
             # Check cache (validate config + schema_version matches before reuse)
-            partial_path = os.path.join(output_dir, f"{video_name}_partial.json")
+            partial_path = os.path.join(output_dir, f"{video_name}{focus_suffix}_partial.json")
             if skip_existing and os.path.isfile(json_path):
                 cache_valid = False
                 try:
@@ -2872,10 +2942,7 @@ class NV_GeminiBatchExtractor:
             print(f"\n  [{idx}/{total}] {vf.name} — extracting... [{_budget_note}]")
             try:
                 mime = _get_mime_type(str(vf))
-                prompt = _EXTRACTION_PROMPT + (
-                    "\n\nCOVERAGE REQUIREMENT: Analyze the ENTIRE video from 00:00 through the final second. "
-                    "If any portion was not fully processed, add an entry to 'uncertainties' naming the timestamp range."
-                )
+                prompt = _build_extraction_prompt(_EXTRACTION_PROMPT, extra_instructions)
 
                 extra_source = {}
                 if use_openrouter:
@@ -2940,6 +3007,10 @@ class NV_GeminiBatchExtractor:
                     "parse_status": parse_status,
                 }
                 source.update(forensics)
+                if extra_instructions and extra_instructions.strip():
+                    ei = extra_instructions.strip()
+                    source["extra_instructions_hash"] = hashlib.sha256(ei.encode("utf-8")).hexdigest()[:8]
+                    source["extra_instructions_preview"] = ei[:500]
                 source.update(extra_source)
                 extraction["_source"] = source
 
@@ -3126,6 +3197,17 @@ class NV_GeminiYoutubeBatchExtractor:
                     "tooltip": "Directory to save extraction JSONs. "
                                "Empty = ComfyUI output/gemini_course/extractions/",
                 }),
+                "extra_instructions": ("STRING", {
+                    "default": "",
+                    "multiline": True,
+                    "tooltip": "Optional. User-provided focus emphasis appended to the built-in "
+                               "extraction prompt for EVERY URL in the batch. Schema-safe: JSON shape "
+                               "stays the same. Cache filenames include a hash of this text so a "
+                               "different focus prompt produces separate JSONs (no silent overwrite).\n\n"
+                               "Example: 'Pay special attention to portfolio review feedback patterns. "
+                               "Treat any mention of pricing or client management as a key concept "
+                               "deserving its own segment.'",
+                }),
                 "max_tokens_mode": (["auto_by_duration", "manual"], {
                     "default": "auto_by_duration",
                     "tooltip": "Output budget strategy. 'auto_by_duration': YouTube durations are "
@@ -3299,8 +3381,9 @@ class NV_GeminiYoutubeBatchExtractor:
 
     def extract_batch(self, urls, playlist_urls="", api_key="", model="gemini-2.5-flash",
                       media_resolution="default", dry_run=False,
-                      skip_existing=True, output_dir="",
+                      skip_existing=True, output_dir="", extra_instructions="",
                       max_tokens_mode="auto_by_duration", max_tokens=24576, trigger=None):
+        focus_suffix = _focus_cache_suffix(extra_instructions)
         # Guard: OR models can't fetch YouTube bytes. Surface early, clearly.
         if _is_openrouter_model(model):
             raise RuntimeError(
@@ -3390,7 +3473,7 @@ class NV_GeminiYoutubeBatchExtractor:
         to_extract = 0
         plan = []
         for idx, e in enumerate(entries, 1):
-            json_path = os.path.join(output_dir, f"{e['stem']}.json")
+            json_path = os.path.join(output_dir, f"{e['stem']}{focus_suffix}.json")
             cached = os.path.isfile(json_path)
             status = "cached (skip)" if cached and skip_existing else "will extract"
             if not (cached and skip_existing):
@@ -3447,15 +3530,12 @@ class NV_GeminiYoutubeBatchExtractor:
         failed_count = 0
 
         # Build prompt once — same shape used by single extractor + folder batch
-        prompt = _EXTRACTION_PROMPT + (
-            "\n\nCOVERAGE REQUIREMENT: Analyze the ENTIRE video from 00:00 through the final second. "
-            "If any portion was not fully processed, add an entry to 'uncertainties' naming the timestamp range."
-        )
+        prompt = _build_extraction_prompt(_EXTRACTION_PROMPT, extra_instructions)
 
         for idx, e in enumerate(entries, 1):
             _check_interrupt()
-            json_path = os.path.join(output_dir, f"{e['stem']}.json")
-            partial_path = os.path.join(output_dir, f"{e['stem']}_partial.json")
+            json_path = os.path.join(output_dir, f"{e['stem']}{focus_suffix}.json")
+            partial_path = os.path.join(output_dir, f"{e['stem']}{focus_suffix}_partial.json")
 
             # Cache check — validate model, media_resolution, schema_version, and
             # video_url all match before reuse. Stale config → re-extract.
@@ -3589,6 +3669,10 @@ class NV_GeminiYoutubeBatchExtractor:
                     "parse_status": parse_status,
                 }
                 source.update(forensics)
+                if extra_instructions and extra_instructions.strip():
+                    ei = extra_instructions.strip()
+                    source["extra_instructions_hash"] = hashlib.sha256(ei.encode("utf-8")).hexdigest()[:8]
+                    source["extra_instructions_preview"] = ei[:500]
                 extraction["_source"] = source
 
                 if parse_status == "ok":

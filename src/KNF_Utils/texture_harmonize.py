@@ -70,16 +70,28 @@ def _masked_std(tensor, mask_4d, min_pixels=100):
     """Compute per-channel std over masked region. Returns [B, C, 1, 1] or None.
 
     Uses soft mask weights (not binarized) for smooth stats at coarse pyramid levels.
-    Checks min pixel count per-frame (not batch average) to avoid hiding bad frames.
+
+    Bug fix (D-126): previous version returned None if ANY frame had too few pixels,
+    killing texture matching for the entire batch. New behavior: stats computed per
+    frame; frames with insufficient support get a median-of-valid-frames fallback.
+    Returns None ONLY if no frames have enough pixels for a meaningful estimate.
     """
     weights = mask_4d.clamp(0, 1)
     count = weights.sum(dim=(2, 3), keepdim=True).clamp(min=1)
-    # Per-frame check: reject if ANY frame has too few pixels
-    if count.min().item() < min_pixels:
+    # Per-frame validity mask
+    valid_mask = (count.squeeze(-1).squeeze(-1).squeeze(-1) >= min_pixels)  # [B]
+    if not valid_mask.any().item():
         return None
     mean = (tensor * weights).sum(dim=(2, 3), keepdim=True) / count
     var = ((tensor - mean) ** 2 * weights).sum(dim=(2, 3), keepdim=True) / count
-    return var.sqrt().clamp(min=1e-6)
+    stats = var.sqrt().clamp(min=1e-6)
+    # Replace invalid-frame stats with median across valid frames
+    if not valid_mask.all().item():
+        fallback = stats[valid_mask].median(dim=0, keepdim=True).values  # [1, C, 1, 1]
+        for b in range(stats.shape[0]):
+            if not valid_mask[b].item():
+                stats[b] = fallback[0]
+    return stats
 
 
 def _masked_mad(tensor, mask_4d, min_pixels=100):
@@ -102,11 +114,16 @@ def _masked_mad(tensor, mask_4d, min_pixels=100):
     B, C, H, W = tensor.shape
     binary_mask = mask_4d.clamp(0, 1) >= 0.5  # [B, 1, H, W] bool
     count = binary_mask.sum(dim=(2, 3))  # [B, 1]
-    if count.min().item() < min_pixels:
+    # Bug fix (D-126): per-frame validity instead of batch-wide bail
+    valid_mask = (count.squeeze(-1) >= min_pixels)  # [B]
+    if not valid_mask.any().item():
         return None
 
     result = torch.empty(B, C, 1, 1, device=tensor.device, dtype=tensor.dtype)
+    valid_indices = []
     for b in range(B):
+        if not valid_mask[b].item():
+            continue  # filled by fallback below
         m = binary_mask[b, 0]  # [H, W]
         for c in range(C):
             values = tensor[b, c][m]  # [N] masked pixels
@@ -114,6 +131,15 @@ def _masked_mad(tensor, mask_4d, min_pixels=100):
             abs_dev = (values - median).abs()
             mad = torch.quantile(abs_dev, 0.5)
             result[b, c, 0, 0] = mad * 1.4826
+        valid_indices.append(b)
+
+    # Fallback: invalid frames get median of valid frames' stats
+    if len(valid_indices) < B:
+        valid_stats = result[valid_indices]  # [n_valid, C, 1, 1]
+        fallback = valid_stats.median(dim=0, keepdim=True).values  # [1, C, 1, 1]
+        for b in range(B):
+            if not valid_mask[b].item():
+                result[b] = fallback[0]
 
     return result.clamp(min=1e-6)
 
@@ -493,13 +519,24 @@ class NV_TextureHarmonize:
         # Check we have enough measurement support for non-full-frame modes.
         # full_frame mode does its own per-frame min check inside the precompute and
         # returns None on failure (handled above).
+        # Bug fix (D-126): previous version `return (generated_crop, info)` bailed the
+        # entire batch if a single frame had insufficient context pixels. Now we warn
+        # and continue — _masked_std/_masked_mad fall back to median-of-valid-frames
+        # for individual bad frames, preserving texture matching for the rest.
         if effective_scope != "full_frame":
-            min_ctx_px = int(meas_ctx_4d.sum(dim=(2, 3)).min().item())
-            if min_ctx_px < min_context_pixels:
-                info_lines.append(f"  Skipped: worst frame has {min_ctx_px} measurement pixels < {min_context_pixels}")
-                info = "\n".join(info_lines)
-                print(info)
-                return (generated_crop, info)
+            ctx_per_frame = meas_ctx_4d.sum(dim=(2, 3)).squeeze(-1)  # [B]
+            min_ctx_px = int(ctx_per_frame.min().item())
+            n_bad = int((ctx_per_frame < min_context_pixels).sum().item())
+            if n_bad > 0:
+                info_lines.append(
+                    f"  Per-frame fallback: {n_bad}/{B} frames below {min_context_pixels} "
+                    f"context pixels (worst={min_ctx_px}); using median-of-valid as fallback"
+                )
+                if n_bad == B:
+                    info_lines.append("  All frames below threshold — passthrough")
+                    info = "\n".join(info_lines)
+                    print(info)
+                    return (generated_crop, info)
 
         # =================================================================
         # Stage 1: Laplacian Pyramid Sharpness/Micro-Contrast Matching
@@ -517,8 +554,12 @@ class NV_TextureHarmonize:
             # Pyramid layout: [0]=finest detail, ..., [N-1]=coarse detail, [N]=base residual
             # Process from finest (0) up to but excluding base levels at the end.
             # skip_base_levels=1 means skip the base residual [N] (color — CropColorFix handles it)
-            num_detail_levels = len(gen_pyr) - 1  # exclude base residual
-            process_up_to = num_detail_levels - skip_base_levels
+            # Bug fix (D-126): previous formula `num_detail_levels - skip_base_levels` skipped one
+            # extra coarse detail level beyond the documented intent. Correct math is
+            # `len(gen_pyr) - skip_base_levels` so that skip=1 skips ONLY index N (base),
+            # skip=2 skips N and N-1, etc.
+            num_detail_levels = len(gen_pyr) - 1  # exclude base residual (kept for info)
+            process_up_to = len(gen_pyr) - skip_base_levels
 
             ratios = []
             for lvl in range(len(gen_pyr)):
@@ -725,12 +766,12 @@ class NV_TextureHarmonize:
             # result = result_lf + blended_hf * gen_4d + result_hf * (1 - gen_4d)
             #        = result_lf + lerp(result_hf, blended_hf, gen_4d)
             result = result_lf + torch.lerp(result_hf, blended_hf, gen_4d)
-            del blended_hf
 
-            # Diagnostic: measure how much HF energy changed
+            # Diagnostic: measure how much HF energy changed (must run BEFORE del blended_hf)
             orig_hf_energy = (orig_hf * gen_4d).abs().mean().item()
             result_hf_pre = (result_hf * gen_4d).abs().mean().item()
             blended_hf_energy = (blended_hf * gen_4d).abs().mean().item()
+            del blended_hf
             info_lines.append(f"  Highband: sigma={highband_sigma}, strength={effective_highband:.3f} "
                               f"(requested={highband_strength:.2f}), "
                               f"orig_hf={orig_hf_energy:.4f}, ai_hf={result_hf_pre:.4f}, "
