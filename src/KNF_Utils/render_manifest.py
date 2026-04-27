@@ -1,0 +1,342 @@
+"""
+NV Render Manifest - Consolidate all pipeline parameters into a JSON sidecar.
+
+The user's workflow scatters config across 60+ nodes. When debugging a render
+weeks later, recovering "what was the CoTracker strength? what was the bbox
+expand? was Track B on?" requires reading the workflow JSON in PNG metadata
+and chasing connections — useless for "what did I actually render with."
+
+This node consolidates everything into one structured JSON file written next
+to the video output. Survives ComfyUI restarts, browser sessions, etc.
+
+Design:
+- Optional inputs for every metadata source (info STRINGs, config buses, raw values)
+- Auto-extracts what it can from structured inputs (stitcher dict, mask_config bus)
+- Free-form notes field for human commentary
+- Trigger input (passthrough) lets the node execute LAST in the dependency graph
+- Output: manifest STRING + trigger passthrough
+
+Place at the end of the pipeline, gated by a trigger input from the video saver
+(or any final node) so it captures the post-execution state.
+"""
+
+import json
+import os
+import time
+
+import torch
+
+
+def _summarize_stitcher(stitcher):
+    """Extract a structured summary of stitcher dict metadata."""
+    if stitcher is None:
+        return None
+    out = {}
+    try:
+        # Crop bbox per frame
+        ctc_x = stitcher.get('cropped_to_canvas_x', None)
+        ctc_y = stitcher.get('cropped_to_canvas_y', None)
+        ctc_w = stitcher.get('cropped_to_canvas_w', None)
+        ctc_h = stitcher.get('cropped_to_canvas_h', None)
+        if ctc_x is not None and ctc_w is not None:
+            n = len(ctc_x)
+            out['frame_count'] = n
+            if n > 0:
+                # Aggregate stats — full per-frame array would be huge
+                out['bbox_x_range'] = [int(min(ctc_x)), int(max(ctc_x))]
+                out['bbox_y_range'] = [int(min(ctc_y)), int(max(ctc_y))]
+                out['bbox_w_range'] = [int(min(ctc_w)), int(max(ctc_w))]
+                out['bbox_h_range'] = [int(min(ctc_h)), int(max(ctc_h))]
+                out['bbox_first'] = [int(ctc_x[0]), int(ctc_y[0]), int(ctc_w[0]), int(ctc_h[0])]
+                out['bbox_last'] = [int(ctc_x[-1]), int(ctc_y[-1]), int(ctc_w[-1]), int(ctc_h[-1])]
+
+        # Canvas dims (from first frame's canvas image if available)
+        canvas_images = stitcher.get('canvas_image', None)
+        if canvas_images is not None and len(canvas_images) > 0:
+            cf = canvas_images[0]
+            if hasattr(cf, 'shape'):
+                if cf.dim() == 3:
+                    out['canvas_dims'] = [int(cf.shape[0]), int(cf.shape[1])]
+                elif cf.dim() == 4:
+                    out['canvas_dims'] = [int(cf.shape[1]), int(cf.shape[2])]
+
+        # Content warp mode
+        cwm = stitcher.get('content_warp_mode', None)
+        out['content_warp_mode'] = str(cwm) if cwm is not None else None
+
+        cwd = stitcher.get('content_warp_data', None)
+        if cwd is not None:
+            out['content_warp_present'] = True
+            if isinstance(cwd, list):
+                out['content_warp_frames'] = len(cwd)
+        else:
+            out['content_warp_present'] = False
+
+        # Resize algorithm
+        ra = stitcher.get('resize_algorithm', None)
+        if ra is not None:
+            out['resize_algorithm'] = str(ra)
+
+    except Exception as e:
+        out['extraction_error'] = str(e)
+    return out
+
+
+def _summarize_mask_config(mask_config):
+    """Extract dict summary of NV_MaskProcessingConfig override values."""
+    if mask_config is None:
+        return None
+    if not isinstance(mask_config, dict):
+        return {"raw": str(type(mask_config))}
+    # Copy known keys
+    keys = [
+        'cleanup_fill_holes', 'cleanup_remove_noise', 'cleanup_smooth',
+        'crop_expand_px', 'crop_blend_feather_px',
+        'vace_input_grow_px', 'vace_erosion_blocks', 'vace_feather_blocks',
+        'vace_halo_px', 'vace_stitch_erosion_px', 'vace_stitch_feather_px',
+    ]
+    out = {}
+    for k in keys:
+        if k in mask_config:
+            v = mask_config[k]
+            try:
+                out[k] = float(v) if isinstance(v, (int, float)) else str(v)
+            except (ValueError, TypeError):
+                out[k] = str(v)
+    return out
+
+
+def _resolve_output_path(output_path: str, shot_name: str) -> str:
+    """Resolve output path: if directory, append timestamped filename. If file, use as-is."""
+    if not output_path:
+        return ""
+
+    # Expand env vars and user
+    output_path = os.path.expandvars(os.path.expanduser(output_path))
+
+    if os.path.isdir(output_path):
+        # Treat as directory; build filename
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        safe_shot = shot_name.strip().replace(os.sep, "_") if shot_name else "render"
+        fname = f"{safe_shot}_{ts}_manifest.json"
+        return os.path.join(output_path, fname)
+    else:
+        # Treat as full file path
+        # Auto-create parent dir if missing
+        parent = os.path.dirname(output_path)
+        if parent and not os.path.isdir(parent):
+            try:
+                os.makedirs(parent, exist_ok=True)
+            except OSError:
+                pass
+        return output_path
+
+
+class NV_RenderManifest:
+    """Consolidate all pipeline parameters into a JSON sidecar file.
+
+    Place at the END of the pipeline (gate via trigger input from the video saver)
+    so it captures the post-execution state. Writes a structured JSON file next
+    to the video output. Use the `notes` field for free-form session context.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "output_path": ("STRING", {
+                    "default": "",
+                    "tooltip": "Full path to JSON file OR directory. If directory, file is named "
+                               "'{shot_name}_{timestamp}_manifest.json'. If file, used as-is. "
+                               "Parent dir created if missing. Example: 'Z:/projects/jcrew/output' "
+                               "(directory) OR 'Z:/projects/jcrew/output/run42.manifest.json' (file)."
+                }),
+                "shot_name": ("STRING", {
+                    "default": "render",
+                    "tooltip": "Shot identifier — used in filename when output_path is a directory."
+                }),
+            },
+            "optional": {
+                "trigger_in": ("*", {
+                    "tooltip": "Optional trigger to gate execution. Wire from any final-stage node "
+                               "(e.g., video saver output) so the manifest writes AFTER the render "
+                               "completes. ComfyUI executes nodes in dependency order."
+                }),
+                "notes": ("STRING", {
+                    "default": "", "multiline": True,
+                    "tooltip": "Free-form session notes. What were you testing? What's different "
+                               "about this render? Future-you will thank present-you."
+                }),
+                # Structured upstream metadata sources
+                "stitcher": ("STITCHER", {
+                    "tooltip": "Stitcher dict from NV_InpaintCrop2 / NV_CoTrackerBridge. Auto-extracts "
+                               "bbox extents per frame, canvas dims, content_warp_mode, etc."
+                }),
+                "mask_config": ("MASK_PROCESSING_CONFIG", {
+                    "tooltip": "NV_MaskProcessingConfig output. Auto-extracts erosion/feather/halo overrides."
+                }),
+                # Info STRING inputs (from each node's info output)
+                "static_vace_mask_info": ("STRING", {"forceInput": True, "tooltip": "info from NV_StaticVaceMask"}),
+                "vace_prep_info": ("STRING", {"forceInput": True, "tooltip": "info from NV_VaceControlVideoPrep"}),
+                "vace_prepass_info": ("STRING", {"forceInput": True, "tooltip": "info from NV_VacePrePassReference"}),
+                "track_b_info": ("STRING", {"forceInput": True, "tooltip": "info from NV_BboxAlignedMaskStabilizer"}),
+                "point_bbox_info": ("STRING", {"forceInput": True, "tooltip": "info from NV_PointDrivenBBox"}),
+                "opt_crop_info": ("STRING", {"forceInput": True, "tooltip": "info from NV_OptimizeCropTrajectory"}),
+                "cotracker_info": ("STRING", {"forceInput": True, "tooltip": "info from NV_CoTrackerBridge"}),
+                "color_match_info": ("STRING", {"forceInput": True, "tooltip": "info from NV_SimpleColorMatch or NV_CropColorFix"}),
+                "texture_harmonize_info": ("STRING", {"forceInput": True, "tooltip": "info from NV_TextureHarmonize"}),
+                "stitch_info": ("STRING", {"forceInput": True, "tooltip": "info from NV_InpaintStitch2 (free-form, not a real output yet)"}),
+                # Raw values (force_input — wire from widgets that don't have info outputs)
+                "cotracker_strength": ("FLOAT", {"forceInput": True, "tooltip": "CoTrackerBridge strength"}),
+                "cfg": ("FLOAT", {"forceInput": True, "tooltip": "KSampler CFG"}),
+                "denoise": ("FLOAT", {"forceInput": True, "tooltip": "KSampler denoise"}),
+                "sampler_steps": ("INT", {"forceInput": True, "tooltip": "KSampler total steps"}),
+                "sampler_name": ("STRING", {"forceInput": True, "tooltip": "Sampler name"}),
+                # Custom JSON blob — paste anything else
+                "custom_json_extras": ("STRING", {
+                    "default": "", "multiline": True,
+                    "tooltip": "Additional JSON to merge into manifest under 'extras' key. "
+                               "Must parse as JSON object. Empty = skipped."
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "*")
+    RETURN_NAMES = ("manifest_json", "trigger_out")
+    FUNCTION = "execute"
+    CATEGORY = "NV_Utils/Debug"
+    OUTPUT_NODE = True
+    DESCRIPTION = (
+        "Write a structured JSON manifest of all pipeline params next to the video output. "
+        "Survives ComfyUI restarts. Recover any past render's settings by reading one file "
+        "instead of chasing 60+ workflow nodes. Place at end of pipeline (use trigger_in to "
+        "execute after video save). Returns the manifest STRING + trigger passthrough."
+    )
+
+    def execute(
+        self,
+        output_path,
+        shot_name,
+        trigger_in=None,
+        notes="",
+        stitcher=None,
+        mask_config=None,
+        static_vace_mask_info=None,
+        vace_prep_info=None,
+        vace_prepass_info=None,
+        track_b_info=None,
+        point_bbox_info=None,
+        opt_crop_info=None,
+        cotracker_info=None,
+        color_match_info=None,
+        texture_harmonize_info=None,
+        stitch_info=None,
+        cotracker_strength=None,
+        cfg=None,
+        denoise=None,
+        sampler_steps=None,
+        sampler_name=None,
+        custom_json_extras="",
+    ):
+        TAG = "[NV_RenderManifest]"
+
+        manifest = {
+            "render_timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "shot_name": shot_name or "unnamed",
+            "notes": notes or "",
+        }
+
+        # Structured extractions
+        sti_summary = _summarize_stitcher(stitcher)
+        if sti_summary is not None:
+            manifest["stitcher"] = sti_summary
+
+        mc_summary = _summarize_mask_config(mask_config)
+        if mc_summary is not None:
+            manifest["mask_processing_config"] = mc_summary
+
+        # Info STRINGs
+        info_block = {}
+        for name, value in [
+            ("static_vace_mask", static_vace_mask_info),
+            ("vace_control_video_prep", vace_prep_info),
+            ("vace_prepass_reference", vace_prepass_info),
+            ("track_b_mask_stabilizer", track_b_info),
+            ("point_driven_bbox", point_bbox_info),
+            ("optimize_crop_trajectory", opt_crop_info),
+            ("cotracker_bridge", cotracker_info),
+            ("color_match", color_match_info),
+            ("texture_harmonize", texture_harmonize_info),
+            ("inpaint_stitch", stitch_info),
+        ]:
+            if value:
+                info_block[name] = value
+        if info_block:
+            manifest["node_info"] = info_block
+
+        # Sampler/scalar block
+        sampler_block = {}
+        if cotracker_strength is not None:
+            sampler_block["cotracker_strength"] = float(cotracker_strength)
+        if cfg is not None:
+            sampler_block["cfg"] = float(cfg)
+        if denoise is not None:
+            sampler_block["denoise"] = float(denoise)
+        if sampler_steps is not None:
+            sampler_block["sampler_steps"] = int(sampler_steps)
+        if sampler_name:
+            sampler_block["sampler_name"] = str(sampler_name)
+        if sampler_block:
+            manifest["sampler"] = sampler_block
+
+        # Custom extras
+        if custom_json_extras and custom_json_extras.strip():
+            try:
+                extras = json.loads(custom_json_extras)
+                manifest["extras"] = extras
+            except json.JSONDecodeError as e:
+                manifest["extras_parse_error"] = f"{e}"
+
+        # Resolve output path and write atomically
+        resolved_path = _resolve_output_path(output_path, shot_name)
+        manifest_json = json.dumps(manifest, indent=2, sort_keys=True, default=str)
+
+        save_status = "no_output_path"
+        if resolved_path:
+            try:
+                # Write to temp + rename for atomic replace
+                import tempfile
+                parent = os.path.dirname(os.path.abspath(resolved_path))
+                fd, tmp_path = tempfile.mkstemp(
+                    prefix=".manifest_", suffix=".tmp",
+                    dir=parent if parent else None,
+                )
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as f:
+                        f.write(manifest_json)
+                    os.replace(tmp_path, resolved_path)
+                    save_status = f"saved → {resolved_path}"
+                except Exception:
+                    if os.path.exists(tmp_path):
+                        try:
+                            os.remove(tmp_path)
+                        except OSError:
+                            pass
+                    raise
+            except Exception as e:
+                save_status = f"FAILED: {e}"
+
+        print(f"{TAG} {save_status}")
+        if resolved_path:
+            print(f"{TAG} manifest contains {len(manifest)} top-level keys")
+
+        return (manifest_json, trigger_in if trigger_in is not None else manifest_json)
+
+
+NODE_CLASS_MAPPINGS = {
+    "NV_RenderManifest": NV_RenderManifest,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "NV_RenderManifest": "NV Render Manifest",
+}

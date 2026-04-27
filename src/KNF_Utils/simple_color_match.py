@@ -42,9 +42,89 @@ NV_CropColorFix remains in the codebase as legacy/opt-in rescue for shots that
 need aggressive variance-scaling correction.
 """
 
+import json
+import os
+import tempfile
+
 import torch
 
 from .mask_ops import mask_erode_dilate
+
+
+def _load_state(state_file: str, state_key: str):
+    """Load (r, g, b) shift triple from JSON state file under state_key.
+
+    Returns (r, g, b) tuple of floats or None if file/key missing or malformed.
+    Never raises — file-load is best-effort. Caller falls back to widget seed values.
+    """
+    if not state_file or not state_key:
+        return None
+    if not os.path.isfile(state_file):
+        return None
+    try:
+        with open(state_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        entry = data.get(state_key)
+        if entry is None:
+            return None
+        # Accept either {"r":x,"g":y,"b":z} dict or [r,g,b] list
+        if isinstance(entry, dict):
+            return float(entry["r"]), float(entry["g"]), float(entry["b"])
+        if isinstance(entry, (list, tuple)) and len(entry) >= 3:
+            return float(entry[0]), float(entry[1]), float(entry[2])
+    except (json.JSONDecodeError, KeyError, ValueError, TypeError, OSError) as e:
+        print(f"[NV_SimpleColorMatch] state-load WARN: {e}; falling back to widget seeds")
+    return None
+
+
+def _save_state(state_file: str, state_key: str, r: float, g: float, b: float):
+    """Atomic write of (r, g, b) under state_key into state_file (JSON dict).
+
+    Uses temp-file + rename for atomic replace so concurrent reads never see
+    a partially-written file. Preserves other keys in the same file. Best-effort
+    — logs and continues on failure (color match still produces output).
+    """
+    if not state_file or not state_key:
+        return False
+    try:
+        # Ensure parent directory exists
+        parent = os.path.dirname(os.path.abspath(state_file))
+        if parent and not os.path.isdir(parent):
+            os.makedirs(parent, exist_ok=True)
+
+        # Read existing file (if any), preserving other keys
+        existing = {}
+        if os.path.isfile(state_file):
+            try:
+                with open(state_file, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    existing = loaded
+            except (json.JSONDecodeError, OSError):
+                pass  # treat as fresh file
+
+        existing[state_key] = {"r": float(r), "g": float(g), "b": float(b)}
+
+        # Atomic write: temp file + rename
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=".nv_state_", suffix=".tmp",
+            dir=parent if parent else None,
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(existing, f, indent=2, sort_keys=True)
+            os.replace(tmp_path, state_file)
+        except Exception:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            raise
+        return True
+    except Exception as e:
+        print(f"[NV_SimpleColorMatch] state-save WARN: {e}; continuing without persistence")
+        return False
 
 
 class NV_SimpleColorMatch:
@@ -133,6 +213,25 @@ class NV_SimpleColorMatch:
                     "forceInput": True,
                     "tooltip": "Optional EMA seed value for B channel."
                 }),
+                "state_file": ("STRING", {
+                    "default": "",
+                    "tooltip": "Optional JSON file path for cross-RUN state persistence. When set "
+                               "(along with state_key), the node loads seed_shift values from this "
+                               "file at entry and writes final shifts back at exit. Survives ComfyUI "
+                               "restarts. File is a dict keyed by state_key — multiple shots/chunks "
+                               "can share the same file with different keys. "
+                               "Example: 'Z:/projects/jcrew/color_state.json'. "
+                               "Leave empty to disable persistence (use widget seeds + outputs only)."
+                }),
+                "state_key": ("STRING", {
+                    "default": "",
+                    "tooltip": "Identifier within state_file for this chunk's color anchor state. "
+                               "Use a stable string per shot+chunk-sequence (e.g., 'jcrew_chunk0', "
+                               "'jcrew_chunk1'). For multi-chunk chains: write chunk N's final state "
+                               "under one key, then read it as chunk N+1's seed by using THE SAME "
+                               "key in chunk N+1 — the file load auto-overrides seed widgets when "
+                               "the key exists. Leave empty to disable persistence."
+                }),
             },
         }
 
@@ -164,6 +263,8 @@ class NV_SimpleColorMatch:
         seed_shift_r=0.0,
         seed_shift_g=0.0,
         seed_shift_b=0.0,
+        state_file="",
+        state_key="",
     ):
         TAG = "[NV_SimpleColorMatch]"
         device = generated_crop.device
@@ -217,12 +318,21 @@ class NV_SimpleColorMatch:
         orig_mean = (orig_rgb * ref_4d).sum(dim=(1, 2)) / count_safe  # [B, 3]
         raw_shifts = (orig_mean - gen_mean).clamp(-max_shift, max_shift)  # [B, 3]
 
+        # --- Resolve seed (file-state takes priority over widget seeds) ---
+        loaded_state = _load_state(state_file, state_key)
+        if loaded_state is not None:
+            effective_seed = loaded_state
+            seed_source = f"state_file (key='{state_key}')"
+        else:
+            effective_seed = (seed_shift_r, seed_shift_g, seed_shift_b)
+            seed_source = "widget" if any(s != 0.0 for s in effective_seed) else "fresh (no seed)"
+
         # --- Sequential EMA pass (state-dependent) ---
         ema_shift = torch.tensor(
-            [seed_shift_r, seed_shift_g, seed_shift_b],
+            list(effective_seed),
             device=device, dtype=torch.float32,
         )
-        ema_initialized = bool(seed_shift_r != 0.0 or seed_shift_g != 0.0 or seed_shift_b != 0.0)
+        ema_initialized = bool(effective_seed[0] != 0.0 or effective_seed[1] != 0.0 or effective_seed[2] != 0.0)
 
         corrected = gen.clone()
         n_valid = 0
@@ -251,30 +361,33 @@ class NV_SimpleColorMatch:
 
             total_abs_shift = total_abs_shift + ema_shift.abs()
 
+        # --- Persist state to file (atomic) ---
+        final_r = float(ema_shift[0].item())
+        final_g = float(ema_shift[1].item())
+        final_b = float(ema_shift[2].item())
+        state_saved = False
+        if state_file and state_key:
+            state_saved = _save_state(state_file, state_key, final_r, final_g, final_b)
+
         # --- Diagnostics ---
         avg_shift_255 = (total_abs_shift / max(B, 1)) * 255.0
         info_lines = [
             f"{TAG} {B} frames, {H}x{W}, ema={ema_strength:.2f}, max_shift={max_shift:.3f}",
             f"  Mask: ref_threshold={ref_threshold:.3f}, ref_erosion={ref_erosion}px (applied ONCE at entry)",
+            f"  Seed source: {seed_source} → R={effective_seed[0]:.4f}, G={effective_seed[1]:.4f}, B={effective_seed[2]:.4f}",
             f"  Validity: {n_valid}/{B} fresh shift, {n_decay}/{B} EMA decay (insufficient ref)",
             f"  Avg applied shift (in /255): "
             f"R={avg_shift_255[0].item():.2f}, G={avg_shift_255[1].item():.2f}, B={avg_shift_255[2].item():.2f}",
             f"  Final EMA shift (chunk-continuation): "
-            f"R={ema_shift[0].item():.4f}, G={ema_shift[1].item():.4f}, B={ema_shift[2].item():.4f}",
+            f"R={final_r:.4f}, G={final_g:.4f}, B={final_b:.4f}",
         ]
-        if seed_shift_r != 0 or seed_shift_g != 0 or seed_shift_b != 0:
-            info_lines.insert(2, f"  Seeded from prior chunk: "
-                                 f"R={seed_shift_r:.4f}, G={seed_shift_g:.4f}, B={seed_shift_b:.4f}")
+        if state_file and state_key:
+            status = "saved" if state_saved else "FAILED"
+            info_lines.append(f"  State persistence: {status} → {state_file} [key='{state_key}']")
         info = "\n".join(info_lines)
         print(info)
 
-        return (
-            corrected,
-            info,
-            float(ema_shift[0].item()),
-            float(ema_shift[1].item()),
-            float(ema_shift[2].item()),
-        )
+        return (corrected, info, final_r, final_g, final_b)
 
 
 NODE_CLASS_MAPPINGS = {
