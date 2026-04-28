@@ -42,6 +42,7 @@ NV_CropColorFix remains in the codebase as legacy/opt-in rescue for shots that
 need aggressive variance-scaling correction.
 """
 
+import copy
 import json
 import os
 import tempfile
@@ -232,11 +233,21 @@ class NV_SimpleColorMatch:
                                "key in chunk N+1 — the file load auto-overrides seed widgets when "
                                "the key exists. Leave empty to disable persistence."
                 }),
+                "manifest_in": ("RENDER_MANIFEST", {
+                    "tooltip": "Optional render-manifest dict from a prior NV_SimpleColorMatch "
+                               "instance OR an upstream NV_RenderManifest node. When wired and "
+                               "containing a `color_state` block with r/g/b shifts, those values "
+                               "are used as EMA seeds — TAKES PRIORITY over state_file and "
+                               "seed_shift_* widgets. ZERO-friction iterative-refinement: wire "
+                               "Pass 1's manifest_out → Pass 2's manifest_in. The dict accumulates "
+                               "color state + flows downstream to a final NV_RenderManifest for "
+                               "JSON serialization. Single source of truth across the workflow."
+                }),
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "STRING", "FLOAT", "FLOAT", "FLOAT")
-    RETURN_NAMES = ("corrected_crop", "info", "final_shift_r", "final_shift_g", "final_shift_b")
+    RETURN_TYPES = ("IMAGE", "STRING", "FLOAT", "FLOAT", "FLOAT", "RENDER_MANIFEST")
+    RETURN_NAMES = ("corrected_crop", "info", "final_shift_r", "final_shift_g", "final_shift_b", "manifest_out")
     FUNCTION = "execute"
     CATEGORY = "NV_Utils/Inpaint"
     DESCRIPTION = (
@@ -244,8 +255,10 @@ class NV_SimpleColorMatch:
         "for NV_CropColorFix in the new static-mask VACE pipeline. Categorically "
         "prevents CCF's failure modes: no variance scaling (no matte-face), single "
         "binarization at entry (no boiling-edge amplification), continuous EMA (no "
-        "skip strobe), hard-clamped shift (bounded blast radius). Outputs final EMA "
-        "state as 3 FLOATs for chunk-to-chunk color continuity."
+        "skip strobe), hard-clamped shift (bounded blast radius). Emits final EMA "
+        "state as 3 FLOATs AND embeds it into a flowing RENDER_MANIFEST dict for "
+        "zero-friction cross-pass continuity (single wire to a downstream ColorMatch "
+        "or final NV_RenderManifest)."
     )
 
     def execute(
@@ -265,13 +278,29 @@ class NV_SimpleColorMatch:
         seed_shift_b=0.0,
         state_file="",
         state_key="",
+        manifest_in=None,
     ):
         TAG = "[NV_SimpleColorMatch]"
         device = generated_crop.device
 
+        # Manifest passthrough on disabled path. Multi-AI bug review fixes:
+        #   - Deep-copy (was shallow): prevents branching workflows from corrupting
+        #     nested dicts when downstream nodes mutate inner state.
+        #   - Float outputs mirror prior color_state (was hardcoded 0/0/0): keeps
+        #     downstream nodes wired to the legacy float outputs in sync with
+        #     downstream nodes wired to the manifest_out dict. Otherwise the same
+        #     upstream state produces two contradictory downstream views.
         if not enable:
             print(f"{TAG} disabled (passthrough)")
-            return (generated_crop, f"{TAG} disabled (passthrough)", 0.0, 0.0, 0.0)
+            manifest_passthrough = copy.deepcopy(manifest_in) if isinstance(manifest_in, dict) else {}
+            prior_cs = manifest_passthrough.get("color_state") if isinstance(manifest_passthrough.get("color_state"), dict) else {}
+            try:
+                fb_r = float(prior_cs.get("r", 0.0))
+                fb_g = float(prior_cs.get("g", 0.0))
+                fb_b = float(prior_cs.get("b", 0.0))
+            except (TypeError, ValueError):
+                fb_r = fb_g = fb_b = 0.0
+            return (generated_crop, f"{TAG} disabled (passthrough)", fb_r, fb_g, fb_b, manifest_passthrough)
 
         B, H, W, C = generated_crop.shape
         if original_crop.shape != generated_crop.shape:
@@ -318,21 +347,66 @@ class NV_SimpleColorMatch:
         orig_mean = (orig_rgb * ref_4d).sum(dim=(1, 2)) / count_safe  # [B, 3]
         raw_shifts = (orig_mean - gen_mean).clamp(-max_shift, max_shift)  # [B, 3]
 
-        # --- Resolve seed (file-state takes priority over widget seeds) ---
-        loaded_state = _load_state(state_file, state_key)
-        if loaded_state is not None:
-            effective_seed = loaded_state
-            seed_source = f"state_file (key='{state_key}')"
+        # --- Resolve seed (priority order, multi-AI bug-review revision) ---
+        # Priority: WIDGET (when explicitly non-zero, manual override) >
+        #           manifest_in.color_state >
+        #           state_file >
+        #           widget zeros / fresh
+        #
+        # Why widget non-zero outranks manifest_in: per multi-AI review, having
+        # manifest_in always win turns the seed widgets into "dead knobs" once
+        # the manifest wire is connected. Operators need an in-graph escape
+        # hatch to force a recovery seed for one shot without unplugging the
+        # manifest. Non-zero widget = explicit human intent.
+        #
+        # Critical: track `seed_present` SEPARATELY from numeric value. An
+        # explicit (0,0,0) anchor from manifest is "carry forward valid neutral
+        # state" — distinct from "no prior anchor." Using `!= 0.0` to infer
+        # initialization conflates these and breaks the bootstrap branch.
+        widget_seed = (seed_shift_r, seed_shift_g, seed_shift_b)
+        widget_explicit = any(s != 0.0 for s in widget_seed)
+
+        manifest_seed = None
+        manifest_lineage = []
+        if isinstance(manifest_in, dict):
+            cs = manifest_in.get("color_state")
+            if isinstance(cs, dict) and all(k in cs for k in ("r", "g", "b")):
+                try:
+                    manifest_seed = (float(cs["r"]), float(cs["g"]), float(cs["b"]))
+                    raw_lineage = cs.get("lineage", [])
+                    manifest_lineage = list(raw_lineage) if isinstance(raw_lineage, list) else []
+                except (TypeError, ValueError):
+                    manifest_seed = None  # malformed → fall through
+
+        if widget_explicit:
+            effective_seed = widget_seed
+            seed_source = "widget (explicit override)"
+            seed_present = True
+        elif manifest_seed is not None:
+            effective_seed = manifest_seed
+            seed_source = (f"manifest_in.color_state (lineage={manifest_lineage}, "
+                           f"depth={len(manifest_lineage)})")
+            seed_present = True
         else:
-            effective_seed = (seed_shift_r, seed_shift_g, seed_shift_b)
-            seed_source = "widget" if any(s != 0.0 for s in effective_seed) else "fresh (no seed)"
+            loaded_state = _load_state(state_file, state_key)
+            if loaded_state is not None:
+                effective_seed = loaded_state
+                seed_source = f"state_file (key='{state_key}')"
+                seed_present = True
+            else:
+                effective_seed = widget_seed  # all zeros at this branch
+                seed_source = "fresh (no seed)"
+                seed_present = False
 
         # --- Sequential EMA pass (state-dependent) ---
         ema_shift = torch.tensor(
             list(effective_seed),
             device=device, dtype=torch.float32,
         )
-        ema_initialized = bool(effective_seed[0] != 0.0 or effective_seed[1] != 0.0 or effective_seed[2] != 0.0)
+        # Multi-AI fix: init flag now derives from SOURCE PRESENCE, not magnitude.
+        # An explicit (0, 0, 0) anchor from manifest_in is a valid "carry-forward
+        # neutral" state — should NOT be treated as "fresh" / uninitialized.
+        ema_initialized = seed_present
 
         corrected = gen.clone()
         n_valid = 0
@@ -384,10 +458,40 @@ class NV_SimpleColorMatch:
         if state_file and state_key:
             status = "saved" if state_saved else "FAILED"
             info_lines.append(f"  State persistence: {status} → {state_file} [key='{state_key}']")
+
+        # --- Build manifest_out (render-manifest as central source of truth) ---
+        # Multi-AI fix: DEEP-copy manifest_in so downstream mutation of nested
+        # dicts (e.g., a future node updating manifest["stitcher"]["frame_count"])
+        # cannot corrupt upstream state. The flowing-carrier contract requires
+        # snapshot semantics per edge; shallow copy aliased nested objects and
+        # broke that invariant on branching workflows.
+        manifest_out = copy.deepcopy(manifest_in) if isinstance(manifest_in, dict) else {}
+        prior_lineage = []
+        prior_cs = manifest_out.get("color_state")
+        if isinstance(prior_cs, dict):
+            prior_lineage = list(prior_cs.get("lineage", [])) if isinstance(prior_cs.get("lineage"), list) else []
+
+        manifest_out["color_state"] = {
+            "r": final_r,
+            "g": final_g,
+            "b": final_b,
+            "ema_strength": float(ema_strength),
+            "max_shift": float(max_shift),
+            "valid_frames": int(n_valid),
+            "decay_frames": int(n_decay),
+            "lineage": prior_lineage + ["color_match"],
+            "version": 1,
+        }
+
+        info_lines.append(
+            f"  Manifest out: color_state written (lineage depth={len(prior_lineage) + 1}, "
+            f"r={final_r:.4f} g={final_g:.4f} b={final_b:.4f})"
+        )
+
         info = "\n".join(info_lines)
         print(info)
 
-        return (corrected, info, final_r, final_g, final_b)
+        return (corrected, info, final_r, final_g, final_b, manifest_out)
 
 
 NODE_CLASS_MAPPINGS = {

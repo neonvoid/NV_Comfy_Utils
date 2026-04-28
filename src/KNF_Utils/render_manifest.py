@@ -20,6 +20,7 @@ Place at the end of the pipeline, gated by a trigger input from the video saver
 (or any final node) so it captures the post-execution state.
 """
 
+import copy
 import json
 import os
 import time
@@ -198,11 +199,24 @@ class NV_RenderManifest:
                     "tooltip": "Additional JSON to merge into manifest under 'extras' key. "
                                "Must parse as JSON object. Empty = skipped."
                 }),
+                # Flowing manifest dict from upstream nodes (e.g., NV_SimpleColorMatch).
+                # Forms the BASE manifest; widget/info inputs above merge on top so they
+                # only OVERRIDE when explicitly set (non-empty). This is what makes the
+                # manifest a single flowing source of truth across the workflow.
+                "manifest_in": ("RENDER_MANIFEST", {
+                    "tooltip": "Optional flowing render-manifest dict from upstream nodes "
+                               "(typically the last NV_SimpleColorMatch in the chain). When "
+                               "wired, its keys form the BASE manifest; widget/info inputs "
+                               "above are merged ON TOP (widget values override only when "
+                               "explicitly non-empty). Carries `color_state` and any other "
+                               "node-contributed metadata into the JSON sidecar with zero "
+                               "user paste effort."
+                }),
             },
         }
 
-    RETURN_TYPES = ("STRING", "*")
-    RETURN_NAMES = ("manifest_json", "trigger_out")
+    RETURN_TYPES = ("STRING", "*", "RENDER_MANIFEST")
+    RETURN_NAMES = ("manifest_json", "trigger_out", "manifest_out")
     FUNCTION = "execute"
     CATEGORY = "NV_Utils/Debug"
     OUTPUT_NODE = True
@@ -237,14 +251,30 @@ class NV_RenderManifest:
         sampler_steps=None,
         sampler_name=None,
         custom_json_extras="",
+        manifest_in=None,
     ):
         TAG = "[NV_RenderManifest]"
 
-        manifest = {
-            "render_timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            "shot_name": shot_name or "unnamed",
-            "notes": notes or "",
-        }
+        # Start from upstream manifest if wired, else fresh dict.
+        # Multi-AI fix: DEEP-copy (was shallow). Branching workflows where two
+        # downstream nodes consume the same upstream manifest must each get an
+        # independent snapshot — shallow copy aliased nested objects and broke
+        # the flowing-carrier contract.
+        if isinstance(manifest_in, dict):
+            manifest = copy.deepcopy(manifest_in)
+        else:
+            manifest = {}
+
+        # Always refresh timestamp; widget values override upstream only when explicitly set
+        manifest["render_timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        if shot_name:
+            manifest["shot_name"] = shot_name
+        elif "shot_name" not in manifest:
+            manifest["shot_name"] = "unnamed"
+        if notes:
+            manifest["notes"] = notes
+        elif "notes" not in manifest:
+            manifest["notes"] = ""
 
         # Structured extractions
         sti_summary = _summarize_stitcher(stitcher)
@@ -255,8 +285,12 @@ class NV_RenderManifest:
         if mc_summary is not None:
             manifest["mask_processing_config"] = mc_summary
 
-        # Info STRINGs
-        info_block = {}
+        # Info STRINGs — MERGE with any upstream node_info rather than overwrite.
+        # Widget-supplied values override upstream per-key; upstream-only entries
+        # (e.g., a node downstream of an upstream RenderManifest that contributed
+        # something we don't have a widget for) are preserved.
+        existing_info = manifest.get("node_info")
+        info_block = dict(existing_info) if isinstance(existing_info, dict) else {}
         for name, value in [
             ("static_vace_mask", static_vace_mask_info),
             ("vace_control_video_prep", vace_prep_info),
@@ -274,8 +308,9 @@ class NV_RenderManifest:
         if info_block:
             manifest["node_info"] = info_block
 
-        # Sampler/scalar block
-        sampler_block = {}
+        # Sampler/scalar block — same merge semantics as node_info.
+        existing_sampler = manifest.get("sampler")
+        sampler_block = dict(existing_sampler) if isinstance(existing_sampler, dict) else {}
         if cotracker_strength is not None:
             sampler_block["cotracker_strength"] = float(cotracker_strength)
         if cfg is not None:
@@ -289,17 +324,37 @@ class NV_RenderManifest:
         if sampler_block:
             manifest["sampler"] = sampler_block
 
-        # Custom extras
+        # Custom extras — explicit clear-on-state-change to prevent stale data
+        # leaking across runs (multi-AI fix). Three branches:
+        #   - widget non-empty + parses OK   → set extras, drop any prior parse_error
+        #   - widget non-empty + parse fails → drop any prior extras, set parse_error
+        #   - widget empty                   → drop any prior parse_error (keep upstream extras)
         if custom_json_extras and custom_json_extras.strip():
             try:
-                extras = json.loads(custom_json_extras)
-                manifest["extras"] = extras
+                manifest["extras"] = json.loads(custom_json_extras)
+                manifest.pop("extras_parse_error", None)
             except json.JSONDecodeError as e:
+                manifest.pop("extras", None)
                 manifest["extras_parse_error"] = f"{e}"
+        else:
+            manifest.pop("extras_parse_error", None)
 
-        # Resolve output path and write atomically
+        # Resolve output path and write atomically.
+        # Multi-AI fix: removed `default=str` from json.dumps so non-serializable
+        # payloads fail loudly rather than getting silently stringified. The
+        # manifest is a single source of truth that flows to LLM agents — silent
+        # type coercion produces lossy schema-breaking JSON the agent would then
+        # consume as if it were authoritative. Better to surface a TypeError
+        # than to ship a misleading manifest.
         resolved_path = _resolve_output_path(output_path, shot_name)
-        manifest_json = json.dumps(manifest, indent=2, sort_keys=True, default=str)
+        try:
+            manifest_json = json.dumps(manifest, indent=2, sort_keys=True)
+        except TypeError as e:
+            raise TypeError(
+                f"{TAG} Manifest contains non-JSON-serializable payload: {e}. "
+                f"All upstream contributors must emit JSON-safe values "
+                f"(strings, numbers, bools, lists, dicts, None)."
+            )
 
         save_status = "no_output_path"
         if resolved_path:
@@ -330,7 +385,11 @@ class NV_RenderManifest:
         if resolved_path:
             print(f"{TAG} manifest contains {len(manifest)} top-level keys")
 
-        return (manifest_json, trigger_in if trigger_in is not None else manifest_json)
+        # Emit (json_string, trigger_passthrough, manifest_dict).
+        # The dict output lets downstream nodes (or chained NV_RenderManifest
+        # instances) keep flowing the central source of truth without needing
+        # to re-parse JSON.
+        return (manifest_json, trigger_in if trigger_in is not None else manifest_json, manifest)
 
 
 NODE_CLASS_MAPPINGS = {

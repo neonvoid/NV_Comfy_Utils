@@ -12,6 +12,7 @@ Workflow:
   InpaintCrop2 (stabilize=off) -> NV_CoTrackerBridge -> denoise -> InpaintStitch2
 """
 
+import hashlib
 import json
 import math
 import torch
@@ -166,6 +167,28 @@ class NV_CoTrackerBridge:
     def apply_tracking(self, stitcher, cropped_image, strength=1.0,
                        cropped_mask=None, cropped_mask_processed=None,
                        tracking_points=None, query_x=-1.0, query_y=-1.0):
+        # Diagnostic for cross-instance contamination report (multi-AI consensus
+        # 2026-04-28: H1 = ComfyUI input-hash cache or shared upstream wiring).
+        # Logs `id(self)` + tracking_points SHA-1 at function entry. If two
+        # CoTrackerBridge nodes "return the results of the first":
+        #   - Only one log line → ComfyUI executor cache hit (Node 2 never ran)
+        #   - Two logs same SHA → same upstream tracking_points (wiring issue)
+        #   - Two logs different SHA → escalate to model-state-leak hypothesis
+        _tp_raw = tracking_points if isinstance(tracking_points, str) else ""
+        _tp_sha = hashlib.sha1(_tp_raw.encode("utf-8")).hexdigest()[:10]
+        # Input shapes — surfaces whether IMAGE and MASK arrive at matching H×W.
+        # If shapes mismatch HERE, the bug is upstream (caller wired mismatched
+        # tensors). If shapes match here but the downstream consumer still sees
+        # mismatch, the bug is internal (warp paths) or the mask wire to the
+        # consumer is NOT actually from this node.
+        _ci_shape = tuple(cropped_image.shape) if cropped_image is not None else None
+        _cm_shape = tuple(cropped_mask.shape) if cropped_mask is not None else None
+        _cmp_shape = tuple(cropped_mask_processed.shape) if cropped_mask_processed is not None else None
+        print(f"[NV_CoTrackerBridge] entry self_id={id(self)} tp_sha1={_tp_sha} "
+              f"tp_preview={_tp_raw[:160]!r}")
+        print(f"[NV_CoTrackerBridge] entry shapes: cropped_image={_ci_shape}, "
+              f"cropped_mask={_cm_shape}, cropped_mask_processed={_cmp_shape}")
+
         device = comfy.model_management.get_torch_device()
         intermediate = comfy.model_management.intermediate_device()
         B, H, W, C = cropped_image.shape
@@ -477,13 +500,33 @@ class NV_CoTrackerBridge:
                         wmp = wmp[:, :, trim_top:trim_top + H, trim_left:trim_left + W]
                     warped_mp.append(wmp.squeeze(0).squeeze(0).to(intermediate))
             else:
-                # No expansion available — pass through unchanged
+                # No expansion available — pass through unchanged.
+                # Multi-AI bug fix (Codex 2026-04-28): the original code passed
+                # `cropped_mask[b]` through RAW, while the image was forced to
+                # cropped_image[b]'s H×W. If the input cropped_mask had
+                # different spatial dims than cropped_image (e.g., upstream
+                # wiring quirk), the bridge would emit shape-mismatched
+                # IMAGE/MASK outputs, crashing strict downstream consumers
+                # like preview_animation's PIL.putalpha(). Force masks to
+                # the image's H×W defensively.
                 wi = cropped_image[b:b + 1].permute(0, 3, 1, 2).to(device)
                 dx, dy = 0.0, 0.0
                 if warped_mo is not None:
-                    warped_mo.append(cropped_mask[b])
+                    mo = cropped_mask[b]
+                    if mo.shape[-2:] != (H, W):
+                        mo = TF.interpolate(
+                            mo.unsqueeze(0).unsqueeze(0).float(),
+                            size=(H, W), mode="bilinear", align_corners=False,
+                        ).squeeze(0).squeeze(0)
+                    warped_mo.append(mo.to(intermediate))
                 if warped_mp is not None:
-                    warped_mp.append(cropped_mask_processed[b])
+                    mp = cropped_mask_processed[b]
+                    if mp.shape[-2:] != (H, W):
+                        mp = TF.interpolate(
+                            mp.unsqueeze(0).unsqueeze(0).float(),
+                            size=(H, W), mode="bilinear", align_corners=False,
+                        ).squeeze(0).squeeze(0)
+                    warped_mp.append(mp.to(intermediate))
 
             warp_data.append({"dx": dx, "dy": dy})
             warped_imgs.append(wi.permute(0, 2, 3, 1).squeeze(0).to(intermediate))
@@ -495,8 +538,48 @@ class NV_CoTrackerBridge:
         stitcher['content_warp_data'] = warp_data
 
         result_images = torch.stack(warped_imgs, dim=0)
-        result_mo = torch.stack(warped_mo, dim=0) if warped_mo else cropped_mask
-        result_mp = torch.stack(warped_mp, dim=0) if warped_mp else cropped_mask_processed
+
+        # Final-fallback shape safety (Codex multi-AI fix 2026-04-28). The
+        # original code returned `cropped_mask` raw when `warped_mo` happened
+        # to be empty (no expansion + no input mask, or all skipped). If a
+        # caller-supplied cropped_mask had different H×W than cropped_image,
+        # downstream strict-equality consumers (PIL.putalpha) would crash.
+        # Resize to image dims here so the bridge's output contract is:
+        # IMAGE and MASK ALWAYS share H×W.
+        def _shape_safe_mask(stacked, raw_fallback):
+            if stacked is not None:
+                return stacked
+            if raw_fallback is None:
+                return None
+            if raw_fallback.shape[-2:] != (H, W):
+                if raw_fallback.dim() == 2:
+                    rf4d = raw_fallback.unsqueeze(0).unsqueeze(0).float()
+                elif raw_fallback.dim() == 3:
+                    rf4d = raw_fallback.unsqueeze(1).float()
+                else:
+                    rf4d = raw_fallback.float()
+                resized = TF.interpolate(rf4d, size=(H, W), mode="bilinear", align_corners=False)
+                if raw_fallback.dim() == 2:
+                    return resized.squeeze(0).squeeze(0)
+                if raw_fallback.dim() == 3:
+                    return resized.squeeze(1)
+                return resized
+            return raw_fallback
+
+        result_mo = torch.stack(warped_mo, dim=0) if warped_mo else _shape_safe_mask(None, cropped_mask)
+        result_mp = torch.stack(warped_mp, dim=0) if warped_mp else _shape_safe_mask(None, cropped_mask_processed)
+
+        # Diagnostic: print final output shapes so cross-instance / wiring bugs
+        # become visible in the log immediately. If you ever see
+        # `result_mo H/W != result_images H/W` here, the bug is INSIDE this node.
+        # If they match here but the downstream consumer still sees a mismatch,
+        # the mask wire to that consumer is NOT actually from this node.
+        _img_hw = tuple(result_images.shape[1:3]) if result_images is not None else None
+        _mo_hw = tuple(result_mo.shape[-2:]) if result_mo is not None else None
+        _mp_hw = tuple(result_mp.shape[-2:]) if result_mp is not None else None
+        print(f"[NV_CoTrackerBridge] FINAL SHAPES: image_HW={_img_hw}, "
+              f"mask_HW={_mo_hw}, mask_processed_HW={_mp_hw}, "
+              f"input_image_HW=({H}, {W}), use_expansion={use_expansion}")
 
         max_disp = max(max(abs(d["dx"]) for d in warp_data),
                        max(abs(d["dy"]) for d in warp_data))

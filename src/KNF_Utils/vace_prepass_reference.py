@@ -239,6 +239,17 @@ class NV_VacePrePassReference:
                                   "tooltip": "Minimum Laplacian variance for identity anchor frames. Frames below this "
                                              "threshold are rejected before sampling. Set to 0 to disable. "
                                              "reference_frames bypass this filter (current chunk's own output)."}),
+                "anchor_resize_mode": (["error", "match_refs", "match_anchor"], {
+                    "default": "error",
+                    "tooltip": "How to handle spatial mismatch between identity_anchor and reference_frames. "
+                               "VACE/torch.cat requires both to share H/W. "
+                               "'error' = raise ValueError on mismatch (safest, default — keeps existing workflows strict). "
+                               "'match_refs' = bilinear-resize anchor to refs resolution (cheap, lossy if anchor was higher-res — "
+                               "anchor's job is sharp identity, downsampling hurts that). "
+                               "'match_anchor' = bilinear-resize refs to anchor resolution (slower VAE encode, more VRAM, "
+                               "no quality gain since refs were already at their native res — only useful if anchor is "
+                               "definitively higher quality and you accept the compute cost)."
+                }),
                 "control_video": ("IMAGE", {
                     "tooltip": "Grey masked inpaint video — the generation target. Mask=1 regions are where "
                                "VACE will paint new content using the reference frames as identity guide."
@@ -264,7 +275,7 @@ class NV_VacePrePassReference:
     def execute(self, positive, negative, vae, width, height, length, batch_size, strength,
                 ref_strength, reference_frames, num_refs, ref_sampling, frame_repeat,
                 identity_anchor=None, num_anchors=3, anchor_sampling="uniform",
-                min_sharpness=50.0,
+                min_sharpness=50.0, anchor_resize_mode="error",
                 control_video=None, control_masks=None):
 
         latent_length = ((length - 1) // 4) + 1
@@ -327,9 +338,51 @@ class NV_VacePrePassReference:
         # Chunk tail continuity is handled by VaceControlVideoPrep + NV_VaceLatentSplice.
         ref_shape = sampled_refs.shape[1:]  # [H, W, C]
         if sampled_anchors is not None and sampled_anchors.shape[1:] != ref_shape:
-            raise ValueError(
-                f"[NV_VacePrePassReference] Spatial mismatch: identity_anchor {list(sampled_anchors.shape[1:])} "
-                f"vs reference_frames {list(ref_shape)}. Resize before connecting.")
+            anchor_shape = list(sampled_anchors.shape[1:])
+            ref_shape_list = list(ref_shape)
+
+            if anchor_resize_mode == "error":
+                raise ValueError(
+                    f"[NV_VacePrePassReference] Spatial mismatch: identity_anchor {anchor_shape} "
+                    f"vs reference_frames {ref_shape_list}. Resize before connecting OR set "
+                    f"anchor_resize_mode='match_refs' / 'match_anchor' to auto-handle.")
+
+            # Channel mismatch is unrecoverable regardless of mode (would need channel
+            # conversion, not a resize) — refuse explicitly so users don't get a silent
+            # garbage output from torch.cat further down.
+            if anchor_shape[2] != ref_shape_list[2]:
+                raise ValueError(
+                    f"[NV_VacePrePassReference] Channel mismatch: identity_anchor has {anchor_shape[2]} "
+                    f"channels vs reference_frames {ref_shape_list[2]}. anchor_resize_mode handles "
+                    f"H/W only — channel conversion must be done upstream.")
+
+            # IMAGE convention: [B, H, W, C]. Permute to [B, C, H, W] for F.interpolate,
+            # resize bilinear (matches the rest of the pipeline's resize convention),
+            # then permute back. Bilinear is the standard for IMAGE→IMAGE resampling
+            # in this codebase (see _gaussian_upsample, mask_ops.rescale_image).
+            import torch.nn.functional as _F
+            if anchor_resize_mode == "match_refs":
+                target_h, target_w = ref_shape_list[0], ref_shape_list[1]
+                src_nchw = sampled_anchors.permute(0, 3, 1, 2)
+                resized = _F.interpolate(src_nchw, size=(target_h, target_w),
+                                         mode="bilinear", align_corners=False)
+                sampled_anchors = resized.permute(0, 2, 3, 1).contiguous()
+                print(f"[NV_VacePrePassReference] anchor_resize_mode=match_refs: "
+                      f"resized identity_anchor {anchor_shape[:2]} → {[target_h, target_w]} "
+                      f"(LOSSY downsample if anchor was higher-res — high-frequency identity "
+                      f"detail attenuated)")
+            elif anchor_resize_mode == "match_anchor":
+                target_h, target_w = anchor_shape[0], anchor_shape[1]
+                src_nchw = sampled_refs.permute(0, 3, 1, 2)
+                resized = _F.interpolate(src_nchw, size=(target_h, target_w),
+                                         mode="bilinear", align_corners=False)
+                sampled_refs = resized.permute(0, 2, 3, 1).contiguous()
+                # Update ref_shape for downstream use (latent_length math etc.)
+                ref_shape = sampled_refs.shape[1:]
+                print(f"[NV_VacePrePassReference] anchor_resize_mode=match_anchor: "
+                      f"resized reference_frames {ref_shape_list[:2]} → {[target_h, target_w]} "
+                      f"(slower VAE encode + more VRAM; no quality gain since refs were "
+                      f"already at native res)")
 
         refs_list = []
         if sampled_anchors is not None:

@@ -31,6 +31,7 @@ polish on top of this — PointDrivenBBox does whole-pixel stabilization,
 CoTrackerBridge cleans up the integer-quantization residual inside the crop.
 """
 
+import hashlib
 import json
 
 import torch
@@ -126,6 +127,18 @@ class NV_PointDrivenBBox:
                 size_mode="lock_largest", downsample_for_tracking=2,
                 output_feather=0, clamp_to_image=True, min_visibility=0.5,
                 verbose_debug=False):
+        # Diagnostic for cross-instance contamination report (multi-AI consensus
+        # 2026-04-28: H1 = ComfyUI input-hash cache or shared upstream wiring).
+        # Logs `id(self)` + tracking_points SHA-1 at function entry. If two
+        # PointDrivenBBox nodes "return the results of the first":
+        #   - Only one log line → ComfyUI executor cache hit (Node 2 never ran)
+        #   - Two logs same SHA → same upstream tracking_points (wiring issue)
+        #   - Two logs different SHA → escalate to model-state-leak hypothesis
+        _tp_raw = tracking_points if isinstance(tracking_points, str) else ""
+        _tp_sha = hashlib.sha1(_tp_raw.encode("utf-8")).hexdigest()[:10]
+        print(f"[NV_PointDrivenBBox] entry self_id={id(self)} tp_sha1={_tp_sha} "
+              f"tp_preview={_tp_raw[:160]!r}")
+
         device = comfy.model_management.get_torch_device()
         intermediate = comfy.model_management.intermediate_device()
         info_lines = []
@@ -164,10 +177,17 @@ class NV_PointDrivenBBox:
                     raise ValueError("each point must be {x: <float>, y: <float>, t?: <int>}")
                 x_i = float(p["x"])
                 y_i = float(p["y"])
-                t_i = p.get("t", 0)
-                try:
-                    t_i = max(0, min(int(t_i), B - 1))
-                except (TypeError, ValueError):
+                # Strict t parsing (Codex review fix #4): silently coercing
+                # malformed `t` to 0 changes fusion behavior invisibly. Only
+                # MISSING t defaults to 0; PRESENT-but-malformed raises.
+                if "t" in p:
+                    try:
+                        t_i = max(0, min(int(p["t"]), B - 1))
+                    except (TypeError, ValueError):
+                        raise ValueError(
+                            f"Invalid t={p['t']!r} in point {p}; must be an integer frame index"
+                        )
+                else:
                     t_i = 0
                 if not (0 <= x_i < W and 0 <= y_i < H):
                     raise ValueError(
@@ -197,7 +217,11 @@ class NV_PointDrivenBBox:
             # ── Step 1: Downsample video for CoTracker if requested ────────────
             ds = max(1, int(downsample_for_tracking))
             if ds > 1:
-                ds_H, ds_W = H // ds, W // ds
+                # Clamp downsampled dims (Codex review fix #5): if user picks
+                # an absurd ds (e.g. > min(H, W)), H // ds = 0 → F.interpolate
+                # crashes. Floor at 1.
+                ds_H = max(1, H // ds)
+                ds_W = max(1, W // ds)
                 img_nchw = image.permute(0, 3, 1, 2)  # [B, C, H, W]
                 track_nchw = F.interpolate(img_nchw, size=(ds_H, ds_W), mode='area')
                 pts_ds = [(qx / ds, qy / ds, t) for qx, qy, t in pts]
@@ -266,17 +290,32 @@ class NV_PointDrivenBBox:
                     weights = (vis_n ** 2) * time_w  # [N]
 
                     total = float(weights.sum().item())
-                    if total < 1e-6:
-                        # All anchors invisible at this frame; mark for interpolation
+                    time_w_total = float(time_w.sum().item())
+
+                    # Numerical-degeneracy guard (Codex review fix #2/#3):
+                    # use a tight epsilon and -1.0 visibility sentinel so
+                    # synthetic holes ALWAYS get interpolated regardless of
+                    # the user's min_visibility setting (including 0.0).
+                    # The previous absolute 1e-6 threshold was too lax —
+                    # at sigma=30, 6 anchors all 100+ frames away still
+                    # produce ~0.001-0.01 total weight from drifted noise.
+                    if total < 1e-12 or time_w_total < 1e-12:
                         positions_t_ds.append((0.0, 0.0))
-                        visibility.append(0.0)
+                        visibility.append(-1.0)
                         continue
 
                     fused_x = float((weights * all_tracks[f, :, 0]).sum().item()) / total
                     fused_y = float((weights * all_tracks[f, :, 1]).sum().item()) / total
                     positions_t_ds.append((fused_x, fused_y))
-                    # Per-frame confidence = max anchor visibility at this frame
-                    visibility.append(float(vis_n.max().item()))
+
+                    # Support-aware confidence (Codex review fix #1):
+                    # weights.sum() / time_w.sum() = time-weighted mean of
+                    # vis_n^2; sqrt brings back to a [0,1] visibility-like
+                    # scale comparable to the single-point path. This catches
+                    # weak fused frames (dominated by far-away anchors with
+                    # decayed time weights) that max(vis_n) would have hidden.
+                    fused_conf = (total / time_w_total) ** 0.5
+                    visibility.append(fused_conf)
 
             positions_t = _interpolate_invisible(
                 positions_t_ds, visibility, threshold=min_visibility

@@ -93,11 +93,33 @@ class NV_PreviewAnimation:
         results = []
         width = height = 0
 
+        # Track dimension-mismatch diagnostics across the whole batch so we
+        # only log the warning once even if every frame mismatches.
+        dim_mismatch_logged = False
+
         for i in range(num_frames):
             if images is not None:
                 pil_img = Image.fromarray(_tensor_to_uint8_np(images[i]))
                 if masks is not None and i < masks.shape[0]:
                     mask_pil = Image.fromarray(_tensor_to_uint8_np(masks[i]), mode='L')
+                    # PIL.Image.putalpha requires alpha and source to have
+                    # IDENTICAL spatial dimensions (per-frame H×W check, NOT
+                    # batch-count). Frame count matching (209 == 209) is not
+                    # sufficient. Wiring a 1280×720 full-frame mask to a 512×512
+                    # cropped IMAGE (a common workflow shape) raises
+                    # `ValueError: images do not match`. Defensive fix:
+                    # bilinear-resize the mask to match the image dimensions.
+                    # Mask is preview-only here so a small resize cost is
+                    # acceptable; the alternative (crashing the preview node
+                    # mid-render) is worse.
+                    if mask_pil.size != pil_img.size:
+                        if not dim_mismatch_logged:
+                            print(f"[NV_PreviewAnimation] WARNING: mask size "
+                                  f"{mask_pil.size} != image size {pil_img.size} — "
+                                  f"resizing mask bilinear for preview overlay. "
+                                  f"(Per-frame; batch count {num_frames} matches.)")
+                            dim_mismatch_logged = True
+                        mask_pil = mask_pil.resize(pil_img.size, Image.BILINEAR)
                     pil_img = pil_img.convert("RGBA")
                     pil_img.putalpha(mask_pil)
                     del mask_pil
