@@ -13,25 +13,90 @@ import torch
 import torch.nn.functional as F
 
 
-def _gaussian_downsample(img, kernel):
-    """Blur then 2x downsample. img: [B, C, H, W], kernel: [1, 1, K, K]."""
-    C = img.shape[1]
-    # Expand kernel to match channels (grouped conv)
-    k = kernel.expand(C, -1, -1, -1)
-    pad = kernel.shape[-1] // 2
-    padded = F.pad(img, (pad, pad, pad, pad), mode='reflect')
-    blurred = F.conv2d(padded, k, groups=C)
-    return blurred[:, :, ::2, ::2]
+# Default batch chunk size for memory-bounded pyramid operations.
+# Caps the peak transient allocation inside F.pad / F.interpolate / subtraction
+# during pyramid build + collapse. Matches the existing pattern in
+# texture_harmonize.py:_chunked_gaussian_blur_sep.
+#
+# Why chunking: at full batch (e.g. B=277, 1080p, fp32), F.pad must allocate a
+# single ~7 GB contiguous host buffer. On Windows late in a long-lived ComfyUI
+# session, virtual address space fragmentation from upstream NV_InpaintStitch2
+# torch.stack calls (each 6.9 GB contiguous) makes that allocation fail with an
+# access violation. Chunk=16 caps the transient at ~400 MB which always fits.
+_PYRAMID_CHUNK_SIZE = 16
 
 
-def _gaussian_upsample(img, kernel, target_h, target_w):
-    """2x upsample then blur. img: [B, C, H, W], kernel: [1, 1, K, K]."""
-    up = F.interpolate(img, size=(target_h, target_w), mode='bilinear', align_corners=False)
-    C = up.shape[1]
+def _validate_chunk_kernel(chunk_size, kernel):
+    """Defensive validation for chunked pyramid helpers.
+
+    chunk_size <= 0 would skip the chunked loop entirely and return uninitialized
+    garbage from torch.empty(). Even-sized kernels would shape-mismatch the
+    pre-allocated output (conv with pad=K//2 adds an extra row/col, ::2 then
+    rounds differently than the (H+1)//2 pre-alloc formula).
+    """
+    if not isinstance(chunk_size, int) or chunk_size < 1:
+        raise ValueError(f"chunk_size must be a positive int (got {chunk_size!r})")
+    K = kernel.shape[-1]
+    if K % 2 == 0:
+        raise ValueError(f"kernel size must be odd (got {K}); chunked path requires odd K for shape consistency")
+
+
+def _batch_slices(batch_size, chunk_size):
+    """Yield (start, end) slice pairs covering [0, batch_size) in chunks of chunk_size."""
+    for s in range(0, batch_size, chunk_size):
+        yield s, min(s + chunk_size, batch_size)
+
+
+def _gaussian_downsample(img, kernel, chunk_size=_PYRAMID_CHUNK_SIZE):
+    """Blur then 2x downsample. img: [B, C, H, W], kernel: [1, 1, K, K].
+
+    Memory-bounded: chunks the F.pad + conv over the batch dimension when B
+    exceeds chunk_size. Reflect padding is along H/W only, so chunked output
+    is bit-identical to the unchunked path (frames are independent).
+    """
+    _validate_chunk_kernel(chunk_size, kernel)
+    B, C, H, W = img.shape
     k = kernel.expand(C, -1, -1, -1)
     pad = kernel.shape[-1] // 2
-    padded = F.pad(up, (pad, pad, pad, pad), mode='reflect')
-    return F.conv2d(padded, k, groups=C)
+
+    if B <= chunk_size:
+        padded = F.pad(img, (pad, pad, pad, pad), mode='reflect')
+        blurred = F.conv2d(padded, k, groups=C)
+        return blurred[:, :, ::2, ::2]
+
+    out_h = (H + 1) // 2
+    out_w = (W + 1) // 2
+    out = torch.empty(B, C, out_h, out_w, device=img.device, dtype=img.dtype)
+    for s, e in _batch_slices(B, chunk_size):
+        padded = F.pad(img[s:e], (pad, pad, pad, pad), mode='reflect')
+        blurred = F.conv2d(padded, k, groups=C)
+        out[s:e].copy_(blurred[:, :, ::2, ::2])
+        del padded, blurred
+    return out
+
+
+def _gaussian_upsample(img, kernel, target_h, target_w, chunk_size=_PYRAMID_CHUNK_SIZE):
+    """2x upsample then blur. img: [B, C, H, W], kernel: [1, 1, K, K].
+
+    Memory-bounded: chunks F.interpolate + F.pad + conv over the batch dimension.
+    """
+    _validate_chunk_kernel(chunk_size, kernel)
+    B, C = img.shape[:2]
+    k = kernel.expand(C, -1, -1, -1)
+    pad = kernel.shape[-1] // 2
+
+    if B <= chunk_size:
+        up = F.interpolate(img, size=(target_h, target_w), mode='bilinear', align_corners=False)
+        padded = F.pad(up, (pad, pad, pad, pad), mode='reflect')
+        return F.conv2d(padded, k, groups=C)
+
+    out = torch.empty(B, C, target_h, target_w, device=img.device, dtype=img.dtype)
+    for s, e in _batch_slices(B, chunk_size):
+        up = F.interpolate(img[s:e], size=(target_h, target_w), mode='bilinear', align_corners=False)
+        padded = F.pad(up, (pad, pad, pad, pad), mode='reflect')
+        out[s:e].copy_(F.conv2d(padded, k, groups=C))
+        del up, padded
+    return out
 
 
 def _make_gaussian_kernel_2d(size=5):
@@ -44,48 +109,85 @@ def _make_gaussian_kernel_2d(size=5):
     return kernel.unsqueeze(0).unsqueeze(0)  # [1, 1, K, K]
 
 
-def build_gaussian_pyramid(img, num_levels, kernel):
+def build_gaussian_pyramid(img, num_levels, kernel, chunk_size=_PYRAMID_CHUNK_SIZE):
     """Build Gaussian pyramid. Returns list of [B, C, H, W] tensors."""
     pyramid = [img]
     current = img
     for _ in range(num_levels - 1):
-        current = _gaussian_downsample(current, kernel)
+        current = _gaussian_downsample(current, kernel, chunk_size=chunk_size)
         pyramid.append(current)
     return pyramid
 
 
-def build_laplacian_pyramid(img, num_levels, kernel):
-    """Build Laplacian pyramid. Returns list of [B, C, H, W] difference images + base."""
-    gauss = build_gaussian_pyramid(img, num_levels, kernel)
+def build_laplacian_pyramid(img, num_levels, kernel, chunk_size=_PYRAMID_CHUNK_SIZE):
+    """Build Laplacian pyramid. Returns list of [B, C, H, W] difference images + base.
+
+    Memory-bounded: when B > chunk_size, level Laplacians are built into
+    pre-allocated buffers via chunked upsample + torch.sub(out=), avoiding
+    full-batch transient subtraction temporaries.
+    """
+    gauss = build_gaussian_pyramid(img, num_levels, kernel, chunk_size=chunk_size)
     laplacian = []
+
     for i in range(len(gauss) - 1):
-        h, w = gauss[i].shape[2], gauss[i].shape[3]
-        expanded = _gaussian_upsample(gauss[i + 1], kernel, h, w)
-        laplacian.append(gauss[i] - expanded)
+        cur = gauss[i]
+        nxt = gauss[i + 1]
+        B, C, H, W = cur.shape
+
+        if B <= chunk_size:
+            expanded = _gaussian_upsample(nxt, kernel, H, W, chunk_size=chunk_size)
+            laplacian.append(cur - expanded)
+            continue
+
+        # Pre-allocate level Laplacian; fill chunk-by-chunk via in-place subtract
+        lap = torch.empty_like(cur)
+        for s, e in _batch_slices(B, chunk_size):
+            expanded = _gaussian_upsample(nxt[s:e], kernel, H, W, chunk_size=chunk_size)
+            torch.sub(cur[s:e], expanded, out=lap[s:e])
+            del expanded
+        laplacian.append(lap)
+
     laplacian.append(gauss[-1])  # Base level (lowest frequency)
     return laplacian
 
 
-def collapse_laplacian_pyramid(pyramid, kernel):
-    """Reconstruct image from Laplacian pyramid."""
+def collapse_laplacian_pyramid(pyramid, kernel, chunk_size=_PYRAMID_CHUNK_SIZE):
+    """Reconstruct image from Laplacian pyramid.
+
+    Memory-bounded: when B > chunk_size, each level's reconstruction is built
+    into a pre-allocated buffer via chunked upsample + torch.add(out=).
+    """
     img = pyramid[-1]
     for i in range(len(pyramid) - 2, -1, -1):
-        h, w = pyramid[i].shape[2], pyramid[i].shape[3]
-        img = _gaussian_upsample(img, kernel, h, w) + pyramid[i]
+        target = pyramid[i]
+        B, C, H, W = target.shape
+
+        if B <= chunk_size:
+            img = _gaussian_upsample(img, kernel, H, W, chunk_size=chunk_size) + target
+            continue
+
+        out = torch.empty_like(target)
+        for s, e in _batch_slices(B, chunk_size):
+            expanded = _gaussian_upsample(img[s:e], kernel, H, W, chunk_size=chunk_size)
+            torch.add(expanded, target[s:e], out=out[s:e])
+            del expanded
+        img = out
+
     return img
 
 
-def build_mask_pyramid(mask, num_levels, kernel):
+def build_mask_pyramid(mask, num_levels, kernel, chunk_size=_PYRAMID_CHUNK_SIZE):
     """Build Gaussian pyramid of the blend mask (progressively blurred at each level)."""
     pyramid = [mask]
     current = mask
     for _ in range(num_levels - 1):
-        current = _gaussian_downsample(current, kernel)
+        current = _gaussian_downsample(current, kernel, chunk_size=chunk_size)
         pyramid.append(current)
     return pyramid
 
 
-def multiband_blend(stitched, original, mask, num_levels=5, kernel_size=5):
+def multiband_blend(stitched, original, mask, num_levels=5, kernel_size=5,
+                    chunk_size=_PYRAMID_CHUNK_SIZE):
     """Perform multi-band blending using Laplacian pyramids.
 
     Args:
@@ -94,6 +196,7 @@ def multiband_blend(stitched, original, mask, num_levels=5, kernel_size=5):
         mask: [B, 1, H, W] — blend mask (1.0 = use stitched, 0.0 = use original).
         num_levels: Number of pyramid levels.
         kernel_size: Gaussian kernel size for pyramid operations.
+        chunk_size: Batch chunk size for memory-bounded pyramid ops (default 16).
 
     Returns:
         [B, C, H, W] — blended result.
@@ -107,11 +210,11 @@ def multiband_blend(stitched, original, mask, num_levels=5, kernel_size=5):
     num_levels = min(num_levels, max_levels)
 
     # Build Laplacian pyramids for both images
-    lap_stitched = build_laplacian_pyramid(stitched, num_levels, kernel)
-    lap_original = build_laplacian_pyramid(original, num_levels, kernel)
+    lap_stitched = build_laplacian_pyramid(stitched, num_levels, kernel, chunk_size=chunk_size)
+    lap_original = build_laplacian_pyramid(original, num_levels, kernel, chunk_size=chunk_size)
 
     # Build Gaussian pyramid for mask
-    mask_pyr = build_mask_pyramid(mask, num_levels, kernel)
+    mask_pyr = build_mask_pyramid(mask, num_levels, kernel, chunk_size=chunk_size)
 
     # Blend each level
     blended_pyr = []
@@ -120,7 +223,7 @@ def multiband_blend(stitched, original, mask, num_levels=5, kernel_size=5):
         blended_pyr.append(m * lap_stitched[i] + (1.0 - m) * lap_original[i])
 
     # Collapse
-    return collapse_laplacian_pyramid(blended_pyr, kernel)
+    return collapse_laplacian_pyramid(blended_pyr, kernel, chunk_size=chunk_size)
 
 
 class NV_MultiBandBlendStitch:
