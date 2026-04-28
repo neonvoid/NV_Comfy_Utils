@@ -188,7 +188,12 @@ class NV_CoTrackerBridge:
         # =====================================================================
         # Step 1: Determine query points
         # =====================================================================
-        query_list = []  # list of (x, y)
+        # Each entry is (x, y, t) where t is the per-point anchor frame.
+        # Legacy point_data without `t` field defaults to t=0 (matches the
+        # pre-multi-frame behavior). NV_PointPicker now embeds the picker's
+        # frame_index per point so different points can anchor on different
+        # frames — CoTracker3 supports per-query t natively.
+        query_list = []  # list of (x, y, t)
 
         # Priority 1: tracking_points from NV_PointPicker
         if tracking_points:
@@ -196,22 +201,28 @@ class NV_CoTrackerBridge:
                 parsed = json.loads(tracking_points)
                 for p in parsed:
                     if isinstance(p, dict) and "x" in p and "y" in p:
-                        query_list.append((float(p["x"]), float(p["y"])))
+                        # Clamp t to [0, B-1] defensively
+                        t = p.get("t", 0)
+                        try:
+                            t = max(0, min(int(t), B - 1))
+                        except (TypeError, ValueError):
+                            t = 0
+                        query_list.append((float(p["x"]), float(p["y"]), t))
             except (json.JSONDecodeError, TypeError):
                 pass
 
-        # Priority 2: manual query_x/query_y
+        # Priority 2: manual query_x/query_y (always anchored at frame 0)
         if not query_list and query_x >= 0 and query_y >= 0:
-            query_list.append((float(query_x), float(query_y)))
+            query_list.append((float(query_x), float(query_y), 0))
 
-        # Priority 3: mask centroid
+        # Priority 3: mask centroid (anchored at frame 0)
         if not query_list and cropped_mask is not None:
             cx, cy = _compute_mask_centroid(cropped_mask[0])
-            query_list.append((cx, cy))
+            query_list.append((cx, cy, 0))
 
-        # Priority 4: image center
+        # Priority 4: image center (anchored at frame 0)
         if not query_list:
-            query_list.append((W / 2.0, H / 2.0))
+            query_list.append((W / 2.0, H / 2.0, 0))
             print("[NV_CoTrackerBridge] WARNING: No tracking points, mask, or manual query. Using image center.")
 
         n_queries = len(query_list)
@@ -220,7 +231,7 @@ class NV_CoTrackerBridge:
             query_source = "image_center (no mask)"
 
         # queries: (1, N, 3) = [[frame_idx, x, y], ...]
-        queries = torch.tensor([[[0.0, qx, qy] for qx, qy in query_list]], dtype=torch.float32)
+        queries = torch.tensor([[[float(t), qx, qy] for qx, qy, t in query_list]], dtype=torch.float32)
 
         # =====================================================================
         # Step 2: Run CoTracker3 inference
@@ -492,9 +503,14 @@ class NV_CoTrackerBridge:
         clamp_str = f", {n_clamped} edge-clamped" if n_clamped > 0 else ""
         mode_str = "expand-crop-trim" if use_expansion else "passthrough"
 
-        query_coords = ", ".join(f"({qx:.0f},{qy:.0f})" for qx, qy in query_list)
+        query_coords = ", ".join(f"({qx:.0f},{qy:.0f})@t={t}" for qx, qy, t in query_list)
+        anchor_frames = sorted({t for _, _, t in query_list})
+        anchor_summary = (
+            f"single anchor frame {anchor_frames[0]}" if len(anchor_frames) == 1
+            else f"multi-anchor frames {anchor_frames}"
+        )
         info_lines = [
-            f"CoTracker3: {B} frames, {n_tracked}/{n_queries} points tracked, query={query_source}",
+            f"CoTracker3: {B} frames, {n_tracked}/{n_queries} points tracked, query={query_source}, {anchor_summary}",
             f"Points: {query_coords}",
             f"Strength: {strength:.2f}, max_disp: {max_disp:.1f}px ({mode_str}{clamp_str})",
             f"Visibility: {n_visible}/{B} frames visible (threshold=0.5)",

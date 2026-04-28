@@ -202,6 +202,16 @@ app.registerExtension({
             return { x, y };
         };
 
+        nodeType.prototype.getCurrentFrameIndex = function () {
+            // Read the live value of the frame_index widget. Each new point
+            // gets stamped with whatever frame is currently displayed, so
+            // users can mix anchors across frames just by changing
+            // frame_index between clicks. CoTracker3 supports per-query t.
+            const fiWidget = this.widgets?.find(w => w.name === "frame_index");
+            const v = fiWidget ? Number(fiWidget.value) : 0;
+            return Number.isFinite(v) && v >= 0 ? Math.floor(v) : 0;
+        };
+
         nodeType.prototype.handleMouseDown = function (e) {
             const { x, y } = this.mouseToCanvas(e);
 
@@ -210,14 +220,16 @@ app.registerExtension({
                 const nearIdx = this.findNearestPoint(x, y);
                 if (nearIdx >= 0) {
                     const removed = this._pointPicker.points.splice(nearIdx, 1)[0];
-                    console.log(`[NV_PointPicker] Removed point ${nearIdx + 1} at (${removed.x.toFixed(1)}, ${removed.y.toFixed(1)})`);
+                    const tStr = removed.t !== undefined ? `@t=${removed.t}` : "";
+                    console.log(`[NV_PointPicker] Removed point ${nearIdx + 1} at (${removed.x.toFixed(1)}, ${removed.y.toFixed(1)})${tStr}`);
                     this.syncPointData();
                     this.redrawCanvas();
                 }
             } else {
-                // Left-click: add point
-                this._pointPicker.points.push({ x, y });
-                console.log(`[NV_PointPicker] Added point ${this._pointPicker.points.length} at (${x.toFixed(1)}, ${y.toFixed(1)})`);
+                // Left-click: add point with current frame_index as anchor t
+                const t = this.getCurrentFrameIndex();
+                this._pointPicker.points.push({ x, y, t });
+                console.log(`[NV_PointPicker] Added point ${this._pointPicker.points.length} at (${x.toFixed(1)}, ${y.toFixed(1)})@t=${t}`);
                 this.syncPointData();
                 this.redrawCanvas();
             }
@@ -277,9 +289,14 @@ app.registerExtension({
 
             const n = pp.points.length;
             if (n > 0) {
-                pp.pointInfo.textContent = `${n} tracking point${n !== 1 ? "s" : ""} placed`;
+                const ts = pp.points.map(p => p.t).filter(t => t !== undefined && t !== null);
+                const uniq = [...new Set(ts)].sort((a, b) => a - b);
+                const anchorStr = uniq.length === 1 ? `t=${uniq[0]}`
+                                : uniq.length > 1 ? `multi-anchor t=${uniq.join(",")}`
+                                : "";
+                pp.pointInfo.textContent = `${n} tracking point${n !== 1 ? "s" : ""} placed${anchorStr ? ` (${anchorStr})` : ""}`;
             } else {
-                pp.pointInfo.textContent = "Left-click: add point | Right-click: remove nearest";
+                pp.pointInfo.textContent = "Left-click: add point on current frame | Change frame_index then click for multi-anchor";
             }
         };
 
@@ -340,13 +357,15 @@ app.registerExtension({
                 ctx.lineTo(p.x, p.y + ch);
                 ctx.stroke();
 
-                // Number label
+                // Number + anchor-frame label: "1@t=50" so the user can see
+                // which frame each point was anchored on
+                const tLabel = (p.t !== undefined && p.t !== null) ? `${i + 1}@t=${p.t}` : `${i + 1}`;
                 ctx.fillStyle = POINT_OUTLINE;
                 ctx.font = `bold ${fontSize}px monospace`;
                 ctx.textAlign = "left";
-                ctx.fillText(`${i + 1}`, p.x + r + 4 * displayScale, p.y - r);
+                ctx.fillText(tLabel, p.x + r + 4 * displayScale, p.y - r);
                 ctx.fillStyle = "#fff";
-                ctx.fillText(`${i + 1}`, p.x + r + 3 * displayScale, p.y - r - 1 * displayScale);
+                ctx.fillText(tLabel, p.x + r + 3 * displayScale, p.y - r - 1 * displayScale);
             }
         };
 

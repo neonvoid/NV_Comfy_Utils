@@ -70,13 +70,23 @@ class NV_PointPicker:
         except (json.JSONDecodeError, TypeError):
             points = []
 
-        # Validate and clamp points to image bounds
+        # Validate and clamp points to image bounds.
+        # Per-point `t` (frame anchor) is optional — defaults to the current
+        # frame_index widget value. Legacy point_data without `t` field gets
+        # t=frame_index for back-compat (was effectively t=0 since downstream
+        # consumers hardcoded that, but using current frame_index is the
+        # least-surprise default for re-saved old workflows).
         valid_points = []
         for p in points:
             if isinstance(p, dict) and "x" in p and "y" in p:
                 px = max(0.0, min(float(p["x"]), float(W)))
                 py = max(0.0, min(float(p["y"]), float(H)))
-                valid_points.append({"x": px, "y": py})
+                pt = p.get("t", frame_index)
+                try:
+                    pt = max(0, min(int(pt), B - 1))
+                except (TypeError, ValueError):
+                    pt = frame_index
+                valid_points.append({"x": px, "y": py, "t": pt})
 
         tracking_points = json.dumps(valid_points)
 
@@ -84,8 +94,16 @@ class NV_PointPicker:
         if n == 0:
             info = f"No points placed. Click on the image to add tracking points. Image: {W}x{H}, {B} frames, showing frame {frame_index}."
         else:
-            coords = ", ".join(f"({p['x']:.0f}, {p['y']:.0f})" for p in valid_points)
-            info = f"{n} tracking point{'s' if n != 1 else ''}: {coords}. Image: {W}x{H}, {B} frames, showing frame {frame_index}."
+            coords = ", ".join(f"({p['x']:.0f}, {p['y']:.0f})@t={p['t']}" for p in valid_points)
+            unique_t = sorted({p["t"] for p in valid_points})
+            anchor_summary = (
+                f"single anchor frame {unique_t[0]}" if len(unique_t) == 1
+                else f"multi-anchor frames {unique_t}"
+            )
+            info = (
+                f"{n} tracking point{'s' if n != 1 else ''} ({anchor_summary}): {coords}. "
+                f"Image: {W}x{H}, {B} frames, showing frame {frame_index}."
+            )
 
         print(f"[NV_PointPicker] {info}")
 

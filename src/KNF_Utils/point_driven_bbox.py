@@ -148,6 +148,11 @@ class NV_PointDrivenBBox:
             )
 
         # ── Parse query point ──────────────────────────────────────────────────
+        # Per-point `t` (frame anchor) is optional and defaults to 0 for
+        # back-compat with old workflows. CoTracker3 supports per-query t
+        # natively — anchoring on a frame where the feature is most visible
+        # often improves tracking robustness vs forcing t=0 when the subject
+        # is at the edge of the crop window at the start.
         try:
             parsed = json.loads(tracking_points) if tracking_points else []
             if not isinstance(parsed, list) or not parsed:
@@ -156,6 +161,11 @@ class NV_PointDrivenBBox:
             if not isinstance(pt, dict) or "x" not in pt or "y" not in pt:
                 raise ValueError("each point must be {x: <float>, y: <float>}")
             qx, qy = float(pt["x"]), float(pt["y"])
+            qt = pt.get("t", 0)
+            try:
+                qt = max(0, min(int(qt), B - 1))
+            except (TypeError, ValueError):
+                qt = 0
         except Exception as e:
             raise ValueError(f"Failed to parse tracking_points: {e}")
 
@@ -165,7 +175,7 @@ class NV_PointDrivenBBox:
                 f"Pick on the FULL-resolution image, not a crop."
             )
 
-        info_lines.append(f"Query point frame 0: ({qx:.1f}, {qy:.1f}) on {W}x{H} image")
+        info_lines.append(f"Query point frame {qt}: ({qx:.1f}, {qy:.1f}) on {W}x{H} image")
 
         # ── Single-frame fast path ─────────────────────────────────────────────
         if B <= 1:
@@ -195,7 +205,7 @@ class NV_PointDrivenBBox:
                 # CoTracker expects [1, T, C, H, W] and queries [1, N, 3]=[[t, x, y],...]
                 video_ct = track_nchw.unsqueeze(0).to(device)
                 queries_ct = torch.tensor(
-                    [[[0.0, qx_t, qy_t]]], dtype=torch.float32, device=device
+                    [[[float(qt), qx_t, qy_t]]], dtype=torch.float32, device=device
                 )
 
                 with torch.no_grad():
