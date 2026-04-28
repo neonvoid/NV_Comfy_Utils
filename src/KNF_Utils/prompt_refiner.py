@@ -312,9 +312,12 @@ an input video and modifies it according to a text prompt. Write a clear, \
 concise edit instruction that tells Kling what to change.
 
 ## Key Constraints
-- The Kling API has a 2500 character total limit. Your prompt body should \
-stay under ~1800 characters to leave room for reference legends (~300 chars) \
-and negative prompt (~400 chars) that are appended automatically downstream.
+- The Kling API has a SINGLE 2500-character total prompt limit. Kling 3 Omni \
+has NO separate negative_prompt field — our pipeline inlines an "Avoid: ..." \
+line into the same 2500-char budget, and reference legends are also appended \
+into that budget downstream. Aim to keep your edit instruction under ~1800 \
+chars so ~300 remains for the auto-appended reference legend and ~400 for the \
+avoidance line.
 - Write EDIT INSTRUCTIONS, not scene descriptions. Focus on the delta \
 between the input video and the desired output. Be direct: "change X to Y", \
 "add Z", "remove W".
@@ -337,9 +340,12 @@ uses an input video as a style and motion template to generate entirely new \
 content. Your job is to describe the desired OUTPUT scene.
 
 ## Key Constraints
-- The Kling API has a 2500 character total limit. Your prompt body should \
-stay under ~1800 characters to leave room for reference legends (~300 chars) \
-and negative prompt (~400 chars) that are appended automatically downstream.
+- The Kling API has a SINGLE 2500-character total prompt limit. Kling 3 Omni \
+has NO separate negative_prompt field — our pipeline inlines an "Avoid: ..." \
+line into the same 2500-char budget, and reference legends are also appended \
+into that budget downstream. Aim to keep your scene description under ~1800 \
+chars so ~300 remains for the auto-appended reference legend and ~400 for the \
+avoidance line.
 - Describe the OUTPUT scene you want generated, NOT the input video. The \
 input video provides motion rhythm and visual style — your prompt defines \
 the new content.
@@ -426,11 +432,79 @@ meta-commentary.
 - When iterating, build on the previous version — do not restart from \
 scratch unless explicitly asked."""
 
+_NANO_BANANA_PRO_SYSTEM = """\
+You are a prompt engineer for Google's Gemini 3 Pro Image (also marketed as \
+"Nano Banana Pro") image generation and editing API. Write a clear scene \
+description or edit instruction in natural prose.
+
+## Key Constraints
+- Nano Banana Pro does NOT use `@image1` / `@imageN` positional tags. When \
+reference images are attached, refer to them by ROLE in natural language: \
+"Use Image 1 for the character's identity, Image 2 for the lighting mood, \
+Image 3 for the background composition." Inline these role assignments \
+directly in the prose — do not list them as a prefix.
+- NO negative_prompt field exists. Convert avoidances into positive language \
+("an empty street" instead of "no cars on the street", "clear sky" instead of \
+"no clouds"). Do NOT add "Avoid:" or "Negative:" lines.
+- Up to 11 reference images supported on Pro (split into ~6 high-fidelity \
+object refs + ~5 character refs). Mention every reference that is actually \
+supplied; unused refs waste API tokens.
+- Prose over keyword lists. Comma-separated tag soup ("4k, cinematic, dramatic \
+lighting, wide angle") performs noticeably worse than a detailed sentence \
+describing the same intent.
+- No hard character limit on the prompt itself, but stay under ~2000 chars \
+for clarity. Detail wins for control; verbosity for its own sake does not.
+
+## Recommended Structure (single coherent paragraph)
+
+For NEW image generation, weave these elements together:
+- Subject — what or who is in the image, with descriptive detail
+- Composition — framing, camera angle, layout, depth
+- Action — what is happening or the static pose / configuration
+- Location — environment, setting, time of day
+- Style — photographic vs illustrative, lighting mood, color palette, lens
+
+For EDIT instructions:
+- Lead with the explicit edit delta: "Change X to Y", "Replace A with B", \
+"Add C to the foreground", "Remove D from the background".
+- For features that must be PRESERVED across the edit, RE-DESCRIBE THEM IN \
+DETAIL in the prompt. Nano Banana Pro can drift on character identity, logos, \
+small text, and garment specifics otherwise. Example: "Keep the woman's red \
+wool sweater, gold hoop earrings, and shoulder-length brown hair exactly as \
+shown in Image 1."
+- Be direct about spatial relationships: "behind the subject", "to the left", \
+"in the foreground", "in front of the window".
+
+## Strengths to Exploit
+- State-of-the-art text rendering — feel free to specify exact text content \
+for signs, menus, logos, infographics, posters. Quote the exact string in \
+the prompt.
+- Strong character consistency across edits when descriptions are detail-rich.
+- Up to 4K output at 10 aspect ratios (1:1, 2:3, 3:2, 3:4, 4:3, 4:5, 5:4, \
+9:16, 16:9, 21:9) — assume the user has already chosen these via API config; \
+do not embed resolution / aspect tokens in the prompt body.
+
+## Pitfalls to Warn Against (when relevant)
+- Small or stylized text and complex multilingual text may render imperfectly \
+— if text accuracy is critical, keep the string short and use a common script.
+- The model may not honor an exact image-count request ("generate 3 \
+variations" is unreliable).
+- Real-world photos of public figures are refused under search grounding.
+
+## General Rules
+- Output ONLY the prompt text — no explanations, preamble, or meta-commentary.
+- When iterating, build on the previous version — do not restart from \
+scratch unless explicitly asked.
+- If reference images are attached, describe their role inline in the prose. \
+Do not invent `@image` tags or bracket syntax — Nano Banana Pro does not \
+parse them."""
+
 _KLING_MODE_MAP = {
     "kling_edit": _KLING_EDIT_SYSTEM,
     "kling_reference": _KLING_REFERENCE_SYSTEM,
     "seedance_ref": _SEEDANCE_REF_SYSTEM,
     "wan27_edit": _WAN27_EDIT_SYSTEM,
+    "nano_banana_pro": _NANO_BANANA_PRO_SYSTEM,
 }
 
 
@@ -453,7 +527,6 @@ _MODEL_LIST = [
     "openai/gpt-5.4-nano",
     # OpenRouter vision+video models (Gemini and Qwen support video input)
     "google/gemini-3.1-pro-preview",
-    "google/gemini-3-flash-preview",
     "google/gemini-3.1-flash-lite-preview",
     "qwen/qwen3.6-plus",
     "qwen/qwen3.5-122b-a10b",
@@ -717,7 +790,7 @@ class NV_PromptRefiner:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "mode": (["custom", "kling_edit", "kling_reference", "seedance_ref", "wan27_edit"], {
+                "mode": (["custom", "kling_edit", "kling_reference", "seedance_ref", "wan27_edit", "nano_banana_pro"], {
                     "default": "custom",
                     "tooltip": (
                         "'custom' = use system_instruction input as-is (for V2V Prompt Builder workflows).\n"
@@ -725,6 +798,7 @@ class NV_PromptRefiner:
                         "'kling_reference' = built-in Kling reference mode system prompt — describe new scene to generate.\n"
                         "'seedance_ref' = built-in ByteDance Seedance 2.0 ref-to-video prompt — multimodal refs (@Image1/@Video1/@Audio1).\n"
                         "'wan27_edit' = built-in Alibaba Tongyi Wan 2.7 Video Edit — edit instructions, no tag convention.\n"
+                        "'nano_banana_pro' = built-in Google Gemini 3 Pro Image (Nano Banana Pro) — natural-language role labels, no @ tags, prose over keywords.\n"
                         "Built-in modes bypass V2V Prompt Builder — type your edit/scene goal directly into initial_prompt."
                     ),
                 }),
@@ -838,14 +912,15 @@ class NV_PromptRefiner:
     CATEGORY = "NV_Utils/Prompt"
     OUTPUT_NODE = True
     DESCRIPTION = (
-        "Iterative LLM captioner/refiner with built-in Kling modes. "
+        "Iterative LLM captioner/refiner with built-in API-mode prompts. "
         "'custom' mode: uses system_instruction from V2V Prompt Builder. "
-        "'kling_edit'/'kling_reference': built-in Kling system prompts — "
-        "type your edit goal directly, no Prompt Builder needed. "
+        "Built-in modes (kling_edit, kling_reference, seedance_ref, "
+        "wan27_edit, nano_banana_pro): type your edit goal directly into "
+        "initial_prompt — no Prompt Builder needed. "
         "Connect reference images (ref_image_1–4) so the LLM sees the same "
-        "visual context that Kling will receive. "
+        "visual context the downstream API will receive. "
         "Edit user_instruction and re-queue to iterate. "
-        "Supports Gemini (direct) and OpenRouter (Claude, GPT, LLaMA, etc.)."
+        "Supports Gemini (direct) and OpenRouter (Claude, GPT, Qwen, etc.)."
     )
 
     @classmethod
@@ -997,6 +1072,8 @@ class NV_PromptRefiner:
                     api_label = "Seedance 2.0 reference-to-video"
                 elif mode == "wan27_edit":
                     api_label = "Wan 2.7 video edit"
+                elif mode == "nano_banana_pro":
+                    api_label = "Nano Banana Pro (Gemini 3 Pro Image)"
                 else:
                     api_label = mode
                 user_message = (

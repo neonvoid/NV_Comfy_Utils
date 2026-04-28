@@ -147,40 +147,52 @@ class NV_PointDrivenBBox:
                 f"{mask.shape[1]}x{mask.shape[2]}"
             )
 
-        # ── Parse query point ──────────────────────────────────────────────────
-        # Per-point `t` (frame anchor) is optional and defaults to 0 for
-        # back-compat with old workflows. CoTracker3 supports per-query t
-        # natively — anchoring on a frame where the feature is most visible
-        # often improves tracking robustness vs forcing t=0 when the subject
-        # is at the edge of the crop window at the start.
+        # ── Parse query points (multi-anchor) ──────────────────────────────────
+        # Phase 1 multi-anchor: ALL provided points are tracked simultaneously
+        # by a single CoTracker3 call (each query has its own [t, x, y] anchor),
+        # then per-frame trajectories are fused via a visibility × time-decay
+        # weighted average. Single-point input falls back to identical
+        # pre-fusion behavior for back-compat. Per Phase 1 brainstorm consensus
+        # — Codex + Gemini + Kimi all converged on the formula below.
         try:
             parsed = json.loads(tracking_points) if tracking_points else []
             if not isinstance(parsed, list) or not parsed:
-                raise ValueError("must be a non-empty JSON array of {x, y}")
-            pt = parsed[0]
-            if not isinstance(pt, dict) or "x" not in pt or "y" not in pt:
-                raise ValueError("each point must be {x: <float>, y: <float>}")
-            qx, qy = float(pt["x"]), float(pt["y"])
-            qt = pt.get("t", 0)
-            try:
-                qt = max(0, min(int(qt), B - 1))
-            except (TypeError, ValueError):
-                qt = 0
+                raise ValueError("must be a non-empty JSON array of {x, y, t?}")
+            pts = []  # list of (qx, qy, qt)
+            for p in parsed:
+                if not isinstance(p, dict) or "x" not in p or "y" not in p:
+                    raise ValueError("each point must be {x: <float>, y: <float>, t?: <int>}")
+                x_i = float(p["x"])
+                y_i = float(p["y"])
+                t_i = p.get("t", 0)
+                try:
+                    t_i = max(0, min(int(t_i), B - 1))
+                except (TypeError, ValueError):
+                    t_i = 0
+                if not (0 <= x_i < W and 0 <= y_i < H):
+                    raise ValueError(
+                        f"Query point ({x_i:.1f}, {y_i:.1f}) is outside image bounds {W}x{H}. "
+                        f"Pick on the FULL-resolution image, not a crop."
+                    )
+                pts.append((x_i, y_i, t_i))
         except Exception as e:
             raise ValueError(f"Failed to parse tracking_points: {e}")
 
-        if not (0 <= qx < W and 0 <= qy < H):
-            raise ValueError(
-                f"Query point ({qx:.1f}, {qy:.1f}) is outside image bounds {W}x{H}. "
-                f"Pick on the FULL-resolution image, not a crop."
-            )
-
-        info_lines.append(f"Query point frame {qt}: ({qx:.1f}, {qy:.1f}) on {W}x{H} image")
+        N = len(pts)
+        anchor_frames = sorted({t for _, _, t in pts})
+        anchor_summary = (
+            f"single anchor frame {anchor_frames[0]}" if len(anchor_frames) == 1
+            else f"multi-anchor frames {anchor_frames}"
+        )
+        coords_str = ", ".join(f"({qx:.0f},{qy:.0f})@t={t}" for qx, qy, t in pts)
+        info_lines.append(
+            f"{N} query point{'s' if N != 1 else ''} ({anchor_summary}): {coords_str} on {W}x{H} image"
+        )
 
         # ── Single-frame fast path ─────────────────────────────────────────────
         if B <= 1:
             info_lines.append("Single frame — no tracking needed.")
-            positions = [(qx, qy)]
+            positions = [(pts[0][0], pts[0][1])]
         else:
             # ── Step 1: Downsample video for CoTracker if requested ────────────
             ds = max(1, int(downsample_for_tracking))
@@ -188,30 +200,31 @@ class NV_PointDrivenBBox:
                 ds_H, ds_W = H // ds, W // ds
                 img_nchw = image.permute(0, 3, 1, 2)  # [B, C, H, W]
                 track_nchw = F.interpolate(img_nchw, size=(ds_H, ds_W), mode='area')
-                qx_t, qy_t = qx / ds, qy / ds
+                pts_ds = [(qx / ds, qy / ds, t) for qx, qy, t in pts]
                 info_lines.append(f"Downsample for tracking: {ds}x → {ds_W}x{ds_H}")
             else:
                 track_nchw = image.permute(0, 3, 1, 2)
-                qx_t, qy_t = qx, qy
+                pts_ds = pts
                 info_lines.append("No downsample — tracking at full resolution")
 
-            # ── Step 2: Run CoTracker3 ─────────────────────────────────────────
+            # ── Step 2: Run CoTracker3 with all N queries in one pass ──────────
             model = None
             try:
-                print(f"{LOG_PREFIX} Running CoTracker3 on {B} frames...")
+                print(f"{LOG_PREFIX} Running CoTracker3 on {B} frames with {N} multi-anchor queries...")
                 model = _get_cotracker_model()
                 model = model.to(device)
 
                 # CoTracker expects [1, T, C, H, W] and queries [1, N, 3]=[[t, x, y],...]
                 video_ct = track_nchw.unsqueeze(0).to(device)
                 queries_ct = torch.tensor(
-                    [[[float(qt), qx_t, qy_t]]], dtype=torch.float32, device=device
+                    [[[float(t), qx, qy] for qx, qy, t in pts_ds]],
+                    dtype=torch.float32, device=device,
                 )
 
                 with torch.no_grad():
                     pred_tracks, pred_visibility = model(video_ct, queries=queries_ct)
-                # pred_tracks: [1, B, 1, 2]
-                # pred_visibility: [1, B, 1] or [1, B, 1, 1]
+                # pred_tracks: [1, B, N, 2]
+                # pred_visibility: [1, B, N] or [1, B, N, 1]
 
             except Exception as e:
                 raise RuntimeError(f"CoTracker3 inference failed: {e}")
@@ -220,23 +233,58 @@ class NV_PointDrivenBBox:
                     model.cpu()
                 torch.cuda.empty_cache()
 
-            # ── Step 3: Extract trajectory + interpolate invisible frames ──────
-            tracks = pred_tracks[0, :, 0].cpu()       # [B, 2]
-            vis = pred_visibility[0, :, 0]
-            if vis.dim() > 1:
-                vis = vis.squeeze(-1)
-            vis = vis.cpu()
+            # ── Step 3: Per-frame visibility × time-decay weighted fusion ──────
+            # Formula (Phase 1 multi-AI brainstorm consensus):
+            #   W_n = V_n^2 × exp(-|f - t_n| / SIGMA_FRAMES)
+            # Squared visibility aggressively suppresses occluded anchors; the
+            # exponential time-decay favors temporally-nearest anchors so a
+            # post-occlusion re-anchor at frame 90 dominates after frame 90
+            # rather than competing with a frame-0 anchor. SIGMA_FRAMES=30 is
+            # the brainstorm-recommended default; tunable later if needed.
+            all_tracks = pred_tracks[0].cpu()       # [B, N, 2]
+            all_vis = pred_visibility[0]
+            if all_vis.dim() > 2:
+                all_vis = all_vis.squeeze(-1)
+            all_vis = all_vis.cpu()                 # [B, N]
 
-            positions_t = [(tracks[b, 0].item(), tracks[b, 1].item()) for b in range(B)]
-            visibility = [float(vis[b].item()) for b in range(B)]
+            if N == 1:
+                # Back-compat: single-point behavior identical to pre-fusion code path
+                positions_t_ds = [
+                    (all_tracks[b, 0, 0].item(), all_tracks[b, 0, 1].item())
+                    for b in range(B)
+                ]
+                visibility = [float(all_vis[b, 0].item()) for b in range(B)]
+            else:
+                SIGMA_FRAMES = 30.0
+                anchors_t = torch.tensor([t for _, _, t in pts], dtype=torch.float32)  # [N]
+                positions_t_ds = []
+                visibility = []
+                for f in range(B):
+                    vis_n = all_vis[f].clamp(min=0)  # [N]
+                    time_dist = (anchors_t - float(f)).abs()
+                    time_w = torch.exp(-time_dist / SIGMA_FRAMES)
+                    weights = (vis_n ** 2) * time_w  # [N]
+
+                    total = float(weights.sum().item())
+                    if total < 1e-6:
+                        # All anchors invisible at this frame; mark for interpolation
+                        positions_t_ds.append((0.0, 0.0))
+                        visibility.append(0.0)
+                        continue
+
+                    fused_x = float((weights * all_tracks[f, :, 0]).sum().item()) / total
+                    fused_y = float((weights * all_tracks[f, :, 1]).sum().item()) / total
+                    positions_t_ds.append((fused_x, fused_y))
+                    # Per-frame confidence = max anchor visibility at this frame
+                    visibility.append(float(vis_n.max().item()))
 
             positions_t = _interpolate_invisible(
-                positions_t, visibility, threshold=min_visibility
+                positions_t_ds, visibility, threshold=min_visibility
             )
             if positions_t is None:
                 raise RuntimeError(
-                    "All frames invisible to CoTracker — cannot build bbox trajectory. "
-                    "Try a different tracking point (more prominent facial feature), "
+                    "All frames invisible across all anchors — cannot build bbox trajectory. "
+                    "Add more anchors at frames where the feature is clearly visible, "
                     "or reduce downsample_for_tracking."
                 )
 
@@ -247,8 +295,9 @@ class NV_PointDrivenBBox:
                 positions = positions_t
 
             visible_count = sum(1 for v in visibility if v >= min_visibility)
+            fusion_str = "" if N == 1 else f" (fused {N} anchors via vis²×exp(-Δt/30) weights)"
             info_lines.append(
-                f"CoTracker: {visible_count}/{B} frames visible "
+                f"CoTracker{fusion_str}: {visible_count}/{B} frames visible "
                 f"(threshold={min_visibility:.2f})"
             )
 
