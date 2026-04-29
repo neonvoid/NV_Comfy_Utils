@@ -429,8 +429,7 @@ class NV_InpaintCrop:
                 raw_bboxes.append(bbox)
 
             # Anomaly detection: reject occlusion/tracking-loss frames before cropping
-            if anomaly_threshold > 0.0:
-                raw_bboxes = detect_bbox_anomalies(raw_bboxes, anomaly_threshold, info_lines)
+            raw_bboxes = detect_bbox_anomalies(raw_bboxes, anomaly_threshold, info_lines)
         else:
             raw_bboxes = None
 
@@ -450,8 +449,8 @@ class NV_InpaintCrop:
             # Keep original mask unmodified
             original_mask = one_mask.clone()
 
-            # Process mask for diffusion (apply all operations)
-            processed_mask = one_mask.clone()
+            # Process mask for diffusion (clone from original, apply ops in place)
+            processed_mask = original_mask.clone()
 
             if fill_holes_v > 0:
                 processed_mask = _op_fill_holes(processed_mask, fill_holes_v)

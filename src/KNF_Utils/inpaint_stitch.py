@@ -68,12 +68,12 @@ def _inverse_content_warp(image, mask, warp_mode, warp_entry):
 
     Args:
         image: [1, H, W, C] — resized inpainted crop.
-        mask: [1, H, W, 1] — blend mask (already clamped+expanded).
+        mask: [1, H, W, 1] or None — optional blend mask. If None, only image is warped.
         warp_mode: 'centroid' or 'optical_flow'.
         warp_entry: dict with warp data for this frame.
 
     Returns:
-        (image, mask) with inverse warp applied.
+        (image, mask) with inverse warp applied. Returned mask is None if input was None.
     """
     device = image.device
     _, H, W, C = image.shape
@@ -96,9 +96,10 @@ def _inverse_content_warp(image, mask, warp_mode, warp_entry):
         image = TF.grid_sample(img_nchw, grid, mode='bilinear',
                                padding_mode='zeros', align_corners=False).permute(0, 2, 3, 1)
 
-        mask_nchw = mask.permute(0, 3, 1, 2)
-        mask = TF.grid_sample(mask_nchw, grid, mode='bilinear',
-                              padding_mode='zeros', align_corners=False).permute(0, 2, 3, 1)
+        if mask is not None:
+            mask_nchw = mask.permute(0, 3, 1, 2)
+            mask = TF.grid_sample(mask_nchw, grid, mode='bilinear',
+                                  padding_mode='zeros', align_corners=False).permute(0, 2, 3, 1)
 
     elif warp_mode == "optical_flow":
         flow = warp_entry["flow"].to(device)  # Forward flow: maps src→ref, used as-is for inverse grid
@@ -119,9 +120,10 @@ def _inverse_content_warp(image, mask, warp_mode, warp_entry):
         image = TF.grid_sample(img_nchw, grid, mode='bilinear',
                                padding_mode='zeros', align_corners=True).permute(0, 2, 3, 1)
 
-        mask_nchw = mask.permute(0, 3, 1, 2)
-        mask = TF.grid_sample(mask_nchw, grid, mode='bilinear',
-                              padding_mode='zeros', align_corners=True).permute(0, 2, 3, 1)
+        if mask is not None:
+            mask_nchw = mask.permute(0, 3, 1, 2)
+            mask = TF.grid_sample(mask_nchw, grid, mode='bilinear',
+                                  padding_mode='zeros', align_corners=True).permute(0, 2, 3, 1)
 
     return image, mask
 
@@ -174,11 +176,8 @@ def stitch_single_frame(canvas_image, inpainted_image, mask,
     # in original (non-stabilized) coordinates and was never forward-warped by CoTrackerBridge.
     # After inverse-warping the image back to original coordinates, the mask already aligns.
     if warp_mode is not None and warp_entry is not None:
-        # Create a dummy mask (all-ones) for the warp function signature — we discard it
-        dummy_mask = torch.ones(1, inpainted_image.shape[1], inpainted_image.shape[2], 1,
-                                device=device, dtype=inpainted_image.dtype)
         inpainted_image, _ = _inverse_content_warp(
-            inpainted_image, dummy_mask, warp_mode, warp_entry
+            inpainted_image, None, warp_mode, warp_entry
         )
 
     # Resize inpainted image and mask to canvas crop size
