@@ -17,78 +17,19 @@ output as a visual chart IMAGE for easy comparison across variants.
 """
 
 import torch
-import torch.nn.functional as F
 import numpy as np
 
-
-def _to_gray_uint8(frame_hwc):
-    """Convert [H, W, 3] float32 [0,1] to [H, W] uint8 grayscale."""
-    gray = 0.299 * frame_hwc[..., 0] + 0.587 * frame_hwc[..., 1] + 0.114 * frame_hwc[..., 2]
-    return (gray * 255).clamp(0, 255).to(torch.uint8)
-
-
-def _psnr(a, b):
-    """PSNR between two [H, W, C] float tensors in [0, 1]."""
-    mse = (a.float() - b.float()).pow(2).mean()
-    if mse < 1e-10:
-        return 100.0
-    return (10 * torch.log10(1.0 / mse)).item()
-
-
-def _ssim_approx(a, b, window_size=11):
-    """Approximate SSIM using mean/variance/covariance on luminance.
-
-    Not exact SSIM (no gaussian window) but fast and correlates well.
-    Input: [H, W, C] float tensors in [0, 1].
-    """
-    a_gray = (0.299 * a[..., 0] + 0.587 * a[..., 1] + 0.114 * a[..., 2]).float()
-    b_gray = (0.299 * b[..., 0] + 0.587 * b[..., 1] + 0.114 * b[..., 2]).float()
-
-    mu_a = a_gray.mean()
-    mu_b = b_gray.mean()
-    sigma_a = a_gray.std()
-    sigma_b = b_gray.std()
-    sigma_ab = ((a_gray - mu_a) * (b_gray - mu_b)).mean()
-
-    C1 = 0.01 ** 2
-    C2 = 0.03 ** 2
-
-    ssim = ((2 * mu_a * mu_b + C1) * (2 * sigma_ab + C2)) / \
-           ((mu_a ** 2 + mu_b ** 2 + C1) * (sigma_a ** 2 + sigma_b ** 2 + C2))
-    return ssim.item()
-
-
-def _optical_flow_magnitude(prev_gray_uint8, curr_gray_uint8):
-    """Compute mean optical flow magnitude between two grayscale uint8 frames.
-
-    Uses Farneback dense optical flow via OpenCV.
-    Returns mean magnitude in pixels.
-    """
-    try:
-        import cv2
-        prev_np = prev_gray_uint8.cpu().numpy()
-        curr_np = curr_gray_uint8.cpu().numpy()
-        flow = cv2.calcOpticalFlowFarneback(
-            prev_np, curr_np, None,
-            pyr_scale=0.5, levels=3, winsize=15,
-            iterations=3, poly_n=5, poly_sigma=1.2, flags=0
-        )
-        mag = np.sqrt(flow[..., 0] ** 2 + flow[..., 1] ** 2)
-        return float(mag.mean())
-    except ImportError:
-        return -1.0  # OpenCV not available
-
-
-def _laplacian_variance(frame_hwc):
-    """Laplacian variance (sharpness proxy) for a [H, W, C] float tensor."""
-    gray = (0.299 * frame_hwc[..., 0] + 0.587 * frame_hwc[..., 1] + 0.114 * frame_hwc[..., 2])
-    gray = (gray * 255.0).float().unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
-    kernel = torch.tensor(
-        [[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]],
-        dtype=torch.float32, device=gray.device
-    ).view(1, 1, 3, 3)
-    lap = F.conv2d(gray, kernel, padding=1)
-    return lap.var().item()
+# Math helpers — single source of truth in seam_ops.py. NV_SeamAnalyzer is a
+# diagnostic visualization wrapper around the same primitives that
+# NV_ShotMeasure/NV_ShotRecord use, so the chart numbers and the agent
+# corpus numbers can never disagree.
+from .seam_ops import (
+    flow_magnitude as _optical_flow_magnitude,
+    laplacian_variance as _laplacian_variance,
+    psnr as _psnr,
+    ssim_approx as _ssim_approx,
+    to_gray_uint8 as _to_gray_uint8,
+)
 
 
 def _channel_means(frame_hwc):

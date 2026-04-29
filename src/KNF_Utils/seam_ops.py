@@ -14,23 +14,30 @@ import torch
 import torch.nn.functional as F
 
 
-def _to_gray_uint8(frame_hwc):
+# Public — exported to seam_analyzer.py and any future consumers. Underscore
+# prefix dropped because cross-module use makes "private" misleading.
+def to_gray_uint8(frame_hwc):
     gray = 0.299 * frame_hwc[..., 0] + 0.587 * frame_hwc[..., 1] + 0.114 * frame_hwc[..., 2]
     return (gray * 255).clamp(0, 255).to(torch.uint8)
 
 
-def _psnr(a, b):
+def psnr(a, b):
     mse = (a.float() - b.float()).pow(2).mean()
     if mse < 1e-10:
         return 100.0
     return float(10 * torch.log10(1.0 / mse))
 
 
-def _ssim_approx(a, b):
+def ssim_approx(a, b):
+    """Fast SSIM approximation — mean/std/cov on luminance with no Gaussian
+    window. Correlates well with full SSIM in our use range but is NOT
+    interchangeable for cross-paper comparison.
+    """
     a_gray = (0.299 * a[..., 0] + 0.587 * a[..., 1] + 0.114 * a[..., 2]).float()
     b_gray = (0.299 * b[..., 0] + 0.587 * b[..., 1] + 0.114 * b[..., 2]).float()
     mu_a, mu_b = a_gray.mean(), b_gray.mean()
-    sa, sb = a_gray.std(), b_gray.std()
+    # unbiased=False so single-element edge case doesn't return NaN
+    sa, sb = a_gray.std(unbiased=False), b_gray.std(unbiased=False)
     sab = ((a_gray - mu_a) * (b_gray - mu_b)).mean()
     C1, C2 = 0.01 ** 2, 0.03 ** 2
     num = (2 * mu_a * mu_b + C1) * (2 * sab + C2)
@@ -38,9 +45,9 @@ def _ssim_approx(a, b):
     return float(num / den)
 
 
-def _flow_magnitude(prev_gray_uint8, curr_gray_uint8):
+def flow_magnitude(prev_gray_uint8, curr_gray_uint8):
     """Mean optical-flow magnitude between two grayscale uint8 frames.
-    Returns -1.0 if cv2 unavailable (so caller can drop from aggregate).
+    Returns -1.0 if cv2 unavailable (caller drops from aggregate).
     """
     try:
         import cv2
@@ -57,7 +64,7 @@ def _flow_magnitude(prev_gray_uint8, curr_gray_uint8):
         return -1.0
 
 
-def _laplacian_variance(frame_hwc):
+def laplacian_variance(frame_hwc):
     gray = (0.299 * frame_hwc[..., 0] + 0.587 * frame_hwc[..., 1] + 0.114 * frame_hwc[..., 2])
     gray = (gray * 255.0).float().unsqueeze(0).unsqueeze(0)
     kernel = torch.tensor(
@@ -65,7 +72,18 @@ def _laplacian_variance(frame_hwc):
         dtype=torch.float32, device=gray.device,
     ).view(1, 1, 3, 3)
     lap = F.conv2d(gray, kernel, padding=1)
-    return float(lap.var())
+    # unbiased=False — variance over a single pixel kernel output never
+    # legitimately needs Bessel correction here.
+    return float(lap.var(unbiased=False))
+
+
+# Legacy underscore aliases — kept so anything that imported the old names
+# still works. Drop after callers migrate.
+_to_gray_uint8 = to_gray_uint8
+_psnr = psnr
+_ssim_approx = ssim_approx
+_flow_magnitude = flow_magnitude
+_laplacian_variance = laplacian_variance
 
 
 def parse_seam_indices(chunk_plan_json):
@@ -73,27 +91,34 @@ def parse_seam_indices(chunk_plan_json):
 
     Expected format (NV_AspectChunkPlanner / similar):
         {"chunks": [{"start": 0, "end": 80}, {"start": 65, "end": 160}, ...]}
-    Seam index = end-1 of each chunk except the last (so seam pair = (end-1, end)
-    of consecutive chunks aligned to the output frame numbering).
+    Seam index = end-1 of each chunk except the last.
 
-    Returns list[int] or [] if unparseable.
+    Returns (seams, parse_error_str). seams is a sorted-deduped list[int];
+    parse_error_str is None on success, or a short reason on failure so
+    callers can distinguish 'no seams' (single-chunk render) from 'parse
+    error' (upstream schema bug — silent zeros are exactly what poisons the
+    agent corpus).
     """
     if not chunk_plan_json or not chunk_plan_json.strip():
-        return []
+        return [], None  # no plan provided = single-chunk; not an error
     try:
         import json
         plan = json.loads(chunk_plan_json)
-        chunks = plan.get("chunks", []) if isinstance(plan, dict) else []
-        if len(chunks) < 2:
-            return []
-        seams = []
-        for c in chunks[:-1]:
-            end = c.get("end")
-            if isinstance(end, int) and end > 0:
-                seams.append(end - 1)
-        return seams
-    except Exception:
-        return []
+    except Exception as e:
+        return [], f"chunk_plan_json: {type(e).__name__}: {e}"
+    if not isinstance(plan, dict):
+        return [], "chunk_plan_json: top-level must be object"
+    chunks = plan.get("chunks", [])
+    if not isinstance(chunks, list):
+        return [], "chunk_plan_json: 'chunks' must be array"
+    if len(chunks) < 2:
+        return [], None  # single chunk = no seams
+    seams = []
+    for c in chunks[:-1]:
+        end = c.get("end") if isinstance(c, dict) else None
+        if isinstance(end, int) and end > 0:
+            seams.append(end - 1)
+    return sorted(set(seams)), None
 
 
 def compute_seam_metrics(images, seam_indices=None, chunk_plan_json=None):
@@ -110,7 +135,9 @@ def compute_seam_metrics(images, seam_indices=None, chunk_plan_json=None):
     out = {}
     try:
         if seam_indices is None:
-            seam_indices = parse_seam_indices(chunk_plan_json)
+            seam_indices, parse_err = parse_seam_indices(chunk_plan_json)
+            if parse_err is not None:
+                return {"seam_count": 0, "parse_error": parse_err}
         if not seam_indices:
             return {"seam_count": 0}
 

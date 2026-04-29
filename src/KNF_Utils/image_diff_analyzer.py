@@ -8,10 +8,18 @@ measuring only the kept pixels (where source and result should match).
 Use case: diagnosing VAE roundtrip degradation, diffusion color drift,
 or stitch seam color mismatch by visualizing exactly where and how much
 pixels change.
+
+ARCHITECTURE NOTE: this is a HUMAN-DEBUG visualization wrapper. Numeric
+metrics that feed the agent corpus go through diff_ops.compute_diff_metrics
+via NV_ShotMeasure / NV_ShotRecord. The boundary-mask helper is shared
+(imported from diff_ops below) so the chart numbers and the JSONL numbers
+can never disagree on zone definitions.
 """
 
 import torch
 import torch.nn.functional as F
+
+from .diff_ops import _compute_boundary_mask as _diff_ops_boundary_mask
 
 
 class NV_ImageDiffAnalyzer:
@@ -245,21 +253,12 @@ class NV_ImageDiffAnalyzer:
         return torch.stack([r, g, b], dim=-1)
 
     def _compute_boundary_mask(self, mask_binary, width):
-        """Compute a boundary zone mask by dilating the mask edge.
+        """Boundary zone — kept pixels within `width` of the mask edge.
 
-        Returns bool tensor: True for kept pixels within `width` px of the mask edge.
-        mask_binary: [B, H, W] bool where True = generated (excluded).
+        Delegates to the shared op so the legacy viz node and the new
+        agent-corpus path use the same zone definition.
         """
-        # Dilate the mask to find pixels near the edge
-        m_float = mask_binary.float().unsqueeze(1)  # [B, 1, H, W]
-        k = 2 * width + 1
-        kernel = torch.ones(1, 1, k, k, device=m_float.device)
-        dilated = F.conv2d(m_float, kernel, padding=width) > 0  # [B, 1, H, W]
-        dilated = dilated.squeeze(1)  # [B, H, W]
-
-        # Boundary zone = dilated region AND NOT the mask itself (i.e., kept pixels near the edge)
-        boundary = dilated & (~mask_binary)
-        return boundary
+        return _diff_ops_boundary_mask(mask_binary, width)
 
     def _zone_stats(self, abs_diff, signed_diff, zone_mask, channel_names=("Red", "Green", "Blue")):
         """Compute stats for a specific zone. Returns list of formatted lines."""

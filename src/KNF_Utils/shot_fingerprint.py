@@ -31,77 +31,94 @@ def _luminance(image_bhwc):
     return (image_bhwc * weights).sum(dim=-1)
 
 
-def _bg_stats(image_bhwc, mask_bhw):
-    """Mean + std of luminance in the NON-mask area, averaged over frames."""
-    lum = _luminance(image_bhwc)              # [B, H, W]
-    if mask_bhw is None:
-        bg_lum = lum                          # whole frame is "BG" if no mask
-    else:
-        if mask_bhw.dim() == 2:
-            mask_bhw = mask_bhw.unsqueeze(0)
-        # broadcast mask to match lum batch size if needed
-        if mask_bhw.shape[0] == 1 and lum.shape[0] > 1:
-            mask_bhw = mask_bhw.expand(lum.shape[0], -1, -1)
-        # Resize mask if spatial dims differ (cheap nearest)
-        if mask_bhw.shape[-2:] != lum.shape[-2:]:
-            mask_bhw = torch.nn.functional.interpolate(
-                mask_bhw.unsqueeze(1).float(),
-                size=lum.shape[-2:],
-                mode="nearest",
-            ).squeeze(1)
-        bg_keep = (mask_bhw < 0.5).float()    # 1 where NOT mask
-        if bg_keep.sum() < 1:
-            return float(lum.mean()), float(lum.std())
-        bg_lum = lum * bg_keep
-        # mean over kept pixels only
-        sum_lum = bg_lum.sum()
-        n = bg_keep.sum().clamp(min=1.0)
-        mean = (sum_lum / n).item()
-        # variance over kept pixels
-        diff_sq = ((lum - mean) ** 2) * bg_keep
-        var = (diff_sq.sum() / n).item()
-        return mean, var ** 0.5
-    return float(bg_lum.mean()), float(bg_lum.std())
+def _normalize_mask(mask, target_shape_bhw):
+    """Bring MASK to image-space [B, H, W] via nearest-neighbor resize +
+    batch broadcast. Centralizes the shape contract so every consumer
+    operates on the same normalized tensor.
+    """
+    if mask is None:
+        return None
+    m = mask.float()
+    if m.dim() == 2:
+        m = m.unsqueeze(0)
+    target_B, target_H, target_W = target_shape_bhw
+    if m.shape[-2:] != (target_H, target_W):
+        m = torch.nn.functional.interpolate(
+            m.unsqueeze(1), size=(target_H, target_W), mode="nearest"
+        ).squeeze(1)
+    if m.shape[0] == 1 and target_B > 1:
+        m = m.expand(target_B, -1, -1)
+    return m
 
 
-def _mask_stats(mask_bhw, total_pixels):
-    """Mean + std of mask occupancy fraction across frames."""
-    if mask_bhw is None or total_pixels <= 0:
+def _bg_stats(image_bhwc, mask_bhw_norm):
+    """Mean + std of luminance in the NON-mask area. Mask must already be
+    normalized to image-space via _normalize_mask().
+    """
+    lum = _luminance(image_bhwc)
+    if mask_bhw_norm is None:
+        return float(lum.mean()), float(lum.std(unbiased=False))
+    bg_keep = (mask_bhw_norm < 0.5).float()
+    if bg_keep.sum() < 1:
+        return float(lum.mean()), float(lum.std(unbiased=False))
+    n = bg_keep.sum().clamp(min=1.0)
+    mean = ((lum * bg_keep).sum() / n).item()
+    var = (((lum - mean) ** 2 * bg_keep).sum() / n).item()
+    return mean, var ** 0.5
+
+
+def _mask_stats(mask_bhw_norm):
+    """Mean + std of per-frame mask occupancy. Mask must be normalized to
+    image-space first. Uses biased std so single-frame batches don't return NaN.
+    """
+    if mask_bhw_norm is None:
         return None, None
-    if mask_bhw.dim() == 2:
-        mask_bhw = mask_bhw.unsqueeze(0)
-    binary = (mask_bhw > 0.5).float()
+    binary = (mask_bhw_norm > 0.5).float()
+    H, W = binary.shape[-2:]
+    total_pixels = H * W
+    if total_pixels <= 0:
+        return None, None
     per_frame = binary.flatten(start_dim=1).sum(dim=1) / total_pixels  # [B]
-    return float(per_frame.mean()), float(per_frame.std())
+    mean = float(per_frame.mean())
+    # unbiased=False so B=1 returns 0.0 instead of NaN — non-finite floats
+    # poison the JSONL record (json.dumps default emits NaN, strict readers reject).
+    std = float(per_frame.std(unbiased=False)) if per_frame.numel() > 0 else 0.0
+    return mean, std
 
 
 def _motion_from_stitcher(stitcher):
     """Mean per-frame bbox-center displacement (pixels) from stitcher trajectory.
-    Returns None if stitcher missing or trajectory too short.
+    Returns (motion_px, error_str). motion_px is None when no signal can be
+    computed; error_str is a short reason ("missing key X", "ragged lengths")
+    so the caller can surface schema bugs rather than silently bucketing
+    'static'.
     """
     if stitcher is None:
-        return None
+        return None, "no_stitcher"
+    if not isinstance(stitcher, dict):
+        return None, f"stitcher_type={type(stitcher).__name__}"
+    cx = stitcher.get('cropped_to_canvas_x')
+    cy = stitcher.get('cropped_to_canvas_y')
+    cw = stitcher.get('cropped_to_canvas_w')
+    ch = stitcher.get('cropped_to_canvas_h')
+    if cx is None or cy is None or cw is None or ch is None:
+        return None, "missing_bbox_keys"
     try:
-        cx = stitcher.get('cropped_to_canvas_x')
-        cy = stitcher.get('cropped_to_canvas_y')
-        cw = stitcher.get('cropped_to_canvas_w')
-        ch = stitcher.get('cropped_to_canvas_h')
-        if cx is None or cy is None or cw is None or ch is None:
-            return None
         n = len(cx)
+        if not (len(cy) == len(cw) == len(ch) == n):
+            return None, "ragged_bbox_arrays"
         if n < 2:
-            return None
-        # bbox center per frame
+            return None, None  # single-frame is genuine, not an error
         centers = [(cx[i] + cw[i] / 2.0, cy[i] + ch[i] / 2.0) for i in range(n)]
         deltas = [
             ((centers[i][0] - centers[i - 1][0]) ** 2 + (centers[i][1] - centers[i - 1][1]) ** 2) ** 0.5
             for i in range(1, n)
         ]
         if not deltas:
-            return None
-        return sum(deltas) / len(deltas)
-    except Exception:
-        return None
+            return None, None
+        return sum(deltas) / len(deltas), None
+    except (TypeError, IndexError) as e:
+        return None, f"{type(e).__name__}: {e}"
 
 
 def _motion_from_mask_centroid(mask_bhw):
@@ -154,24 +171,33 @@ def compute_fingerprint(images, mask=None, stitcher=None):
         fp["resolution"] = [int(H), int(W)]
         fp["frame_count"] = int(B)
 
+        # Normalize mask to image space ONCE — _bg_stats and _mask_stats both
+        # need image-space resolution, otherwise occupancy fractions can exceed
+        # 1.0 when mask is at a different resolution and poison bucket assignment.
+        mask_norm = _normalize_mask(mask, (B, H, W)) if mask is not None else None
+
         # BG luminance
-        bg_mean, bg_std = _bg_stats(images, mask)
+        bg_mean, bg_std = _bg_stats(images, mask_norm)
         fp["bg_luminance_mean"] = round(bg_mean, 4)
         fp["bg_luminance_std"] = round(bg_std, 4)
         fp["bg_luminance_bucket"] = _bucket(bg_mean, BG_LUMINANCE_BUCKETS)
 
         # Mask occupancy
-        occ_mean, occ_std = _mask_stats(mask, H * W)
+        occ_mean, occ_std = _mask_stats(mask_norm)
         if occ_mean is not None:
             fp["mask_occupancy_mean"] = round(occ_mean, 4)
             fp["mask_area_std"] = round(occ_std, 4) if occ_std is not None else None
             fp["mask_occupancy_bucket"] = _bucket(occ_mean, MASK_OCCUPANCY_BUCKETS)
 
         # Motion
-        motion_px = _motion_from_stitcher(stitcher)
+        motion_px, motion_err = _motion_from_stitcher(stitcher)
         motion_source = "stitcher_bbox"
+        if motion_px is None and stitcher is not None and motion_err and motion_err != "no_stitcher":
+            # Schema-level stitcher failure — surface it instead of silently
+            # falling through to mask centroid (which would mask the upstream bug).
+            fp["motion_error"] = motion_err
         if motion_px is None:
-            motion_px = _motion_from_mask_centroid(mask)
+            motion_px = _motion_from_mask_centroid(mask_norm)
             motion_source = "mask_centroid"
         if motion_px is not None:
             fp["motion_displacement_mean_px"] = round(motion_px, 3)

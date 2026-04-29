@@ -33,25 +33,26 @@ def _compute_boundary_mask(mask_binary_bhw, width):
 
 
 def _zone_stats(abs_diff_bhwc, zone_mask_bhw):
-    """Per-channel mean + percentiles for the kept-zone pixels. Returns dict."""
-    out = {}
-    if zone_mask_bhw.sum() == 0:
-        return {"count": 0}
+    """Per-channel mean + percentiles for the kept-zone pixels.
+
+    Returns dict with `count` always present; `mean`/`p95` are None when the
+    zone is empty (no pixels) so downstream can distinguish 'no measurement'
+    from 'measured zero'.
+    """
+    count = int(zone_mask_bhw.sum())
+    if count == 0:
+        return {"count": 0, "mean": None, "p95": None}
     mean_per_channel = []
     p95_per_channel = []
     for c in range(abs_diff_bhwc.shape[-1]):
         ch = abs_diff_bhwc[..., c][zone_mask_bhw]
-        if ch.numel() == 0:
-            mean_per_channel.append(0.0)
-            p95_per_channel.append(0.0)
-        else:
-            mean_per_channel.append(float(ch.mean()))
-            p95_per_channel.append(_percentile(ch, 0.95))
-    out["count"] = int(zone_mask_bhw.sum())
-    # Aggregate across channels — agent only needs one number per zone
-    out["mean"] = sum(mean_per_channel) / max(1, len(mean_per_channel))
-    out["p95"]  = max(p95_per_channel) if p95_per_channel else 0.0
-    return out
+        mean_per_channel.append(float(ch.mean()))
+        p95_per_channel.append(_percentile(ch, 0.95))
+    return {
+        "count": count,
+        "mean": sum(mean_per_channel) / len(mean_per_channel),
+        "p95":  max(p95_per_channel),
+    }
 
 
 def compute_diff_metrics(image_a, image_b, mask=None, mask_threshold=0.5, boundary_width=16):
@@ -84,37 +85,42 @@ def compute_diff_metrics(image_a, image_b, mask=None, mask_threshold=0.5, bounda
         out["global_p95"]  = round(_percentile(global_flat, 0.95), 6)
 
         # Mask-aware zone stats
+        out["mask_present"] = mask is not None
         if mask is not None:
             m = mask.float()
             if m.dim() == 2:
                 m = m.unsqueeze(0)
             if m.shape[1:] != image_a.shape[1:3]:
+                # nearest interpolation: keeps mask edges crisp before threshold.
+                # bilinear would shift edges and bias zone occupancy.
                 m = F.interpolate(m.unsqueeze(1), size=(image_a.shape[1], image_a.shape[2]),
-                                  mode="bilinear", align_corners=False).squeeze(1)
+                                  mode="nearest").squeeze(1)
             if m.shape[0] == 1 and abs_diff.shape[0] > 1:
                 m = m.expand(abs_diff.shape[0], -1, -1)
 
             mask_binary = (m >= mask_threshold)        # True = generated (excluded)
-            interior = (~mask_binary)                  # all kept pixels
-            boundary = _compute_boundary_mask(mask_binary, boundary_width)
+            boundary    = _compute_boundary_mask(mask_binary, boundary_width)
+            # interior = kept pixels NOT in the boundary band, so the two zones
+            # are disjoint and boundary_to_interior_ratio is meaningful.
+            interior    = (~mask_binary) & (~boundary)
 
             i_stats = _zone_stats(abs_diff, interior)
             b_stats = _zone_stats(abs_diff, boundary)
-            out["interior_mean"] = round(i_stats.get("mean", 0.0), 6)
-            out["interior_p95"]  = round(i_stats.get("p95", 0.0), 6)
-            out["boundary_mean"] = round(b_stats.get("mean", 0.0), 6)
-            out["boundary_p95"]  = round(b_stats.get("p95", 0.0), 6)
-            out["interior_pixel_count"] = i_stats.get("count", 0)
-            out["boundary_pixel_count"] = b_stats.get("count", 0)
+            out["interior_mean"] = round(i_stats["mean"], 6) if i_stats["mean"] is not None else None
+            out["interior_p95"]  = round(i_stats["p95"], 6)  if i_stats["p95"]  is not None else None
+            out["boundary_mean"] = round(b_stats["mean"], 6) if b_stats["mean"] is not None else None
+            out["boundary_p95"]  = round(b_stats["p95"], 6)  if b_stats["p95"]  is not None else None
+            out["interior_pixel_count"] = i_stats["count"]
+            out["boundary_pixel_count"] = b_stats["count"]
 
-            # Boundary-to-interior ratio: high = seam-localized failure
-            if out["interior_mean"] > 1e-9:
+            # Boundary-to-interior ratio: high = seam-localized failure.
+            # None if either zone is empty or interior_mean is ~0 (degenerate).
+            if (out["interior_mean"] is not None and out["interior_mean"] > 1e-9
+                    and out["boundary_mean"] is not None):
                 out["boundary_to_interior_ratio"] = round(out["boundary_mean"] / out["interior_mean"], 3)
             else:
                 out["boundary_to_interior_ratio"] = None
             out["mask_occupancy"] = round(float(mask_binary.float().mean()), 4)
-        else:
-            out["mask_present"] = False
     except Exception as e:
         out["compute_error"] = f"{type(e).__name__}: {e}"
     return out

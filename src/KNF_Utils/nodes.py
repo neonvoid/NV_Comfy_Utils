@@ -42,17 +42,18 @@ from .streaming_vace_to_video import NV_WanVaceToVideoStreaming
 from .b2_output_sync import NV_B2OutputSync
 # Import B2 input sync for pulling from cloud storage
 from .b2_input_sync import NV_B2InputSync
-# Import VACE benchmark logger for memory analysis
-from .vace_benchmark import NV_VACEBenchmarkLogger
-# Import workflow logger for memory analysis dataset collection
-from .workflow_logger import NV_WorkflowLogger, NV_WorkflowLoggerStart
+# DEPRECATED 2026-04-29 — superseded by NV_ShotMeasure / NV_ShotRecord (shot_telemetry).
+# VRAM estimator formulas from vace_benchmark were preserved in vram_estimators.py.
+# Commented out for runtime test; delete files after confirmation.
+# from .vace_benchmark import NV_VACEBenchmarkLogger
+# from .workflow_logger import NV_WorkflowLogger, NV_WorkflowLoggerStart
+# from .json_metadata_writer import NV_JsonMetadataWriter
+# from .json_metadata_reader import NV_JsonMetadataReader
+
 # Import frame number overlay for debugging
 from .frame_number_overlay import NV_FrameNumberOverlay
 # Import heartbeat for serverless deployments
 from .heartbeat import NV_Heartbeat
-# Import JSON metadata writer/reader for serverless deployments
-from .json_metadata_writer import NV_JsonMetadataWriter
-from .json_metadata_reader import NV_JsonMetadataReader
 
 # Import Slack notifier (optional dependency - requires slack-sdk)
 try:
@@ -7773,14 +7774,15 @@ NODE_CLASS_MAPPINGS = {
     "NV_B2OutputSync": NV_B2OutputSync,
     "NV_B2InputSync": NV_B2InputSync,
     "NV_FrameAnnotator": NV_FrameAnnotator,
-    "NV_VACEBenchmarkLogger": NV_VACEBenchmarkLogger,
-    "NV_WorkflowLogger": NV_WorkflowLogger,
-    "NV_WorkflowLoggerStart": NV_WorkflowLoggerStart,
+    # DEPRECATED 2026-04-29 — superseded by NV_ShotMeasure / NV_ShotRecord
+    # "NV_VACEBenchmarkLogger": NV_VACEBenchmarkLogger,
+    # "NV_WorkflowLogger": NV_WorkflowLogger,
+    # "NV_WorkflowLoggerStart": NV_WorkflowLoggerStart,
+    # "NV_JsonMetadataWriter": NV_JsonMetadataWriter,
+    # "NV_JsonMetadataReader": NV_JsonMetadataReader,
     "NV_FrameNumberOverlay": NV_FrameNumberOverlay,
     "NV_BatchFolderScanner": NV_BatchFolderScanner,
     "NV_Heartbeat": NV_Heartbeat,
-    "NV_JsonMetadataWriter": NV_JsonMetadataWriter,
-    "NV_JsonMetadataReader": NV_JsonMetadataReader,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -7814,14 +7816,15 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NV_B2OutputSync": "NV B2 Output Sync",
     "NV_B2InputSync": "NV B2 Input Sync",
     "NV_FrameAnnotator": "NV Frame Annotator",
-    "NV_VACEBenchmarkLogger": "NV VACE Benchmark Logger",
-    "NV_WorkflowLogger": "NV Workflow Logger",
-    "NV_WorkflowLoggerStart": "NV Workflow Logger (Start)",
+    # DEPRECATED 2026-04-29 — superseded by NV_ShotMeasure / NV_ShotRecord
+    # "NV_VACEBenchmarkLogger": "NV VACE Benchmark Logger",
+    # "NV_WorkflowLogger": "NV Workflow Logger",
+    # "NV_WorkflowLoggerStart": "NV Workflow Logger (Start)",
+    # "NV_JsonMetadataWriter": "NV JSON Metadata Writer",
+    # "NV_JsonMetadataReader": "NV JSON Metadata Reader",
     "NV_FrameNumberOverlay": "NV Frame Number Overlay",
     "NV_BatchFolderScanner": "NV Batch Folder Scanner",
     "NV_Heartbeat": "NV Heartbeat (Serverless)",
-    "NV_JsonMetadataWriter": "NV JSON Metadata Writer",
-    "NV_JsonMetadataReader": "NV JSON Metadata Reader",
 }
 
 # Conditionally add NV_Video_Loader_Path if it imported successfully

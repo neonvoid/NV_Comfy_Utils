@@ -15,8 +15,8 @@ WIRING (typical):
                 → writes one .jsonl line to agent_log_inbox/{MACHINE_ID}.jsonl
 """
 
-import copy
 import json
+import math
 import time
 import uuid
 
@@ -32,12 +32,47 @@ from .shot_jsonl_writer import (
     get_machine_id,
     resolve_inbox_path,
 )
-from .shot_runtime import get_gen_time_sec, get_memory_snapshot
+from .shot_runtime import get_runtime_snapshot
 from .shot_telemetry_types import (
     DISQUALIFYING_ARTIFACT_TAGS,
     RUBRIC_VERSION,
     SCHEMA_VERSION,
 )
+
+
+_JSON_SAFE_PRIMITIVES = (str, int, bool, type(None))
+
+
+def _to_json_safe(value, _depth=0):
+    """Recursively convert arbitrary values into JSON-safe primitives.
+
+    Tensors, numpy arrays, paths, sets, and other non-JSON types get
+    stringified rather than failing the whole record. Non-finite floats
+    (NaN/Infinity) become None — strict JSON readers reject them.
+
+    Capped at depth 8 to defend against pathological cycles.
+    """
+    if _depth > 8:
+        return f"<truncated:depth>"
+    if isinstance(value, _JSON_SAFE_PRIMITIVES):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {str(k): _to_json_safe(v, _depth + 1) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_json_safe(v, _depth + 1) for v in value]
+    if isinstance(value, (set, frozenset)):
+        return [_to_json_safe(v, _depth + 1) for v in value]
+    # numpy scalars / tensors / arrays / Paths / etc.
+    for attr in ("tolist", "item"):
+        fn = getattr(value, attr, None)
+        if callable(fn):
+            try:
+                return _to_json_safe(fn(), _depth + 1)
+            except (TypeError, ValueError):
+                pass
+    return f"<non_json:{type(value).__name__}>"
 
 
 # ---------------------------------------------------------------------------
@@ -192,37 +227,53 @@ class NV_ShotRecord:
 
     @staticmethod
     def _parse_artifact_tags(raw):
+        """Parse + validate artifact tags against the controlled vocabulary.
+
+        Returns dict with `valid` (recognized tags, agent reads these as vetoes)
+        and `unknown` (operator typos / future tags — kept separate so the
+        agent can spot schema drift instead of treating typos as valid vetoes).
+        """
         if not raw or not raw.strip():
-            return []
-        # Accept comma- or newline-separated; strip whitespace; dedupe; preserve order
-        chunks = []
+            return {"valid": [], "unknown": []}
+        valid, unknown = [], []
+        seen = set()
         for line in raw.replace(",", "\n").split("\n"):
             t = line.strip().lower()
-            if t and t not in chunks:
-                chunks.append(t)
-        return chunks
+            if not t or t in seen:
+                continue
+            seen.add(t)
+            if t == "none":
+                continue  # explicit "none" sentinel = empty list
+            if t in DISQUALIFYING_ARTIFACT_TAGS:
+                valid.append(t)
+            else:
+                unknown.append(t)
+        return {"valid": valid, "unknown": unknown}
 
     def record(self, trigger, shot_id, inbox_dir,
                verdict_overall, verdict_identity, verdict_temporal,
                metrics=None, manifest_in=None, stitcher=None, mask_config=None,
                disqualifying_artifacts="", render_status="completed", notes=""):
 
-        # Build params dict — prefer manifest_in (richer), fall back to direct stitcher/mask_config
+        # Build params dict — prefer manifest_in (richer), fall back to direct stitcher/mask_config.
+        # Sanitize through _to_json_safe: manifests can carry tensors/numpy/paths
+        # that crash json.dumps. Sanitizing at the boundary keeps the JSONL
+        # contract strict without forcing every upstream node to be JSON-aware.
         params = {}
         if isinstance(manifest_in, dict):
-            params = copy.deepcopy(manifest_in)
+            params = _to_json_safe(manifest_in)
         if stitcher is not None and "stitcher" not in params:
             sti = summarize_stitcher(stitcher)
             if sti is not None:
-                params["stitcher"] = sti
+                params["stitcher"] = _to_json_safe(sti)
         if mask_config is not None and "mask_processing_config" not in params:
             mc = summarize_mask_config(mask_config)
             if mc is not None:
-                params["mask_processing_config"] = mc
+                params["mask_processing_config"] = _to_json_safe(mc)
 
-        # Runtime snapshot — non-destructive
-        gen_time = get_gen_time_sec()
-        mem = get_memory_snapshot()
+        # Runtime snapshot — non-destructive, returns None for unavailable fields
+        runtime = get_runtime_snapshot()
+        artifact_tags = self._parse_artifact_tags(disqualifying_artifacts)
 
         record = {
             "schema_version": SCHEMA_VERSION,
@@ -233,38 +284,43 @@ class NV_ShotRecord:
             "shot_id": shot_id.strip() or "unnamed_shot",
             "render_status": render_status,
             "params": params,
-            "fingerprint": metrics.get("fingerprint") if isinstance(metrics, dict) else None,
+            "fingerprint": _to_json_safe(metrics.get("fingerprint")) if isinstance(metrics, dict) else None,
             "metrics": {
-                "diff": metrics.get("diff") if isinstance(metrics, dict) else None,
-                "seam": metrics.get("seam") if isinstance(metrics, dict) else None,
+                "diff": _to_json_safe(metrics.get("diff")) if isinstance(metrics, dict) else None,
+                "seam": _to_json_safe(metrics.get("seam")) if isinstance(metrics, dict) else None,
             },
             "performance": {
-                "gen_time_sec": round(gen_time, 3) if gen_time > 0 else None,
-                "vram_peak_gb": mem.get("vram_peak_gb"),
-                "vram_total_gb": mem.get("vram_total_gb"),
-                "ram_used_gb": mem.get("ram_used_gb"),
-                "gpu_name": mem.get("gpu_name"),
-                "hook_installed": mem.get("hook_installed"),
+                # gen_time_sec is None when the prompt hook didn't install — never silently 0.
+                "gen_time_sec": runtime.get("gen_time_sec"),
+                "gen_time_scope": runtime.get("gen_time_scope"),
+                "vram_session_peak_gb": runtime.get("vram_session_peak_gb"),  # NOT shot-scoped
+                "vram_total_gb": runtime.get("vram_total_gb"),
+                "ram_used_gb": runtime.get("ram_used_gb"),
+                "gpu_name": runtime.get("gpu_name"),
+                "hook_installed": runtime.get("hook_installed"),
+                "hook_install_error": runtime.get("hook_install_error"),
+                "vram_error": runtime.get("vram_error"),
+                "ram_error": runtime.get("ram_error"),
             },
             "verdict": {
                 "overall": verdict_overall if verdict_overall > 0 else None,
                 "identity": verdict_identity if verdict_identity > 0 else None,
                 "temporal": verdict_temporal if verdict_temporal > 0 else None,
-                "artifacts": self._parse_artifact_tags(disqualifying_artifacts),
+                "artifacts": artifact_tags["valid"],
+                "artifacts_unknown": artifact_tags["unknown"],
                 "notes": notes.strip(),
             },
         }
 
         path = resolve_inbox_path(inbox_dir)
-        success = append_record(path, record)
-        count = count_records(path) if success else 0
+        # Let exceptions propagate. Silent telemetry loss is the failure mode
+        # we explicitly designed against — better the workflow surfaces a
+        # red error node than the agent corpus quietly misses records.
+        append_record(path, record)
+        count = count_records(path)
 
-        record_json_out = json.dumps(record, indent=2, ensure_ascii=False)
-        if success:
-            print(f"[NV_ShotRecord] appended record {record['record_id'][:8]} to {path} ({count} total)")
-        else:
-            print(f"[NV_ShotRecord] WARNING: append failed; record returned but not persisted")
-
+        record_json_out = json.dumps(record, indent=2, ensure_ascii=False, allow_nan=False)
+        print(f"[NV_ShotRecord] appended record {record['record_id'][:8]} to {path} ({count} total)")
         return (record_json_out, path, count, trigger)
 
 
