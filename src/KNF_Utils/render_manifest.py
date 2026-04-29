@@ -22,43 +22,42 @@ Place at the end of the pipeline, gated by a trigger input from the video saver
 
 import copy
 import json
-import os
 import time
-
-import torch
 
 # Shared ops — single source of truth. Helpers used to live here; they're now
 # in manifest_ops.py so NV_RenderManifest and NV_ShotRecord see identical
 # summaries and there's no risk of one copy drifting from the other.
 from .manifest_ops import (
-    resolve_output_path as _resolve_output_path,
     summarize_mask_config as _summarize_mask_config,
     summarize_stitcher as _summarize_stitcher,
 )
 
 
 class NV_RenderManifest:
-    """Consolidate all pipeline parameters into a JSON sidecar file.
+    """Per-pass manifest aggregator + cross-pass flow carrier.
 
-    Place at the END of the pipeline (gate via trigger input from the video saver)
-    so it captures the post-execution state. Writes a structured JSON file next
-    to the video output. Use the `notes` field for free-form session context.
+    Two roles:
+      1. Aggregates scattered upstream config (info STRINGs from per-node info
+         outputs, sampler widget values, stitcher/mask_config summaries) into
+         one structured dict.
+      2. Carries that dict between passes via the RENDER_MANIFEST custom type
+         (manifest_in → manifest_out). Multi-pass workflows (e.g. SimpleColorMatch
+         chain) need this so cross-pass state (`color_state`, etc.) survives.
+
+    Disk-write was removed 2026-04-29 — NV_ShotRecord now writes structured
+    JSONL records to agent_log_inbox/, which supersedes the per-render JSON
+    sidecar this node used to emit. Wire `manifest_out` into NV_ShotRecord's
+    `manifest_in` to persist.
     """
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "output_path": ("STRING", {
-                    "default": "",
-                    "tooltip": "Full path to JSON file OR directory. If directory, file is named "
-                               "'{shot_name}_{timestamp}_manifest.json'. If file, used as-is. "
-                               "Parent dir created if missing. Example: 'Z:/projects/jcrew/output' "
-                               "(directory) OR 'Z:/projects/jcrew/output/run42.manifest.json' (file)."
-                }),
                 "shot_name": ("STRING", {
                     "default": "render",
-                    "tooltip": "Shot identifier — used in filename when output_path is a directory."
+                    "tooltip": "Shot identifier — recorded in the manifest dict so downstream "
+                               "NV_ShotRecord can pick it up if no shot_id widget is set there."
                 }),
             },
             "optional": {
@@ -123,17 +122,15 @@ class NV_RenderManifest:
     RETURN_NAMES = ("manifest_json", "trigger_out", "manifest_out")
     FUNCTION = "execute"
     CATEGORY = "NV_Utils/Debug"
-    OUTPUT_NODE = True
     DESCRIPTION = (
-        "Write a structured JSON manifest of all pipeline params next to the video output. "
-        "Survives ComfyUI restarts. Recover any past render's settings by reading one file "
-        "instead of chasing 60+ workflow nodes. Place at end of pipeline (use trigger_in to "
-        "execute after video save). Returns the manifest STRING + trigger passthrough."
+        "Aggregates pipeline params from upstream info STRINGs + sampler widget "
+        "values + stitcher/mask_config into one manifest dict. Pipes via "
+        "RENDER_MANIFEST custom type for cross-pass workflows. Wire "
+        "manifest_out → NV_ShotRecord.manifest_in to persist."
     )
 
     def execute(
         self,
-        output_path,
         shot_name,
         trigger_in=None,
         notes="",
@@ -243,14 +240,10 @@ class NV_RenderManifest:
         else:
             manifest.pop("extras_parse_error", None)
 
-        # Resolve output path and write atomically.
-        # Multi-AI fix: removed `default=str` from json.dumps so non-serializable
-        # payloads fail loudly rather than getting silently stringified. The
-        # manifest is a single source of truth that flows to LLM agents — silent
-        # type coercion produces lossy schema-breaking JSON the agent would then
-        # consume as if it were authoritative. Better to surface a TypeError
-        # than to ship a misleading manifest.
-        resolved_path = _resolve_output_path(output_path, shot_name)
+        # Serialize for the human-readable STRING output (workflow inspection).
+        # No `default=str` — non-serializable payloads fail loudly so upstream
+        # contributors don't silently ship lossy data downstream into the
+        # JSONL agent corpus via NV_ShotRecord.
         try:
             manifest_json = json.dumps(manifest, indent=2, sort_keys=True)
         except TypeError as e:
@@ -260,39 +253,13 @@ class NV_RenderManifest:
                 f"(strings, numbers, bools, lists, dicts, None)."
             )
 
-        save_status = "no_output_path"
-        if resolved_path:
-            try:
-                # Write to temp + rename for atomic replace
-                import tempfile
-                parent = os.path.dirname(os.path.abspath(resolved_path))
-                fd, tmp_path = tempfile.mkstemp(
-                    prefix=".manifest_", suffix=".tmp",
-                    dir=parent if parent else None,
-                )
-                try:
-                    with os.fdopen(fd, "w", encoding="utf-8") as f:
-                        f.write(manifest_json)
-                    os.replace(tmp_path, resolved_path)
-                    save_status = f"saved → {resolved_path}"
-                except Exception:
-                    if os.path.exists(tmp_path):
-                        try:
-                            os.remove(tmp_path)
-                        except OSError:
-                            pass
-                    raise
-            except Exception as e:
-                save_status = f"FAILED: {e}"
-
-        print(f"{TAG} {save_status}")
-        if resolved_path:
-            print(f"{TAG} manifest contains {len(manifest)} top-level keys")
+        print(f"{TAG} manifest contains {len(manifest)} top-level keys; "
+              f"wire manifest_out → NV_ShotRecord to persist.")
 
         # Emit (json_string, trigger_passthrough, manifest_dict).
-        # The dict output lets downstream nodes (or chained NV_RenderManifest
-        # instances) keep flowing the central source of truth without needing
-        # to re-parse JSON.
+        # The dict output lets downstream nodes (chained NV_RenderManifest
+        # instances or NV_ShotRecord) keep flowing the central source of truth
+        # without re-parsing JSON.
         return (manifest_json, trigger_in if trigger_in is not None else manifest_json, manifest)
 
 

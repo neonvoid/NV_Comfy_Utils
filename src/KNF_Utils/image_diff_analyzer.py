@@ -19,7 +19,10 @@ can never disagree on zone definitions.
 import torch
 import torch.nn.functional as F
 
-from .diff_ops import _compute_boundary_mask as _diff_ops_boundary_mask
+from .diff_ops import (
+    _compute_boundary_mask as _diff_ops_boundary_mask,
+    _percentile as _diff_ops_percentile,
+)
 
 
 class NV_ImageDiffAnalyzer:
@@ -109,12 +112,18 @@ class NV_ImageDiffAnalyzer:
             magnitude = (magnitude * amplify).clamp(0, 1)
             vis = self._apply_heatmap(magnitude)
 
-        # Prepare mask zones
+        # Prepare mask zones — mirror diff_ops.compute_diff_metrics exactly so
+        # the legacy chart numbers can never disagree with the JSONL numbers.
+        # 2D→3D promote handles ComfyUI's bare [H, W] mask shape.
+        # `nearest` keeps mask edges crisp before threshold; bilinear would
+        # bias zone occupancy and split this node's stats from the agent path.
         m_resized = None
         if mask is not None:
             m = mask.float()
+            if m.dim() == 2:
+                m = m.unsqueeze(0)
             if m.shape[1:] != image_a.shape[1:3]:
-                m = F.interpolate(m.unsqueeze(1), size=(image_a.shape[1], image_a.shape[2]), mode="bilinear", align_corners=False).squeeze(1)
+                m = F.interpolate(m.unsqueeze(1), size=(image_a.shape[1], image_a.shape[2]), mode="nearest").squeeze(1)
             if m.shape[0] == 1 and vis.shape[0] > 1:
                 m = m.expand(vis.shape[0], -1, -1)
             m_resized = m
@@ -278,12 +287,13 @@ class NV_ImageDiffAnalyzer:
             mean_signed = ch_signed.mean().item()
             std_signed = ch_signed.std().item()
 
-            # Percentiles
-            sorted_abs = ch_abs.sort().values
-            p50 = sorted_abs[len(sorted_abs) // 2].item()
-            p90 = sorted_abs[int(len(sorted_abs) * 0.9)].item()
-            p95 = sorted_abs[int(len(sorted_abs) * 0.95)].item()
-            p99 = sorted_abs[min(int(len(sorted_abs) * 0.99), len(sorted_abs) - 1)].item()
+            # Percentiles via shared helper — matches diff_ops indexing convention
+            # (round(q * (n-1))) so this node's text report and the JSONL
+            # numbers agree on small zones.
+            p50 = _diff_ops_percentile(ch_abs, 0.50)
+            p90 = _diff_ops_percentile(ch_abs, 0.90)
+            p95 = _diff_ops_percentile(ch_abs, 0.95)
+            p99 = _diff_ops_percentile(ch_abs, 0.99)
 
             lines.append(f"  {name}:")
             lines.append(f"    Mean |diff|:  {mean_abs:.6f}  ({mean_abs*255:.2f}/255)")
@@ -416,9 +426,8 @@ class NV_ImageDiffAnalyzer:
         if lum_vals.numel() > 0:
             mse = (lum_vals ** 2).mean().item()
             psnr = 10 * torch.log10(torch.tensor(1.0 / max(mse, 1e-10))).item()
-            lum_sorted = lum_vals.abs().sort().values
-            lp90 = lum_sorted[int(len(lum_sorted) * 0.9)].item()
-            lp99 = lum_sorted[min(int(len(lum_sorted) * 0.99), len(lum_sorted) - 1)].item()
+            lp90 = _diff_ops_percentile(lum_vals.abs(), 0.90)
+            lp99 = _diff_ops_percentile(lum_vals.abs(), 0.99)
 
             lines.append(f"  Luminance (BT.709):")
             lines.append(f"    Mean shift:   {lum_vals.mean().item():+.6f}  ({lum_vals.mean().item()*255:+.2f}/255)")

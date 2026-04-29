@@ -252,7 +252,11 @@ class NV_SeamAnalyzer:
             seam_m = seam_metrics[0]
             avg_psnr = np.mean([m["psnr"] for m in non_seam])
             avg_ssim = np.mean([m["ssim"] for m in non_seam])
-            avg_flow = np.mean([m["flow_mag"] for m in non_seam if m["flow_mag"] >= 0])
+            # Guard against empty list (cv2 unavailable → all flow_mag values
+            # are sentinel -1.0 and get filtered out). np.mean([]) emits a
+            # RuntimeWarning and returns NaN, which then prints as "nan".
+            _flow_vals = [m["flow_mag"] for m in non_seam if m["flow_mag"] >= 0]
+            avg_flow = float(np.mean(_flow_vals)) if _flow_vals else 0.0
 
             print(f"\n--- Summary ---")
             print(f"  Seam PSNR:  {seam_m['psnr']:.2f}  (avg non-seam: {avg_psnr:.2f}, delta: {seam_m['psnr'] - avg_psnr:+.2f})")
