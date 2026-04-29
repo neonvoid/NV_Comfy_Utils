@@ -413,6 +413,27 @@ class NV_InpaintCrop:
             'skipped_indices': [],
             'original_frames': [],
             'total_frames': batch_size,
+            # Resolved param record — what was ACTUALLY used after mask_config override.
+            # Read by NV_FixtureDumper and by the editor's parity tests.
+            # Additive; downstream consumers that don't know about it ignore it.
+            'crop_params': {
+                'crop_stitch_source': crop_stitch_source,
+                'crop_blend_feather_px': blend_pixels_v,
+                'hybrid_falloff': hybrid_falloff,
+                'hybrid_curve': hybrid_curve,
+                'cleanup_fill_holes': fill_holes_v,
+                'cleanup_remove_noise': remove_noise_v,
+                'cleanup_smooth': smooth_v,
+                'crop_expand_px': erode_dilate_v,
+                'resize_algorithm': resize_algorithm,
+                'target_mode': target_mode,
+                'target_width': target_width,
+                'target_height': target_height,
+                'auto_preset': auto_preset,
+                'padding_multiple': padding_multiple,
+                'anomaly_threshold': anomaly_threshold,
+                'mask_config_used': mask_config is not None,
+            },
         }
 
         result_images = []

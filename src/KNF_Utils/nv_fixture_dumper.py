@@ -32,7 +32,6 @@ from __future__ import annotations
 import datetime
 import json
 import os
-import time
 from pathlib import Path
 
 import torch
@@ -43,41 +42,6 @@ import folder_paths
 
 # --- Memory warning threshold for total dumped tensor bytes ---------------
 _MEM_WARN_MB = 2000
-
-
-def _parse_pseudo_yaml(s: str) -> dict:
-    """Minimal `key: value` parser. Numeric values are int/float; "true"/"false"
-    are bools; everything else is a string. Lines starting with # are skipped.
-    Inline `# comment` AFTER a value is also stripped before parsing.
-
-    We deliberately don't pull in PyYAML for this — the param dump is small
-    and hand-edited, and the user shouldn't need a yaml dependency to capture
-    a fixture.
-    """
-    out: dict = {}
-    for line in s.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if ":" not in line:
-            continue
-        key, _, val = line.partition(":")
-        key = key.strip()
-        # Strip inline comments — handles "key: 5  # tweaked" correctly
-        val = val.split("#", 1)[0].strip()
-        if not val:
-            continue
-        if val.lower() in ("true", "false"):
-            out[key] = val.lower() == "true"
-            continue
-        try:
-            if "." in val or "e" in val.lower():
-                out[key] = float(val)
-            else:
-                out[key] = int(val)
-        except ValueError:
-            out[key] = val
-    return out
 
 
 def _stack_or_none(tensor_list, name: str):
@@ -177,37 +141,6 @@ class NV_FixtureDumper:
                     "tooltip": "Starting frame index. Pick a representative segment "
                                "(e.g. a head turn or motion peak)."
                 }),
-                "crop_params": ("STRING", {
-                    "multiline": True,
-                    "default": (
-                        "# Copy these from your NV_InpaintCrop2 widget values.\n"
-                        "# build_blend_mask parity tests will read this back.\n"
-                        "crop_stitch_source: processed\n"
-                        "crop_blend_feather_px: 16\n"
-                        "hybrid_falloff: 48\n"
-                        "hybrid_curve: 0.6\n"
-                        "cleanup_fill_holes: 0\n"
-                        "cleanup_remove_noise: 0\n"
-                        "cleanup_smooth: 0\n"
-                        "crop_expand_px: 0\n"
-                    ),
-                    "tooltip": "Paste your NV_InpaintCrop2 widget values here. "
-                               "Used by the parity test harness to reproduce the same blend mask."
-                }),
-                "stitch_params": ("STRING", {
-                    "multiline": True,
-                    "default": (
-                        "# Copy these from your NV_InpaintStitch2 widget values.\n"
-                        "# composite_frame parity tests will read this back.\n"
-                        "blend_mode: multiband\n"
-                        "multiband_levels: 5\n"
-                        "guided_refine: false\n"
-                        "guided_radius: 8\n"
-                        "guided_eps: 0.001\n"
-                        "guided_strength: 0.7\n"
-                    ),
-                    "tooltip": "Paste your NV_InpaintStitch2 widget values here."
-                }),
                 "output_dir": ("STRING", {
                     "default": "fixtures",
                     "tooltip": "Output dir relative to ComfyUI's output folder. "
@@ -229,8 +162,7 @@ class NV_FixtureDumper:
     )
 
     def dump(self, stitcher, inpainted_image, comfy_output,
-             shot_id, num_frames, frame_offset,
-             crop_params, stitch_params, output_dir):
+             shot_id, num_frames, frame_offset, output_dir):
 
         # ----- Validate inputs upfront, fail with useful messages --------
         if not isinstance(stitcher, dict):
@@ -390,8 +322,13 @@ class NV_FixtureDumper:
             },
             "blend_pixels_baked": int(stitcher.get("blend_pixels", 0)),
             "content_warp_mode": stitcher.get("content_warp_mode"),
-            "crop_params": _parse_pseudo_yaml(crop_params),
-            "stitch_params": _parse_pseudo_yaml(stitch_params),
+            # Read params directly from the stitcher dict — NV_InpaintCrop2 records
+            # crop_params at construction; NV_InpaintStitch2 mutates the same dict
+            # to add stitch_params at the start of stitch(). The dumper depends on
+            # comfy_output (which forces NV_InpaintStitch2 to run first), so by the
+            # time we read stitcher here both keys are populated.
+            "crop_params": stitcher.get("crop_params", {}),
+            "stitch_params": stitcher.get("stitch_params", {}),
             "tensor_inventory": {k: list(v.shape) for k, v in tensors.items()},
             "tensor_dtypes": {k: str(v.dtype) for k, v in tensors.items()},
             "tensor_total_mb": round(total_mb, 1),

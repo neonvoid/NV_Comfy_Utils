@@ -351,6 +351,20 @@ class NV_InpaintStitch:
         device = comfy.model_management.get_torch_device()
         intermediate = comfy.model_management.intermediate_device()
         resize_algorithm = _get_resize_algorithm(stitcher)
+
+        # Record stitch-time params on the stitcher in-place. Additive mutation;
+        # observed by downstream nodes (NV_FixtureDumper) and by the editor's
+        # parity tests, which need to know the exact params used to produce
+        # the comfy_output ground truth.
+        stitcher['stitch_params'] = {
+            'blend_mode': blend_mode,
+            'multiband_levels': multiband_levels,
+            'guided_refine': guided_refine,
+            'guided_radius': guided_radius,
+            'guided_eps': guided_eps,
+            'guided_strength': guided_strength,
+            'output_dtype': output_dtype,
+        }
         # Resolve output dtype (default fp16 — see pre-allocation block below for why)
         output_dtype_torch = torch.float16 if output_dtype == "fp16" else torch.float32
 
