@@ -197,12 +197,50 @@ async def _get_task(session, api_key, task_id):
             raise RuntimeError(f"Seedance status non-JSON: {e}\nBody: {body_text[:500]}")
 
 
+# Transient network failures during long polls (Beijing endpoint, 5-75min jobs).
+# A single TLS handshake reset or DNS hiccup must NOT forfeit the whole task —
+# Volcengine's server-side job continues regardless of our polling client.
+_TRANSIENT_POLL_ERRORS = (
+    aiohttp.ClientConnectionError,    # parent of ClientConnectorError, ServerDisconnectedError
+    aiohttp.ClientPayloadError,
+    asyncio.TimeoutError,
+    ConnectionResetError,
+    ConnectionError,
+)
+_MAX_CONSECUTIVE_POLL_FAILURES = 10   # ~5 min of unreachable at default interval = real outage
+_POLL_RETRY_BACKOFF_CAP_S = 30.0
+
+
 async def _poll_task(session, api_key, task_id, interval, timeout):
     deadline = time.time() + timeout
     last_status = None
+    consecutive_failures = 0
     while True:
         _check_interrupt()
-        resp = await _get_task(session, api_key, task_id)
+        try:
+            resp = await _get_task(session, api_key, task_id)
+        except _TRANSIENT_POLL_ERRORS as e:
+            consecutive_failures += 1
+            if consecutive_failures >= _MAX_CONSECUTIVE_POLL_FAILURES:
+                raise RuntimeError(
+                    f"Seedance poll failed {consecutive_failures}× consecutively — "
+                    f"likely a real outage. task_id={task_id}. Last error: {type(e).__name__}: {e}. "
+                    f"Re-run with NV_SeedanceFetchTask once connectivity recovers."
+                ) from e
+            backoff = min(_POLL_RETRY_BACKOFF_CAP_S, 2.0 * consecutive_failures)
+            print(f"[NV_SeedanceNative_V2] poll #{consecutive_failures} transient error "
+                  f"({type(e).__name__}: {e}); retrying in {backoff:.1f}s. task_id={task_id}")
+            elapsed = 0.0
+            while elapsed < backoff:
+                _check_interrupt()
+                step = min(0.5, backoff - elapsed)
+                await asyncio.sleep(step)
+                elapsed += step
+            # Don't count retry sleeps against the wall-clock deadline; transient
+            # outages should consume retry budget, not job-completion budget.
+            deadline += backoff
+            continue
+        consecutive_failures = 0  # reset on any successful GET
         status = resp.get("status")
         if status != last_status:
             print(f"[NV_SeedanceNative_V2] status: {status}")

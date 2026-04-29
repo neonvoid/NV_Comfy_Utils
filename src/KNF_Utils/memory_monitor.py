@@ -34,7 +34,6 @@ class NV_MemoryReport:
             "optional": {
                 "trigger": ("*", {"tooltip": "Optional - connect to any output to control execution order"}),
                 "log_to_file": ("BOOLEAN", {"default": True, "tooltip": "Write stats to output/memory_logs/"}),
-                "reset_after_report": ("BOOLEAN", {"default": False, "tooltip": "Reset peak counter after report (for per-run tracking)"}),
                 "workflow_name": ("STRING", {"default": "", "tooltip": "Optional identifier in logs"}),
             }
         }
@@ -46,7 +45,7 @@ class NV_MemoryReport:
     CATEGORY = "NV_Utils/Debug"
     DESCRIPTION = "Reports VRAM/RAM usage. Place anywhere in workflow. Returns data in API response for deployment scaling."
 
-    def measure_memory(self, trigger=None, log_to_file=True, reset_after_report=False, workflow_name=""):
+    def measure_memory(self, trigger=None, log_to_file=True, workflow_name=""):
         # VRAM measurement
         if torch.cuda.is_available():
             device = torch.cuda.current_device()
@@ -100,9 +99,6 @@ class NV_MemoryReport:
             "=" * 50,
         ]
 
-        if reset_after_report:
-            report_lines.append("(Peak counter will reset after this report)")
-
         report_lines.append("")
         report = "\n".join(report_lines)
         print(report)
@@ -136,11 +132,6 @@ class NV_MemoryReport:
                 print(f"[NV_MemoryReport] Logged to {log_file}")
             except Exception as e:
                 print(f"[NV_MemoryReport] Warning: Could not write log: {e}")
-
-        # Reset peak counter if requested (for per-run tracking)
-        if reset_after_report and torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
-            print("[NV_MemoryReport] Peak memory counter reset for next run")
 
         # Return with API-compatible format
         return {

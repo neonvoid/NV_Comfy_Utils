@@ -19,8 +19,53 @@ Workflow:
 
 import json
 import os
+import time
 from datetime import datetime
 from comfy.comfy_types.node_typing import IO
+
+
+class _SweepFileLock:
+    """Cross-platform file lock via O_EXCL .lock sentinel + retry. Prevents
+    parallel sweep workers from clobbering sweep_plan.json mid-update.
+    """
+    def __init__(self, path, timeout=15.0, poll=0.05):
+        self.lock_path = path + ".lock"
+        self.timeout = timeout
+        self.poll = poll
+        self.fd = None
+
+    def __enter__(self):
+        deadline = time.time() + self.timeout
+        while True:
+            try:
+                self.fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                return self
+            except FileExistsError:
+                if time.time() > deadline:
+                    raise TimeoutError(
+                        f"Could not acquire sweep lock {self.lock_path} within {self.timeout}s. "
+                        f"Stale lock? Delete it manually if no other process is writing."
+                    )
+                time.sleep(self.poll)
+
+    def __exit__(self, *args):
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            try:
+                os.unlink(self.lock_path)
+            except OSError:
+                pass
+
+
+def _atomic_write_json(path, data):
+    """Write JSON via tmp+rename. Avoids partial writes on crash."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
 
 
 class NV_SweepIterationRecorder:
@@ -96,6 +141,20 @@ class NV_SweepIterationRecorder:
         Record iteration status and update sweep JSON.
         """
 
+        # Acquire lock for the full read-modify-write cycle. Parallel sweep
+        # workers writing to the same plan would otherwise corrupt the JSON.
+        with _SweepFileLock(sweep_json_path):
+            return self._record_locked(
+                trigger, sweep_json_path, iteration_id,
+                status, output_path, notes,
+                metric_1_name, metric_1_value,
+                metric_2_name, metric_2_value,
+            )
+
+    def _record_locked(self, trigger, sweep_json_path, iteration_id,
+                       status, output_path, notes,
+                       metric_1_name, metric_1_value,
+                       metric_2_name, metric_2_value):
         # Load the plan
         try:
             with open(sweep_json_path, 'r') as f:
@@ -148,9 +207,8 @@ class NV_SweepIterationRecorder:
 
         plan["completed_iterations"] = completed_count
 
-        # Write updated JSON
-        with open(sweep_json_path, 'w') as f:
-            json.dump(plan, f, indent=2)
+        # Atomic write via tmp+rename (already inside the lock)
+        _atomic_write_json(sweep_json_path, plan)
 
         # Build status message
         status_message = (
