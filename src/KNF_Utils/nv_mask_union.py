@@ -21,10 +21,30 @@ positional `widgets_values` mapping for existing workflows). New widgets are
 appended after it.
 """
 
+import time
+
 import torch
 
 from .guided_filter import refine_mask
 from .mask_ops import mask_blur, mask_fill_holes
+
+
+def _mask_stats(label, mask):
+    """Single-line summary of a mask tensor for verbose_debug logging.
+
+    Forces CPU-GPU sync via .min/.max/.mean — only call inside `if verbose_debug:`.
+    """
+    if mask is None:
+        return f"{label}=unwired"
+    fg = float((mask > 0.5).sum())
+    total = float(mask.numel())
+    pct = 100.0 * fg / max(total, 1.0)
+    return (
+        f"{label}: shape={tuple(mask.shape)}, "
+        f"fg_px={int(fg)} ({pct:.2f}%), "
+        f"range=[{float(mask.min()):.3f},{float(mask.max()):.3f}], "
+        f"mean={float(mask.mean()):.4f}, dtype={mask.dtype}"
+    )
 
 
 _COMBINE_MODES = ("max", "probabilistic_or")
@@ -192,7 +212,25 @@ class NV_MaskUnion:
         guided_radius=0,
         guided_eps=0.001,
         guided_strength=0.7,
+        verbose_debug=False,
     ):
+        t_start = time.perf_counter() if verbose_debug else 0.0
+        if verbose_debug:
+            print(f"[NV_MaskUnion] === call ===")
+            print(f"[NV_MaskUnion]   {_mask_stats('mask_a', mask_a)}")
+            print(f"[NV_MaskUnion]   {_mask_stats('mask_b', mask_b)}")
+            print(f"[NV_MaskUnion]   {_mask_stats('mask_c', mask_c)}")
+            print(f"[NV_MaskUnion]   {_mask_stats('mask_d', mask_d)}")
+            print(f"[NV_MaskUnion]   config: combine_mode={combine_mode}, "
+                  f"pre_feather_px={pre_feather_px}, post_close_px={post_close_px}, "
+                  f"post_smooth_px={post_smooth_px}, clamp_output={clamp_output}")
+            if guided_image is not None:
+                print(f"[NV_MaskUnion]   guided: image=wired (shape={tuple(guided_image.shape)}), "
+                      f"radius={guided_radius} (0=auto), eps={guided_eps:.4f}, "
+                      f"strength={guided_strength:.2f}")
+            else:
+                print(f"[NV_MaskUnion]   guided: unwired")
+
         # --- Param validation ------------------------------------------------
         if combine_mode not in _COMBINE_MODES:
             raise ValueError(
@@ -271,6 +309,23 @@ class NV_MaskUnion:
             result = result.clamp(0.0, 1.0)
         if result.dtype != torch.float32:
             result = result.to(dtype=torch.float32)
+
+        if verbose_debug:
+            stages_run = []
+            if pre_feather_px > 0:
+                stages_run.append(f"pre_feather({pre_feather_px})")
+            stages_run.append(f"combine({combine_mode})")
+            if post_close_px > 0:
+                stages_run.append(f"post_close({post_close_px})")
+            if post_smooth_px > 0:
+                stages_run.append(f"post_smooth({post_smooth_px})")
+            if guided_image is not None and float(guided_strength) > 0:
+                stages_run.append(f"guided_refine(s={guided_strength:.2f})")
+            elapsed_ms = (time.perf_counter() - t_start) * 1000.0
+            print(f"[NV_MaskUnion]   stages_run: {' → '.join(stages_run)}")
+            print(f"[NV_MaskUnion]   {_mask_stats('output', result)}")
+            print(f"[NV_MaskUnion]   total_time={elapsed_ms:.1f} ms")
+            print(f"[NV_MaskUnion] === done ===")
 
         return (result,)
 

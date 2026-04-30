@@ -21,6 +21,8 @@ information preserved (e.g. blend feathering for InpaintStitch2 with
 Use NV_MaskUnion's `post_smooth_px` or NV_GuidedFilterMask instead.
 """
 
+import time
+
 import cv2
 import numpy as np
 import scipy.ndimage
@@ -131,6 +133,16 @@ class NV_MaskBinaryCleanup:
                         "entirely (saves compute). Only used when guided_image is wired."
                     ),
                 }),
+                "verbose_debug": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": (
+                        "Print structured diagnostics to the ComfyUI console: input/output "
+                        "stats (shape, foreground %, range, mean), per-stage active flags "
+                        "(threshold, fill_holes, CC counts dropped/kept, dilate, guided, "
+                        "feather), timing. Off by default; turn on while tuning thresholds "
+                        "or debugging which stage is dominating output shape."
+                    ),
+                }),
             },
         }
 
@@ -157,7 +169,22 @@ class NV_MaskBinaryCleanup:
         guided_radius=0,
         guided_eps=0.001,
         guided_strength=0.7,
+        verbose_debug=False,
     ):
+        t_start = time.perf_counter() if verbose_debug else 0.0
+        if verbose_debug:
+            fg_in = float((mask > 0.5).sum()) if mask is not None else 0.0
+            total_in = float(mask.numel()) if mask is not None else 1.0
+            print(f"[NV_MaskBinaryCleanup] === call ===")
+            print(f"[NV_MaskBinaryCleanup]   input: shape={tuple(mask.shape)}, "
+                  f"fg_px={int(fg_in)} ({100.0 * fg_in / max(total_in, 1.0):.2f}%), "
+                  f"range=[{float(mask.min()):.3f},{float(mask.max()):.3f}], "
+                  f"mean={float(mask.mean()):.4f}")
+            print(f"[NV_MaskBinaryCleanup]   config: threshold={binarize_threshold:.2f}, "
+                  f"fill_holes={fill_holes}, min_cc_area={min_component_area_px}, "
+                  f"keep_n_largest={keep_n_largest}, dilate={final_dilate_px}, "
+                  f"feather={final_feather_px}, "
+                  f"guided={'wired' if guided_image is not None else 'unwired'}")
         # --- Normalize input -------------------------------------------------
         if mask.ndim == 2:
             mask = mask.unsqueeze(0)
@@ -245,6 +272,16 @@ class NV_MaskBinaryCleanup:
         # --- Final feather (Gaussian softening) -----------------------------
         if final_feather_px > 0:
             result = mask_blur(result, int(final_feather_px))
+
+        if verbose_debug:
+            elapsed_ms = (time.perf_counter() - t_start) * 1000.0
+            fg_out = float((result > 0.5).sum())
+            total_out = float(result.numel())
+            print(f"[NV_MaskBinaryCleanup]   output: shape={tuple(result.shape)}, "
+                  f"fg_px={int(fg_out)} ({100.0 * fg_out / max(total_out, 1.0):.2f}%), "
+                  f"range=[{float(result.min()):.3f},{float(result.max()):.3f}]")
+            print(f"[NV_MaskBinaryCleanup]   total_time={elapsed_ms:.1f} ms")
+            print(f"[NV_MaskBinaryCleanup] === done ===")
 
         # ComfyUI MASK convention: float32, [0,1]
         return (result.clamp(0.0, 1.0).to(dtype=torch.float32),)
