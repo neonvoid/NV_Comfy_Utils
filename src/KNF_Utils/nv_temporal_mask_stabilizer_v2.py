@@ -41,6 +41,7 @@ import time
 
 import cv2
 import numpy as np
+import scipy.ndimage
 import torch
 
 from .mask_ops import mask_blur
@@ -201,6 +202,19 @@ class NV_TemporalMaskStabilizer_V2:
                         "subject. Only used when binarize_output=True."
                     ),
                 }),
+                "post_fill_holes": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": (
+                        "True binary fill of internal holes (scipy.ndimage.binary_fill_holes) "
+                        "AFTER consensus + binarize_output. Default ON because median "
+                        "consensus + bilinear warp artifacts can punch micro-holes inside "
+                        "the subject silhouette: median([1.0_current, 0.0_warped_n1, "
+                        "0.0_warped_n2]) = 0 even when current was correctly foreground. "
+                        "This step closes any-sized internal holes regardless of kernel "
+                        "(unlike greyscale closing). Different from `final_feather_px` — "
+                        "fill_holes runs first, feather optionally softens after."
+                    ),
+                }),
                 "final_feather_px": ("INT", {
                     "default": 0, "min": 0, "max": 32, "step": 1,
                     "tooltip": (
@@ -244,6 +258,7 @@ class NV_TemporalMaskStabilizer_V2:
         anomaly_iou_threshold=0.35,
         binarize_output=True,
         binarize_output_threshold=0.5,
+        post_fill_holes=True,
         final_feather_px=0,
         verbose_debug=False,
     ):
@@ -454,6 +469,33 @@ class NV_TemporalMaskStabilizer_V2:
         if binarize_output:
             output_np = (output_np > float(binarize_output_threshold)).astype(np.float32)
 
+        # --- Post-fill internal holes from median + warp artifacts ----------
+        # Median over warped neighbors can punch micro-holes inside the subject
+        # silhouette when Farneback flow misaligns on textureless interior
+        # regions: median([1.0_current, 0.0_warped_n1, 0.0_warped_n2]) = 0.
+        # True binary fill (scipy) closes any-sized holes regardless of kernel.
+        # Per-frame loop (scipy is CPU-only). Skip if not binarized — fill_holes
+        # is a binary operation; thresholds soft input internally at non-zero.
+        if post_fill_holes and binarize_output:
+            t_fill_start = time.perf_counter() if verbose_debug else 0.0
+            n_holes_filled = 0
+            for t in range(N):
+                frame_u8 = output_np[t].astype(np.uint8)
+                filled = scipy.ndimage.binary_fill_holes(frame_u8).astype(np.float32)
+                if verbose_debug:
+                    delta = int((filled > 0.5).sum() - (frame_u8 > 0).sum())
+                    if delta > 0:
+                        n_holes_filled += 1
+                output_np[t] = filled
+            if verbose_debug:
+                t_fill = time.perf_counter() - t_fill_start
+                print(f"[NV_TemporalMaskStabilizer_V2]   post_fill_holes: "
+                      f"frames_with_holes_filled={n_holes_filled}/{N}, "
+                      f"time={t_fill:.2f}s")
+        elif post_fill_holes and not binarize_output and verbose_debug:
+            print(f"[NV_TemporalMaskStabilizer_V2]   post_fill_holes SKIPPED "
+                  f"(requires binarize_output=True; soft alpha hole-fill is undefined)")
+
         # --- Back to torch + optional final feather --------------------------
         # final_feather AFTER binarize_output: clean binary silhouette gets a
         # consistent feathered edge for downstream blend compositing.
@@ -475,6 +517,7 @@ class NV_TemporalMaskStabilizer_V2:
             f"[NV_TemporalMaskStabilizer_V2] N={N}, window={window_size}, "
             f"consensus={consensus_mode}, binarize_first={binarize_first}, "
             f"binarize_output={binarize_output} (thr={binarize_output_threshold:.2f}), "
+            f"post_fill_holes={post_fill_holes}, "
             f"auto_repair={auto_repair} (threshold={anomaly_iou_threshold:.2f}), "
             f"warps_computed={n_warps_computed}, "
             f"repaired_anomaly={n_repaired}, dropout_recovered={n_dropout_recovered}, "
