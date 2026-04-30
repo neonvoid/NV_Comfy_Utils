@@ -233,12 +233,22 @@ class NV_PreCompWarp:
         # Also apply hybrid Strategy E: short-gap visibility flicker gets bumped to 0.5 (low-trust
         # but active); long gaps stay low and get hard-filtered by quality_floor.
         if visibility_aware_solve and source_vis is not None and render_vis is not None:
-            # Truncate to T frames + slice to N anchors (defensive — trajectory shapes already validated)
-            src_v = source_vis[:T, :N]
-            ren_v = render_vis[:T, :N]
-            src_v = self._interpolate_visibility_short_gaps(src_v, int(short_gap_max))
-            ren_v = self._interpolate_visibility_short_gaps(ren_v, int(short_gap_max))
-            quality_per_frame = np.clip(src_v * ren_v, 0.0, 1.0)  # [T, N]
+            # Defensive shape validation — np.array slicing tolerates oversized indices and
+            # silently returns a smaller array, which would cause an IndexError later when
+            # the per-frame loop accesses quality_per_frame[t]. Multi-AI review R5 (Gemini Q10).
+            if (source_vis.shape[0] < T or source_vis.shape[1] < N or
+                    render_vis.shape[0] < T or render_vis.shape[1] < N):
+                print(f"[NV_PreCompWarp] WARNING: visibility arrays smaller than expected "
+                      f"(source={source_vis.shape}, render={render_vis.shape}, want >={T}x{N}). "
+                      f"Falling back to uniform weights.")
+                quality_per_frame = np.ones((T, N), dtype=np.float64)
+            else:
+                # Truncate to T frames + slice to N anchors (oversized inputs are fine to truncate)
+                src_v = source_vis[:T, :N]
+                ren_v = render_vis[:T, :N]
+                src_v = self._interpolate_visibility_short_gaps(src_v, int(short_gap_max))
+                ren_v = self._interpolate_visibility_short_gaps(ren_v, int(short_gap_max))
+                quality_per_frame = np.clip(src_v * ren_v, 0.0, 1.0)  # [T, N]
         elif visibility_aware_solve:
             # Visibility-aware mode requested but trajectories don't carry visibility — degrade
             # to all-anchors-equal-weight (effectively gives weighted Umeyama with uniform weights,
@@ -256,9 +266,6 @@ class NV_PreCompWarp:
             sparse_baseline_min = max(float(min_baseline_px), float(sparse_shot_span_frac) * torso_diag)
         else:
             sparse_baseline_min = float(min_baseline_px)
-
-        # Effective stricter residual gate for 2-anchor case (multi-AI consensus: 0.75x normal)
-        rmse_threshold_px_2pt = 0.75 * (rmse_threshold_frac * torso_diag)
 
         # Track previous fit_ok index for 1-anchor translation-only fallback
         last_good_idx_for_oneanchor = -1
@@ -310,32 +317,21 @@ class NV_PreCompWarp:
                 dst_active = to_pts_full[active_idx]
                 baseline = float(np.linalg.norm(src_active[0] - src_active[1]))
                 if baseline >= sparse_baseline_min:
+                    # Multi-AI review R5 (Gemini): the previous external-validation block tried
+                    # to verify the 2-point fit against OTHER (sub-quality_floor) anchors — but
+                    # those anchors were filtered out precisely because their positions are
+                    # untrustworthy (CoTracker hallucinates positions when visibility is low).
+                    # Using untrusted positions as a veto signal would spuriously fail valid
+                    # 2-point fits. The baseline check is the real safety net; trust it.
+                    # Step 5b's applied_residual against the full anchor set still surfaces
+                    # systematic disagreement downstream.
                     tx, ty, log_s, theta, residual, ok = self._solve_2point_similarity(src_active, dst_active)
                     if ok:
-                        # Stricter residual gate for 2-anchor: residual is 0 by construction on
-                        # these 2 points, so verify fit against the FULL set's good anchors at
-                        # this frame to catch "the 2 surviving anchors agreed but everything else
-                        # is wildly off" — we promote ok=False if so.
-                        # Compute residual against any other anchors with q > 0.05 (low bar):
-                        check_mask = (q_t > 0.05) & ~active_mask
-                        if check_mask.any():
-                            cs = from_pts_full[check_mask]
-                            cd = to_pts_full[check_mask]
-                            scale = np.exp(log_s)
-                            cos_t, sin_t = np.cos(theta) * scale, np.sin(theta) * scale
-                            M_check = np.array([[cos_t, -sin_t], [sin_t, cos_t]], dtype=np.float64)
-                            transformed = (M_check @ cs.T).T + np.array([tx, ty])
-                            check_err = np.linalg.norm(transformed - cd, axis=1)
-                            check_rmse = float(np.sqrt(np.mean(check_err ** 2)))
-                            if check_rmse > rmse_threshold_px_2pt:
-                                ok = False
-                                residual = check_rmse
                         params[t] = [tx, ty, log_s, theta]
                         residuals[t] = residual
                         fit_ok[t] = ok
-                        branch_per_frame[t] = "two_point" if ok else "two_point_failed_check"
-                        if ok:
-                            last_good_idx_for_oneanchor = t
+                        branch_per_frame[t] = "two_point"
+                        last_good_idx_for_oneanchor = t
                     else:
                         params[t] = [0.0, 0.0, 0.0, 0.0]
                         residuals[t] = np.inf
@@ -883,8 +879,10 @@ class NV_PreCompWarp:
         except np.linalg.LinAlgError:
             return 0.0, 0.0, 0.0, 0.0, np.inf, False
 
-        # Reflection-resistant proper rotation (Umeyama eq. 39-43): D corrects for det(UV^T) = -1
-        d = np.sign(np.linalg.det(U @ Vt))
+        # Reflection-resistant proper rotation (Umeyama eq. 39-43): D corrects for det(UV^T) = -1.
+        # Force strictly ±1 — np.sign(0.0) returns 0 which would zero out s and break the solve;
+        # for non-degenerate inputs the determinant is essentially never exactly 0 but be defensive.
+        d = -1.0 if float(np.linalg.det(U @ Vt)) < 0.0 else 1.0
         D = np.eye(2)
         D[1, 1] = d
         R = U @ D @ Vt
@@ -964,8 +962,12 @@ class NV_PreCompWarp:
         if max_gap <= 0:
             return vis  # disabled — return as-is
 
-        # Threshold below which we consider a frame's visibility "low"
-        LOW = 0.30  # conservative — don't flag mildly-low as gap
+        # Gap-detection threshold: any frame below this is part of a "low" run.
+        # Set equal to the post-rescue floor (0.5) so that short low runs are uniformly
+        # raised to a flat 0.5 with NO discontinuity (frames already at 0.4 don't get
+        # left at 0.4 while frames at 0.2 get bumped to 0.5 — the bizarre inversion
+        # multi-AI review R5 (Gemini) flagged in the previous LOW=0.30 / rescue-to-0.5 split).
+        LOW = 0.50
 
         for n in range(N):
             t = 0
@@ -976,9 +978,9 @@ class NV_PreCompWarp:
                         t += 1
                     gap_len = t - gap_start
                     if gap_len <= max_gap:
-                        # Short gap: interpolate to a low-trust 0.5 (still active but downweighted)
-                        vis[gap_start:t, n] = np.maximum(vis[gap_start:t, n], 0.5)
-                    # else: long gap, leave as-is (will be hard-filtered by quality_floor)
+                        # Short gap: flatline to LOW (0.5) — low-trust but active.
+                        vis[gap_start:t, n] = LOW
+                    # else: long gap, leave raw (will be hard-filtered by quality_floor downstream)
                 else:
                     t += 1
         return vis

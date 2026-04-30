@@ -37,6 +37,8 @@ Performance notes:
     follow-up if it ever blocks.
 """
 
+import time
+
 import cv2
 import numpy as np
 import torch
@@ -148,11 +150,13 @@ class NV_TemporalMaskStabilizer_V2:
                 "binarize_first": ("BOOLEAN", {
                     "default": False,
                     "tooltip": (
-                        "Threshold input to binary at 0.5 before stabilizing. Set TRUE "
-                        "if input is soft (e.g. post-guided-filter); set FALSE if input "
-                        "is already binary (e.g. post-NV_MaskBinaryCleanup with no final "
-                        "feather). Binarizing first eliminates soft-edge flicker but "
-                        "destroys anti-aliasing."
+                        "INPUT-SIDE binarize. Threshold input to binary at 0.5 BEFORE "
+                        "stabilizing. Set TRUE if input is soft (post-guided-filter); "
+                        "leave FALSE if input is already binary (post-NV_MaskBinaryCleanup). "
+                        "NOTE: this only controls the input side — for clean binary output "
+                        "use `binarize_output` (default ON), since bilinear warp + median "
+                        "consensus reintroduce fractional values at boundaries even when "
+                        "the input is binary."
                     ),
                 }),
             },
@@ -177,12 +181,43 @@ class NV_TemporalMaskStabilizer_V2:
                         "frame; empty-current dropout recovery still fires regardless)."
                     ),
                 }),
+                "binarize_output": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": (
+                        "OUTPUT-SIDE binarize. Threshold the stabilized result at "
+                        "`binarize_output_threshold` AFTER consensus. Default ON because "
+                        "bilinear warp (cv2.remap) + median consensus reintroduce fractional "
+                        "values at mask boundaries even on binary inputs — produces a visible "
+                        "grey halo around the subject. Turn OFF only if you specifically want "
+                        "soft alpha output (downstream blend feathering with non-binary edges)."
+                    ),
+                }),
+                "binarize_output_threshold": ("FLOAT", {
+                    "default": 0.5, "min": 0.01, "max": 0.99, "step": 0.01,
+                    "tooltip": (
+                        "Threshold for binarize_output. 0.5 = standard. Lower values "
+                        "(0.3) preserve more of the soft-consensus halo as foreground; "
+                        "higher values (0.7) tighten the silhouette but may cut into the "
+                        "subject. Only used when binarize_output=True."
+                    ),
+                }),
                 "final_feather_px": ("INT", {
                     "default": 0, "min": 0, "max": 32, "step": 1,
                     "tooltip": (
-                        "Optional Gaussian softening on the stabilized output. 0 = off "
-                        "(preserves whatever softness median consensus produced). 2-4 = "
-                        "subtle smoothing for downstream blend masks."
+                        "Optional Gaussian softening on the stabilized output. 0 = off. "
+                        "Runs AFTER binarize_output, so set this > 0 + binarize_output ON "
+                        "to get a clean binary silhouette with a soft feathered edge for "
+                        "downstream blend compositing. 2-4 = subtle. 8+ = heavy falloff."
+                    ),
+                }),
+                "verbose_debug": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": (
+                        "Print structured diagnostics to the ComfyUI console: per-call "
+                        "config, per-frame repair status (flagged/dropout/trusted), IoU "
+                        "values, timing breakdown (flow vs warp+consensus). Off by default "
+                        "to avoid log spam. Turn on while tuning anomaly_iou_threshold + "
+                        "comparing repair counts against actual shot motion."
                     ),
                 }),
             },
@@ -207,8 +242,13 @@ class NV_TemporalMaskStabilizer_V2:
         binarize_first,
         auto_repair=True,
         anomaly_iou_threshold=0.35,
+        binarize_output=True,
+        binarize_output_threshold=0.5,
         final_feather_px=0,
+        verbose_debug=False,
     ):
+        # Wall-clock for the full call. Cheap; runs whether or not verbose_debug.
+        t_start = time.perf_counter()
         # --- Validate inputs -------------------------------------------------
         if mask.ndim == 2:
             mask = mask.unsqueeze(0)
@@ -236,12 +276,29 @@ class NV_TemporalMaskStabilizer_V2:
         N, H, W = mask.shape
         device = mask.device
 
+        if verbose_debug:
+            # Single .min/.max/.mean call set; uses CPU-GPU sync but only when opted in.
+            mn, mx, mean = float(mask.min()), float(mask.max()), float(mask.mean())
+            print(f"[NV_TemporalMaskStabilizer_V2] === call ===")
+            print(f"[NV_TemporalMaskStabilizer_V2]   input mask: shape=({N},{H},{W}), "
+                  f"range=[{mn:.3f},{mx:.3f}], mean={mean:.4f}, dtype={mask.dtype}, device={device}")
+            print(f"[NV_TemporalMaskStabilizer_V2]   input image: shape={tuple(image.shape)}, "
+                  f"dtype={image.dtype}, device={image.device}")
+            print(f"[NV_TemporalMaskStabilizer_V2]   config: window={window_size}, "
+                  f"consensus={consensus_mode}, binarize_first={binarize_first}, "
+                  f"auto_repair={auto_repair} (threshold={anomaly_iou_threshold:.2f}), "
+                  f"binarize_output={binarize_output} "
+                  f"(threshold={binarize_output_threshold:.2f}), "
+                  f"final_feather_px={final_feather_px}")
+
         # Single/zero-frame: pass through (need ≥2 for any temporal consensus).
         if N < 2:
             info = (
                 f"[NV_TemporalMaskStabilizer_V2] N={N} frames; pass-through "
                 f"(need ≥2 for temporal consensus)."
             )
+            if verbose_debug:
+                print(f"[NV_TemporalMaskStabilizer_V2]   {info}")
             empty_flags = torch.zeros((N, H, W), dtype=torch.float32, device=device)
             return (mask.to(torch.float32), empty_flags, info)
 
@@ -275,12 +332,25 @@ class NV_TemporalMaskStabilizer_V2:
         n_repaired = 0
         n_dropout_recovered = 0
         n_passthrough = 0
+        # Verbose-mode timing accumulators (zero overhead when verbose_debug=False)
+        t_flow = 0.0
+        t_consensus = 0.0
+
+        if verbose_debug:
+            mask_mb = mask_np.nbytes / (1024 * 1024)
+            gray_mb = gray_np.nbytes / (1024 * 1024)
+            print(f"[NV_TemporalMaskStabilizer_V2]   memory: mask_np={mask_mb:.1f} MB "
+                  f"(fp32), gray_np={gray_mb:.1f} MB (uint8), "
+                  f"output_np={mask_mb:.1f} MB. Peak ~{(mask_mb*2 + gray_mb):.1f} MB.")
+            print(f"[NV_TemporalMaskStabilizer_V2]   per-frame log "
+                  f"(repaired frames + every 50th progress tick):")
 
         for t in range(N):
             # Collect window: warped neighbors only (current frame handled separately).
             current_mask = mask_np[t]
             warped_neighbors = []
 
+            t_flow_start = time.perf_counter() if verbose_debug else 0.0
             for offset in range(-radius, radius + 1):
                 if offset == 0:
                     continue
@@ -292,13 +362,19 @@ class NV_TemporalMaskStabilizer_V2:
                 warped = _warp_mask_with_flow(mask_np[tn], flow)
                 warped_neighbors.append(warped)
                 n_warps_computed += 1
+            if verbose_debug:
+                t_flow += time.perf_counter() - t_flow_start
 
             # No neighbors available — pass current through.
             if len(warped_neighbors) == 0:
                 output_np[t] = current_mask
                 n_passthrough += 1
+                if verbose_debug:
+                    print(f"[NV_TemporalMaskStabilizer_V2]     [t={t:>4}/{N-1}] "
+                          f"PASSTHROUGH (no neighbors in window)")
                 continue
 
+            t_cons_start = time.perf_counter() if verbose_debug else 0.0
             # Compute neighbor consensus (used for both anomaly check + repair).
             neighbor_stack = np.stack(warped_neighbors, axis=0)
             if consensus_mode == "median":
@@ -308,6 +384,8 @@ class NV_TemporalMaskStabilizer_V2:
 
             # --- Anomaly detection (consensus-based, with dropout recovery) ---
             do_repair = False
+            repair_reason = None  # for verbose log
+            iou_used = None       # for verbose log
             current_is_empty = float(current_mask.max()) < _EMPTY_MASK_EPS
             if auto_repair:
                 # Special case: current frame is empty but at least one neighbor
@@ -320,13 +398,16 @@ class NV_TemporalMaskStabilizer_V2:
                 if current_is_empty and any_neighbor_nonempty:
                     do_repair = True
                     n_dropout_recovered += 1
+                    repair_reason = "DROPOUT"
                 elif anomaly_iou_threshold > 0.0:
                     # Score current vs the neighbor CONSENSUS (not max-of-individuals),
                     # so a single matching-but-bad neighbor can't certify a bad frame.
                     iou = _binary_iou(current_mask, neighbor_consensus)
+                    iou_used = iou
                     if iou < float(anomaly_iou_threshold):
                         do_repair = True
                         n_repaired += 1
+                        repair_reason = "ANOMALY"
 
             if do_repair:
                 # Use precomputed neighbor consensus (drop current frame's contribution).
@@ -345,7 +426,37 @@ class NV_TemporalMaskStabilizer_V2:
             if binarize_first:
                 output_np[t] = (output_np[t] > 0.5).astype(np.float32)
 
+            if verbose_debug:
+                t_consensus += time.perf_counter() - t_cons_start
+                if do_repair:
+                    n_nonempty = sum(
+                        1 for wn in warped_neighbors if float(wn.max()) >= _EMPTY_MASK_EPS
+                    )
+                    if repair_reason == "DROPOUT":
+                        print(f"[NV_TemporalMaskStabilizer_V2]     [t={t:>4}/{N-1}] "
+                              f"REPAIRED (dropout) — current empty, "
+                              f"{n_nonempty}/{len(warped_neighbors)} neighbors carry signal")
+                    else:
+                        print(f"[NV_TemporalMaskStabilizer_V2]     [t={t:>4}/{N-1}] "
+                              f"REPAIRED (anomaly) — IoU={iou_used:.3f} "
+                              f"< threshold={anomaly_iou_threshold:.2f}")
+                elif (t + 1) % 50 == 0 or t == N - 1:
+                    elapsed = time.perf_counter() - t_start
+                    rate = (t + 1) / max(elapsed, 1e-3)
+                    eta = (N - t - 1) / max(rate, 1e-3)
+                    print(f"[NV_TemporalMaskStabilizer_V2]     progress: {t+1}/{N} "
+                          f"({rate:.1f} fps, elapsed {elapsed:.1f}s, ETA {eta:.1f}s)")
+
+        # --- Output-side binarize (fixes the bilinear-warp-grey-halo issue) ---
+        # Bilinear cv2.remap + median consensus reintroduce fractional values at
+        # mask boundaries even on binary input. Without this step the output is
+        # a soft mask with a visible grey halo on the subject. Default ON.
+        if binarize_output:
+            output_np = (output_np > float(binarize_output_threshold)).astype(np.float32)
+
         # --- Back to torch + optional final feather --------------------------
+        # final_feather AFTER binarize_output: clean binary silhouette gets a
+        # consistent feathered edge for downstream blend compositing.
         result = torch.from_numpy(output_np).to(device=device, dtype=torch.float32)
         if final_feather_px > 0:
             result = mask_blur(result, int(final_feather_px))
@@ -359,15 +470,34 @@ class NV_TemporalMaskStabilizer_V2:
         )
         repaired_flags = repaired_flags.view(N, 1, 1).expand(N, H, W).contiguous()
 
+        total_elapsed = time.perf_counter() - t_start
         info = (
             f"[NV_TemporalMaskStabilizer_V2] N={N}, window={window_size}, "
             f"consensus={consensus_mode}, binarize_first={binarize_first}, "
+            f"binarize_output={binarize_output} (thr={binarize_output_threshold:.2f}), "
             f"auto_repair={auto_repair} (threshold={anomaly_iou_threshold:.2f}), "
             f"warps_computed={n_warps_computed}, "
             f"repaired_anomaly={n_repaired}, dropout_recovered={n_dropout_recovered}, "
             f"passthrough_boundary={n_passthrough}, "
-            f"final_feather_px={final_feather_px}."
+            f"final_feather_px={final_feather_px}, "
+            f"total_time={total_elapsed:.1f}s."
         )
+        if verbose_debug:
+            other = max(0.0, total_elapsed - t_flow - t_consensus)
+            print(f"[NV_TemporalMaskStabilizer_V2]   summary:")
+            print(f"[NV_TemporalMaskStabilizer_V2]     warps_computed={n_warps_computed}, "
+                  f"repaired_anomaly={n_repaired}, dropout_recovered={n_dropout_recovered}, "
+                  f"passthrough_boundary={n_passthrough}")
+            n_trusted = N - n_repaired - n_dropout_recovered - n_passthrough
+            print(f"[NV_TemporalMaskStabilizer_V2]     frame disposition: "
+                  f"trusted={n_trusted}/{N} ({100.0 * n_trusted / N:.1f}%), "
+                  f"repaired={n_repaired + n_dropout_recovered}/{N} "
+                  f"({100.0 * (n_repaired + n_dropout_recovered) / N:.1f}%)")
+            print(f"[NV_TemporalMaskStabilizer_V2]     timing: "
+                  f"flow+warp={t_flow:.1f}s ({100.0 * t_flow / max(total_elapsed, 1e-3):.0f}%), "
+                  f"consensus={t_consensus:.1f}s ({100.0 * t_consensus / max(total_elapsed, 1e-3):.0f}%), "
+                  f"other={other:.1f}s, total={total_elapsed:.1f}s")
+            print(f"[NV_TemporalMaskStabilizer_V2] === done ===")
         return (result, repaired_flags, info)
 
 

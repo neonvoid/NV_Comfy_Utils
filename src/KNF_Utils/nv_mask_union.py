@@ -127,6 +127,15 @@ class NV_MaskUnion:
                         "blur, low contrast). Only used when guided_image is wired."
                     ),
                 }),
+                "verbose_debug": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": (
+                        "Print per-input mask statistics (shape, fg-pixel count, range, mean) "
+                        "+ which post-stages ran + per-stage timing to the ComfyUI console. "
+                        "Off by default to avoid log spam. Turn on while debugging which input "
+                        "is dominating the union or whether guided refine is actually firing."
+                    ),
+                }),
             },
         }
 
