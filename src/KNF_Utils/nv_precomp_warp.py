@@ -89,10 +89,16 @@ class NV_PreCompWarp:
                     "tooltip": "Per-frame failure threshold: RMSE residual after fit > this fraction of torso diagonal "
                                "triggers fallback. 0.08-0.12 typical."
                 }),
-                "fallback_mode": (["translation_only", "hold_last_good", "bypass_pass_through"], {
-                    "default": "translation_only",
-                    "tooltip": "What to do on high-residual frames. translation_only: keep tx/ty, drop scale+rotation. "
-                               "hold_last_good: copy last successful transform. bypass: pass-through original render."
+                "fallback_mode": (["smoothed_interp", "translation_only", "hold_last_good", "bypass_pass_through"], {
+                    "default": "smoothed_interp",
+                    "tooltip": "What to do on high-residual frames AFTER smoothing has already filled them via interpolation.\n"
+                               "  smoothed_interp (default, recommended): trust the smoother+interpolation result, no override. "
+                               "Best for action shots where rotation/scale matter and the interpolation is plausible.\n"
+                               "  translation_only: zero scale/rotation, keep only tx/ty. Conservative; forces pure translation. "
+                               "Wrong choice for shots where the character rotates or changes scale during failure stretches.\n"
+                               "  hold_last_good: step-hold the full smoothed transform of the last good frame across the failure gap. "
+                               "Good for 'mostly static pose with periodic tracker dropouts'.\n"
+                               "  bypass_pass_through: no warp at all on failure frames; output raw render. Most conservative."
                 }),
                 "verbose_debug": ("BOOLEAN", {
                     "default": False,
@@ -101,8 +107,8 @@ class NV_PreCompWarp:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "MASK", "STRING")
-    RETURN_NAMES = ("warped_render", "warped_mask", "alignment_info")
+    RETURN_TYPES = ("IMAGE", "MASK", "IMAGE", "STRING")
+    RETURN_NAMES = ("warped_render", "warped_mask", "warped_render_full", "alignment_info")
     FUNCTION = "execute"
     CATEGORY = "NV_Utils/Inpaint"
     DESCRIPTION = (
@@ -234,16 +240,20 @@ class NV_PreCompWarp:
         # --- Step 5: Apply user fallback_mode (POST-smoothing override) ---
         # After interpolation+smoothing, params for failure frames already contain a plausible
         # estimate from neighboring good frames. fallback_mode is an explicit user override:
-        #   translation_only: even if smoothed scale/rotation look reasonable, force pure
-        #                     translation on failure frames (user is being conservative)
+        #   smoothed_interp (default): NO OVERRIDE. Trust the smoother+interpolation result.
+        #                              Best for action shots where rotation/scale matter and
+        #                              translation-only would discard valuable transform info.
+        #   translation_only: zero scale/rotation, keep tx/ty. Conservative — forces pure
+        #                     translation. WRONG for shots where character rotates/scales
+        #                     during failure stretches (residuals balloon to 200+px).
         #   hold_last_good:   step-hold semantics — copy last good frame's smoothed params
-        #                     onto each failure frame (instead of the interpolated-then-smoothed
-        #                     estimate). Useful when motion is "static most of the time but
-        #                     tracker fails periodically" — interpolation creates phantom
-        #                     motion through the gap; hold_last_good keeps the last known pose.
-        #                     Multi-AI review R2 MED (Codex): was a no-op pre-fix.
-        #   bypass_pass_through: handled at warp time (explicit copy of raw render)
-        if fallback_mode == "translation_only":
+        #                     onto each failure frame. Good for "mostly static pose with
+        #                     periodic tracker dropouts". Multi-AI R2 MED (Codex): was a no-op
+        #                     pre-fix.
+        #   bypass_pass_through: handled at warp time (explicit copy of raw render).
+        if fallback_mode == "smoothed_interp":
+            pass  # no override — smoothed-interpolated params used as-is
+        elif fallback_mode == "translation_only":
             for t in range(T):
                 if failure_mask[t]:
                     params[t, 2] = 0.0  # log_s = 0 -> scale = 1
@@ -283,6 +293,11 @@ class NV_PreCompWarp:
         # Output tensors sized to T (the truncated min length) — not T_render — to avoid silent zero tail
         warped_rgb = np.zeros((T, H, W, C), dtype=np.float32)
         warped_mask_out = np.zeros((T, H, W), dtype=np.float32)
+        # Full-frame warp output (no masking applied) — useful for diagnostic visualization
+        # of where the entire render lands in source coords, and for compositing workflows
+        # that want the unmasked warped render as a base layer. Uses BORDER_REFLECT so the
+        # edges look natural rather than abrupt black bands when the warp shifts.
+        warped_full = np.zeros((T, H, W, C), dtype=np.float32)
 
         render_np = render_video.cpu().numpy()  # [T_render, H, W, C] in [0, 1]
         mask_np = render_mask.cpu().numpy()     # [T_mask, H, W] in [0, 1]
@@ -302,8 +317,14 @@ class NV_PreCompWarp:
             # (Identity warp would still resample with INTER_CUBIC and apply edge erode/feather, which
             # is NOT a true pass-through; user expectation is "if alignment fails, give me the raw render".)
             if fallback_mode == "bypass_pass_through" and failure_mask[t]:
-                warped_rgb[t] = img_t
+                # warped_rgb (the masked output) must match the standard path's behavior of
+                # zero-ing the background outside the mask. Otherwise non-bypass frames have
+                # black BG and bypass frames flash to the render's actual BG = visible strobe.
+                # Multi-AI review R3 LOW/MED (Gemini).
+                bypass_zero_mask = mask_t[..., None] <= 1e-6
+                warped_rgb[t] = np.where(bypass_zero_mask, 0.0, img_t)
                 warped_mask_out[t] = mask_t
+                warped_full[t] = img_t  # full-frame output also passes through unwarped
                 continue
 
             tx, ty, log_s, theta = params[t]
@@ -359,6 +380,18 @@ class NV_PreCompWarp:
 
             warped_rgb[t] = rgb_unpremult
             warped_mask_out[t] = warped_alpha
+
+            # Full-frame warp output: warp the entire render frame (no premult, no mask).
+            # Same M and WARP_INVERSE_MAP. BORDER_REPLICATE (industry standard for motion
+            # compensation) smears the edge pixel outward — visually fades into the comp
+            # without drawing the eye, unlike BORDER_REFLECT which mirrors a localized scene
+            # patch that looks artificial. Multi-AI review R3 (Gemini recommendation).
+            warped_full_t = cv2.warpAffine(
+                img_t, M, (W, H),
+                flags=cv2.INTER_CUBIC | cv2.WARP_INVERSE_MAP,
+                borderMode=cv2.BORDER_REPLICATE
+            )
+            warped_full[t] = np.clip(warped_full_t, 0.0, 1.0)
 
         # --- Step 7: Build alignment_info JSON for downstream nodes ---
         # Report BOTH raw-fit residuals (pre-smoothing) and applied residuals (post-smoothing+fallback)
@@ -421,12 +454,14 @@ class NV_PreCompWarp:
 
         warped_rgb_tensor = torch.from_numpy(warped_rgb).clamp(0.0, 1.0)
         warped_mask_tensor = torch.from_numpy(warped_mask_out).clamp(0.0, 1.0)
+        warped_full_tensor = torch.from_numpy(warped_full).clamp(0.0, 1.0)
 
         if verbose_debug:
             print(f"[NV_PreCompWarp] Done. warped_render={tuple(warped_rgb_tensor.shape)}, "
-                  f"warped_mask={tuple(warped_mask_tensor.shape)}")
+                  f"warped_mask={tuple(warped_mask_tensor.shape)}, "
+                  f"warped_render_full={tuple(warped_full_tensor.shape)}")
 
-        return (warped_rgb_tensor, warped_mask_tensor, info_str)
+        return (warped_rgb_tensor, warped_mask_tensor, warped_full_tensor, info_str)
 
     # =========================================================================
     # Helpers

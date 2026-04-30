@@ -92,6 +92,26 @@ app.registerExtension({
             pointInfo.textContent = "Left-click: add point | Right-click: remove nearest";
             infoBar.appendChild(pointInfo);
 
+            // Filter toggle: show only points anchored to the current frame.
+            // With multi-anchor placements (10+ points across many keyframes), the canvas
+            // gets so cluttered with overlapping dots and labels that you can't see the
+            // image. Toggle ON = only show points where p.t === currentFrame; existing
+            // points on other frames are hidden (not deleted).
+            const filterBtn = document.createElement("button");
+            filterBtn.textContent = "👁 Show: All";
+            filterBtn.title = "Toggle: show only points anchored to the current frame, or all points across all frames";
+            filterBtn.style.cssText = `
+                padding: 5px 10px; background: #444; color: #fff;
+                border: 1px solid #666; border-radius: 3px; cursor: pointer;
+                font-size: 12px; font-family: monospace;
+            `;
+            filterBtn.onmouseover = () => filterBtn.style.background = "#555";
+            filterBtn.onmouseout = () => {
+                // Background depends on toggle state — restored in updateFilterBtnUI
+                filterBtn.style.background = node._pointPicker?.filterByCurrentFrame ? "#2a6" : "#444";
+            };
+            infoBar.appendChild(filterBtn);
+
             // Clear button
             const clearBtn = document.createElement("button");
             clearBtn.textContent = "Clear All";
@@ -180,6 +200,9 @@ app.registerExtension({
                 points: [],       // [{x, y, t}, ...]
                 hoveredIndex: -1,
                 pointInfo,
+                // Filter state — when true, only render points where p.t === current frame
+                filterByCurrentFrame: false,
+                filterBtn,
                 // Frame navigation state
                 lastBackendFrameIndex: null,   // authoritative frame_index that backend used (set in onExecuted)
                 totalFrames: 0,                // total batch size, populated by backend
@@ -210,6 +233,33 @@ app.registerExtension({
                 node.syncPointData();
                 node.redrawCanvas();
             });
+
+            // Filter toggle handler — flip filterByCurrentFrame, update button cosmetics, redraw.
+            const updateFilterBtnUI = () => {
+                const pp = node._pointPicker;
+                if (!pp) return;
+                if (pp.filterByCurrentFrame) {
+                    pp.filterBtn.textContent = "👁 Show: This Frame";
+                    pp.filterBtn.style.background = "#2a6";
+                    pp.filterBtn.style.borderColor = "#1a4";
+                } else {
+                    pp.filterBtn.textContent = "👁 Show: All";
+                    pp.filterBtn.style.background = "#444";
+                    pp.filterBtn.style.borderColor = "#666";
+                }
+            };
+            node._pointPicker.updateFilterBtnUI = updateFilterBtnUI;
+            updateFilterBtnUI();
+            filterBtn.addEventListener("click", (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                node._pointPicker.filterByCurrentFrame = !node._pointPicker.filterByCurrentFrame;
+                updateFilterBtnUI();
+                node.syncPointData();   // refresh the count display in pointInfo
+                node.redrawCanvas();
+            });
+            filterBtn.addEventListener("pointerdown", (e) => e.stopPropagation());
+            filterBtn.addEventListener("mousedown", (e) => e.stopPropagation());
 
             // ── Frame navigation handlers ──
             // Detect whether frame_index is driven by an upstream connection (wired-as-input).
@@ -380,6 +430,12 @@ app.registerExtension({
                     const tot = pp.totalFrames || "?";
                     pp.frameLabel.textContent = `Frame: ${cur} / ${tot}`;
                 }
+
+                // When filter is active and frame just changed, refresh the
+                // "X on this frame, Y hidden" count in the header.
+                if (pp.filterByCurrentFrame && typeof node.syncPointData === "function") {
+                    node.syncPointData();
+                }
                 if (message.bg_image && message.bg_image[0]) {
                     const img = new Image();
                     img.onload = () => {
@@ -511,7 +567,12 @@ app.registerExtension({
             const scale = pp.canvas.width / renderW;
             const threshold = REMOVE_RADIUS * scale;
 
+            // When filter is on, only consider points on the current frame — otherwise
+            // a right-click could silently remove a point you can't even see.
+            const filterFrame = pp.filterByCurrentFrame ? this.getCurrentFrameIndex() : null;
+
             for (let i = 0; i < pp.points.length; i++) {
+                if (filterFrame !== null && pp.points[i].t !== filterFrame) continue;
                 const dx = pp.points[i].x - x;
                 const dy = pp.points[i].y - y;
                 const dist = Math.sqrt(dx * dx + dy * dy);
@@ -548,7 +609,14 @@ app.registerExtension({
                 const anchorStr = uniq.length === 1 ? `t=${uniq[0]}`
                                 : uniq.length > 1 ? `multi-anchor t=${uniq.join(",")}`
                                 : "";
-                pp.pointInfo.textContent = `${n} tracking point${n !== 1 ? "s" : ""} placed${anchorStr ? ` (${anchorStr})` : ""}`;
+                let header = `${n} tracking point${n !== 1 ? "s" : ""} placed${anchorStr ? ` (${anchorStr})` : ""}`;
+                // When filter is active, show "X on this frame / Y hidden"
+                if (pp.filterByCurrentFrame) {
+                    const cur = this.getCurrentFrameIndex?.();
+                    const onFrame = pp.points.filter(p => p.t === cur).length;
+                    header += ` — showing ${onFrame} on frame ${cur}, ${n - onFrame} hidden`;
+                }
+                pp.pointInfo.textContent = header;
             } else {
                 pp.pointInfo.textContent = "Left-click: add point on current frame | Change frame_index then click for multi-anchor";
             }
@@ -578,9 +646,15 @@ app.registerExtension({
             const r = POINT_RADIUS * displayScale;
             const fontSize = Math.round(11 * displayScale);
 
+            // Filter: when filterByCurrentFrame is on, only render points where p.t === current frame
+            const filterFrame = pp.filterByCurrentFrame
+                ? (typeof this.getCurrentFrameIndex === "function" ? this.getCurrentFrameIndex() : null)
+                : null;
+
             // Draw points
             for (let i = 0; i < points.length; i++) {
                 const p = points[i];
+                if (filterFrame !== null && p.t !== filterFrame) continue;  // hidden by filter
                 const isHovered = (i === hoveredIndex);
                 const color = isHovered ? HOVER_COLOR : POINT_COLOR;
 

@@ -239,7 +239,12 @@ class NV_PointDrivenBBox:
                 model = model.to(device)
 
                 # CoTracker expects [1, T, C, H, W] and queries [1, N, 3]=[[t, x, y],...]
-                video_ct = track_nchw.unsqueeze(0).to(device)
+                # CRITICAL: scale to [0, 255] — CoTracker3 is trained on uint8-as-float values,
+                # not [0, 1]. Without the *255 scaling the model sees near-black frames and
+                # visibility collapses on every anchor regardless of input quality. This is the
+                # same bug fixed in nv_cotracker_trajectories.py and cotracker_bridge.py
+                # (multi-AI review R3 caught the missed third file). See nv_cotracker_trajectories.py.
+                video_ct = track_nchw.unsqueeze(0).to(device) * 255.0
                 queries_ct = torch.tensor(
                     [[[float(t), qx, qy] for qx, qy, t in pts_ds]],
                     dtype=torch.float32, device=device,
@@ -266,7 +271,9 @@ class NV_PointDrivenBBox:
             # rather than competing with a frame-0 anchor. SIGMA_FRAMES=30 is
             # the brainstorm-recommended default; tunable later if needed.
             all_tracks = pred_tracks[0].cpu()       # [B, N, 2]
-            all_vis = pred_visibility[0]
+            # Cast visibility to float at the boundary (was bool in some CoTracker versions —
+            # downstream weighting expects numeric values). Multi-AI review R1 MED #4.
+            all_vis = pred_visibility[0].float()
             if all_vis.dim() > 2:
                 all_vis = all_vis.squeeze(-1)
             all_vis = all_vis.cpu()                 # [B, N]
