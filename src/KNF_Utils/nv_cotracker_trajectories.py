@@ -24,6 +24,7 @@ Output format (matches NV_PreCompWarp.source_trajectories input):
 import json
 from typing import List, Tuple
 
+import cv2
 import numpy as np
 import torch
 
@@ -110,11 +111,18 @@ class NV_CoTrackerTrajectoriesJSON:
                     "tooltip": "Optional comma-separated names for anchors (in same order as tracking_points). "
                                "E.g., 'head,L_shoulder,R_shoulder,L_hip,R_hip'. If blank, auto-generates 'anchor_0'..'anchor_{N-1}'."
                 }),
+                "build_debug_overlay": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Render an IMAGE batch showing each anchor as a colored dot per frame "
+                               "(filled = tracked above min_visibility, hollow = below threshold / interpolated). "
+                               "Anchor index labels + per-frame visible count + max frame-to-frame jump in header. "
+                               "Wire to NV_Preview_Animation or VHS_VideoCombine to *see* whether CoTracker is actually tracking."
+                }),
             },
         }
 
-    RETURN_TYPES = ("STRING", "STRING")
-    RETURN_NAMES = ("trajectories_json", "info")
+    RETURN_TYPES = ("STRING", "STRING", "IMAGE")
+    RETURN_NAMES = ("trajectories_json", "info", "debug_overlay")
     FUNCTION = "execute"
     CATEGORY = "NV_Utils/Tracking"
     DESCRIPTION = (
@@ -123,7 +131,7 @@ class NV_CoTrackerTrajectoriesJSON:
         "Reuses the cached CoTracker3 model singleton."
     )
 
-    def execute(self, image, tracking_points, min_visibility, names_csv):
+    def execute(self, image, tracking_points, min_visibility, names_csv, build_debug_overlay):
         # --- Step 1: Parse seed points ---
         if not tracking_points or not tracking_points.strip():
             raise ValueError("[NV_CoTrackerTrajectoriesJSON] tracking_points is empty. "
@@ -203,7 +211,12 @@ class NV_CoTrackerTrajectoriesJSON:
         all_vis = None
         try:
             model = model.to(device)
-            video_dev = image.permute(0, 3, 1, 2).unsqueeze(0).to(device)  # [1, T, C, H, W]
+            # CRITICAL: CoTracker3 expects video in [0, 255] float range (per the official
+            # PyTorch Hub examples: `read_video_from_path` returns uint8 [0,255], then `.float()`
+            # is called WITHOUT normalization). ComfyUI IMAGE is [0, 1] float — without scaling,
+            # the model sees almost-black frames on every input and visibility collapses to ~0
+            # across all anchors regardless of how visually clear the actual image is.
+            video_dev = image.permute(0, 3, 1, 2).unsqueeze(0).to(device) * 255.0  # [1, T, C, H, W] in [0, 255]
             queries_dev = queries.to(device)
             with torch.no_grad():
                 pred_tracks, pred_visibility = model(video_dev, queries=queries_dev)
@@ -213,6 +226,14 @@ class NV_CoTrackerTrajectoriesJSON:
             # the empty_cache call due to Python GC ordering).
             all_tracks = pred_tracks[0].cpu()
             all_vis = pred_visibility[0].cpu()
+            # Diagnostic: print model output stats so input/output mismatches are visible at runtime.
+            # Run once, then can be removed when stable.
+            print(f"[NV_CoTrackerTrajectoriesJSON] DEBUG model outputs: "
+                  f"tracks shape={tuple(all_tracks.shape)} dtype={all_tracks.dtype} "
+                  f"range=[{all_tracks.min().item():.1f}, {all_tracks.max().item():.1f}] | "
+                  f"visibility shape={tuple(all_vis.shape)} dtype={all_vis.dtype} "
+                  f"range=[{all_vis.float().min().item():.3f}, {all_vis.float().max().item():.3f}] "
+                  f"mean={all_vis.float().mean().item():.3f}")
             del video_dev, queries_dev, pred_tracks, pred_visibility
         finally:
             try:
@@ -262,19 +283,187 @@ class NV_CoTrackerTrajectoriesJSON:
         }
         out_str = json.dumps(out)
 
+        # --- Step 6: Diagnostic stats ---
+        # Per-anchor visibility stats
+        per_anchor_stats = []
+        for qi in range(N):
+            v_arr = np.asarray(per_point_vis[qi], dtype=np.float64)
+            visible_count = int(np.sum(v_arr >= min_visibility))
+            per_anchor_stats.append({
+                "name": names[qi],
+                "vis_avg": float(v_arr.mean()),
+                "vis_min": float(v_arr.min()),
+                "vis_max": float(v_arr.max()),
+                "visible_frames": visible_count,
+                "visible_pct": (visible_count / T_video) * 100.0,
+            })
+
+        # Frame-to-frame anchor displacement (max across anchors per frame transition).
+        # Sudden jumps = CoTracker losing track. p99/max indicate how violent the worst jumps are.
+        max_jumps_per_transition = []
+        worst_jump_frame = -1
+        worst_jump_value = 0.0
+        for t in range(1, T_video):
+            jumps_at_t = []
+            for qi in range(N):
+                x0, y0 = per_point_positions[qi][t - 1]
+                x1, y1 = per_point_positions[qi][t]
+                jumps_at_t.append(float(np.hypot(x1 - x0, y1 - y0)))
+            mx = max(jumps_at_t) if jumps_at_t else 0.0
+            max_jumps_per_transition.append(mx)
+            if mx > worst_jump_value:
+                worst_jump_value = mx
+                worst_jump_frame = t
+        if max_jumps_per_transition:
+            jumps_arr = np.asarray(max_jumps_per_transition)
+            jump_p50 = float(np.percentile(jumps_arr, 50))
+            jump_p95 = float(np.percentile(jumps_arr, 95))
+            jump_p99 = float(np.percentile(jumps_arr, 99))
+            jump_max = float(jumps_arr.max())
+        else:
+            jump_p50 = jump_p95 = jump_p99 = jump_max = 0.0
+
+        # Per-frame visible counts -> "frames with all visible", "frames with <2 visible" (warp can't fit)
+        per_frame_visible = []
+        for t in range(T_video):
+            vc = sum(1 for qi in range(N) if per_point_vis[qi][t] >= min_visibility)
+            per_frame_visible.append(vc)
+        all_visible = sum(1 for vc in per_frame_visible if vc == N)
+        half_visible = sum(1 for vc in per_frame_visible if vc >= max(2, N // 2))
+        below_two = sum(1 for vc in per_frame_visible if vc < 2)
+
         info_lines = [
             f"[NV_CoTrackerTrajectoriesJSON]",
             f"  T={T_video} frames, N={N} anchors, {H}x{W} px",
             f"  Anchor names: {', '.join(names)}",
-            f"  Frames with at least one invisible anchor: {len(interpolated_frames)}/{T_video}",
-            f"  Min visibility per anchor: " + ", ".join(
-                f"{names[qi]}={min(per_point_vis[qi]):.2f}" for qi in range(N)
-            ),
+            f"",
+            f"  Per-anchor visibility (vis_avg / vis_min / visible_frames):",
         ]
+        for s in per_anchor_stats:
+            info_lines.append(
+                f"    {s['name']:<14} avg={s['vis_avg']:.2f}  min={s['vis_min']:.2f}  "
+                f"visible={s['visible_frames']}/{T_video} ({s['visible_pct']:.0f}%)"
+            )
+        info_lines.extend([
+            f"",
+            f"  Frame-to-frame anchor jump (max across {N} anchors per transition):",
+            f"    p50={jump_p50:.1f}px  p95={jump_p95:.1f}px  p99={jump_p99:.1f}px  "
+            f"max={jump_max:.1f}px (at frame {worst_jump_frame})",
+            f"",
+            f"  Visibility threshold: {min_visibility:.2f}",
+            f"  Frames with ALL {N} anchors visible: {all_visible}/{T_video} ({100*all_visible/T_video:.0f}%)",
+            f"  Frames with >={max(2, N // 2)} anchors visible: {half_visible}/{T_video} ({100*half_visible/T_video:.0f}%)",
+            f"  Frames with <2 anchors visible (warp cannot fit similarity): "
+            f"{below_two}/{T_video} ({100*below_two/T_video:.0f}%)",
+            f"  Frames with at least one invisible anchor: {len(interpolated_frames)}/{T_video}",
+        ])
         info_str = "\n".join(info_lines)
         print(info_str)
 
-        return (out_str, info_str)
+        # --- Step 7: Build debug overlay (optional) ---
+        if build_debug_overlay:
+            overlay = self._render_debug_overlay(
+                image, per_point_positions, per_point_vis,
+                names, float(min_visibility), max_jumps_per_transition,
+            )
+        else:
+            # Return a 1-frame placeholder to satisfy the IMAGE output type
+            overlay = torch.zeros((1, H, W, image.shape[3]), dtype=torch.float32)
+
+        return (out_str, info_str, overlay)
+
+    @staticmethod
+    def _render_debug_overlay(
+        image: torch.Tensor,
+        per_point_positions: List[List[Tuple[float, float]]],
+        per_point_vis: List[List[float]],
+        names: List[str],
+        min_visibility: float,
+        max_jumps_per_transition: List[float],
+    ) -> torch.Tensor:
+        """Render the input video with anchor positions overlaid as colored dots.
+
+        - Filled circle: visibility >= min_visibility (raw CoTracker output trusted)
+        - Hollow circle: visibility < min_visibility (linearly interpolated, tracker had no signal here)
+        - Per-anchor distinct color (HSV cycle)
+        - Anchor index labels next to each dot
+        - Header bar with frame number, visible count, and frame-to-frame max jump
+        """
+        T, H, W, C = image.shape
+        N = len(per_point_positions)
+
+        # Per-anchor distinct colors via HSV cycle (BGR for cv2)
+        bgr_colors = []
+        for qi in range(N):
+            hue_180 = int((qi * 180.0 / max(1, N)) % 180.0)  # cv2 uses 0-180 hue range
+            hsv = np.array([[[hue_180, 255, 255]]], dtype=np.uint8)
+            bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0, 0]
+            bgr_colors.append((int(bgr[0]), int(bgr[1]), int(bgr[2])))
+
+        img_np = image.detach().cpu().numpy()  # [T, H, W, C] in [0, 1]
+        overlay_frames = np.empty((T, H, W, C), dtype=np.float32)
+
+        # Sizing scales with frame size so dots/text remain readable across resolutions
+        dot_radius = max(4, min(H, W) // 120)
+        ring_thickness = max(1, dot_radius // 4)
+        font_scale = max(0.3, min(H, W) / 1500.0)
+        font_thickness = max(1, int(font_scale * 2))
+        header_h = max(20, int(min(H, W) * 0.04))
+
+        for t in range(T):
+            # Convert to BGR uint8 for cv2 drawing
+            frame_rgb = (np.clip(img_np[t], 0.0, 1.0) * 255.0).astype(np.uint8)
+            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+
+            visible_count = 0
+            for qi in range(N):
+                x_f, y_f = per_point_positions[qi][t]
+                vis = per_point_vis[qi][t]
+                color = bgr_colors[qi]
+
+                xi, yi = int(round(x_f)), int(round(y_f))
+                if not (0 <= xi < W and 0 <= yi < H):
+                    continue  # off-frame — don't draw
+
+                if vis >= min_visibility:
+                    visible_count += 1
+                    # Filled circle with thin black outline for contrast
+                    cv2.circle(frame_bgr, (xi, yi), dot_radius, color, -1, lineType=cv2.LINE_AA)
+                    cv2.circle(frame_bgr, (xi, yi), dot_radius, (0, 0, 0), 1, lineType=cv2.LINE_AA)
+                else:
+                    # Hollow ring for interpolated/invisible
+                    cv2.circle(frame_bgr, (xi, yi), dot_radius, color, ring_thickness, lineType=cv2.LINE_AA)
+                    cv2.line(frame_bgr,
+                             (xi - dot_radius, yi - dot_radius),
+                             (xi + dot_radius, yi + dot_radius),
+                             color, ring_thickness, lineType=cv2.LINE_AA)
+
+                # Anchor index label
+                label = str(qi)
+                cv2.putText(frame_bgr, label,
+                            (xi + dot_radius + 2, yi - dot_radius - 2),
+                            cv2.FONT_HERSHEY_SIMPLEX, font_scale,
+                            (0, 0, 0), font_thickness + 1, cv2.LINE_AA)
+                cv2.putText(frame_bgr, label,
+                            (xi + dot_radius + 2, yi - dot_radius - 2),
+                            cv2.FONT_HERSHEY_SIMPLEX, font_scale,
+                            color, font_thickness, cv2.LINE_AA)
+
+            # Header bar
+            jump_str = ""
+            if t > 0 and (t - 1) < len(max_jumps_per_transition):
+                jump_str = f"  jump={max_jumps_per_transition[t - 1]:.1f}px"
+            header = f"t={t}/{T - 1}  visible={visible_count}/{N}{jump_str}"
+            cv2.rectangle(frame_bgr, (0, 0), (W, header_h), (0, 0, 0), -1)
+            cv2.putText(frame_bgr, header, (8, int(header_h * 0.72)),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale * 1.1,
+                        (255, 255, 255), font_thickness, cv2.LINE_AA)
+
+            # Convert back to RGB float [0,1]
+            frame_rgb_out = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            overlay_frames[t] = frame_rgb_out.astype(np.float32) / 255.0
+
+        return torch.from_numpy(overlay_frames)
 
 
 NODE_CLASS_MAPPINGS = {

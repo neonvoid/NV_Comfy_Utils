@@ -227,9 +227,37 @@ app.registerExtension({
                 updateNavEnabledState();
             };
 
-            // seekFrame: bump frame_index widget by `delta` (or set absolute), wrap, then queue.
-            // app.queuePrompt(0, 1) re-runs the workflow including this picker — backend will
-            // read the new widget value and send back the corresponding preview frame.
+            // seekFrame: bump frame_index widget, then queue ONLY this node's subgraph (not the
+            // whole workflow). app.queueOutputNodes([id]) is the same path as right-click → "Queue
+            // Selected Output Nodes" — runs this picker + its upstream image source, nothing else.
+            // Falls back to a clear warning if the API isn't available rather than silently
+            // running the entire (potentially expensive) workflow.
+            const partialQueueThisNode = () => {
+                // Preferred: ComfyUI 1.x partial-queue API
+                if (typeof app.queueOutputNodes === "function") {
+                    return app.queueOutputNodes([node.id]);
+                }
+                // Fallback: temporarily select only this node and run the menu command
+                if (app.commandManager?.executeCommand && app.canvas) {
+                    const prevSelected = Object.values(app.canvas.selected_nodes || {});
+                    app.canvas.deselectAllNodes?.();
+                    app.canvas.selectNode?.(node, false);
+                    try {
+                        return app.commandManager.executeCommand("Comfy.Canvas.QueueSelectedOutputNodes");
+                    } finally {
+                        app.canvas.deselectAllNodes?.();
+                        for (const n of prevSelected) {
+                            if (n !== node) app.canvas.selectNode?.(n, true);
+                        }
+                    }
+                }
+                // No partial-queue path available — refuse to run the full workflow silently.
+                throw new Error(
+                    "No partial-queue API available (app.queueOutputNodes / commandManager.executeCommand). " +
+                    "Right-click the node → Queue Selected Output Nodes to refresh the preview manually."
+                );
+            };
+
             const seekFrame = (delta, absolute = null) => {
                 if (isFrameIndexWired()) {
                     console.warn("[NV_PointPicker] frame_index is wired as input — disconnect to use nav buttons");
@@ -254,10 +282,11 @@ app.registerExtension({
                 node._pointPicker.queueInFlight = true;
                 updateNavEnabledState();
                 try {
-                    app.queuePrompt(0, 1);
+                    partialQueueThisNode();
                 } catch (err) {
-                    console.warn("[NV_PointPicker] queuePrompt failed:", err);
-                    // Recover from queue failure so buttons aren't permanently disabled
+                    console.warn("[NV_PointPicker] partial queue failed:", err);
+                    node._pointPicker.frameLabel.textContent = `Frame: ${next + 1} / ${total} — right-click → Queue Selected to refresh`;
+                    // Recover so buttons aren't permanently disabled
                     node._pointPicker.queueInFlight = false;
                     updateNavEnabledState();
                 }

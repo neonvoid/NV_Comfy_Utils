@@ -264,7 +264,13 @@ class NV_CoTrackerBridge:
             model = model.to(device)
 
             # IMAGE [B,H,W,C] -> CoTracker [1,T,C,H,W]
-            video = cropped_image.permute(0, 3, 1, 2).unsqueeze(0).to(device)
+            # CoTracker3 expects video in [0, 255] float range (per official PyTorch Hub examples:
+            # `read_video_from_path` returns uint8 [0,255], then `.float()` is called WITHOUT
+            # normalization). ComfyUI IMAGE is [0, 1] float — without the *255 scaling, the model
+            # sees near-black frames on every input and visibility collapses to ~0. Pre-fix this
+            # bridge "worked" only because median-displacement averaging across degenerate
+            # trajectories produced near-zero warps that looked OK on tight crops.
+            video = cropped_image.permute(0, 3, 1, 2).unsqueeze(0).to(device) * 255.0
 
             with torch.no_grad():
                 pred_tracks, pred_visibility = model(video, queries=queries.to(device))
