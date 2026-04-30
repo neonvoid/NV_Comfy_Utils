@@ -225,7 +225,11 @@ class NV_CoTrackerTrajectoriesJSON:
             # actually frees the VRAM (Gemini review flag — local GPU tensors otherwise outlive
             # the empty_cache call due to Python GC ordering).
             all_tracks = pred_tracks[0].cpu()
-            all_vis = pred_visibility[0].cpu()
+            # CoTracker3 may return pred_visibility as a bool tensor in some versions —
+            # cast to float at the boundary so downstream `.item()`, JSON serialization,
+            # and visibility statistics behave as numeric values (not True/False that format
+            # as "0.00" and confuse the user-facing reporting). Multi-AI review MED #4.
+            all_vis = pred_visibility[0].cpu().float()
             # Diagnostic: print model output stats so input/output mismatches are visible at runtime.
             # Run once, then can be removed when stable.
             print(f"[NV_CoTrackerTrajectoriesJSON] DEBUG model outputs: "

@@ -167,6 +167,10 @@ class NV_CoTrackerBridge:
     def apply_tracking(self, stitcher, cropped_image, strength=1.0,
                        cropped_mask=None, cropped_mask_processed=None,
                        tracking_points=None, query_x=-1.0, query_y=-1.0):
+        # Multi-AI review MED: tooltip says strength is capped at 1.0 but no code clamp
+        # existed. A wired-input override could pass strength=2.0 and break the
+        # expand-crop-trim margin math (assumed |displacement| <= positive). Clamp here.
+        strength = float(max(0.0, min(1.0, float(strength))))
         # Diagnostic for cross-instance contamination report (multi-AI consensus
         # 2026-04-28: H1 = ComfyUI input-hash cache or shared upstream wiring).
         # Logs `id(self)` + tracking_points SHA-1 at function entry. If two

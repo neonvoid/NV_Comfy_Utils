@@ -5,8 +5,33 @@
  */
 
 import { app } from "../../scripts/app.js";
+import { api } from "../../scripts/api.js";
 
 console.log("[NV_PointPicker] Loading extension...");
+
+// Global execution-error listener: if the backend rejects the prompt or the queue
+// fails before onExecuted fires, our local `queueInFlight` flag would stick true
+// forever and lock the nav buttons. Catch the error event and reset all picker
+// instances. Attach exactly once. Multi-AI review HIGH #4.
+if (!window._NV_PointPicker_errorListenerAttached) {
+    const resetAllInFlight = (reason) => {
+        try {
+            for (const n of (app.graph?._nodes || [])) {
+                if (n?._pointPicker) {
+                    n._pointPicker.queueInFlight = false;
+                    if (typeof n._pointPicker.updateNavEnabledState === "function") {
+                        n._pointPicker.updateNavEnabledState();
+                    }
+                }
+            }
+        } catch (e) {
+            console.warn("[NV_PointPicker] error-listener reset failed:", e);
+        }
+    };
+    api.addEventListener("execution_error", (e) => resetAllInFlight("execution_error"));
+    api.addEventListener("execution_interrupted", (e) => resetAllInFlight("execution_interrupted"));
+    window._NV_PointPicker_errorListenerAttached = true;
+}
 
 function hideWidgetForGood(node, widget) {
     if (!widget) return;

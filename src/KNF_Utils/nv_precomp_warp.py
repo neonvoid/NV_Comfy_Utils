@@ -157,9 +157,12 @@ class NV_PreCompWarp:
             print(f"[NV_PreCompWarp] T={T}, N={N} anchors, torso_diag={torso_diag:.1f}px")
 
         # --- Step 2: Solve per-frame similarity transforms ---
-        # We need M such that cv2.warpAffine(render_image, M) -> aligned-with-source.
-        # Per cv2 docs, M maps OUTPUT coords back to INPUT coords (inverse warp).
-        # So M maps source_pos -> render_pos. Therefore call with from=source, to=render.
+        # We solve M mapping source_pos -> render_pos (cv2.estimateAffinePartial2D src->dst).
+        # That M is the INVERSE-MAP for cv2.warpAffine: at output pixel = source_pos, read from
+        # render at M @ source_pos = render_pos. So when we call cv2.warpAffine below, we MUST
+        # pass cv2.WARP_INVERSE_MAP, otherwise cv2 treats M as a forward transform and inverts
+        # it internally — applying the inverse of what we want (geometrically backward warp).
+        # Multi-AI review CRIT #1 (Codex + Gemini consensus 2026-04-30).
         params = np.zeros((T, 4), dtype=np.float64)  # [tx, ty, log_s, theta]
         residuals = np.zeros(T, dtype=np.float64)
         fit_ok = np.zeros(T, dtype=bool)
@@ -172,10 +175,52 @@ class NV_PreCompWarp:
             residuals[t] = residual
             fit_ok[t] = ok
 
-        # Unwrap rotation to remove -pi/+pi discontinuity before smoothing
-        params[:, 3] = np.unwrap(params[:, 3])
+        # NOTE: np.unwrap deliberately NOT applied here on the raw series. Multi-AI review R2
+        # (Gemini CRIT): unwrapping cyclic noise from failed-tracker frames as if it were real
+        # >180° rotations would create permanent phase shifts. With Step 3's interpolation,
+        # those phantom rotations would then be linearly bridged across gaps producing 360°
+        # "spin" artifacts in the warped output. We unwrap only over good_indices in Step 3.
 
-        # --- Step 3: Savitzky-Golay smoothing per parameter ---
+        # --- Step 3: Detect failure frames + INTERPOLATE failure params from good neighbors ---
+        # We do NOT stamp translation_only zeros here — that would inject log_s=0, theta=0 into
+        # the param series and the smoother would propagate those zeros into neighboring good
+        # frames (observed: applied_failure_count 91/121 vs raw 65/121). Instead, linearly
+        # interpolate each param column over good frames so the smoother sees a continuous
+        # plausible series. The user's `fallback_mode` is then applied POST-smoothing as a
+        # safety override (Step 5). Multi-AI review R1 HIGH #2 + R2 follow-up.
+        rmse_threshold_px = rmse_threshold_frac * torso_diag
+        failure_mask = (~fit_ok) | (residuals > rmse_threshold_px)
+        failure_count = int(failure_mask.sum())
+        if verbose_debug:
+            print(f"[NV_PreCompWarp] RMSE threshold: {rmse_threshold_px:.2f}px | "
+                  f"failure frames: {failure_count}/{T}")
+
+        good_indices = np.where(~failure_mask)[0]
+        if len(good_indices) >= 2:
+            # Unwrap rotation ONLY over good frames before interpolating, so cyclic
+            # noise from failed-tracker frames doesn't get treated as real rotations.
+            params[good_indices, 3] = np.unwrap(params[good_indices, 3])
+
+            # Linear interpolation per parameter column from good frames onto all frames.
+            # np.interp clamps to endpoint values for out-of-range queries (no extrapolation).
+            x_all = np.arange(T, dtype=np.float64)
+            x_good = good_indices.astype(np.float64)
+            for col in range(4):
+                params[:, col] = np.interp(x_all, x_good, params[good_indices, col])
+        elif len(good_indices) == 1:
+            # Only one good frame — propagate its params to all frames as best-effort
+            params[:] = params[good_indices[0]]
+        else:
+            # Zero good frames — every frame failed RMSE. Raw params are garbage from failed
+            # solves. Degrade to identity transform per-frame so the warp is a no-op rather
+            # than applying nonsense matrices. Multi-AI review R2 MED (Codex). User should
+            # switch to bypass_pass_through fallback_mode or re-place anchors.
+            print(f"[NV_PreCompWarp] WARNING: ALL {T} frames failed RMSE threshold "
+                  f"({rmse_threshold_px:.2f}px). Falling back to identity transform "
+                  f"(no warp applied). Consider bypass_pass_through or different anchors.")
+            params[:] = 0.0  # tx=ty=log_s=theta=0 -> identity transform
+
+        # --- Step 4: Savitzky-Golay smoothing per parameter (on sanitized series) ---
         eff_window = self._safe_savgol_window(smooth_window, T, smooth_polyorder)
         if eff_window is not None:
             for i in range(4):
@@ -186,31 +231,33 @@ class NV_PreCompWarp:
             if verbose_debug:
                 print(f"[NV_PreCompWarp] Sequence too short for smoothing (T={T}); using raw per-frame params")
 
-        # --- Step 4: Detect failure frames ---
-        rmse_threshold_px = rmse_threshold_frac * torso_diag
-        failure_mask = (~fit_ok) | (residuals > rmse_threshold_px)
-        failure_count = int(failure_mask.sum())
-        if verbose_debug:
-            print(f"[NV_PreCompWarp] RMSE threshold: {rmse_threshold_px:.2f}px | "
-                  f"failure frames: {failure_count}/{T}")
-
-        # --- Step 5: Apply fallback mode for failure frames ---
-        # bypass_pass_through is handled at warp time (explicit copy of source frame), not via params
-        last_good_idx = None
-        for t in range(T):
-            if not failure_mask[t]:
-                last_good_idx = t
-                continue
-
-            if fallback_mode == "translation_only":
-                # Keep tx/ty, drop scale (log_s=0 -> s=1) + rotation (theta=0)
-                params[t, 2] = 0.0
-                params[t, 3] = 0.0
-            elif fallback_mode == "hold_last_good":
+        # --- Step 5: Apply user fallback_mode (POST-smoothing override) ---
+        # After interpolation+smoothing, params for failure frames already contain a plausible
+        # estimate from neighboring good frames. fallback_mode is an explicit user override:
+        #   translation_only: even if smoothed scale/rotation look reasonable, force pure
+        #                     translation on failure frames (user is being conservative)
+        #   hold_last_good:   step-hold semantics — copy last good frame's smoothed params
+        #                     onto each failure frame (instead of the interpolated-then-smoothed
+        #                     estimate). Useful when motion is "static most of the time but
+        #                     tracker fails periodically" — interpolation creates phantom
+        #                     motion through the gap; hold_last_good keeps the last known pose.
+        #                     Multi-AI review R2 MED (Codex): was a no-op pre-fix.
+        #   bypass_pass_through: handled at warp time (explicit copy of raw render)
+        if fallback_mode == "translation_only":
+            for t in range(T):
+                if failure_mask[t]:
+                    params[t, 2] = 0.0  # log_s = 0 -> scale = 1
+                    params[t, 3] = 0.0  # theta = 0
+        elif fallback_mode == "hold_last_good":
+            last_good_idx = None
+            for t in range(T):
+                if not failure_mask[t]:
+                    last_good_idx = t
+                    continue
                 if last_good_idx is not None:
                     params[t] = params[last_good_idx].copy()
-                # If no prior good frame, leave as-is (best-effort fit)
-            # bypass_pass_through: leave params as-is; will be overridden by explicit copy at warp time
+                # else: leave smoothed-from-interpolation as best-effort
+        # bypass_pass_through: applied at warp time
 
         # --- Step 5b: Re-evaluate residuals against the SMOOTHED+fallback transform actually applied ---
         # Reason: smoothing can pull the transform away from the optimal raw fit; a frame that passed raw
@@ -271,23 +318,37 @@ class NV_PreCompWarp:
             if erode_kernel is not None:
                 mask_t = cv2.erode(mask_t, erode_kernel)
 
-            # Premultiplied RGB warp prevents bg-color bleed at mask edges
+            # Pre-warp feather (Multi-AI review HIGH #3, Gemini): blurring alpha post-warp
+            # while leaving premult RGB sharp causes the unpremult divide (rgb / feathered_alpha)
+            # to blow out edge pixels. Soften the input mask BEFORE premult so warp resamples
+            # an already-soft edge and unpremult sees consistent values.
+            if edge_feather_px > 0.0:
+                k = max(3, int(edge_feather_px * 2) | 1)  # odd kernel
+                mask_t = cv2.GaussianBlur(mask_t, (k, k), edge_feather_px)
+
+            # Premultiplied RGB warp prevents bg-color bleed at mask edges.
+            # CRITICAL: pass cv2.WARP_INVERSE_MAP — M maps source_pos -> render_pos (inverse-map
+            # convention: "for each output pixel at source_pos, read input at M @ source_pos =
+            # render_pos"). Without this flag cv2 treats M as a forward src->dst transform and
+            # inverts it internally before sampling, applying the inverse of the intended warp
+            # — i.e., the geometry is mirrored. Multi-AI review R1 CRIT #1 (Codex + Gemini consensus).
+            #
+            # Both warps use INTER_CUBIC: mismatched modes (cubic premult / linear alpha)
+            # produced subtle dark fringing because cubic's edge overshoot rings divided by
+            # smooth linear alpha left harsh structural edges. Multi-AI review R2 MED (Gemini).
             premult = img_t * mask_t[..., None]
             warped_premult = cv2.warpAffine(
                 premult, M, (W, H),
-                flags=cv2.INTER_CUBIC,
+                flags=cv2.INTER_CUBIC | cv2.WARP_INVERSE_MAP,
                 borderMode=cv2.BORDER_CONSTANT, borderValue=0.0
             )
             warped_alpha = cv2.warpAffine(
                 mask_t, M, (W, H),
-                flags=cv2.INTER_LINEAR,
+                flags=cv2.INTER_CUBIC | cv2.WARP_INVERSE_MAP,
                 borderMode=cv2.BORDER_CONSTANT, borderValue=0.0
             )
-
-            # Gaussian feather post-warp
-            if edge_feather_px > 0.0:
-                k = max(3, int(edge_feather_px * 2) | 1)  # odd kernel
-                warped_alpha = cv2.GaussianBlur(warped_alpha, (k, k), edge_feather_px)
+            # Cubic can produce slight negative overshoots on hard edges; clip alpha to [0, 1].
+            warped_alpha = np.clip(warped_alpha, 0.0, 1.0)
 
             # Unpremultiply to standard RGB+alpha for downstream consumers
             alpha_safe = np.maximum(warped_alpha, 1e-6)
@@ -303,6 +364,31 @@ class NV_PreCompWarp:
         # Report BOTH raw-fit residuals (pre-smoothing) and applied residuals (post-smoothing+fallback)
         # so downstream tools / debug viewers can distinguish "fit failed" from "smoothing distorted".
         applied_failure_mask = applied_residuals > rmse_threshold_px
+
+        # Smoother health metric: ratio of applied/raw residuals.
+        # Healthy: applied ~= raw (ratio ~1.0) — smoother preserves the per-frame fit quality
+        # Sick:    applied >> raw (ratio >> 1.0) — smoother is destroying good fits
+        # Computed only over GOOD raw frames (where raw_residuals < threshold), since failure
+        # frames have garbage raw residuals that make the ratio meaningless.
+        good_raw_mask = ~failure_mask & (residuals < np.inf)
+        if good_raw_mask.any():
+            raw_good = residuals[good_raw_mask]
+            applied_good = applied_residuals[good_raw_mask]
+            mean_ratio = float(applied_good.mean() / max(raw_good.mean(), 1e-6))
+            median_ratio = float(np.median(applied_good) / max(np.median(raw_good), 1e-6))
+            if median_ratio < 1.5:
+                health = "HEALTHY (smoother preserves per-frame fit quality)"
+            elif median_ratio < 3.0:
+                health = "OK (smoother adds some drift, within tolerance)"
+            elif median_ratio < 6.0:
+                health = "DEGRADED (smoother is meaningfully harming fits — consider lower polyorder/window)"
+            else:
+                health = "BROKEN (smoother is destroying fits — check for fallback-poison or noisy input)"
+        else:
+            mean_ratio = float("inf")
+            median_ratio = float("inf")
+            health = "UNDEFINED (no good frames to evaluate)"
+
         info = {
             "T": int(T),
             "N_anchors": int(N),
@@ -313,6 +399,12 @@ class NV_PreCompWarp:
             "raw_failure_count": failure_count,
             "applied_failure_frame_indices": applied_failure_mask.nonzero()[0].tolist(),
             "applied_failure_count": int(applied_failure_mask.sum()),
+            "smoother_health": health,
+            "smoother_health_metrics": {
+                "mean_ratio_applied_over_raw": mean_ratio,
+                "median_ratio_applied_over_raw": median_ratio,
+                "note": "Computed over good-raw-fit frames only. Ratio ~1.0 = healthy; >>1.0 = smoother is corrupting fits."
+            },
             "fallback_mode_used": fallback_mode,
             "smooth_window": int(eff_window) if eff_window is not None else None,
             "smooth_polyorder": int(smooth_polyorder),
