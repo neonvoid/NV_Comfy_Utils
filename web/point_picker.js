@@ -79,6 +79,54 @@ app.registerExtension({
             clearBtn.onmouseout = () => clearBtn.style.background = "#d44";
             infoBar.appendChild(clearBtn);
 
+            // ── Frame navigation row (Prev / Next / Frame label / Goto) ──
+            // Lets the user advance frames without right-click → Queue Selected Output.
+            // Each button updates the frame_index widget value and triggers a queue.
+            const navBar = document.createElement("div");
+            navBar.style.cssText = `
+                position: relative; padding: 4px 8px; z-index: 10;
+                display: flex; gap: 4px; align-items: center;
+                background: rgba(0,0,0,0.55); flex-shrink: 0;
+                border-top: 1px solid rgba(255,255,255,0.1);
+            `;
+            const navBtnStyle = `
+                padding: 3px 10px; background: #444; color: #fff;
+                border: 1px solid #666; border-radius: 3px; cursor: pointer;
+                font-size: 12px; font-family: monospace; min-width: 28px;
+            `;
+            const prevBtn = document.createElement("button");
+            prevBtn.textContent = "⏪";
+            prevBtn.title = "Previous frame (queues to refresh preview)";
+            prevBtn.style.cssText = navBtnStyle;
+            const nextBtn = document.createElement("button");
+            nextBtn.textContent = "⏩";
+            nextBtn.title = "Next frame (queues to refresh preview)";
+            nextBtn.style.cssText = navBtnStyle;
+            const frameLabel = document.createElement("span");
+            frameLabel.style.cssText = `
+                font-size: 11px; font-family: monospace; color: #aaa;
+                min-width: 100px; text-align: center;
+            `;
+            frameLabel.textContent = "Frame: ?";
+            const gotoInput = document.createElement("input");
+            gotoInput.type = "number";
+            gotoInput.min = 0;
+            gotoInput.placeholder = "Go to";
+            gotoInput.title = "Type a frame number and press Enter to jump (queues to refresh)";
+            gotoInput.style.cssText = `
+                width: 60px; padding: 3px 6px; background: #222; color: #fff;
+                border: 1px solid #555; border-radius: 3px; font-size: 11px;
+                font-family: monospace;
+            `;
+            navBar.appendChild(prevBtn);
+            navBar.appendChild(nextBtn);
+            navBar.appendChild(frameLabel);
+            const navSpacer = document.createElement("div");
+            navSpacer.style.flex = "1";
+            navBar.appendChild(navSpacer);
+            navBar.appendChild(gotoInput);
+            container.appendChild(navBar);
+
             // Canvas wrapper
             const canvasWrapper = document.createElement("div");
             canvasWrapper.style.cssText = `
@@ -104,9 +152,14 @@ app.registerExtension({
                 image: null,
                 imageWidth: 512,
                 imageHeight: 512,
-                points: [],       // [{x, y}, ...]
+                points: [],       // [{x, y, t}, ...]
                 hoveredIndex: -1,
                 pointInfo,
+                // Frame navigation state
+                lastBackendFrameIndex: null,   // authoritative frame_index that backend used (set in onExecuted)
+                totalFrames: 0,                // total batch size, populated by backend
+                frameLabel,                    // navBar UI elements
+                gotoInput, prevBtn, nextBtn,
             };
 
             // DOM widget
@@ -133,27 +186,160 @@ app.registerExtension({
                 node.redrawCanvas();
             });
 
+            // ── Frame navigation handlers ──
+            // Detect whether frame_index is driven by an upstream connection (wired-as-input).
+            // If so, our local widget mutation won't affect the actual execution value because
+            // ComfyUI evaluates the upstream node and ignores the widget. Disable nav in that case.
+            const isFrameIndexWired = () => {
+                // The widget exists but its `type` becomes "converted-widget" when wired.
+                // Also check the input slot for a link.
+                const fiWidget = node.widgets?.find(w => w.name === "frame_index");
+                if (fiWidget && (fiWidget.type === "converted-widget" || fiWidget.hidden === true)) {
+                    return true;
+                }
+                const fiInput = node.inputs?.find(i => i.name === "frame_index");
+                if (fiInput && fiInput.link != null) {
+                    return true;
+                }
+                return false;
+            };
+
+            const updateNavEnabledState = () => {
+                const wired = isFrameIndexWired();
+                const inFlight = !!node._pointPicker.queueInFlight;
+                const disabled = wired || inFlight;
+                prevBtn.disabled = disabled;
+                nextBtn.disabled = disabled;
+                gotoInput.disabled = disabled;
+                prevBtn.style.opacity = disabled ? "0.5" : "1";
+                nextBtn.style.opacity = disabled ? "0.5" : "1";
+                gotoInput.style.opacity = disabled ? "0.5" : "1";
+                if (wired && node._pointPicker.frameLabel) {
+                    node._pointPicker.frameLabel.textContent = "Frame driven by upstream input — nav disabled";
+                }
+            };
+            node._pointPicker.updateNavEnabledState = updateNavEnabledState;
+            // Initial state — also re-check when connections change
+            updateNavEnabledState();
+            const origOnConnectionsChange = node.onConnectionsChange;
+            node.onConnectionsChange = function (...args) {
+                if (origOnConnectionsChange) origOnConnectionsChange.apply(this, args);
+                updateNavEnabledState();
+            };
+
+            // seekFrame: bump frame_index widget by `delta` (or set absolute), wrap, then queue.
+            // app.queuePrompt(0, 1) re-runs the workflow including this picker — backend will
+            // read the new widget value and send back the corresponding preview frame.
+            const seekFrame = (delta, absolute = null) => {
+                if (isFrameIndexWired()) {
+                    console.warn("[NV_PointPicker] frame_index is wired as input — disconnect to use nav buttons");
+                    return;
+                }
+                const fiWidget = node.widgets?.find(w => w.name === "frame_index");
+                if (!fiWidget) return;
+                const total = node._pointPicker.totalFrames || 1;
+                const current = (typeof node._pointPicker.lastBackendFrameIndex === "number"
+                                  ? node._pointPicker.lastBackendFrameIndex
+                                  : Number(fiWidget.value) || 0);
+                let next;
+                if (absolute !== null) {
+                    next = Math.max(0, Math.min(absolute, total - 1));
+                } else {
+                    next = ((current + delta) % total + total) % total;
+                }
+                fiWidget.value = next;
+                if (fiWidget.callback) fiWidget.callback(next);
+                node._pointPicker.frameLabel.textContent = `Frame: ${next + 1} / ${total} (queueing...)`;
+                // Mark queue-in-flight to disable buttons until onExecuted clears it
+                node._pointPicker.queueInFlight = true;
+                updateNavEnabledState();
+                try {
+                    app.queuePrompt(0, 1);
+                } catch (err) {
+                    console.warn("[NV_PointPicker] queuePrompt failed:", err);
+                    // Recover from queue failure so buttons aren't permanently disabled
+                    node._pointPicker.queueInFlight = false;
+                    updateNavEnabledState();
+                }
+            };
+
+            prevBtn.addEventListener("click", (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                seekFrame(-1);
+            });
+            nextBtn.addEventListener("click", (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                seekFrame(1);
+            });
+            gotoInput.addEventListener("keydown", (e) => {
+                if (e.key === "Enter") {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    // gotoInput shows 1-indexed frame numbers (Frame X / Y label is 1-indexed),
+                    // so subtract 1 to get 0-indexed value passed to seekFrame.
+                    const target1 = parseInt(gotoInput.value, 10);
+                    if (Number.isFinite(target1)) seekFrame(0, target1 - 1);
+                }
+            });
+            // Stop button presses from being interpreted as canvas-area events by LiteGraph
+            for (const el of [prevBtn, nextBtn, gotoInput]) {
+                el.addEventListener("pointerdown", (e) => e.stopPropagation());
+                el.addEventListener("mousedown", (e) => e.stopPropagation());
+            }
+
             // Mouse events
             canvas.addEventListener("mousedown", (e) => node.handleMouseDown(e));
             canvas.addEventListener("mousemove", (e) => node.handleMouseMove(e));
             canvas.addEventListener("contextmenu", (e) => e.preventDefault());
 
-            // Receive preview image from backend
+            // Receive preview image + frame info from backend.
+            // Chain any prior onExecuted handler so we don't silently drop other extensions' hooks.
+            const priorOnExecuted = node.onExecuted;
             node.onExecuted = (message) => {
+                if (priorOnExecuted) {
+                    try { priorOnExecuted.call(node, message); }
+                    catch (e) { console.warn("[NV_PointPicker] prior onExecuted threw:", e); }
+                }
+                const pp = node._pointPicker;
+                if (!pp) return;
+                // Clear queue-in-flight so nav buttons re-enable
+                pp.queueInFlight = false;
+                if (pp.updateNavEnabledState) pp.updateNavEnabledState();
+
+                // Capture authoritative frame_index from backend — handles wired-input case
+                // where the widget's .value goes stale (the bug that caused the t-collapse).
+                if (message.frame_index && typeof message.frame_index[0] === "number") {
+                    pp.lastBackendFrameIndex = message.frame_index[0];
+                }
+                if (message.total_frames && typeof message.total_frames[0] === "number") {
+                    pp.totalFrames = message.total_frames[0];
+                    if (pp.gotoInput) {
+                        pp.gotoInput.max = Math.max(1, pp.totalFrames);
+                    }
+                }
+                // Update Frame: X / Y label (1-indexed for display)
+                if (pp.frameLabel && !isFrameIndexWired()) {
+                    const cur = (typeof pp.lastBackendFrameIndex === "number")
+                        ? (pp.lastBackendFrameIndex + 1) : "?";
+                    const tot = pp.totalFrames || "?";
+                    pp.frameLabel.textContent = `Frame: ${cur} / ${tot}`;
+                }
                 if (message.bg_image && message.bg_image[0]) {
                     const img = new Image();
                     img.onload = () => {
-                        node._pointPicker.image = img;
+                        pp.image = img;
                         // Use actual image dimensions for coordinate accuracy
                         if (message.image_size && message.image_size[0]) {
-                            node._pointPicker.imageWidth = message.image_size[0].width;
-                            node._pointPicker.imageHeight = message.image_size[0].height;
+                            pp.imageWidth = message.image_size[0].width;
+                            pp.imageHeight = message.image_size[0].height;
                         } else {
-                            node._pointPicker.imageWidth = img.naturalWidth;
-                            node._pointPicker.imageHeight = img.naturalHeight;
+                            pp.imageWidth = img.naturalWidth;
+                            pp.imageHeight = img.naturalHeight;
                         }
-                        canvas.width = node._pointPicker.imageWidth;
-                        canvas.height = node._pointPicker.imageHeight;
+                        canvas.width = pp.imageWidth;
+                        canvas.height = pp.imageHeight;
                         node.redrawCanvas();
                     };
                     img.src = "data:image/jpeg;base64," + message.bg_image[0];
@@ -203,10 +389,19 @@ app.registerExtension({
         };
 
         nodeType.prototype.getCurrentFrameIndex = function () {
-            // Read the live value of the frame_index widget. Each new point
-            // gets stamped with whatever frame is currently displayed, so
-            // users can mix anchors across frames just by changing
-            // frame_index between clicks. CoTracker3 supports per-query t.
+            // Each new point gets stamped with the frame currently displayed in the picker.
+            // Priority order:
+            //   1. lastBackendFrameIndex — authoritative value the backend last used to
+            //      render the preview. Set in onExecuted from message.frame_index.
+            //      Handles the wired-input case correctly (Int upstream node feeding
+            //      frame_index — widget.value goes stale, but backend echo is correct).
+            //   2. frame_index widget value — fallback when backend hasn't replied yet
+            //      (e.g. very first click before any execute).
+            //   3. 0 — last-resort fallback.
+            const pp = this._pointPicker;
+            if (pp && typeof pp.lastBackendFrameIndex === "number" && Number.isFinite(pp.lastBackendFrameIndex)) {
+                return Math.max(0, Math.floor(pp.lastBackendFrameIndex));
+            }
             const fiWidget = this.widgets?.find(w => w.name === "frame_index");
             const v = fiWidget ? Number(fiWidget.value) : 0;
             return Number.isFinite(v) && v >= 0 ? Math.floor(v) : 0;
@@ -236,6 +431,11 @@ app.registerExtension({
         };
 
         nodeType.prototype.handleMouseMove = function (e) {
+            // Pre-existing bug: `pp` was used without being declared, causing a silent
+            // ReferenceError on every mousemove (browsers swallow event-handler errors).
+            // Caught by Codex multi-AI review 2026-04-30.
+            const pp = this._pointPicker;
+            if (!pp) return;
             const { x, y } = this.mouseToCanvas(e);
 
             const oldHover = pp.hoveredIndex;

@@ -3,9 +3,10 @@ NV PreComp Warp - Aligns closed-model character render to source actor pose via 
 
 Designed as the alignment layer for the "rough pre-composite + low-denoise VACE refinement" workflow:
   1. Generate target character via Kling/Seedance (scene-matched, identity-correct, but pose-imperfect)
-  2. Track torso anchors on source actor (via NV_CoTrackerBridge)
-  3. Pick same anchors on render's first frame (NV_PointPicker)
-  4. NV_PreCompWarp solves per-frame 4-DOF similarity transform mapping source -> render coords
+  2. Track torso anchors on source actor (NV_PointPicker -> NV_CoTrackerTrajectoriesJSON) -> source_traj [T, N, 2]
+  3. Track SAME anchors on render too (NV_PointPicker -> NV_CoTrackerTrajectoriesJSON) -> render_traj [T, N, 2]
+     The render is itself a moving video — a static frame-0 reference cannot align a moving render to a moving source.
+  4. NV_PreCompWarp solves per-frame 4-DOF similarity transform mapping source[t] -> render[t]
   5. Outputs warped masked render ready for paste over source for VACE V2V refinement (fill_mode='none')
 
 Architecture decisions (validated by 2026-04-30 multi-AI debate + research synthesis):
@@ -55,11 +56,14 @@ class NV_PreCompWarp:
                                "Format: shape [T, N, 2] where T=frames, N=points, last dim=(x, y) in pixels. "
                                "Either a JSON array directly, or {'shape': [T, N, 2], 'data': [...], 'names': [...]}."
                 }),
-                "render_anchors_t0": ("STRING", {
+                "render_trajectories": ("STRING", {
                     "default": "",
                     "multiline": True,
-                    "tooltip": "JSON of N anchor points clicked on the render's first frame, in SAME ORDER as source_trajectories. "
-                               "Format: shape [N, 2] (x, y) in pixels. Accepts NV_PointPicker JSON ([{x,y,t}]) — t is ignored."
+                    "tooltip": "JSON of CoTracker3-tracked anchor trajectories on the render (Kling/Seedance) video, "
+                               "in SAME ORDER and SAME COUNT as source_trajectories. "
+                               "Format: shape [T, N, 2] where T=frames, N=points, last dim=(x, y) in pixels. "
+                               "Either a JSON array directly, or {'shape': [T, N, 2], 'data': [...], 'names': [...]}. "
+                               "The render must be tracked too — a static frame-0 reference cannot align a moving render to a moving source."
                 }),
                 "smooth_window": ("INT", {
                     "default": 11, "min": 3, "max": 51, "step": 2,
@@ -103,7 +107,7 @@ class NV_PreCompWarp:
     CATEGORY = "NV_Utils/Inpaint"
     DESCRIPTION = (
         "Per-frame similarity transform (4-DOF: translation + uniform scale + rotation) from tracked source "
-        "anchors and render frame-0 anchors. Warps the masked render to align with the source actor. "
+        "and render trajectories. Warps the masked render at frame t to align with the source actor at frame t. "
         "Designed for the pre-composite + low-denoise VACE refinement workflow."
     )
 
@@ -111,22 +115,23 @@ class NV_PreCompWarp:
     # Main execute
     # =========================================================================
 
-    def execute(self, render_video, render_mask, source_trajectories, render_anchors_t0,
+    def execute(self, render_video, render_mask, source_trajectories, render_trajectories,
                 smooth_window, smooth_polyorder, edge_erode_px, edge_feather_px,
                 rmse_threshold_frac, fallback_mode, verbose_debug):
 
         # --- Step 1: Parse inputs ---
-        source_traj = self._parse_trajectories(source_trajectories)  # [T, N, 2]
-        render_pts_t0 = self._parse_anchors_t0(render_anchors_t0)    # [N, 2]
+        source_traj = self._parse_trajectories(source_trajectories)  # [T_src, N, 2]
+        render_traj = self._parse_trajectories(render_trajectories)  # [T_ren, N, 2]
 
         T_render, H, W, C = render_video.shape
         T_track, N, _ = source_traj.shape
+        T_render_track, N_render, _ = render_traj.shape
         T_mask = render_mask.shape[0]
 
-        if N != render_pts_t0.shape[0]:
+        if N != N_render:
             raise ValueError(
                 f"[NV_PreCompWarp] Anchor count mismatch: source has {N} points, "
-                f"render has {render_pts_t0.shape[0]}. Must be equal and in same order."
+                f"render has {N_render}. Must be equal and in same order."
             )
         if N < 2:
             raise ValueError(f"[NV_PreCompWarp] Need at least 2 anchors for similarity fit, got {N}.")
@@ -136,13 +141,18 @@ class NV_PreCompWarp:
             raise ValueError("[NV_PreCompWarp] render_mask has zero frames")
         if T_track < 1:
             raise ValueError("[NV_PreCompWarp] source_trajectories has zero frames")
+        if T_render_track < 1:
+            raise ValueError("[NV_PreCompWarp] render_trajectories has zero frames")
 
-        if T_track != T_render:
-            print(f"[NV_PreCompWarp] WARNING: source trajectories T={T_track} vs render T={T_render}. "
-                  f"Output truncated to min(T) = {min(T_render, T_track)}.")
-        T = min(T_render, T_track)
+        if T_track != T_render or T_render_track != T_render:
+            print(f"[NV_PreCompWarp] WARNING: source T={T_track}, render_traj T={T_render_track}, "
+                  f"render_video T={T_render}. Output truncated to min(T) = "
+                  f"{min(T_render, T_track, T_render_track)}.")
+        T = min(T_render, T_track, T_render_track)
 
-        torso_diag = self._compute_torso_diag(render_pts_t0)
+        # Use render's frame-0 anchor spread as the torso scale reference for RMSE threshold.
+        # (Per-frame torso scale would also work but adds noise; frame-0 is a stable reference.)
+        torso_diag = self._compute_torso_diag(render_traj[0])
         if verbose_debug:
             print(f"[NV_PreCompWarp] T={T}, N={N} anchors, torso_diag={torso_diag:.1f}px")
 
@@ -156,7 +166,7 @@ class NV_PreCompWarp:
 
         for t in range(T):
             from_pts = source_traj[t]      # source actor anchors at frame t
-            to_pts = render_pts_t0          # render character anchors (frame-0, static)
+            to_pts = render_traj[t]         # render character anchors at frame t (per-frame, was static t=0)
             tx, ty, log_s, theta, residual, ok = self._solve_similarity(from_pts, to_pts)
             params[t] = [tx, ty, log_s, theta]
             residuals[t] = residual
@@ -216,7 +226,7 @@ class NV_PreCompWarp:
                 [sin_a,  cos_a, float(ty_a)],
             ], dtype=np.float64)
             from_2d = source_traj[t].astype(np.float64)
-            to_2d = render_pts_t0.astype(np.float64)
+            to_2d = render_traj[t].astype(np.float64)
             ones = np.ones((from_2d.shape[0], 1), dtype=np.float64)
             from_h = np.hstack([from_2d, ones])
             transformed = (M_a @ from_h.T).T
@@ -356,39 +366,6 @@ class NV_PreCompWarp:
         return arr
 
     @staticmethod
-    def _parse_anchors_t0(s: str) -> np.ndarray:
-        """Parse render_anchors_t0 JSON. Accepts:
-        - Raw JSON array of shape [N, 2]
-        - NV_PointPicker format: list of {x, y, t} dicts (t ignored)
-        Returns numpy [N, 2].
-        """
-        if not s.strip():
-            raise ValueError("[NV_PreCompWarp] render_anchors_t0 is empty")
-        try:
-            obj = json.loads(s)
-        except json.JSONDecodeError as e:
-            raise ValueError(f"[NV_PreCompWarp] render_anchors_t0 not valid JSON: {e}")
-
-        if isinstance(obj, list) and len(obj) > 0 and isinstance(obj[0], dict):
-            # NV_PointPicker format: [{"x":..., "y":..., "t":...}, ...]
-            try:
-                pts = [(float(p["x"]), float(p["y"])) for p in obj]
-            except (KeyError, TypeError) as e:
-                raise ValueError(
-                    f"[NV_PreCompWarp] render_anchors_t0 looks like NV_PointPicker JSON but a point "
-                    f"is missing 'x' or 'y' or has non-numeric values: {e}"
-                )
-            arr = np.asarray(pts, dtype=np.float64)
-        else:
-            arr = np.asarray(obj, dtype=np.float64)
-
-        if arr.ndim != 2 or arr.shape[-1] != 2:
-            raise ValueError(
-                f"[NV_PreCompWarp] render_anchors_t0 must have shape [N, 2], got {arr.shape}"
-            )
-        return arr
-
-    @staticmethod
     def _check_geometry_ok(pts: np.ndarray, min_spread_frac: float = 0.02) -> bool:
         """Sanity-check anchor geometry before fitting. Rejects:
         - All points nearly collinear (rank-deficient → unstable similarity fit)
@@ -406,18 +383,21 @@ class NV_PreCompWarp:
         if spread < 1.0:  # all anchors within 1 pixel of each other
             return False
 
-        # Collinearity test: SVD of centered points; if smallest singular value is tiny relative
-        # to the largest, the anchors lie on (or very near) a line.
-        centered = pts - pts.mean(axis=0, keepdims=True)
-        try:
-            _, sv, _ = np.linalg.svd(centered, full_matrices=False)
-        except np.linalg.LinAlgError:
-            return False
-        if sv.size < 2 or sv[0] < 1e-6:
-            return False
-        ratio = sv[1] / sv[0]
-        if ratio < 1e-3:  # near-collinear
-            return False
+        # Collinearity test only meaningful for N >= 3.
+        # 2 anchors are inherently collinear (any 2 points lie on a line) but a 4-DOF
+        # similarity transform is still exactly determined from 2 points (4 unknowns,
+        # 2 points x 2 coords = 4 equations). So skip collinearity rejection when N == 2.
+        if pts.shape[0] >= 3:
+            centered = pts - pts.mean(axis=0, keepdims=True)
+            try:
+                _, sv, _ = np.linalg.svd(centered, full_matrices=False)
+            except np.linalg.LinAlgError:
+                return False
+            if sv.size < 2 or sv[0] < 1e-6:
+                return False
+            ratio = sv[1] / sv[0]
+            if ratio < 1e-3:  # near-collinear
+                return False
         return True
 
     @staticmethod

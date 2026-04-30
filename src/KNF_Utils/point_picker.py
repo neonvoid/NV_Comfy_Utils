@@ -111,7 +111,15 @@ class NV_PointPicker:
         preview = self._encode_preview(images[frame_index], mask=mask, frame_index=frame_index if mask is not None else 0)
 
         return {
-            "ui": {"bg_image": [preview], "image_size": [{"width": W, "height": H}], "total_frames": [B]},
+            "ui": {
+                "bg_image": [preview],
+                "image_size": [{"width": W, "height": H}],
+                "total_frames": [B],
+                # Echo back the resolved frame_index so the frontend can authoritatively
+                # know which frame the preview represents (fixes wired-input case where
+                # the widget's stored .value goes stale).
+                "frame_index": [int(frame_index)],
+            },
             "result": (images, tracking_points, info, frame_index, B),
         }
 
