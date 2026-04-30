@@ -49,6 +49,7 @@ from .mask_ops import mask_blur
 
 _WINDOW_SIZES = (3, 5)
 _CONSENSUS_MODES = ("median", "mean")
+_WARP_INTERPOLATIONS = ("nearest", "linear")
 # Empty-mask threshold: a frame is considered "empty" if its max value is below
 # this. Used by the dropout-recovery special case in auto_repair.
 _EMPTY_MASK_EPS = 0.01
@@ -75,20 +76,33 @@ def _compute_backward_flow_farneback(curr_gray_u8, neighbor_gray_u8):
     )
 
 
-def _warp_mask_with_flow(mask_2d, flow):
+def _warp_mask_with_flow(mask_2d, flow, interpolation_mode="nearest"):
     """Warp [H, W] mask using [H, W, 2] backward-flow field via cv2.remap.
 
     For each (y, x) in output, samples source mask at (x + flow_dx, y + flow_dy).
     Border: zero-fill (a mask region warped past frame boundary disappears
-    rather than wrapping). Bilinear interpolation.
+    rather than wrapping).
+
+    interpolation_mode:
+      - "nearest": preserves binarity (binary in → binary out). No grey halo at
+        boundaries. Cost: stairstep edges where the warp is not pixel-aligned.
+        DEFAULT — multi-AI review flagged this as the right root-cause fix for
+        the bilinear-warp grey halo bug.
+      - "linear": bilinear interpolation. Smoother edges but reintroduces
+        fractional values at binary boundaries (the original halo bug). Use
+        only if downstream wants soft alpha output AND `binarize_output=False`.
     """
+    if interpolation_mode == "linear":
+        flag = cv2.INTER_LINEAR
+    else:
+        flag = cv2.INTER_NEAREST
     H, W = mask_2d.shape
     y_idx, x_idx = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
     map_x = (x_idx + flow[..., 0]).astype(np.float32)
     map_y = (y_idx + flow[..., 1]).astype(np.float32)
     return cv2.remap(
         mask_2d.astype(np.float32), map_x, map_y,
-        interpolation=cv2.INTER_LINEAR,
+        interpolation=flag,
         borderMode=cv2.BORDER_CONSTANT, borderValue=0.0,
     )
 
@@ -149,19 +163,31 @@ class NV_TemporalMaskStabilizer_V2:
                     ),
                 }),
                 "binarize_first": ("BOOLEAN", {
-                    "default": False,
+                    "default": True,
                     "tooltip": (
                         "INPUT-SIDE binarize. Threshold input to binary at 0.5 BEFORE "
-                        "stabilizing. Set TRUE if input is soft (post-guided-filter); "
-                        "leave FALSE if input is already binary (post-NV_MaskBinaryCleanup). "
-                        "NOTE: this only controls the input side — for clean binary output "
-                        "use `binarize_output` (default ON), since bilinear warp + median "
-                        "consensus reintroduce fractional values at boundaries even when "
-                        "the input is binary."
+                        "stabilizing. **DEFAULT TRUE** — the suite is tuned for crisp "
+                        "binary output, so all internal stages (warp, median, IoU) run "
+                        "on binary values end-to-end. No-op when input is already binary "
+                        "(the canonical MaskUnion → MaskBinaryCleanup → Stabilizer chain). "
+                        "Set FALSE only if you specifically want soft input → soft "
+                        "intermediate computation (e.g. with `binarize_output=False` for "
+                        "a downstream consumer that wants soft alpha)."
                     ),
                 }),
             },
             "optional": {
+                "warp_interpolation": (list(_WARP_INTERPOLATIONS), {
+                    "default": "nearest",
+                    "tooltip": (
+                        "Interpolation mode for cv2.remap when warping neighbor masks "
+                        "into the current frame's coords. 'nearest' (DEFAULT) preserves "
+                        "binarity → no grey halo at source. 'linear' = bilinear, smoother "
+                        "edges but reintroduces fractional values at binary boundaries "
+                        "(the original halo bug). Use 'linear' only if you specifically "
+                        "want soft alpha output AND `binarize_output=False`."
+                    ),
+                }),
                 "auto_repair": ("BOOLEAN", {
                     "default": True,
                     "tooltip": (
@@ -172,14 +198,17 @@ class NV_TemporalMaskStabilizer_V2:
                     ),
                 }),
                 "anomaly_iou_threshold": ("FLOAT", {
-                    "default": 0.35, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
                     "tooltip": (
                         "Frame is flagged anomalous when IoU(current, neighbor_consensus) "
-                        "< threshold. Lower = stricter (fewer repairs, less risk of over-"
-                        "smoothing valid fast motion). 0.35 = balanced default (walking "
-                        "subjects, mixed motion). 0.50-0.70 for static subjects only. "
-                        "0.15-0.30 for fast action shots. 0.0 = off (always trust current "
-                        "frame; empty-current dropout recovery still fires regardless)."
+                        "< threshold. **DEFAULT 0.0 = OFF** — multi-AI review flagged that "
+                        "full-frame replacement on IoU-anomaly tends to over-fire on legitimate "
+                        "fast motion (head turns, swinging arms, hair motion), creating new "
+                        "smearing artifacts where good frames get replaced with blurry warped "
+                        "consensus. Empty-current dropout recovery still fires regardless of "
+                        "this threshold. Opt back in for shots with known SAM3 dropouts: "
+                        "0.20-0.30 for fast action, 0.35-0.45 for walking subjects, 0.50-0.70 "
+                        "for static-camera talking heads."
                     ),
                 }),
                 "binarize_output": ("BOOLEAN", {
@@ -244,9 +273,12 @@ class NV_TemporalMaskStabilizer_V2:
     DESCRIPTION = (
         "Motion-compensated short-window temporal mask stabilizer. Removes per-frame "
         "jitter, fills lost frames, repairs anomalies via median consensus over "
-        "Farneback-warped neighbors. Designed to follow NV_MaskBinaryCleanup in the "
-        "canonical chain. V2 of the shelved 2026-04-24 stabilizer — small window, "
-        "motion-compensated, memory-bounded, no frame-0 seed."
+        "Farneback-warped neighbors. **Defaults tuned for crisp binary output** "
+        "(nearest warp + binarize_first + binarize_output + post_fill_holes all ON; "
+        "IoU-anomaly-repair OFF to avoid smearing legitimate fast motion). Designed "
+        "to follow NV_MaskBinaryCleanup in the canonical chain. V2 of the shelved "
+        "2026-04-24 stabilizer — small window, motion-compensated, memory-bounded, "
+        "no frame-0 seed."
     )
 
     def stabilize(
@@ -254,8 +286,9 @@ class NV_TemporalMaskStabilizer_V2:
         mask, image,
         window_size, consensus_mode,
         binarize_first,
+        warp_interpolation="nearest",
         auto_repair=True,
-        anomaly_iou_threshold=0.35,
+        anomaly_iou_threshold=0.0,
         binarize_output=True,
         binarize_output_threshold=0.5,
         post_fill_holes=True,
@@ -300,10 +333,13 @@ class NV_TemporalMaskStabilizer_V2:
             print(f"[NV_TemporalMaskStabilizer_V2]   input image: shape={tuple(image.shape)}, "
                   f"dtype={image.dtype}, device={image.device}")
             print(f"[NV_TemporalMaskStabilizer_V2]   config: window={window_size}, "
-                  f"consensus={consensus_mode}, binarize_first={binarize_first}, "
-                  f"auto_repair={auto_repair} (threshold={anomaly_iou_threshold:.2f}), "
+                  f"consensus={consensus_mode}, warp={warp_interpolation}, "
+                  f"binarize_first={binarize_first}, "
+                  f"auto_repair={auto_repair} (threshold={anomaly_iou_threshold:.2f}, "
+                  f"{'IoU-anomaly OFF' if anomaly_iou_threshold <= 0 else 'IoU-anomaly ON'}), "
                   f"binarize_output={binarize_output} "
                   f"(threshold={binarize_output_threshold:.2f}), "
+                  f"post_fill_holes={post_fill_holes}, "
                   f"final_feather_px={final_feather_px}")
 
         # Single/zero-frame: pass through (need ≥2 for any temporal consensus).
@@ -374,7 +410,7 @@ class NV_TemporalMaskStabilizer_V2:
                     continue
 
                 flow = _compute_backward_flow_farneback(gray_np[t], gray_np[tn])
-                warped = _warp_mask_with_flow(mask_np[tn], flow)
+                warped = _warp_mask_with_flow(mask_np[tn], flow, interpolation_mode=warp_interpolation)
                 warped_neighbors.append(warped)
                 n_warps_computed += 1
             if verbose_debug:
@@ -436,10 +472,9 @@ class NV_TemporalMaskStabilizer_V2:
                 else:
                     output_np[t] = np.mean(stack, axis=0)
 
-            # Re-binarize if user asked for binary I/O — linear-interp warp +
-            # median both reintroduce fractional values, which violate intent.
-            if binarize_first:
-                output_np[t] = (output_np[t] > 0.5).astype(np.float32)
+            # NOTE: previous code re-binarized here using `binarize_first` with hardcoded
+            # 0.5. Removed — output-side binarization is now `binarize_output` (with its
+            # own threshold) applied AFTER the loop. Multi-AI review caught the redundancy.
 
             if verbose_debug:
                 t_consensus += time.perf_counter() - t_cons_start
@@ -515,7 +550,8 @@ class NV_TemporalMaskStabilizer_V2:
         total_elapsed = time.perf_counter() - t_start
         info = (
             f"[NV_TemporalMaskStabilizer_V2] N={N}, window={window_size}, "
-            f"consensus={consensus_mode}, binarize_first={binarize_first}, "
+            f"consensus={consensus_mode}, warp={warp_interpolation}, "
+            f"binarize_first={binarize_first}, "
             f"binarize_output={binarize_output} (thr={binarize_output_threshold:.2f}), "
             f"post_fill_holes={post_fill_holes}, "
             f"auto_repair={auto_repair} (threshold={anomaly_iou_threshold:.2f}), "
