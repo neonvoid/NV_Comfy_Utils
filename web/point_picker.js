@@ -225,16 +225,30 @@ app.registerExtension({
                 }
             }, 100);
 
-            // Clear handler
+            // Clear handler — scope matches the filter:
+            //   filter OFF → clear ALL points across all frames
+            //   filter ON  → clear only points whose t === current frame
+            // The button label updates accordingly via updateClearBtnUI().
             clearBtn.addEventListener("click", (e) => {
                 e.preventDefault();
                 e.stopPropagation();
-                node._pointPicker.points = [];
+                const pp = node._pointPicker;
+                if (pp.filterByCurrentFrame) {
+                    const cur = node.getCurrentFrameIndex?.();
+                    const before = pp.points.length;
+                    pp.points = pp.points.filter(p => p.t !== cur);
+                    const removed = before - pp.points.length;
+                    console.log(`[NV_PointPicker] Cleared ${removed} point(s) on frame ${cur} (${pp.points.length} remain on other frames)`);
+                } else {
+                    pp.points = [];
+                }
                 node.syncPointData();
                 node.redrawCanvas();
             });
 
             // Filter toggle handler — flip filterByCurrentFrame, update button cosmetics, redraw.
+            // Also retitle the Clear button to match the filter scope so it's visually obvious
+            // what "Clear" will actually do (clear all vs clear current frame only).
             const updateFilterBtnUI = () => {
                 const pp = node._pointPicker;
                 if (!pp) return;
@@ -242,10 +256,14 @@ app.registerExtension({
                     pp.filterBtn.textContent = "👁 Show: This Frame";
                     pp.filterBtn.style.background = "#2a6";
                     pp.filterBtn.style.borderColor = "#1a4";
+                    clearBtn.textContent = "Clear Frame";
+                    clearBtn.title = "Remove only the points anchored to the current frame (filter is on)";
                 } else {
                     pp.filterBtn.textContent = "👁 Show: All";
                     pp.filterBtn.style.background = "#444";
                     pp.filterBtn.style.borderColor = "#666";
+                    clearBtn.textContent = "Clear All";
+                    clearBtn.title = "Remove ALL tracking points across all frames";
                 }
             };
             node._pointPicker.updateFilterBtnUI = updateFilterBtnUI;

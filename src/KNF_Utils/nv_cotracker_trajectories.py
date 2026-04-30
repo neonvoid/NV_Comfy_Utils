@@ -336,17 +336,90 @@ class NV_CoTrackerTrajectoriesJSON:
         half_visible = sum(1 for vc in per_frame_visible if vc >= max(2, N // 2))
         below_two = sum(1 for vc in per_frame_visible if vc < 2)
 
+        # --- Step 6b: Per-anchor verdicts (DROP / MARGINAL / OK / STRONG) ---
+        # Used both in the per-anchor table and in actionable suggestions below.
+        def _classify_anchor(pct):
+            if pct < 30: return "DROP"
+            if pct < 60: return "MARGINAL"
+            if pct < 90: return "OK"
+            return "STRONG"
+        for s in per_anchor_stats:
+            s["verdict"] = _classify_anchor(s["visible_pct"])
+
+        # --- Step 6c: Find consecutive runs where visible_count < min threshold ---
+        # These are the ranges where the warp can't fit similarity (need >=2 anchors).
+        # We also surface ranges with only 1 anchor visible — warp can technically fit but
+        # is vulnerable to drift since there's no rotation/scale lever arm.
+        def _find_runs(per_frame_count, predicate):
+            """Return list of (start, end) inclusive frame ranges where predicate(count) is True."""
+            runs, start = [], None
+            for t in range(len(per_frame_count)):
+                if predicate(per_frame_count[t]):
+                    if start is None: start = t
+                else:
+                    if start is not None:
+                        runs.append((start, t - 1))
+                        start = None
+            if start is not None:
+                runs.append((start, len(per_frame_count) - 1))
+            return runs
+
+        no_fit_runs = _find_runs(per_frame_visible, lambda c: c < 2)            # warp fails entirely
+        thin_runs = _find_runs(per_frame_visible, lambda c: c == 1)             # warp drift-prone
+
+        # For each problem range, find the frame within it (or just outside) most likely to
+        # benefit from a multi-keyframe seed: highest visible_count, then highest sum of
+        # raw visibility scores. If all frames in the range have 0 visibility, fall back to
+        # the closest frame outside the range with at least 1 visible anchor.
+        def _best_seed_frame(start, end):
+            best_t, best_score = start, -1.0
+            for t in range(start, end + 1):
+                vis_sum = sum(per_point_vis[qi][t] for qi in range(N))
+                count = per_frame_visible[t]
+                # Score: prioritize visible_count, break ties by sum of vis scores
+                score = count * 1000 + vis_sum
+                if score > best_score:
+                    best_score = score
+                    best_t = t
+            # If best frame in range has 0 visibility, look just outside the range
+            if per_frame_visible[best_t] == 0:
+                for offset in range(1, T_video):
+                    for cand in (start - offset, end + offset):
+                        if 0 <= cand < T_video and per_frame_visible[cand] >= 1:
+                            return cand, "outside_range"
+                return best_t, "all_invisible"
+            return best_t, "within_range"
+
+        # --- Step 6d: Overall quality verdict ---
+        n_strong = sum(1 for s in per_anchor_stats if s["verdict"] == "STRONG")
+        n_ok = sum(1 for s in per_anchor_stats if s["verdict"] == "OK")
+        n_drop = sum(1 for s in per_anchor_stats if s["verdict"] == "DROP")
+        no_fit_pct = 100 * below_two / T_video
+        if n_drop == 0 and no_fit_pct < 5 and jump_p99 < 30:
+            quality = "GOOD"
+        elif n_drop <= max(1, N // 4) and no_fit_pct < 25 and jump_p99 < 60:
+            quality = "FAIR"
+        else:
+            quality = "POOR"
+
+        # --- Build info string with verdicts + actionable suggestions ---
         info_lines = [
             f"[NV_CoTrackerTrajectoriesJSON]",
             f"  T={T_video} frames, N={N} anchors, {H}x{W} px",
-            f"  Anchor names: {', '.join(names)}",
             f"",
-            f"  Per-anchor visibility (vis_avg / vis_min / visible_frames):",
+            f"  ┌─ TRACKING QUALITY: {quality} ─────────────────────────",
+            f"  │ Strong anchors (>=90% visible):     {n_strong}/{N}",
+            f"  │ OK or better (>=60% visible):       {n_strong + n_ok}/{N}",
+            f"  │ Frames warp cannot fit (<2 visible): {below_two}/{T_video} ({no_fit_pct:.0f}%)",
+            f"  │ Worst tracker jump: {jump_max:.0f}px at frame {worst_jump_frame}",
+            f"  └─",
+            f"",
+            f"  Per-anchor breakdown (verdict | vis_avg | vis_min | visible%):",
         ]
         for s in per_anchor_stats:
             info_lines.append(
-                f"    {s['name']:<14} avg={s['vis_avg']:.2f}  min={s['vis_min']:.2f}  "
-                f"visible={s['visible_frames']}/{T_video} ({s['visible_pct']:.0f}%)"
+                f"    {s['name']:<14} {s['verdict']:<9} avg={s['vis_avg']:.2f}  "
+                f"min={s['vis_min']:.2f}  visible={s['visible_frames']}/{T_video} ({s['visible_pct']:.0f}%)"
             )
         info_lines.extend([
             f"",
@@ -355,12 +428,93 @@ class NV_CoTrackerTrajectoriesJSON:
             f"max={jump_max:.1f}px (at frame {worst_jump_frame})",
             f"",
             f"  Visibility threshold: {min_visibility:.2f}",
-            f"  Frames with ALL {N} anchors visible: {all_visible}/{T_video} ({100*all_visible/T_video:.0f}%)",
-            f"  Frames with >={max(2, N // 2)} anchors visible: {half_visible}/{T_video} ({100*half_visible/T_video:.0f}%)",
-            f"  Frames with <2 anchors visible (warp cannot fit similarity): "
-            f"{below_two}/{T_video} ({100*below_two/T_video:.0f}%)",
-            f"  Frames with at least one invisible anchor: {len(interpolated_frames)}/{T_video}",
+            f"    All {N} anchors visible: {all_visible}/{T_video} ({100*all_visible/T_video:.0f}%)",
+            f"    >={max(2, N // 2)} anchors visible: {half_visible}/{T_video} ({100*half_visible/T_video:.0f}%)",
+            f"    <2 anchors visible (warp cannot fit): {below_two}/{T_video} ({100*below_two/T_video:.0f}%)",
         ])
+
+        # --- Actionable suggestions section ---
+        suggestions = []
+
+        # 1. Per-anchor: re-place DROP/MARGINAL anchors
+        drop_anchors = [s for s in per_anchor_stats if s["verdict"] == "DROP"]
+        for s in drop_anchors:
+            suggestions.append(
+                f"DROP {s['name']} (only {s['visible_pct']:.0f}% visible) — re-place on a more "
+                f"contrasted feature. Try: edge of nostril, mouth corner, eyebrow tip, "
+                f"clothing seam, or a tattoo edge — NOT smooth interior skin/fabric."
+            )
+        marginal_anchors = [s for s in per_anchor_stats if s["verdict"] == "MARGINAL"]
+        if len(marginal_anchors) >= 2:
+            names_str = ", ".join(s["name"] for s in marginal_anchors)
+            suggestions.append(
+                f"MARGINAL anchors: {names_str}. Multiple sub-60% anchors compound noise. "
+                f"Consider replacing the lowest one on a different feature."
+            )
+
+        # 2. Problem ranges: <2 visible (warp fails)
+        for (start, end) in no_fit_runs:
+            length = end - start + 1
+            seed_t, seed_kind = _best_seed_frame(start, end)
+            if seed_kind == "all_invisible":
+                suggestions.append(
+                    f"Frames {start}-{end} ({length}f) have ZERO anchors visible — tracker "
+                    f"completely lost. Multi-keyframe seeding won't help; this stretch may need "
+                    f"`bypass_pass_through` fallback or a different shot."
+                )
+            elif seed_kind == "outside_range":
+                suggestions.append(
+                    f"Frames {start}-{end} ({length}f) have <2 anchors visible — warp can't fit. "
+                    f"Try seeding a multi-keyframe anchor at frame {seed_t} (closest frame "
+                    f"outside range with visible features)."
+                )
+            else:
+                seed_count = per_frame_visible[seed_t]
+                suggestions.append(
+                    f"Frames {start}-{end} ({length}f) have <2 anchors visible — warp can't fit "
+                    f"similarity here. Recommended: change frame_index to {seed_t} (best within "
+                    f"range, {seed_count}/{N} anchors visible) and click a NEW feature visible "
+                    f"there. CoTracker will treat it as a multi-keyframe seed."
+                )
+
+        # 3. Thin ranges: only 1 anchor visible (warp works but drift-prone)
+        if thin_runs and not no_fit_runs:  # only mention if no worse problems exist
+            longest = max(thin_runs, key=lambda r: r[1] - r[0])
+            tlen = longest[1] - longest[0] + 1
+            if tlen >= 5:
+                seed_t, _ = _best_seed_frame(longest[0], longest[1])
+                suggestions.append(
+                    f"Frames {longest[0]}-{longest[1]} ({tlen}f) have only 1 anchor visible — "
+                    f"warp fits but is drift-prone (no rotation/scale lever arm). Consider "
+                    f"adding a 2nd anchor at frame {seed_t} on a different feature for stability."
+                )
+
+        # 4. Tracker jump warning
+        if jump_max > 50 and jump_p95 > 25:
+            suggestions.append(
+                f"Violent tracker jumps detected (max {jump_max:.0f}px at frame "
+                f"{worst_jump_frame}, p95 {jump_p95:.1f}px). Likely motion blur breaking anchor "
+                f"lock. Watch the debug_overlay near frame {worst_jump_frame} to diagnose."
+            )
+
+        # 5. Universal hint when adding multi-keyframe seeds
+        if no_fit_runs or (thin_runs and len(thin_runs) > 1):
+            suggestions.append(
+                f"REMINDER: when adding multi-keyframe seeds, click a feature that is NOT "
+                f"already tracked. CoTracker treats each (x,y,t) as an INDEPENDENT track — "
+                f"re-clicking the same logical feature creates duplicate tracks, not stronger ones."
+            )
+
+        if suggestions:
+            info_lines.append("")
+            info_lines.append("⚠ ACTIONABLE SUGGESTIONS:")
+            for i, sug in enumerate(suggestions, 1):
+                # Hanging-indent wrap for readability
+                info_lines.append(f"  {i}. {sug}")
+        else:
+            info_lines.append("")
+            info_lines.append("✓ No actionable issues detected — tracking quality looks healthy.")
+
         info_str = "\n".join(info_lines)
         print(info_str)
 
