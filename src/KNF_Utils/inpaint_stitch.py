@@ -332,6 +332,14 @@ class NV_InpaintStitch:
                                "If you OOM with fp32 (allocator can't allocate ~6.9 GB twice for "
                                "back-to-back stitches), drop to fp16."
                 }),
+                "editor_config_path": ("STRING", {
+                    "default": "",
+                    "tooltip": "Optional path to a stitch-config.json exported from "
+                               "NV_Interactive_Masking_Suite. When set, overrides matching "
+                               "stitch_params widget values (blend_mode / multiband_levels / "
+                               "guided_* / output_dtype). Hard-fails on malformed config or "
+                               "out-of-range values; empty = no override (use widgets)."
+                }),
             },
         }
 
@@ -347,7 +355,33 @@ class NV_InpaintStitch:
 
     def stitch(self, stitcher, inpainted_image, blend_mode="multiband", multiband_levels=5,
                guided_refine=False, guided_radius=8, guided_eps=0.001, guided_strength=0.7,
-               output_dtype="fp16"):
+               output_dtype="fp16", editor_config_path=""):
+        # Editor-config override: applied FIRST, before any other widget logic.
+        # Lets a tuned per-shot config from the desktop editor override the
+        # static widget values without graph surgery on every shot.
+        if editor_config_path and editor_config_path.strip():
+            from .stitch_config_loader import maybe_apply_stitch_config
+            _stitch_kwargs = {
+                "blend_mode": blend_mode,
+                "multiband_levels": multiband_levels,
+                "guided_refine": guided_refine,
+                "guided_radius": guided_radius,
+                "guided_eps": guided_eps,
+                "guided_strength": guided_strength,
+                "output_dtype": output_dtype,
+            }
+            _overridden = maybe_apply_stitch_config(
+                _stitch_kwargs, editor_config_path,
+                inpainted_image=inpainted_image,
+            )
+            blend_mode = _overridden["blend_mode"]
+            multiband_levels = _overridden["multiband_levels"]
+            guided_refine = _overridden["guided_refine"]
+            guided_radius = _overridden["guided_radius"]
+            guided_eps = _overridden["guided_eps"]
+            guided_strength = _overridden["guided_strength"]
+            output_dtype = _overridden["output_dtype"]
+
         device = comfy.model_management.get_torch_device()
         intermediate = comfy.model_management.intermediate_device()
         resize_algorithm = _get_resize_algorithm(stitcher)

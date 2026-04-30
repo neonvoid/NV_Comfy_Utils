@@ -79,6 +79,10 @@ class NV_BBoxSaver:
                 break
             counter += 1
 
+        # filename_prefix may contain subdirectories (e.g. "subdir/name") —
+        # ensure the leaf directory exists before writing.
+        os.makedirs(os.path.dirname(mask_path), exist_ok=True)
+
         # Convert mask to PIL Image and save
         # Mask shape is [B, H, W] - take first mask
         if len(mask.shape) == 3:
@@ -362,6 +366,10 @@ class NV_ImageSaver:
                 if not os.path.exists(img_path):
                     break
                 counter += 1
+
+            # filename_prefix may contain subdirectories (e.g. "subdir/name") —
+            # ensure the leaf directory exists before writing.
+            os.makedirs(os.path.dirname(img_path), exist_ok=True)
 
             # Convert tensor to PIL Image
             # Image shape is [H, W, C] in range [0, 1]

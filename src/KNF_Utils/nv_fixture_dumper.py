@@ -30,6 +30,7 @@ Output layout:
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -42,6 +43,41 @@ import folder_paths
 
 # --- Memory warning threshold for total dumped tensor bytes ---------------
 _MEM_WARN_MB = 2000
+
+# --- Bundle fingerprint algorithm -----------------------------------------
+# blake2b (stdlib, ~700 MB/s) — fast enough for live drift checks at
+# import time, zero deps, deterministic. Used to detect when an editor
+# bundle no longer matches the workflow's current render outputs.
+_FINGERPRINT_ALGO = "blake2b-128"  # blake2b digest_size=16 -> 128-bit
+_FINGERPRINT_DIGEST_SIZE = 16
+
+
+def _hash_tensor(t: torch.Tensor) -> str:
+    """Return a hex blake2b-128 digest of a tensor's contiguous bytes.
+
+    Hashes the dtype + shape + raw byte data, so two tensors with identical
+    content but different dtypes/shapes hash differently. CPU + contiguous
+    enforced for byte-stable output (a non-contiguous CUDA tensor's view
+    might serialize differently across devices/strides otherwise).
+    """
+    h = hashlib.blake2b(digest_size=_FINGERPRINT_DIGEST_SIZE)
+    h.update(str(t.dtype).encode("utf-8"))
+    h.update(b"|")
+    h.update(repr(tuple(t.shape)).encode("utf-8"))
+    h.update(b"|")
+    h.update(t.detach().cpu().contiguous().numpy().tobytes())
+    return h.hexdigest()
+
+
+def _hash_geometry(geom: dict) -> str:
+    """Hash the geometry dict (per-frame xywh lists + crop target + algorithm).
+
+    Stable JSON serialization (sort_keys, no whitespace) feeds blake2b. Any
+    upstream change that affects bbox math will invalidate this digest.
+    """
+    h = hashlib.blake2b(digest_size=_FINGERPRINT_DIGEST_SIZE)
+    h.update(json.dumps(geom, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+    return h.hexdigest()
 
 
 def _stack_or_none(tensor_list, name: str):
@@ -241,6 +277,27 @@ class NV_FixtureDumper:
         canvas_masks = [stitcher["canvas_mask"][p] for p in stitcher_positions]
         canvas_masks_processed = [stitcher["canvas_mask_processed"][p] for p in stitcher_positions]
         cropped_blend_masks = [stitcher["cropped_mask_for_blend"][p] for p in stitcher_positions]
+
+        # ----- Content warp data (CoTracker / NV_PointDrivenBBox / flow) -
+        # Aligned with the non-skipped index space (CoTrackerBridge appends one
+        # entry per batch position). Slice by stitcher_positions to stay 1:1
+        # with the canvas tensors. Format depends on content_warp_mode:
+        #   centroid     -> list of {"dx": float, "dy": float} (scalar per frame)
+        #   optical_flow -> list of {"flow": Tensor[2, H, W] or [1, 2, H, W]}
+        #   None         -> warp_data is None; nothing to dump
+        content_warp_mode_raw = stitcher.get("content_warp_mode")
+        content_warp_data_raw = stitcher.get("content_warp_data")
+        warp_entries = None
+        if content_warp_mode_raw is not None and content_warp_data_raw:
+            try:
+                warp_entries = [content_warp_data_raw[p] for p in stitcher_positions]
+            except (IndexError, TypeError) as e:
+                raise RuntimeError(
+                    f"[NV_FixtureDumper] Could not slice content_warp_data "
+                    f"(mode={content_warp_mode_raw!r}, len="
+                    f"{len(content_warp_data_raw) if hasattr(content_warp_data_raw, '__len__') else '?'}, "
+                    f"requested positions {stitcher_positions[:5]}...): {e}"
+                ) from e
         ctc_x = [stitcher["cropped_to_canvas_x"][p] for p in stitcher_positions]
         ctc_y = [stitcher["cropped_to_canvas_y"][p] for p in stitcher_positions]
         ctc_w = [stitcher["cropped_to_canvas_w"][p] for p in stitcher_positions]
@@ -276,6 +333,64 @@ class NV_FixtureDumper:
         tensors["inpainted_image"] = inpainted_image.index_select(0, idx_pos).cpu().contiguous()
         tensors["comfy_output"] = comfy_output.index_select(0, idx_glb).cpu().contiguous()
 
+        # ----- Encode warp_entries into safetensors-compatible tensors ---
+        # safetensors only stores torch tensors keyed by str; we project the
+        # mode-specific dict format into per-mode tensor keys so the parity
+        # test loader can reconstruct a list[dict] without dtype guessing.
+        warp_dump_format = None
+        if warp_entries is not None:
+            if content_warp_mode_raw == "centroid":
+                # Validate every entry has dx/dy as scalars before stacking.
+                dxs, dys = [], []
+                for i, e in enumerate(warp_entries):
+                    if not isinstance(e, dict) or "dx" not in e or "dy" not in e:
+                        raise RuntimeError(
+                            f"[NV_FixtureDumper] centroid warp entry {i} missing dx/dy: "
+                            f"got {type(e).__name__} {e!r}"
+                        )
+                    dxs.append(float(e["dx"]))
+                    dys.append(float(e["dy"]))
+                tensors["warp_dx"] = torch.tensor(dxs, dtype=torch.float32)
+                tensors["warp_dy"] = torch.tensor(dys, dtype=torch.float32)
+                warp_dump_format = "centroid_dx_dy"
+            elif content_warp_mode_raw == "optical_flow":
+                # Each entry is {"flow": Tensor[2, H, W] or [1, 2, H, W]}. Stack
+                # into [N, 2, H, W]. Validate dtype/shape uniformity to fail fast.
+                flows = []
+                for i, e in enumerate(warp_entries):
+                    if not isinstance(e, dict) or "flow" not in e:
+                        raise RuntimeError(
+                            f"[NV_FixtureDumper] optical_flow warp entry {i} missing 'flow' key: "
+                            f"got {type(e).__name__}"
+                        )
+                    f = e["flow"]
+                    if not isinstance(f, torch.Tensor):
+                        raise TypeError(
+                            f"[NV_FixtureDumper] optical_flow warp entry {i} 'flow' is not a tensor: "
+                            f"got {type(f).__name__}"
+                        )
+                    if f.dim() == 4 and f.shape[0] == 1:
+                        f = f.squeeze(0)
+                    if f.dim() != 3 or f.shape[0] != 2:
+                        raise RuntimeError(
+                            f"[NV_FixtureDumper] optical_flow warp entry {i} flow has bad shape "
+                            f"{tuple(f.shape)}; expected [2, H, W] or [1, 2, H, W]"
+                        )
+                    flows.append(f.cpu().to(torch.float32))
+                tensors["warp_flow"] = torch.stack(flows, dim=0).contiguous()
+                warp_dump_format = "optical_flow_NCHW"
+                # Loud size warning — flows are massive (4 bytes * 2 * H * W per frame).
+                flow_mb = tensors["warp_flow"].element_size() * tensors["warp_flow"].nelement() / 1e6
+                if flow_mb > 500:
+                    print(
+                        f"[NV_FixtureDumper] WARNING: optical_flow dump is {flow_mb:.0f} MB. "
+                        f"Consider re-rendering this fixture with content_warp_mode=centroid "
+                        f"or shrinking num_frames."
+                    )
+            else:
+                # Unknown mode — record metadata but don't try to encode tensors.
+                warp_dump_format = f"unknown_{content_warp_mode_raw}_skipped"
+
         # ----- Memory sanity check --------------------------------------
         total_bytes = sum(t.element_size() * t.nelement() for t in tensors.values())
         total_mb = total_bytes / 1e6
@@ -298,8 +413,36 @@ class NV_FixtureDumper:
 
         save_file(tensors, str(tmp_tensor_path))
 
+        # ----- Bundle fingerprint (per-tensor + geometry hashes) --------
+        # Multi-AI consensus 2026-04-30: per-tensor digests give actionable
+        # diagnostics (e.g. "only inpainted_image changed → KSampler drift")
+        # vs a single combined hash. blake2b-128 over CPU-contiguous bytes
+        # for stable cross-device output. Geometry digest covers per-frame
+        # xywh + target dims + resize algorithm.
+        geometry_for_hash = {
+            "cropped_to_canvas_x": list(map(int, ctc_x)),
+            "cropped_to_canvas_y": list(map(int, ctc_y)),
+            "cropped_to_canvas_w": list(map(int, ctc_w)),
+            "cropped_to_canvas_h": list(map(int, ctc_h)),
+            "canvas_to_orig_x": list(map(int, cto_x)),
+            "canvas_to_orig_y": list(map(int, cto_y)),
+            "canvas_to_orig_w": list(map(int, cto_w)),
+            "canvas_to_orig_h": list(map(int, cto_h)),
+            "crop_target_w": int(stitcher.get("crop_target_w", 0)),
+            "crop_target_h": int(stitcher.get("crop_target_h", 0)),
+            "resize_algorithm": str(stitcher.get("resize_algorithm", "bicubic")),
+        }
+        bundle_fingerprint = {
+            "algo": _FINGERPRINT_ALGO,
+            "canvas_image": _hash_tensor(tensors["canvas_image"]),
+            "canvas_mask": _hash_tensor(tensors["canvas_mask"]),
+            "canvas_mask_processed": _hash_tensor(tensors["canvas_mask_processed"]),
+            "inpainted_image": _hash_tensor(tensors["inpainted_image"]),
+            "geometry": _hash_geometry(geometry_for_hash),
+        }
+
         meta = {
-            "schema_version": "fixture-0.1.0",
+            "schema_version": "fixture-0.3.0",
             "shot_id": shot_id,
             "frame_offset": offset,
             "num_frames": actual_count,
@@ -322,6 +465,8 @@ class NV_FixtureDumper:
             },
             "blend_pixels_baked": int(stitcher.get("blend_pixels", 0)),
             "content_warp_mode": stitcher.get("content_warp_mode"),
+            "content_warp_dump_format": warp_dump_format,
+            "bundle_fingerprint": bundle_fingerprint,
             # Read params directly from the stitcher dict — NV_InpaintCrop2 records
             # crop_params at construction; NV_InpaintStitch2 mutates the same dict
             # to add stitch_params at the start of stitch(). The dumper depends on

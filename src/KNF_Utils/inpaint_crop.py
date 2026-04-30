@@ -315,6 +315,15 @@ class NV_InpaintCrop:
                                "Rejected frames are filled from neighbors. "
                                "0.0 = disabled. 1.0 = strict. 1.5 = moderate (recommended). 3.0 = lenient."
                 }),
+                "editor_config_path": ("STRING", {
+                    "default": "",
+                    "tooltip": "Optional path to a stitch-config.json exported from "
+                               "NV_Interactive_Masking_Suite. When set, overrides matching "
+                               "crop_params widget values (crop_stitch_source / "
+                               "crop_blend_feather_px / hybrid_* / cleanup_* / crop_expand_px / "
+                               "target_* / resize_algorithm). Hard-fails on malformed config "
+                               "or out-of-range values; empty = no override (use widgets)."
+                }),
             }
         }
 
@@ -329,7 +338,55 @@ class NV_InpaintCrop:
              cleanup_fill_holes=0, cleanup_remove_noise=0, cleanup_smooth=0,
              crop_expand_px=0, crop_stitch_source="tight", crop_blend_feather_px=16,
              hybrid_falloff=48, hybrid_curve=0.6, resize_algorithm="bicubic",
-             mask_config=None, bounding_box_mask=None, anomaly_threshold=1.5):
+             mask_config=None, bounding_box_mask=None, anomaly_threshold=1.5,
+             editor_config_path=""):
+        # Editor-config override: applied FIRST, before mask_config. Lets a
+        # tuned per-shot config from the desktop editor override the static
+        # widget values without graph surgery on every shot.
+        #
+        # mask_config interaction (multi-AI 2026-04-30 MED): when BOTH are
+        # wired, mask_config silently wins on overlapping keys after our
+        # override below. The loader detects this and HARD-FAILS on any
+        # pre-diffusion key conflict (cleanup_*, crop_expand_px) — those
+        # produce a "Preview Lie" where the editor preview cannot match
+        # production. Post-diffusion overlaps just log a warning.
+        if editor_config_path and editor_config_path.strip():
+            from .stitch_config_loader import maybe_apply_crop_config
+            _crop_kwargs = {
+                "target_mode": target_mode, "target_width": target_width,
+                "target_height": target_height, "auto_preset": auto_preset,
+                "padding_multiple": padding_multiple,
+                "cleanup_fill_holes": cleanup_fill_holes,
+                "cleanup_remove_noise": cleanup_remove_noise,
+                "cleanup_smooth": cleanup_smooth,
+                "crop_expand_px": crop_expand_px,
+                "crop_stitch_source": crop_stitch_source,
+                "crop_blend_feather_px": crop_blend_feather_px,
+                "hybrid_falloff": hybrid_falloff,
+                "hybrid_curve": hybrid_curve,
+                "resize_algorithm": resize_algorithm,
+                "anomaly_threshold": anomaly_threshold,
+            }
+            _overridden = maybe_apply_crop_config(
+                _crop_kwargs, editor_config_path,
+                mask_config=mask_config,
+                canvas_image=image,
+            )
+            target_mode = _overridden["target_mode"]
+            target_width = _overridden["target_width"]
+            target_height = _overridden["target_height"]
+            auto_preset = _overridden["auto_preset"]
+            padding_multiple = _overridden["padding_multiple"]
+            cleanup_fill_holes = _overridden["cleanup_fill_holes"]
+            cleanup_remove_noise = _overridden["cleanup_remove_noise"]
+            cleanup_smooth = _overridden["cleanup_smooth"]
+            crop_expand_px = _overridden["crop_expand_px"]
+            crop_stitch_source = _overridden["crop_stitch_source"]
+            crop_blend_feather_px = _overridden["crop_blend_feather_px"]
+            hybrid_falloff = _overridden["hybrid_falloff"]
+            hybrid_curve = _overridden["hybrid_curve"]
+            resize_algorithm = _overridden["resize_algorithm"]
+            anomaly_threshold = _overridden["anomaly_threshold"]
 
         # Apply shared config override if connected
         from .mask_processing_config import apply_mask_config

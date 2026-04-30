@@ -1,0 +1,503 @@
+"""
+NV PreComp Warp - Aligns closed-model character render to source actor pose via tracked-point similarity transform.
+
+Designed as the alignment layer for the "rough pre-composite + low-denoise VACE refinement" workflow:
+  1. Generate target character via Kling/Seedance (scene-matched, identity-correct, but pose-imperfect)
+  2. Track torso anchors on source actor (via NV_CoTrackerBridge)
+  3. Pick same anchors on render's first frame (NV_PointPicker)
+  4. NV_PreCompWarp solves per-frame 4-DOF similarity transform mapping source -> render coords
+  5. Outputs warped masked render ready for paste over source for VACE V2V refinement (fill_mode='none')
+
+Architecture decisions (validated by 2026-04-30 multi-AI debate + research synthesis):
+  - 4-DOF SIMILARITY transform (tx, ty, uniform scale, rotation) - preserves aspect, no shear
+    Citation: Umeyama 1991 "Least-squares estimation of transformation parameters between two point patterns"
+    Implementation: cv2.estimateAffinePartial2D (RANSAC-robust)
+  - Savitzky-Golay smoothing on parameters (zero-phase, preserves motion peaks; offline pipeline)
+    Smooth scale in log-space; rotation after np.unwrap to handle the -pi/+pi discontinuity
+  - Erode-warp-feather edge pipeline:
+    1. Erode mask 1-2 px before warp (kills bg color contamination from render edges)
+    2. Premultiplied RGB+alpha warp (prevents bg color bleed into edges via interpolation)
+    3. INTER_CUBIC for RGB (sharpness), INTER_LINEAR for mask
+    4. Gaussian feather 2-4 px post-warp (gives VACE smooth gradient to blend at low denoise)
+  - Failure detection: RMSE residual after fit > threshold fraction of torso diagonal
+    Fallback: translation-only fit (drop scale+rotation) + flag for downstream crop_expand_px inflation
+  - Anchors: torso-centric (head/neck, L/R shoulders, L/R hips) - most stable across motion blur
+"""
+
+import json
+from typing import Optional, Tuple
+
+import numpy as np
+import torch
+import cv2
+from scipy.signal import savgol_filter
+
+
+class NV_PreCompWarp:
+    """Align closed-model character render to source actor pose via similarity-transform pre-comp."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "render_video": ("IMAGE", {
+                    "tooltip": "The closed-model output (Kling/Seedance) showing the target character. "
+                               "Should be approximately scene-matched to source. Will be warped per-frame to align."
+                }),
+                "render_mask": ("MASK", {
+                    "tooltip": "SAM3 silhouette mask of the target character extracted from the render. "
+                               "Background pixels = 0; character pixels = 1."
+                }),
+                "source_trajectories": ("STRING", {
+                    "default": "",
+                    "multiline": True,
+                    "tooltip": "JSON of CoTracker3-tracked anchor trajectories on the source actor. "
+                               "Format: shape [T, N, 2] where T=frames, N=points, last dim=(x, y) in pixels. "
+                               "Either a JSON array directly, or {'shape': [T, N, 2], 'data': [...], 'names': [...]}."
+                }),
+                "render_anchors_t0": ("STRING", {
+                    "default": "",
+                    "multiline": True,
+                    "tooltip": "JSON of N anchor points clicked on the render's first frame, in SAME ORDER as source_trajectories. "
+                               "Format: shape [N, 2] (x, y) in pixels. Accepts NV_PointPicker JSON ([{x,y,t}]) — t is ignored."
+                }),
+                "smooth_window": ("INT", {
+                    "default": 11, "min": 3, "max": 51, "step": 2,
+                    "tooltip": "Savitzky-Golay smoothing window (must be odd). Larger = smoother, less responsive. "
+                               "11-15 typical for 24fps action shots. Auto-clamped to T-1 if larger than the sequence."
+                }),
+                "smooth_polyorder": ("INT", {
+                    "default": 2, "min": 1, "max": 5,
+                    "tooltip": "Savitzky-Golay polynomial order. 2 preserves motion peaks well; 3-4 for very smooth."
+                }),
+                "edge_erode_px": ("INT", {
+                    "default": 2, "min": 0, "max": 8,
+                    "tooltip": "Erode mask before warp to kill background-color contamination from render edges. "
+                               "1-2 px standard. Higher (4-6) if render bg is high-contrast (green-screen artifacts)."
+                }),
+                "edge_feather_px": ("FLOAT", {
+                    "default": 3.0, "min": 0.0, "max": 16.0, "step": 0.5,
+                    "tooltip": "Gaussian feather radius after warp. 2-4 px gives VACE smooth gradient to blend. "
+                               "0 = hard edge."
+                }),
+                "rmse_threshold_frac": ("FLOAT", {
+                    "default": 0.10, "min": 0.01, "max": 0.5, "step": 0.01,
+                    "tooltip": "Per-frame failure threshold: RMSE residual after fit > this fraction of torso diagonal "
+                               "triggers fallback. 0.08-0.12 typical."
+                }),
+                "fallback_mode": (["translation_only", "hold_last_good", "bypass_pass_through"], {
+                    "default": "translation_only",
+                    "tooltip": "What to do on high-residual frames. translation_only: keep tx/ty, drop scale+rotation. "
+                               "hold_last_good: copy last successful transform. bypass: pass-through original render."
+                }),
+                "verbose_debug": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Print per-frame diagnostics (transform params, residuals, fallback frames)."
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK", "STRING")
+    RETURN_NAMES = ("warped_render", "warped_mask", "alignment_info")
+    FUNCTION = "execute"
+    CATEGORY = "NV_Utils/Inpaint"
+    DESCRIPTION = (
+        "Per-frame similarity transform (4-DOF: translation + uniform scale + rotation) from tracked source "
+        "anchors and render frame-0 anchors. Warps the masked render to align with the source actor. "
+        "Designed for the pre-composite + low-denoise VACE refinement workflow."
+    )
+
+    # =========================================================================
+    # Main execute
+    # =========================================================================
+
+    def execute(self, render_video, render_mask, source_trajectories, render_anchors_t0,
+                smooth_window, smooth_polyorder, edge_erode_px, edge_feather_px,
+                rmse_threshold_frac, fallback_mode, verbose_debug):
+
+        # --- Step 1: Parse inputs ---
+        source_traj = self._parse_trajectories(source_trajectories)  # [T, N, 2]
+        render_pts_t0 = self._parse_anchors_t0(render_anchors_t0)    # [N, 2]
+
+        T_render, H, W, C = render_video.shape
+        T_track, N, _ = source_traj.shape
+        T_mask = render_mask.shape[0]
+
+        if N != render_pts_t0.shape[0]:
+            raise ValueError(
+                f"[NV_PreCompWarp] Anchor count mismatch: source has {N} points, "
+                f"render has {render_pts_t0.shape[0]}. Must be equal and in same order."
+            )
+        if N < 2:
+            raise ValueError(f"[NV_PreCompWarp] Need at least 2 anchors for similarity fit, got {N}.")
+        if T_render < 1:
+            raise ValueError("[NV_PreCompWarp] render_video has zero frames")
+        if T_mask < 1:
+            raise ValueError("[NV_PreCompWarp] render_mask has zero frames")
+        if T_track < 1:
+            raise ValueError("[NV_PreCompWarp] source_trajectories has zero frames")
+
+        if T_track != T_render:
+            print(f"[NV_PreCompWarp] WARNING: source trajectories T={T_track} vs render T={T_render}. "
+                  f"Output truncated to min(T) = {min(T_render, T_track)}.")
+        T = min(T_render, T_track)
+
+        torso_diag = self._compute_torso_diag(render_pts_t0)
+        if verbose_debug:
+            print(f"[NV_PreCompWarp] T={T}, N={N} anchors, torso_diag={torso_diag:.1f}px")
+
+        # --- Step 2: Solve per-frame similarity transforms ---
+        # We need M such that cv2.warpAffine(render_image, M) -> aligned-with-source.
+        # Per cv2 docs, M maps OUTPUT coords back to INPUT coords (inverse warp).
+        # So M maps source_pos -> render_pos. Therefore call with from=source, to=render.
+        params = np.zeros((T, 4), dtype=np.float64)  # [tx, ty, log_s, theta]
+        residuals = np.zeros(T, dtype=np.float64)
+        fit_ok = np.zeros(T, dtype=bool)
+
+        for t in range(T):
+            from_pts = source_traj[t]      # source actor anchors at frame t
+            to_pts = render_pts_t0          # render character anchors (frame-0, static)
+            tx, ty, log_s, theta, residual, ok = self._solve_similarity(from_pts, to_pts)
+            params[t] = [tx, ty, log_s, theta]
+            residuals[t] = residual
+            fit_ok[t] = ok
+
+        # Unwrap rotation to remove -pi/+pi discontinuity before smoothing
+        params[:, 3] = np.unwrap(params[:, 3])
+
+        # --- Step 3: Savitzky-Golay smoothing per parameter ---
+        eff_window = self._safe_savgol_window(smooth_window, T, smooth_polyorder)
+        if eff_window is not None:
+            for i in range(4):
+                params[:, i] = savgol_filter(params[:, i], eff_window, smooth_polyorder)
+            if verbose_debug:
+                print(f"[NV_PreCompWarp] Smoothed with savgol window={eff_window}, polyorder={smooth_polyorder}")
+        else:
+            if verbose_debug:
+                print(f"[NV_PreCompWarp] Sequence too short for smoothing (T={T}); using raw per-frame params")
+
+        # --- Step 4: Detect failure frames ---
+        rmse_threshold_px = rmse_threshold_frac * torso_diag
+        failure_mask = (~fit_ok) | (residuals > rmse_threshold_px)
+        failure_count = int(failure_mask.sum())
+        if verbose_debug:
+            print(f"[NV_PreCompWarp] RMSE threshold: {rmse_threshold_px:.2f}px | "
+                  f"failure frames: {failure_count}/{T}")
+
+        # --- Step 5: Apply fallback mode for failure frames ---
+        # bypass_pass_through is handled at warp time (explicit copy of source frame), not via params
+        last_good_idx = None
+        for t in range(T):
+            if not failure_mask[t]:
+                last_good_idx = t
+                continue
+
+            if fallback_mode == "translation_only":
+                # Keep tx/ty, drop scale (log_s=0 -> s=1) + rotation (theta=0)
+                params[t, 2] = 0.0
+                params[t, 3] = 0.0
+            elif fallback_mode == "hold_last_good":
+                if last_good_idx is not None:
+                    params[t] = params[last_good_idx].copy()
+                # If no prior good frame, leave as-is (best-effort fit)
+            # bypass_pass_through: leave params as-is; will be overridden by explicit copy at warp time
+
+        # --- Step 5b: Re-evaluate residuals against the SMOOTHED+fallback transform actually applied ---
+        # Reason: smoothing can pull the transform away from the optimal raw fit; a frame that passed raw
+        # RMSE could become noticeably worse after smoothing. Codex review flag #3.
+        applied_residuals = np.zeros(T, dtype=np.float64)
+        for t in range(T):
+            tx_a, ty_a, log_s_a, theta_a = params[t]
+            scale_a = float(np.exp(log_s_a))
+            cos_a = float(np.cos(theta_a)) * scale_a
+            sin_a = float(np.sin(theta_a)) * scale_a
+            M_a = np.array([
+                [cos_a, -sin_a, float(tx_a)],
+                [sin_a,  cos_a, float(ty_a)],
+            ], dtype=np.float64)
+            from_2d = source_traj[t].astype(np.float64)
+            to_2d = render_pts_t0.astype(np.float64)
+            ones = np.ones((from_2d.shape[0], 1), dtype=np.float64)
+            from_h = np.hstack([from_2d, ones])
+            transformed = (M_a @ from_h.T).T
+            applied_residuals[t] = float(np.sqrt(np.mean(np.linalg.norm(transformed - to_2d, axis=1) ** 2)))
+
+        # --- Step 6: Apply per-frame warp + edge pipeline ---
+        # Output tensors sized to T (the truncated min length) — not T_render — to avoid silent zero tail
+        warped_rgb = np.zeros((T, H, W, C), dtype=np.float32)
+        warped_mask_out = np.zeros((T, H, W), dtype=np.float32)
+
+        render_np = render_video.cpu().numpy()  # [T_render, H, W, C] in [0, 1]
+        mask_np = render_mask.cpu().numpy()     # [T_mask, H, W] in [0, 1]
+
+        erode_kernel = None
+        if edge_erode_px > 0:
+            ek = 2 * edge_erode_px + 1
+            erode_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ek, ek))
+
+        for t in range(T):
+            t_mask = min(t, T_mask - 1)
+            t_img = min(t, T_render - 1)
+            mask_t = mask_np[t_mask].astype(np.float32)
+            img_t = render_np[t_img].astype(np.float32)
+
+            # bypass_pass_through on failure frames: explicit copy of original render+mask, no warp
+            # (Identity warp would still resample with INTER_CUBIC and apply edge erode/feather, which
+            # is NOT a true pass-through; user expectation is "if alignment fails, give me the raw render".)
+            if fallback_mode == "bypass_pass_through" and failure_mask[t]:
+                warped_rgb[t] = img_t
+                warped_mask_out[t] = mask_t
+                continue
+
+            tx, ty, log_s, theta = params[t]
+            scale = float(np.exp(log_s))
+            cos_t = float(np.cos(theta)) * scale
+            sin_t = float(np.sin(theta)) * scale
+            M = np.array([
+                [cos_t, -sin_t, float(tx)],
+                [sin_t,  cos_t, float(ty)],
+            ], dtype=np.float32)
+
+            if erode_kernel is not None:
+                mask_t = cv2.erode(mask_t, erode_kernel)
+
+            # Premultiplied RGB warp prevents bg-color bleed at mask edges
+            premult = img_t * mask_t[..., None]
+            warped_premult = cv2.warpAffine(
+                premult, M, (W, H),
+                flags=cv2.INTER_CUBIC,
+                borderMode=cv2.BORDER_CONSTANT, borderValue=0.0
+            )
+            warped_alpha = cv2.warpAffine(
+                mask_t, M, (W, H),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT, borderValue=0.0
+            )
+
+            # Gaussian feather post-warp
+            if edge_feather_px > 0.0:
+                k = max(3, int(edge_feather_px * 2) | 1)  # odd kernel
+                warped_alpha = cv2.GaussianBlur(warped_alpha, (k, k), edge_feather_px)
+
+            # Unpremultiply to standard RGB+alpha for downstream consumers
+            alpha_safe = np.maximum(warped_alpha, 1e-6)
+            rgb_unpremult = warped_premult / alpha_safe[..., None]
+            # Zero-out RGB where alpha is essentially 0 (avoids garbage from divide)
+            zero_mask = warped_alpha[..., None] <= 1e-6
+            rgb_unpremult = np.where(zero_mask, 0.0, rgb_unpremult)
+
+            warped_rgb[t] = rgb_unpremult
+            warped_mask_out[t] = warped_alpha
+
+        # --- Step 7: Build alignment_info JSON for downstream nodes ---
+        # Report BOTH raw-fit residuals (pre-smoothing) and applied residuals (post-smoothing+fallback)
+        # so downstream tools / debug viewers can distinguish "fit failed" from "smoothing distorted".
+        applied_failure_mask = applied_residuals > rmse_threshold_px
+        info = {
+            "T": int(T),
+            "N_anchors": int(N),
+            "torso_diag_px": float(torso_diag),
+            "rmse_threshold_px": float(rmse_threshold_px),
+            "rmse_threshold_frac": float(rmse_threshold_frac),
+            "raw_failure_frame_indices": failure_mask.nonzero()[0].tolist(),
+            "raw_failure_count": failure_count,
+            "applied_failure_frame_indices": applied_failure_mask.nonzero()[0].tolist(),
+            "applied_failure_count": int(applied_failure_mask.sum()),
+            "fallback_mode_used": fallback_mode,
+            "smooth_window": int(eff_window) if eff_window is not None else None,
+            "smooth_polyorder": int(smooth_polyorder),
+            "edge_erode_px": int(edge_erode_px),
+            "edge_feather_px": float(edge_feather_px),
+            "params_layout": "[T, 4] = [tx, ty, log_scale, theta_unwrapped_radians]",
+            "residuals_note": "RMSE computed over ALL anchors (not just RANSAC inliers); strict gate.",
+            "per_frame_raw_residuals_px": (residuals.tolist() if verbose_debug else
+                                           "(set verbose_debug=True to include)"),
+            "per_frame_applied_residuals_px": (applied_residuals.tolist() if verbose_debug else
+                                               "(set verbose_debug=True to include)"),
+        }
+        info_str = json.dumps(info, indent=2)
+
+        warped_rgb_tensor = torch.from_numpy(warped_rgb).clamp(0.0, 1.0)
+        warped_mask_tensor = torch.from_numpy(warped_mask_out).clamp(0.0, 1.0)
+
+        if verbose_debug:
+            print(f"[NV_PreCompWarp] Done. warped_render={tuple(warped_rgb_tensor.shape)}, "
+                  f"warped_mask={tuple(warped_mask_tensor.shape)}")
+
+        return (warped_rgb_tensor, warped_mask_tensor, info_str)
+
+    # =========================================================================
+    # Helpers
+    # =========================================================================
+
+    @staticmethod
+    def _parse_trajectories(s: str) -> np.ndarray:
+        """Parse source_trajectories JSON. Accepts:
+        - Raw JSON array of shape [T, N, 2]
+        - Dict with {'data': [[[x,y], ...], ...], optional 'names': [...]}
+        Returns numpy [T, N, 2].
+        """
+        if not s.strip():
+            raise ValueError("[NV_PreCompWarp] source_trajectories is empty")
+        try:
+            obj = json.loads(s)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"[NV_PreCompWarp] source_trajectories not valid JSON: {e}")
+
+        if isinstance(obj, dict) and "data" in obj:
+            arr = np.asarray(obj["data"], dtype=np.float64)
+        else:
+            arr = np.asarray(obj, dtype=np.float64)
+
+        if arr.ndim != 3 or arr.shape[-1] != 2:
+            raise ValueError(
+                f"[NV_PreCompWarp] source_trajectories must have shape [T, N, 2], got {arr.shape}"
+            )
+        return arr
+
+    @staticmethod
+    def _parse_anchors_t0(s: str) -> np.ndarray:
+        """Parse render_anchors_t0 JSON. Accepts:
+        - Raw JSON array of shape [N, 2]
+        - NV_PointPicker format: list of {x, y, t} dicts (t ignored)
+        Returns numpy [N, 2].
+        """
+        if not s.strip():
+            raise ValueError("[NV_PreCompWarp] render_anchors_t0 is empty")
+        try:
+            obj = json.loads(s)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"[NV_PreCompWarp] render_anchors_t0 not valid JSON: {e}")
+
+        if isinstance(obj, list) and len(obj) > 0 and isinstance(obj[0], dict):
+            # NV_PointPicker format: [{"x":..., "y":..., "t":...}, ...]
+            try:
+                pts = [(float(p["x"]), float(p["y"])) for p in obj]
+            except (KeyError, TypeError) as e:
+                raise ValueError(
+                    f"[NV_PreCompWarp] render_anchors_t0 looks like NV_PointPicker JSON but a point "
+                    f"is missing 'x' or 'y' or has non-numeric values: {e}"
+                )
+            arr = np.asarray(pts, dtype=np.float64)
+        else:
+            arr = np.asarray(obj, dtype=np.float64)
+
+        if arr.ndim != 2 or arr.shape[-1] != 2:
+            raise ValueError(
+                f"[NV_PreCompWarp] render_anchors_t0 must have shape [N, 2], got {arr.shape}"
+            )
+        return arr
+
+    @staticmethod
+    def _check_geometry_ok(pts: np.ndarray, min_spread_frac: float = 0.02) -> bool:
+        """Sanity-check anchor geometry before fitting. Rejects:
+        - All points nearly collinear (rank-deficient → unstable similarity fit)
+        - All points within a tiny region (< min_spread_frac of pairwise diagonal)
+        Returns False if anchors are geometrically degenerate.
+        """
+        pts = np.asarray(pts, dtype=np.float64).reshape(-1, 2)
+        if pts.shape[0] < 2:
+            return False
+
+        # Spread test: max pairwise distance must be non-trivial
+        diffs = pts[:, None, :] - pts[None, :, :]
+        dists = np.linalg.norm(diffs, axis=-1)
+        spread = float(np.max(dists))
+        if spread < 1.0:  # all anchors within 1 pixel of each other
+            return False
+
+        # Collinearity test: SVD of centered points; if smallest singular value is tiny relative
+        # to the largest, the anchors lie on (or very near) a line.
+        centered = pts - pts.mean(axis=0, keepdims=True)
+        try:
+            _, sv, _ = np.linalg.svd(centered, full_matrices=False)
+        except np.linalg.LinAlgError:
+            return False
+        if sv.size < 2 or sv[0] < 1e-6:
+            return False
+        ratio = sv[1] / sv[0]
+        if ratio < 1e-3:  # near-collinear
+            return False
+        return True
+
+    @staticmethod
+    def _solve_similarity(from_pts: np.ndarray, to_pts: np.ndarray) -> Tuple[float, float, float, float, float, bool]:
+        """Solve 4-DOF similarity transform (Umeyama 1991) mapping from_pts -> to_pts.
+
+        Returns (tx, ty, log_s, theta_rad, rms_residual_px, ok).
+        ok=False if the fit failed (degenerate points, all collinear, off-frame outliers, etc.)
+        """
+        # Geometry sanity check before fitting (catches near-collinear / collapsed anchors that
+        # cv2.estimateAffinePartial2D may silently return a numerically-plausible-but-degenerate
+        # matrix for). Codex review flag #5.
+        if not NV_PreCompWarp._check_geometry_ok(from_pts) or not NV_PreCompWarp._check_geometry_ok(to_pts):
+            return 0.0, 0.0, 0.0, 0.0, np.inf, False
+
+        src = np.asarray(from_pts, dtype=np.float32).reshape(-1, 1, 2)
+        dst = np.asarray(to_pts, dtype=np.float32).reshape(-1, 1, 2)
+
+        M, inliers = cv2.estimateAffinePartial2D(
+            src, dst,
+            method=cv2.RANSAC,
+            ransacReprojThreshold=3.0,
+        )
+        if M is None:
+            return 0.0, 0.0, 0.0, 0.0, np.inf, False
+
+        # Decompose 2x3 similarity: M = [[s*cos, -s*sin, tx], [s*sin, s*cos, ty]]
+        a, b = float(M[0, 0]), float(M[0, 1])
+        tx, ty = float(M[0, 2]), float(M[1, 2])
+        scale = float(np.sqrt(a * a + b * b))
+        if scale < 1e-6:
+            return 0.0, 0.0, 0.0, 0.0, np.inf, False
+        theta = float(np.arctan2(M[1, 0], M[0, 0]))
+        log_s = float(np.log(scale))
+
+        # Compute residual: apply M to from_pts and compare to to_pts.
+        # Note: residual is computed over ALL anchors (not just RANSAC inliers) — this is a strict gate.
+        # Frames where one anchor is grossly mistracked will be flagged for fallback even if 4/5 inliers fit well.
+        from_2d = np.asarray(from_pts, dtype=np.float64).reshape(-1, 2)
+        to_2d = np.asarray(to_pts, dtype=np.float64).reshape(-1, 2)
+        ones = np.ones((from_2d.shape[0], 1), dtype=np.float64)
+        from_h = np.hstack([from_2d, ones])
+        transformed = (M.astype(np.float64) @ from_h.T).T  # [N, 2]
+        per_pt_err = np.linalg.norm(transformed - to_2d, axis=1)
+        rms = float(np.sqrt(np.mean(per_pt_err ** 2)))
+
+        return tx, ty, log_s, theta, rms, True
+
+    @staticmethod
+    def _compute_torso_diag(pts: np.ndarray) -> float:
+        """Compute torso scale via max pairwise distance among anchors. More stable than bbox-diagonal
+        when anchor distribution is non-rectangular (e.g., 6 torso joints)."""
+        pts = np.asarray(pts, dtype=np.float64)
+        if pts.shape[0] < 2:
+            return 1.0
+        diffs = pts[:, None, :] - pts[None, :, :]
+        dists = np.linalg.norm(diffs, axis=-1)
+        return float(np.max(dists))
+
+    @staticmethod
+    def _safe_savgol_window(requested: int, T: int, polyorder: int) -> Optional[int]:
+        """Return the largest valid odd window <= min(requested, T) that satisfies the polynomial
+        order constraint, or None if smoothing is infeasible for this sequence.
+
+        savgol requires: window > polyorder, window <= sequence length, and window odd.
+        """
+        if T < polyorder + 2:
+            return None
+        win = min(int(requested), T)
+        if win % 2 == 0:
+            win -= 1
+        if win < polyorder + 2:
+            return None
+        return win
+
+
+NODE_CLASS_MAPPINGS = {
+    "NV_PreCompWarp": NV_PreCompWarp,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "NV_PreCompWarp": "NV PreComp Warp",
+}

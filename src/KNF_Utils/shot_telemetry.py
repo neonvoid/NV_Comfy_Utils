@@ -34,7 +34,6 @@ from .shot_jsonl_writer import (
 )
 from .shot_runtime import get_runtime_snapshot
 from .shot_telemetry_types import (
-    DISQUALIFYING_ARTIFACT_TAGS,
     RUBRIC_VERSION,
     SCHEMA_VERSION,
 )
@@ -149,9 +148,23 @@ class NV_ShotMeasure:
 # NV_ShotRecord — sink, writes one .jsonl record per render
 # ---------------------------------------------------------------------------
 class NV_ShotRecord:
-    """End-of-workflow drain. Bundles params + fingerprint + metrics + verdict
-    + runtime (timing/memory) into one structured record and appends one line
-    to agent_log_inbox/{MACHINE_ID}.jsonl.
+    """End-of-workflow drain. Bundles params + fingerprint + metrics + runtime
+    into one structured record and appends one line to
+    agent_log_inbox/{MACHINE_ID}.jsonl.
+
+    VERDICT FIELDS ARE WRITTEN AS NULL placeholders. The operator fills them
+    in by editing the .jsonl AFTER viewing the render output. The widgets-at-
+    queue-time pattern was abandoned because it asks the operator to rate a
+    render they haven't seen yet — that data is noise, not signal.
+
+    Each record's `verdict` block is shaped:
+        "verdict": {
+            "overall":  null,   // set to 1-5 after viewing
+            "identity": null,
+            "temporal": null,
+            "artifacts": [],    // controlled-vocab veto tags (see DISQUALIFYING_ARTIFACT_TAGS)
+            "notes":    ""
+        }
 
     Trigger from SaveVideo to guarantee post-render execution.
     """
@@ -171,22 +184,10 @@ class NV_ShotRecord:
                     "default": "node_notes/agent_log_inbox/{MACHINE_ID}.jsonl",
                     "tooltip": "Path to .jsonl inbox. {MACHINE_ID} is auto-substituted from hostname (or NV_MACHINE_ID env var)."
                 }),
-                "verdict_overall": ("INT", {
-                    "default": 0, "min": 0, "max": 5, "step": 1,
-                    "tooltip": "Overall quality 1-5 per locked rubric. 0 = not yet rated (record kept, marked unrated)."
-                }),
-                "verdict_identity": ("INT", {
-                    "default": 0, "min": 0, "max": 5, "step": 1,
-                    "tooltip": "Identity preservation 1-5. 0 = not rated."
-                }),
-                "verdict_temporal": ("INT", {
-                    "default": 0, "min": 0, "max": 5, "step": 1,
-                    "tooltip": "Temporal stability 1-5. 0 = not rated."
-                }),
             },
             "optional": {
                 "metrics": ("SHOT_METRICS", {
-                    "tooltip": "From NV_ShotMeasure. Optional — record can persist params+verdict without metrics."
+                    "tooltip": "From NV_ShotMeasure. Optional — record can persist params without metrics."
                 }),
                 "manifest_in": ("RENDER_MANIFEST", {
                     "tooltip": "From NV_RenderManifest or upstream node. Param state of the render."
@@ -197,20 +198,9 @@ class NV_ShotRecord:
                 "mask_config": ("MASK_PROCESSING_CONFIG", {
                     "tooltip": "Optional fallback if no manifest_in — extracts mask processing params."
                 }),
-                "disqualifying_artifacts": ("STRING", {
-                    "default": "", "multiline": True,
-                    "tooltip": (
-                        "Comma- or newline-separated tags from controlled vocab. Any non-empty tag = "
-                        "binary VETO for the agent. Vocab: " + ", ".join(DISQUALIFYING_ARTIFACT_TAGS)
-                    ),
-                }),
                 "render_status": (["completed", "failed", "oom", "aborted"], {
                     "default": "completed",
                     "tooltip": "Outcome status. 'failed' / 'oom' records still useful — they teach safe bounds."
-                }),
-                "notes": ("STRING", {
-                    "default": "", "multiline": True,
-                    "tooltip": "Free-form session notes. Will be summarized into agent context, not parsed structurally."
                 }),
             },
         }
@@ -222,38 +212,13 @@ class NV_ShotRecord:
     OUTPUT_NODE = True
     DESCRIPTION = (
         "Writes one structured record per render to agent_log_inbox/{MACHINE_ID}.jsonl. "
-        "Append-only, atomic, lock-protected. Feeds NV_AgentParamPlanner."
+        "Append-only, atomic, lock-protected. Verdict fields are null placeholders — "
+        "fill them in by editing the .jsonl after viewing the render. Feeds NV_AgentParamPlanner."
     )
 
-    @staticmethod
-    def _parse_artifact_tags(raw):
-        """Parse + validate artifact tags against the controlled vocabulary.
-
-        Returns dict with `valid` (recognized tags, agent reads these as vetoes)
-        and `unknown` (operator typos / future tags — kept separate so the
-        agent can spot schema drift instead of treating typos as valid vetoes).
-        """
-        if not raw or not raw.strip():
-            return {"valid": [], "unknown": []}
-        valid, unknown = [], []
-        seen = set()
-        for line in raw.replace(",", "\n").split("\n"):
-            t = line.strip().lower()
-            if not t or t in seen:
-                continue
-            seen.add(t)
-            if t == "none":
-                continue  # explicit "none" sentinel = empty list
-            if t in DISQUALIFYING_ARTIFACT_TAGS:
-                valid.append(t)
-            else:
-                unknown.append(t)
-        return {"valid": valid, "unknown": unknown}
-
     def record(self, trigger, shot_id, inbox_dir,
-               verdict_overall, verdict_identity, verdict_temporal,
                metrics=None, manifest_in=None, stitcher=None, mask_config=None,
-               disqualifying_artifacts="", render_status="completed", notes=""):
+               render_status="completed"):
 
         # Build params dict — prefer manifest_in (richer), fall back to direct stitcher/mask_config.
         # Sanitize through _to_json_safe: manifests can carry tensors/numpy/paths
@@ -273,7 +238,6 @@ class NV_ShotRecord:
 
         # Runtime snapshot — non-destructive, returns None for unavailable fields
         runtime = get_runtime_snapshot()
-        artifact_tags = self._parse_artifact_tags(disqualifying_artifacts)
 
         record = {
             "schema_version": SCHEMA_VERSION,
@@ -302,13 +266,21 @@ class NV_ShotRecord:
                 "vram_error": runtime.get("vram_error"),
                 "ram_error": runtime.get("ram_error"),
             },
+            # Verdict block — null placeholders. Operator fills these in by
+            # editing the .jsonl directly AFTER viewing the render output.
+            # Schema is fixed so the agent's parser can rely on shape; values
+            # are null/empty until human judgment is recorded.
+            #   - overall/identity/temporal: integer 1-5 per the locked rubric
+            #     (see VERDICT_RUBRIC in shot_telemetry_types.py)
+            #   - artifacts: array of strings from DISQUALIFYING_ARTIFACT_TAGS
+            #     (any non-empty entry is a binary VETO for the agent)
+            #   - notes: free-form
             "verdict": {
-                "overall": verdict_overall if verdict_overall > 0 else None,
-                "identity": verdict_identity if verdict_identity > 0 else None,
-                "temporal": verdict_temporal if verdict_temporal > 0 else None,
-                "artifacts": artifact_tags["valid"],
-                "artifacts_unknown": artifact_tags["unknown"],
-                "notes": notes.strip(),
+                "overall": None,
+                "identity": None,
+                "temporal": None,
+                "artifacts": [],
+                "notes": "",
             },
         }
 
