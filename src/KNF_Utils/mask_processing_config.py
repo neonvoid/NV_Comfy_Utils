@@ -219,9 +219,10 @@ def normalize_mask_config(persisted_config, *, report_lines=None):
       - Deepcopies input (defensive — ComfyUI passes dicts by reference).
       - Fills missing keys with current schema defaults.
       - Produces canonical key order (schema iteration order).
-      - Warns on unknown keys via report_lines (does NOT drop them — preserves
-        forward-compatibility evidence; downstream consumer just won't see them
-        because the canonical dict only contains schema keys).
+      - Unknown keys: EXCLUDED from the canonical output dict (downstream
+        consumers see only schema keys), but PRESERVED via the second tuple
+        return value AND a warning in report_lines. This keeps consumers
+        simple while retaining diagnostic evidence of forward-compat drift.
 
     Args:
         persisted_config: The mask_config dict from metadata.json (or None).
@@ -436,6 +437,23 @@ class NV_MaskConfigPatch:
                 continue
             value = kwargs[key]
             if value != spec["sentinel"]:
+                # Bounds check: the widget min was extended down to the sentinel
+                # so 'use base' was a selectable default, but values strictly
+                # between sentinel+1 and the natural min are NOT valid override
+                # values — they only exist because the widget min was lowered.
+                # Without this check, dragging the slider into the gap would
+                # silently pass an out-of-bounds value to consumers.
+                # (Gemini impl-review 2026-05-01, "Sentinel Gap" critical bug.)
+                if not (spec["min"] <= value <= spec["max"]):
+                    raise ValueError(
+                        f"[NV_MaskConfigPatch] override for {key!r} = {value} is out of "
+                        f"bounds [{spec['min']}, {spec['max']}]. The widget min was "
+                        f"extended to the sentinel ({spec['sentinel']}) so 'use base' "
+                        f"is selectable as the default, but values between sentinel+1 "
+                        f"and the natural min are not valid overrides. Set the widget "
+                        f"back to {spec['sentinel']} (use base) or to a value within the "
+                        f"natural range [{spec['min']}, {spec['max']}]."
+                    )
                 old = result.get(key, "<absent>")
                 result[key] = value
                 applied.append(f"{key}: {old} -> {value}")

@@ -23,6 +23,7 @@ spec.loader.exec_module(mod)
 
 MASK_CONFIG_SCHEMA = mod.MASK_CONFIG_SCHEMA
 normalize_mask_config = mod.normalize_mask_config
+NV_MaskConfigPatch = mod.NV_MaskConfigPatch
 
 
 # Frozen snapshot as of 2026-04-30. Append new keys at the END only — never
@@ -187,6 +188,67 @@ def test_normalize_deepcopies_input():
 
 
 run_test("normalize_deepcopies_input", test_normalize_deepcopies_input)
+
+
+# === Patch node bounds check (Gemini impl-review 2026-05-01) ===
+
+def test_patch_rejects_out_of_bounds_override():
+    """Sentinel-gap drag (e.g., -50 on a 0-128 widget) must raise ValueError, not pass through."""
+    # Build a minimal valid base config
+    base = {key: spec["default"] for key, spec in MASK_CONFIG_SCHEMA.items()}
+    patch_node = NV_MaskConfigPatch()
+
+    # cleanup_fill_holes has natural range 0-128, sentinel -999. -50 is in the gap.
+    kwargs = {key: spec["sentinel"] for key, spec in MASK_CONFIG_SCHEMA.items()}
+    kwargs["cleanup_fill_holes"] = -50  # sentinel-gap drag
+
+    raised = False
+    try:
+        patch_node.patch(base, **kwargs)
+    except ValueError as e:
+        raised = True
+        msg = str(e)
+        if "out of bounds" not in msg or "cleanup_fill_holes" not in msg:
+            raise AssertionError(
+                f"ValueError raised but message lacks expected content: {msg!r}"
+            )
+    if not raised:
+        raise AssertionError(
+            "Patch node accepted out-of-bounds value (-50 on cleanup_fill_holes 0-128) "
+            "without raising. Sentinel-gap UX bug not fixed."
+        )
+
+
+run_test("patch_rejects_out_of_bounds_override", test_patch_rejects_out_of_bounds_override)
+
+
+def test_patch_accepts_valid_override():
+    """Valid value within natural range still works (sanity check the bounds check didn't over-fire)."""
+    base = {key: spec["default"] for key, spec in MASK_CONFIG_SCHEMA.items()}
+    patch_node = NV_MaskConfigPatch()
+    kwargs = {key: spec["sentinel"] for key, spec in MASK_CONFIG_SCHEMA.items()}
+    kwargs["vace_halo_px"] = 24  # legit value within 0-48
+    (result,) = patch_node.patch(base, **kwargs)
+    assert result["vace_halo_px"] == 24, f"expected 24, got {result['vace_halo_px']}"
+
+
+run_test("patch_accepts_valid_override", test_patch_accepts_valid_override)
+
+
+def test_patch_sentinel_passes_through_unchanged():
+    """All-sentinel kwargs must pass the base config through with no overrides applied."""
+    base = {key: spec["default"] for key, spec in MASK_CONFIG_SCHEMA.items()}
+    base["cleanup_fill_holes"] = 7  # sanity: distinct from default to confirm passthrough
+    patch_node = NV_MaskConfigPatch()
+    kwargs = {key: spec["sentinel"] for key, spec in MASK_CONFIG_SCHEMA.items()}
+    (result,) = patch_node.patch(base, **kwargs)
+    assert result["cleanup_fill_holes"] == 7, "passthrough did not preserve base value"
+    # And confirm deepcopy: mutating result must not touch base
+    result["cleanup_fill_holes"] = 999
+    assert base["cleanup_fill_holes"] == 7, "patch did not deepcopy — base mutated"
+
+
+run_test("patch_sentinel_passes_through_unchanged", test_patch_sentinel_passes_through_unchanged)
 
 
 # === Summary ===

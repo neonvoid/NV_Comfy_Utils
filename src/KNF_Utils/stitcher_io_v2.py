@@ -749,14 +749,27 @@ class NV_LoadStitcher_V2:
         )
 
         # Step 2: choose effective config. Override (when wired) replaces saved.
-        # Deepcopy override defensively — ComfyUI dicts pass by reference (Q5 verdict).
+        # We normalize the override against the current schema TOO — defends
+        # against an old upstream config emitted before a schema append: that
+        # would otherwise flow through here verbatim and arrive at consumers
+        # missing the new key, who'd silently fall back to their widget defaults.
+        # normalize_mask_config() also deepcopies internally, so this satisfies
+        # the Q5 deepcopy verdict in one step.
+        # (Codex impl-review 2026-05-01, override-not-normalized gap.)
         if mask_config_override is not None:
             if not isinstance(mask_config_override, dict):
                 raise TypeError(
                     f"[NV_LoadStitcher_V2] mask_config_override must be a dict "
                     f"(MASK_PROCESSING_CONFIG), got {type(mask_config_override).__name__}"
                 )
-            mask_config = copy.deepcopy(mask_config_override)
+            override_report_lines = []
+            mask_config, _override_unknown = normalize_mask_config(
+                mask_config_override, report_lines=override_report_lines
+            )
+            if override_report_lines:
+                # Tag normalize messages so they don't conflate with saved-config diagnostics
+                for line in override_report_lines:
+                    report_lines.append(line.replace("normalize_mask_config:", "normalize_mask_config (override):"))
             if saved_mask_config is not None:
                 report_lines.append(
                     f"mask_config_override wired — REPLACING saved config "
