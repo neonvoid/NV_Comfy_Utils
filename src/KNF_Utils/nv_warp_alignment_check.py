@@ -214,9 +214,23 @@ class NV_WarpAlignmentCheck:
 
     @classmethod
     def _ssim_batched(cls, a, b, win=11, sigma=1.5):
-        """Gaussian-windowed reflect-padded SSIM on [B, H, W] luminance tensors. Returns [B, H, W] map."""
+        """Gaussian-windowed reflect-padded SSIM on [B, H, W] luminance tensors. Returns [B, H, W] map.
+
+        Adaptively shrinks the window for tiny images: F.pad reflect-mode requires the
+        image dimension to be larger than the pad size, so on H or W ≤ 5 the default
+        win=11 (pad=5) would crash. Shrinks win to fit and falls back to win=3 minimum.
+        """
         device = a.device
         dtype = a.dtype
+        # Adaptive window size for small images
+        H, W = a.shape[-2:]
+        max_win = min(H, W)
+        if max_win < win:
+            # Largest odd window that fits, minimum 3
+            win = max(3, max_win if max_win % 2 == 1 else max_win - 1)
+            if win < 3:
+                # Image is 1x1 or 2x2 — return all-ones map (degenerate; SSIM not meaningful)
+                return torch.ones((a.shape[0], H, W), device=device, dtype=dtype)
         kernel = cls._gaussian_kernel_2d(win, sigma, device, dtype)
         a4 = a.unsqueeze(1)  # [B, 1, H, W]
         b4 = b.unsqueeze(1)
@@ -256,7 +270,12 @@ class NV_WarpAlignmentCheck:
 
     @staticmethod
     def _phase_correlate_hann(a_np, b_np):
-        """cv2.phaseCorrelate with Hann window. Both [H, W] float32."""
+        """cv2.phaseCorrelate with Hann window. Both [H, W] float32.
+
+        Returns (dx, dy, status):
+          status="valid" — successful estimate
+          status="failed" — cv2 raised; estimate is NaN (caller should distinguish from "disabled")
+        """
         h, w = a_np.shape
         try:
             hann = cv2.createHanningWindow((w, h), cv2.CV_32F)
@@ -265,9 +284,11 @@ class NV_WarpAlignmentCheck:
                 b_np.astype(np.float32),
                 window=hann,
             )
-            return float(dx), float(dy)
+            return float(dx), float(dy), "valid"
+        except cv2.error:
+            return float("nan"), float("nan"), "failed"
         except Exception:
-            return float("nan"), float("nan")
+            return float("nan"), float("nan"), "failed"
 
     @staticmethod
     def _percentile(arr, p):
@@ -389,6 +410,10 @@ class NV_WarpAlignmentCheck:
         # ---- phase correlation (per-frame, CPU-bound, but with Hann window + masked bbox) ----
         phase_dx = [None] * B
         phase_dy = [None] * B
+        # Track per-frame phase status to distinguish "intentionally disabled" from
+        # "tried but failed" / "input too small" — the gate auto-passes only on disabled,
+        # not on failure (which would be a silent gate-bypass bug).
+        phase_status = ["disabled"] * B
         if compute_phase_correlation:
             # Move luminance batches to CPU once. Faster than per-frame transfers.
             lum_o_cpu = lum_o.detach().cpu().numpy()
@@ -409,22 +434,23 @@ class NV_WarpAlignmentCheck:
                         active_in_bbox = int(m_i[y0:y1, x0:x1].sum())
                         if (ch >= _PHASE_MIN_BBOX_DIM and cw >= _PHASE_MIN_BBOX_DIM
                                 and active_in_bbox >= _PHASE_MIN_ACTIVE_PX):
-                            # Pass raw crop to phaseCorrelate. Multiplying by a hard binary
-                            # mask creates a razor-sharp edge the FFT latches onto, biasing
-                            # dx/dy toward (0, 0). The Hann window applied inside
-                            # _phase_correlate_hann smoothly fades the borders without that
-                            # artifact.
                             crop_o = a_np[y0:y1, x0:x1]
                             crop_w = b_np[y0:y1, x0:x1]
-                            dx, dy = self._phase_correlate_hann(crop_o, crop_w)
+                            dx, dy, status = self._phase_correlate_hann(crop_o, crop_w)
+                            phase_status[i] = status
                             phase_dx[i] = None if np.isnan(dx) else round(dx, 3)
                             phase_dy[i] = None if np.isnan(dy) else round(dy, 3)
                             continue
+                        else:
+                            phase_status[i] = "unavailable_small_bbox"
                 # Fallback: full-frame phase correlation (still Hann-windowed).
                 if a_np.shape[0] >= _PHASE_MIN_BBOX_DIM and a_np.shape[1] >= _PHASE_MIN_BBOX_DIM:
-                    dx, dy = self._phase_correlate_hann(a_np, b_np)
+                    dx, dy, status = self._phase_correlate_hann(a_np, b_np)
+                    phase_status[i] = status
                     phase_dx[i] = None if np.isnan(dx) else round(dx, 3)
                     phase_dy[i] = None if np.isnan(dy) else round(dy, 3)
+                else:
+                    phase_status[i] = "unavailable_small_image"
 
         # ---- assemble per-frame entries ----
         per_frame = []
@@ -466,10 +492,20 @@ class NV_WarpAlignmentCheck:
             fallback_warning = None
 
         # ---- is_aligned BOOLEAN (the gatekeeper output) + gate_eval explainability ----
-        is_aligned, gate_eval = self._compute_is_aligned(agg, face_swap_mode)
+        # Phase-correlation status: distinguishes "user disabled it" (auto-pass) from
+        # "user enabled it but it failed / inputs too small" (fail closed — don't silently
+        # bypass the gate when a real failure happened).
+        if not compute_phase_correlation:
+            phase_state = "disabled"
+        elif "phase_offset_magnitude_px" in agg and agg["phase_offset_magnitude_px"]["valid_frames"] > 0:
+            phase_state = "valid"
+        else:
+            phase_state = "failed"  # user wanted phase corr, but no valid samples produced
+        is_aligned, gate_eval = self._compute_is_aligned(agg, face_swap_mode, phase_state)
 
         # ---- viz ----
-        viz = self._build_viz(original_rgb, warped_rgb, viz_mode, viz_strength, tint_color, checkerboard_tile_px)
+        viz = self._build_viz(original_rgb, warped_rgb, viz_mode, viz_strength, tint_color,
+                              checkerboard_tile_px, edge_iou_threshold)
 
         # ---- format outputs ----
         # Thresholds the gate actually used (mode-dependent).
@@ -607,23 +643,20 @@ class NV_WarpAlignmentCheck:
     # ===================================================================
 
     @staticmethod
-    def _compute_is_aligned(agg, face_swap_mode):
+    def _compute_is_aligned(agg, face_swap_mode, phase_state="valid"):
         """Gate on alignment-truth metrics. Returns (is_aligned: bool, gate_eval: dict).
 
-        gate_eval is a per-gate explainability block with structure:
-            {gate_name: {"value": float|None, "threshold": float, "passed": bool, "present": bool}, ...}
-        Distinguishes "metric missing" (present=False) from "metric measured but failed"
-        (present=True, passed=False) so users can debug why is_aligned tripped.
+        phase_state: "disabled" (user opted out — auto-pass phase gate),
+                     "valid" (metric present and trusted),
+                     "failed" (user requested phase corr but cv2 failed / inputs too small —
+                               FAIL CLOSED to avoid silently bypassing the gate).
 
-        face_swap_mode=False (strict, same-content re-warp):
-            PSNR p50 >= 27 AND SSIM mean >= 0.85 AND edge_IoU mean >= 0.40 AND phase_offset p90 <= 2.
-
-        face_swap_mode=True (default — face/body swap with different actor):
-            edge_IoU mean >= 0.20 AND phase_offset p90 <= 5.0.
-            PSNR/SSIM are NOT gated — different people produce inherently low pixel similarity
-            regardless of how good the warp is. Only geometric alignment is gated.
+        gate_eval includes per-gate value/threshold/passed/present. The mode field
+        identifies face_swap vs strict; phase_state field surfaces the failure-vs-disabled
+        distinction so users can debug why is_aligned tripped.
         """
-        gate_eval = {"mode": "face_swap" if face_swap_mode else "strict"}
+        gate_eval = {"mode": "face_swap" if face_swap_mode else "strict",
+                     "phase_state": phase_state}
 
         def _gate(metric_key, value_path, threshold, comparator):
             present = metric_key in agg and agg[metric_key].get(value_path) is not None
@@ -631,27 +664,33 @@ class NV_WarpAlignmentCheck:
             passed = comparator(value, threshold) if present else False
             return {"value": value, "threshold": float(threshold), "passed": bool(passed), "present": bool(present)}
 
+        def _phase_gate(threshold, le_cmp):
+            """Resolve the phase gate based on phase_state."""
+            if phase_state == "disabled":
+                # User opted out — soft-pass.
+                return {"value": None, "threshold": threshold, "passed": True, "present": False,
+                        "status": "disabled"}
+            if phase_state == "failed":
+                # User requested phase corr but no valid samples — FAIL CLOSED.
+                return {"value": None, "threshold": threshold, "passed": False, "present": False,
+                        "status": "failed"}
+            # phase_state == "valid"
+            g = _gate("phase_offset_magnitude_px", "p90", threshold, le_cmp)
+            g["status"] = "valid"
+            return g
+
         ge = lambda a, b: a >= b
         le = lambda a, b: a <= b
 
         if face_swap_mode:
             gate_eval["edge_iou_mean"] = _gate("edge_iou", "mean", _THRESH_EDGE_IOU_FACE_SWAP, ge)
-            # Phase gate is optional — soft-pass if metric absent (e.g., compute_phase_correlation=False).
-            if "phase_offset_magnitude_px" in agg:
-                gate_eval["phase_offset_p90"] = _gate("phase_offset_magnitude_px", "p90", _THRESH_PHASE_P90_FACE_SWAP, le)
-            else:
-                gate_eval["phase_offset_p90"] = {"value": None, "threshold": _THRESH_PHASE_P90_FACE_SWAP,
-                                                  "passed": True, "present": False}
+            gate_eval["phase_offset_p90"] = _phase_gate(_THRESH_PHASE_P90_FACE_SWAP, le)
             is_aligned = gate_eval["edge_iou_mean"]["passed"] and gate_eval["phase_offset_p90"]["passed"]
         else:
             gate_eval["psnr_p50"] = _gate("psnr_db", "p50", _THRESH_PSNR_MEDIAN, ge)
             gate_eval["ssim_mean"] = _gate("ssim", "mean", _THRESH_SSIM_MEAN, ge)
             gate_eval["edge_iou_mean"] = _gate("edge_iou", "mean", _THRESH_EDGE_IOU, ge)
-            if "phase_offset_magnitude_px" in agg:
-                gate_eval["phase_offset_p90"] = _gate("phase_offset_magnitude_px", "p90", _THRESH_PHASE_P90, le)
-            else:
-                gate_eval["phase_offset_p90"] = {"value": None, "threshold": _THRESH_PHASE_P90,
-                                                  "passed": True, "present": False}
+            gate_eval["phase_offset_p90"] = _phase_gate(_THRESH_PHASE_P90, le)
             is_aligned = (gate_eval["psnr_p50"]["passed"] and gate_eval["ssim_mean"]["passed"]
                           and gate_eval["edge_iou_mean"]["passed"] and gate_eval["phase_offset_p90"]["passed"])
 
@@ -662,7 +701,7 @@ class NV_WarpAlignmentCheck:
     # Visualization builders
     # ===================================================================
 
-    def _build_viz(self, original, warped, mode, strength, tint, checker_tile):
+    def _build_viz(self, original, warped, mode, strength, tint, checker_tile, edge_thresh):
         if mode == "anaglyph":
             return self._viz_anaglyph(original, warped)
         if mode == "translucent":
@@ -672,7 +711,7 @@ class NV_WarpAlignmentCheck:
         if mode == "checkerboard":
             return self._viz_checkerboard(original, warped, checker_tile)
         if mode == "edge_overlay":
-            return self._viz_edge_overlay(original, warped, strength, tint)
+            return self._viz_edge_overlay(original, warped, strength, tint, edge_thresh)
         raise ValueError(f"[NV_WarpAlignmentCheck] unknown viz_mode: {mode!r}")
 
     def _viz_anaglyph(self, orig, warped):
@@ -695,7 +734,9 @@ class NV_WarpAlignmentCheck:
     def _viz_difference(self, orig, warped, gain):
         diff_lum = (orig - warped).abs().mean(dim=-1, keepdim=True)
         amplified = (diff_lum * float(gain)).clamp(0, 1)
-        return amplified.expand(-1, -1, -1, 3)
+        # `.contiguous()` materializes the 3-channel tensor — `.expand()` returns a
+        # zero-stride view that breaks downstream `.numpy()` and some C-bridges.
+        return amplified.expand(-1, -1, -1, 3).contiguous()
 
     def _viz_checkerboard(self, orig, warped, tile):
         B, H, W, _ = orig.shape
@@ -705,8 +746,11 @@ class NV_WarpAlignmentCheck:
         cb = ((ys + xs) % 2 == 0).float().unsqueeze(0).unsqueeze(-1)  # [1, H, W, 1]
         return (orig * cb + warped * (1.0 - cb)).clamp(0, 1)
 
-    def _viz_edge_overlay(self, orig, warped, alpha, tint_name):
+    def _viz_edge_overlay(self, orig, warped, alpha, tint_name, edge_thresh):
         # GPU Sobel + threshold instead of cv2.Canny — fully batched, no CPU transfer.
+        # Uses the SAME edge_thresh as the metric so the overlay shows exactly the pixels
+        # the IoU computation counted as edges. (Previously hardcoded to 0.20, which
+        # diverged from the user-tunable metric threshold.)
         tint = torch.tensor(_TINT_COLORS[tint_name], device=orig.device, dtype=orig.dtype)
         a = max(0.0, min(1.0, float(alpha)))
         lum_w = self._luminance_batched(warped)
@@ -714,8 +758,7 @@ class NV_WarpAlignmentCheck:
         # Per-frame normalization so the overlay reads on both flat and contrasty footage.
         max_per_frame = edges.view(edges.shape[0], -1).max(dim=1).values.clamp(min=1e-5).view(-1, 1, 1)
         edges_norm = (edges / max_per_frame).clamp(0, 1)
-        # Threshold to binarize, then soft-falloff for cleaner viz.
-        e = (edges_norm > 0.20).float().unsqueeze(-1)  # [B, H, W, 1]
+        e = (edges_norm > float(edge_thresh)).float().unsqueeze(-1)  # [B, H, W, 1]
         tint_full = tint.view(1, 1, 1, 3)
         return (orig * (1.0 - e * a) + tint_full * (e * a)).clamp(0, 1)
 
@@ -762,10 +805,14 @@ class NV_WarpAlignmentCheck:
         # Per-gate explainability — surfaces exactly which gate(s) tripped.
         gate_lines = []
         for gate_name, gate_data in gate_eval.items():
-            if gate_name in ("mode", "overall"):
+            # Skip metadata fields (these are strings/bools, not gate dicts).
+            if gate_name in ("mode", "overall", "phase_state"):
                 continue
             if not gate_data.get("present", False):
-                gate_lines.append(f"   {gate_name:<16s} {'(metric not computed)':<30s} {'soft-pass' if gate_data['passed'] else 'FAIL':<10s}")
+                # Distinguish disabled (auto-pass) vs failed (fail closed) for phase gates.
+                status_label = gate_data.get("status", "n/a")
+                pass_label = "soft-pass" if gate_data["passed"] else "FAIL"
+                gate_lines.append(f"   {gate_name:<16s} {('(metric ' + status_label + ')'):<30s} {pass_label:<10s}")
             else:
                 v = gate_data["value"]
                 t = gate_data["threshold"]
@@ -815,12 +862,22 @@ class NV_WarpAlignmentCheck:
                 lines.append(f"  {'  dy (signed)':<14s} mean={d['mean']:>+8.3f} min={d['min']:>+8.3f} max={d['max']:>+8.3f}  (px)")
 
         lines.append("")
-        lines.append(" Reading guide (recalibrated for low-denoise face/body swap pipeline):")
-        lines.append(f"   PSNR median > {_THRESH_PSNR_MEDIAN} dB     = visually aligned (PSNR is sensitive to appearance, not just geometry)")
-        lines.append(f"   SSIM mean > {_THRESH_SSIM_MEAN}         = structurally aligned")
-        lines.append(f"   edge_IoU mean > {_THRESH_EDGE_IOU}      = boundaries line up (adaptive threshold={edge_thresh})")
-        lines.append(f"   |phase_offset| p90 < {_THRESH_PHASE_P90} px = no systematic translation drift across the clip")
-        lines.append(f"   |phase_offset| > 2 px on a frame  = check anchor placement at worst_frame")
+        # Mode-aware reading guide: shows the thresholds that ACTUALLY gated the verdict
+        # for the active mode, so users don't get strict-mode "Expected > 0.40" lines while
+        # face_swap_mode used 0.20.
+        if face_swap_mode:
+            lines.append(" Reading guide (face_swap_mode — geometry-only gating):")
+            lines.append(f"   edge_IoU mean ≥ {_THRESH_EDGE_IOU_FACE_SWAP}      = subject geometry overlaps (adaptive Sobel threshold={edge_thresh})")
+            lines.append(f"   |phase_offset| p90 ≤ {_THRESH_PHASE_P90_FACE_SWAP} px = no systematic translation drift")
+            lines.append("   PSNR/SSIM are reported but NOT gated — different actors produce inherently low pixel similarity.")
+            lines.append(f"   Strict-mode floor (informational): PSNR > {_THRESH_PSNR_MEDIAN} dB, SSIM > {_THRESH_SSIM_MEAN} would also pass for same-actor re-warps.")
+        else:
+            lines.append(" Reading guide (strict mode — same-content re-warp validation):")
+            lines.append(f"   PSNR median > {_THRESH_PSNR_MEDIAN} dB     = visually aligned (sensitive to appearance, not just geometry)")
+            lines.append(f"   SSIM mean > {_THRESH_SSIM_MEAN}         = structurally aligned")
+            lines.append(f"   edge_IoU mean > {_THRESH_EDGE_IOU}      = boundaries line up (adaptive Sobel threshold={edge_thresh})")
+            lines.append(f"   |phase_offset| p90 < {_THRESH_PHASE_P90} px = no systematic translation drift")
+        lines.append("   |phase_offset| > 2 px on a frame  = check anchor placement at worst_frame")
         if fallback_count:
             lines.append(f"   {fallback_count} frame(s) used fallback_full_frame — your mask may be too tight on those frames.")
         lines.append(bar)

@@ -109,15 +109,46 @@ subtracting 0.5, so fill=0.5 → centered=0.0 → both inactive and reactive get
 (true neutral). The original #999999 (0.6) produces a slight brightness bias.
 """
 
+import cv2
+import numpy as np
 import torch
-# numpy + scipy.distance_transform_edt removed 2026-05-01: were only used by
-# compute_inscribed_radius() which fed the retired auto-mode erosion/feather logic.
 
 from .mask_ops import mask_erode_dilate, mask_blur, mask_fill_holes, mask_remove_noise, mask_smooth
 from .bbox_ops import (
     extract_bboxes, build_bbox_masks,
     gaussian_smooth_1d, median_filter_1d,
 )
+
+
+def compute_inscribed_radius(mask):
+    """Per-frame inscribed-circle radius via Euclidean distance transform.
+
+    For each frame, returns the largest distance any mask pixel has from a non-mask
+    pixel — i.e., the radius of the largest disk that fits entirely inside the mask.
+    Used by `vace_mask_prep.py` to cap auto-mode erosion/feather to safe values:
+    erosion ≤ min_radius / 3, feather ≤ min_radius / 2.
+
+    Args:
+        mask: torch.Tensor [B, H, W] or [H, W] in [0, 1].
+
+    Returns:
+        (radii, min_frame): radii is a list[float] of per-frame inscribed radii in
+                             pixels; min_frame is the index of the smallest radius
+                             (the bottleneck frame for safe erosion sizing).
+    """
+    if mask.ndim == 2:
+        mask = mask.unsqueeze(0)
+    radii = []
+    arr = (mask > 0.5).detach().cpu().numpy().astype(np.uint8)
+    for i in range(arr.shape[0]):
+        m = arr[i]
+        if m.sum() == 0:
+            radii.append(0.0)
+            continue
+        dist = cv2.distanceTransform(m, cv2.DIST_L2, 5)
+        radii.append(float(dist.max()))
+    min_frame = int(np.argmin(radii)) if radii else 0
+    return radii, min_frame
 
 
 def masks_to_bboxes(mask, padding, smooth_window, vae_stride, info_lines):
@@ -178,20 +209,41 @@ def _snap_mask_to_vae_grid(mask, stride=8):
     B, H, W = mask.shape
     pad_h = (stride - H % stride) % stride
     pad_w = (stride - W % stride) % stride
+
     if pad_h or pad_w:
         # Pad to clean stride multiples for the reshape, snap, then crop back.
         # Pad value 0 (background) is the safe default — won't introduce false fg.
+        # BUT: we must also track which pixels in each edge block are real vs. padded
+        # so the per-block majority vote is computed against actual valid pixel count,
+        # not the full stride*stride area. Otherwise a fully-foreground edge strip
+        # whose partial block contains <stride*stride/2 valid pixels gets erased by
+        # phantom zeros (valid pixels are about to be cropped away anyway, so the
+        # "no" votes from padding shouldn't influence the block's snap state).
         mask_p = torch.nn.functional.pad(mask, (0, pad_w, 0, pad_h), mode="constant", value=0.0)
+        validity = torch.zeros_like(mask_p)
+        validity[:, :H, :W] = 1.0
     else:
         mask_p = mask
+        validity = None
     Hp, Wp = mask_p.shape[1], mask_p.shape[2]
 
-    # Per-block majority vote: each (stride x stride) block becomes 1.0 if >50% fg.
-    binary = (mask_p > 0.5).to(mask.dtype)
+    # `.contiguous()` before `.view()` — pad/slicing can leave the tensor non-contiguous
+    # on some upstreams; .view() would raise. Cheap no-op when already contiguous.
+    binary = (mask_p > 0.5).to(mask.dtype).contiguous()
     blocks = binary.view(B, Hp // stride, stride, Wp // stride, stride)
-    block_sum = blocks.sum(dim=(2, 4))                       # [B, H/s, W/s]
-    threshold = (stride * stride) / 2.0
-    block_on = (block_sum > threshold).to(mask.dtype)        # [B, H/s, W/s]
+    fg_count = blocks.sum(dim=(2, 4))                                   # [B, H/s, W/s]
+
+    if validity is not None:
+        valid_blocks = validity.contiguous().view(B, Hp // stride, stride, Wp // stride, stride)
+        valid_count = valid_blocks.sum(dim=(2, 4))                      # [B, H/s, W/s]
+        # Per-block half-threshold over actual valid pixel count.
+        # Strict `>` preserves tie-goes-to-off (matches old full-block convention:
+        # exactly stride*stride/2 fg out of stride*stride → OFF).
+        threshold = valid_count * 0.5
+    else:
+        threshold = (stride * stride) * 0.5
+
+    block_on = (fg_count > threshold).to(mask.dtype)                    # [B, H/s, W/s]
 
     # Expand each block back to full resolution
     snapped = block_on.unsqueeze(2).unsqueeze(4).expand(

@@ -146,12 +146,21 @@ class NV_MaskDiffViz:
 
     @staticmethod
     def _promote_mask(mask, name):
-        """[H,W] or [B,H,W] → [B,H,W] float."""
+        """[H,W] or [B,H,W] → [B,H,W] float in [0, 1].
+
+        Normalizes uint8 / [0, 255]-ranged masks to [0, 1] so binary_threshold=0.5
+        works correctly. Without this, a uint8 mask of values 0/255 would treat almost
+        every nonzero pixel as True at threshold 0.5 (because 255 > 0.5 trivially).
+        """
         if mask.ndim == 2:
             mask = mask.unsqueeze(0)
         elif mask.ndim != 3:
             raise ValueError(f"[NV_MaskDiffViz] {name} must be 2D or 3D, got {mask.ndim}D shape={tuple(mask.shape)}")
-        return mask.float()
+        mask = mask.float()
+        # Auto-normalize if values are in [0, 255] range (uint8 or float "as bytes").
+        if mask.numel() > 0 and float(mask.max()) > 1.5:
+            mask = mask / 255.0
+        return mask
 
     @staticmethod
     def _align_batches(a, b, image):
@@ -227,16 +236,25 @@ class NV_MaskDiffViz:
         b = self._promote_mask(mask_b, "mask_b")
         img = image if image is not None else None
 
+        # Validate image shape BEFORE batch alignment so the user sees the correct
+        # error ("wrong rank/channels") rather than a misleading "batch mismatch"
+        # when they pass a [H, W, 3] tensor (rank 3, where shape[0] would be H).
+        if img is not None and (img.ndim != 4 or img.shape[-1] not in (3, 4)):
+            raise ValueError(
+                f"[NV_MaskDiffViz] image must be [B, H, W, 3] or [B, H, W, 4], "
+                f"got rank {img.ndim} with shape {tuple(img.shape)}"
+            )
+
         # Align batches and spatial dims
         a, b, img = self._align_batches(a, b, img)
 
         # Establish reference H, W from mask_a; resize others to match.
+        # NOTE: mask_a is the resolution authority. If you need a different reference,
+        # resize upstream before wiring into this node.
         B, H, W = a.shape
         if b.shape[1:] != (H, W):
             b = self._resize_to(b, H, W, mode="nearest")
         if img is not None:
-            if img.ndim != 4 or img.shape[-1] not in (3, 4):
-                raise ValueError(f"[NV_MaskDiffViz] image must be [B,H,W,3] or [B,H,W,4], got {tuple(img.shape)}")
             img = img[..., :3].contiguous().float()
             if img.shape[1:3] != (H, W):
                 img = self._resize_to(img, H, W, mode="bilinear")
