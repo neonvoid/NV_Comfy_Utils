@@ -16,6 +16,61 @@ import numpy as np
 from scipy.ndimage import gaussian_filter1d, median_filter
 
 
+# WAN 2.1 VAE spatial compression factor — used by VAE-grid alignment helpers below.
+VAE_STRIDE = 8
+
+
+def snap_to_vae_grid(x, y, w, h, spatial_h_px, spatial_w_px, stride=VAE_STRIDE):
+    """Snap pixel-space crop coordinates to VAE grid boundaries.
+
+    Origin is floor-snapped, dimensions are ceil-snapped, then clamped to image bounds.
+    Both origin and final dimensions are guaranteed to be multiples of stride.
+    Returns (x, y, w, h) as ints, all multiples of stride.
+
+    Args:
+        x, y, w, h: pixel-space crop rectangle. May be float (e.g. from auto-resolution
+                    helpers) — dimensions are ceil-snapped to preserve "fully cover the
+                    requested region" semantics; origin is floor-snapped.
+        spatial_h_px, spatial_w_px: the source image dimensions in pixels (may not be
+                    multiples of stride — function clamps so the snapped crop never
+                    extends past the largest stride-aligned origin).
+        stride: VAE spatial stride. Defaults to VAE_STRIDE (8 for WAN 2.1).
+    """
+    if stride <= 0:
+        raise ValueError(f"snap_to_vae_grid: stride must be positive (got {stride})")
+    if spatial_w_px < stride or spatial_h_px < stride:
+        raise ValueError(
+            f"snap_to_vae_grid: image too small for stride {stride} "
+            f"(got spatial={spatial_w_px}x{spatial_h_px})"
+        )
+
+    # Origin: floor-snap. math.floor handles negative floats correctly (int() truncates
+    # toward zero, which would mis-snap negative inputs — defensive).
+    x = (math.floor(float(x)) // stride) * stride
+    y = (math.floor(float(y)) // stride) * stride
+
+    # Dimensions: ceil-snap. Floats from auto-resolution helpers (e.g. 8.1) must round
+    # UP to the next stride multiple (16), not get truncated to 8.
+    w = max(stride, math.ceil(float(w) / stride) * stride)
+    h = max(stride, math.ceil(float(h) / stride) * stride)
+
+    # Clamp origin to the largest stride-aligned position that still leaves room for
+    # at least one stride. Old code used `spatial_w_px - stride` directly, which yielded
+    # non-aligned origins when spatial_w_px % stride != 0 (e.g. 1025 → 1017, not /8).
+    max_x = ((spatial_w_px - stride) // stride) * stride
+    max_y = ((spatial_h_px - stride) // stride) * stride
+    x = max(0, min(x, max_x))
+    y = max(0, min(y, max_y))
+
+    # Clamp dimensions: floor-snap remaining width/height. Non-stride-multiple image dims
+    # mean the largest representable crop is the largest stride multiple ≤ available room.
+    if x + w > spatial_w_px:
+        w = ((spatial_w_px - x) // stride) * stride
+    if y + h > spatial_h_px:
+        h = ((spatial_h_px - y) // stride) * stride
+    return int(x), int(y), int(w), int(h)
+
+
 # =============================================================================
 # Forward/Backward Fill (single implementation for all callers)
 # =============================================================================

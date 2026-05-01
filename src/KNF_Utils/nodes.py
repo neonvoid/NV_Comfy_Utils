@@ -33,9 +33,6 @@ from .wan_memory_estimator import NV_WorkflowFeasibilityChecker
 # Import parallel chunk processing nodes
 from .parallel_chunk_planner import NV_ParallelChunkPlanner
 from .chunk_loader import NV_ChunkLoader, NV_ChunkLoaderAdvanced, NV_ChunkPlanReader, NV_ChunkLoaderVACE
-# DEPRECATED: pixel-space stitchers — averages two decoded images → ghosting.
-# Use NV_LatentChunkStitcher + NV_BoundaryNoiseMask instead.
-# from .chunk_stitcher import NV_ChunkStitcher, NV_ChunkStitcherFromImages
 # Import streaming VACE to video for long video VACE conditioning
 from .streaming_vace_to_video import NV_WanVaceToVideoStreaming
 # Import B2 output sync for cloud storage

@@ -548,7 +548,11 @@ class NV_VaceControlVideoPrep:
             print(info)
             return (cv, cm, mask, mask, info, tail_trim)
 
-        if mask_min > 0.99:
+        # All-ones early return: skipped when vace_input_grow_px < 0 because the operator
+        # explicitly asked to SHRINK an already-saturated mask. Without this gate the
+        # negative grow is silently ignored (saturated input + grow=-16 stays saturated).
+        # Fall through to the normal pipeline so Step 1b erosion runs.
+        if mask_min > 0.99 and vace_input_grow_px >= 0:
             fill = torch.full_like(image, FILL_VALUE)
             info_lines.append("  Mask is all ones — full fill applied (0.5 neutral)")
             cv, cm = _apply_tail(fill, mask)

@@ -21,7 +21,7 @@ from .chunk_utils import (
 from .latent_constants import LATENT_SAFE_KEYS
 from .mask_tracking_bbox import extract_bboxes
 from .inpaint_crop import compute_auto_resolution, WAN_PRESETS
-from .latent_inpaint_crop import snap_to_vae_grid
+from .bbox_ops import snap_to_vae_grid
 
 
 # ---------------------------------------------------------------------------
