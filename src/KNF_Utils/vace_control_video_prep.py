@@ -252,8 +252,17 @@ def _snap_mask_to_vae_grid(mask, stride=8):
     return snapped[:, :H, :W]
 
 
-class NV_VaceControlVideoPrep:
-    """Prepare both control_video and control_masks for WanVaceToVideo in a single node."""
+class NV_VaceControlVideoPrep_V2:
+    """Prepare both control_video and control_masks for WanVaceToVideo in a single node.
+
+    Version-bumped from NV_VaceControlVideoPrep on 2026-05-01 alongside the slim
+    refactor (6 widgets retired). The version-bump is a hard migration break for
+    saved workflows: pre-slim workflows referenced "NV_VaceControlVideoPrep" and
+    serialised 19 positional widget values; this V2 takes 13 widgets, so loading
+    pre-slim saves under the same class name would silently shift values across
+    sockets. The bump forces "node type not found" on pre-slim saves so users
+    explicitly re-wire the V2 node instead of getting silent miscalibration.
+    """
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -518,11 +527,11 @@ class NV_VaceControlVideoPrep:
 
                     _tail_frames = _tail_frames.to(device=image.device, dtype=image.dtype)
                     tail_trim = actual_tail
-                    print(f"[NV_VaceControlVideoPrep] Tail: {actual_tail} frames prepared "
+                    print(f"[NV_VaceControlVideoPrep_V2] Tail: {actual_tail} frames prepared "
                           f"(will prepend to control_video/control_masks after mask processing)")
 
         info_lines = [
-            f"[NV_VaceControlVideoPrep v2.1] shape={mask_shape} | grid_snap={vae_grid_snap} | "
+            f"[NV_VaceControlVideoPrep_V2] shape={mask_shape} | grid_snap={vae_grid_snap} | "
             f"vae_stride={vae_stride}px | fill=soft@0.5 (canonical VACE neutral)"
         ]
 
@@ -716,9 +725,9 @@ class NV_VaceControlVideoPrep:
 
 
 NODE_CLASS_MAPPINGS = {
-    "NV_VaceControlVideoPrep": NV_VaceControlVideoPrep,
+    "NV_VaceControlVideoPrep_V2": NV_VaceControlVideoPrep_V2,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "NV_VaceControlVideoPrep": "NV VACE Control Video Prep",
+    "NV_VaceControlVideoPrep_V2": "NV VACE Control Video Prep V2",
 }
