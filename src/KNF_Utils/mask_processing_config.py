@@ -212,10 +212,156 @@ class NV_MaskProcessingConfig:
         return (config,)
 
 
+# =============================================================================
+# Patch Node — per-key overrides on a base config
+# =============================================================================
+
+class NV_MaskConfigPatch:
+    """Patch a base MASK_PROCESSING_CONFIG with per-key overrides.
+
+    Use case: load a saved stitcher's mask_config (via NV_LoadStitcher_V2),
+    keep most values, but tweak one or two before feeding into InpaintCrop_V2
+    or VaceControlVideoPrep.
+
+    Each override widget defaults to a sentinel value (-999 for ints, -999.0
+    for floats) which means "use base value unchanged". Set to a real value
+    in the legitimate range to override that specific key. Sentinels are
+    chosen to be outside every key's natural range.
+    """
+
+    _SENTINEL_INT = -999
+    _SENTINEL_FLOAT = -999.0
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        # Tooltip suffix used to keep the sentinel-semantics explanation short
+        # without copy-pasting it 11 times.
+        _USE_BASE_INT = "  (-999 = use base unchanged)"
+        _USE_BASE_FLOAT = "  (-999.0 = use base unchanged)"
+        return {
+            "required": {
+                "base_config": ("MASK_PROCESSING_CONFIG", {
+                    "tooltip": "Base config to patch. Typically wired from "
+                               "NV_LoadStitcher_V2.mask_config or NV_MaskProcessingConfig."
+                }),
+
+                # Cleanup overrides
+                "cleanup_fill_holes": ("INT", {
+                    "default": -999, "min": -999, "max": 128, "step": 1,
+                    "tooltip": "Override cleanup_fill_holes (real range 0-128)." + _USE_BASE_INT,
+                }),
+                "cleanup_remove_noise": ("INT", {
+                    "default": -999, "min": -999, "max": 32, "step": 1,
+                    "tooltip": "Override cleanup_remove_noise (real range 0-32)." + _USE_BASE_INT,
+                }),
+                "cleanup_smooth": ("INT", {
+                    "default": -999, "min": -999, "max": 127, "step": 1,
+                    "tooltip": "Override cleanup_smooth (real range 0-127)." + _USE_BASE_INT,
+                }),
+
+                # Crop / Stitch overrides
+                "crop_expand_px": ("INT", {
+                    "default": -999, "min": -999, "max": 128, "step": 1,
+                    "tooltip": "Override crop_expand_px (real range -128 to 128)." + _USE_BASE_INT,
+                }),
+                "crop_blend_feather_px": ("INT", {
+                    "default": -999, "min": -999, "max": 64, "step": 1,
+                    "tooltip": "Override crop_blend_feather_px (real range 0-64)." + _USE_BASE_INT,
+                }),
+
+                # VACE overrides
+                "vace_input_grow_px": ("INT", {
+                    "default": -999, "min": -999, "max": 128, "step": 1,
+                    "tooltip": "Override vace_input_grow_px (real range -128 to 128)." + _USE_BASE_INT,
+                }),
+                "vace_erosion_blocks": ("FLOAT", {
+                    "default": -999.0, "min": -999.0, "max": 4.0, "step": 0.25,
+                    "tooltip": "Override vace_erosion_blocks (real range 0.0-4.0)." + _USE_BASE_FLOAT,
+                }),
+                "vace_feather_blocks": ("FLOAT", {
+                    "default": -999.0, "min": -999.0, "max": 8.0, "step": 0.25,
+                    "tooltip": "Override vace_feather_blocks (real range 0.0-8.0)." + _USE_BASE_FLOAT,
+                }),
+                "vace_halo_px": ("INT", {
+                    "default": -999, "min": -999, "max": 48, "step": 4,
+                    "tooltip": "Override vace_halo_px (real range 0-48)." + _USE_BASE_INT,
+                }),
+                "vace_stitch_erosion_px": ("INT", {
+                    "default": -999, "min": -999, "max": 32, "step": 1,
+                    "tooltip": "Override vace_stitch_erosion_px (real range -32 to 32)." + _USE_BASE_INT,
+                }),
+                "vace_stitch_feather_px": ("INT", {
+                    "default": -999, "min": -999, "max": 64, "step": 1,
+                    "tooltip": "Override vace_stitch_feather_px (real range 0-64)." + _USE_BASE_INT,
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("MASK_PROCESSING_CONFIG",)
+    RETURN_NAMES = ("patched_config",)
+    FUNCTION = "patch"
+    CATEGORY = "NV_Utils/Inpaint"
+    DESCRIPTION = (
+        "Patch a base MASK_PROCESSING_CONFIG with per-key overrides. "
+        "Each widget defaults to a sentinel (-999 / -999.0) meaning 'use "
+        "base unchanged'. Set to a real value to override that specific key. "
+        "Useful for loading a saved mask_config and tweaking just one or two "
+        "values without rebuilding the whole config from scratch."
+    )
+
+    def patch(self,
+              base_config,
+              cleanup_fill_holes, cleanup_remove_noise, cleanup_smooth,
+              crop_expand_px, crop_blend_feather_px,
+              vace_input_grow_px, vace_erosion_blocks, vace_feather_blocks,
+              vace_halo_px, vace_stitch_erosion_px, vace_stitch_feather_px):
+
+        if not isinstance(base_config, dict):
+            raise TypeError(
+                f"[NV_MaskConfigPatch] base_config must be a MASK_PROCESSING_CONFIG dict, "
+                f"got {type(base_config).__name__}"
+            )
+
+        result = dict(base_config)
+
+        # (key, value, sentinel) — single source of truth for the patch loop
+        overrides = (
+            ("cleanup_fill_holes", cleanup_fill_holes, self._SENTINEL_INT),
+            ("cleanup_remove_noise", cleanup_remove_noise, self._SENTINEL_INT),
+            ("cleanup_smooth", cleanup_smooth, self._SENTINEL_INT),
+            ("crop_expand_px", crop_expand_px, self._SENTINEL_INT),
+            ("crop_blend_feather_px", crop_blend_feather_px, self._SENTINEL_INT),
+            ("vace_input_grow_px", vace_input_grow_px, self._SENTINEL_INT),
+            ("vace_erosion_blocks", vace_erosion_blocks, self._SENTINEL_FLOAT),
+            ("vace_feather_blocks", vace_feather_blocks, self._SENTINEL_FLOAT),
+            ("vace_halo_px", vace_halo_px, self._SENTINEL_INT),
+            ("vace_stitch_erosion_px", vace_stitch_erosion_px, self._SENTINEL_INT),
+            ("vace_stitch_feather_px", vace_stitch_feather_px, self._SENTINEL_INT),
+        )
+
+        applied = []
+        for key, value, sentinel in overrides:
+            if value != sentinel:
+                old = result.get(key, "<absent>")
+                result[key] = value
+                applied.append(f"{key}: {old} -> {value}")
+
+        if applied:
+            print(f"[NV_MaskConfigPatch] Applied {len(applied)} override(s):")
+            for line in applied:
+                print(f"  {line}")
+        else:
+            print("[NV_MaskConfigPatch] No overrides — config passes through unchanged")
+
+        return (result,)
+
+
 NODE_CLASS_MAPPINGS = {
     "NV_MaskProcessingConfig": NV_MaskProcessingConfig,
+    "NV_MaskConfigPatch": NV_MaskConfigPatch,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "NV_MaskProcessingConfig": "NV Mask Processing Config",
+    "NV_MaskConfigPatch": "NV Mask Config Patch",
 }
