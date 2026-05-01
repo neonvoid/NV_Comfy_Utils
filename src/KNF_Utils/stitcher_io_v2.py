@@ -37,12 +37,15 @@ NV_SaveStitcher / NV_LoadStitcher / NV_StitcherInfo for legacy saves.
 """
 
 import os
+import copy
 import json
 import datetime
 
 import numpy as np
 import torch
 from PIL import Image
+
+from .mask_processing_config import normalize_mask_config
 
 
 SCHEMA_VERSION = "2.0"
@@ -634,12 +637,14 @@ class NV_LoadStitcher_V2:
             "optional": {
                 "mask_config_override": ("MASK_PROCESSING_CONFIG", {
                     "tooltip": (
-                        "Optional override that REPLACES the saved mask_config when wired. "
-                        "When connected, the saved config is ignored and this override is "
-                        "emitted on the mask_config output instead. Use to run with totally "
-                        "different mask settings than what produced this stitcher. For "
-                        "per-key tweaks (keep most saved values, change one or two), "
-                        "wire NV_MaskConfigPatch in front of the consumer instead."
+                        "FULL REPLACEMENT (NOT a merge) — when wired, this REPLACES "
+                        "the saved mask_config entirely. The saved config is logged in "
+                        "load_report for human-debug provenance but discarded from the "
+                        "dataflow. For SELECTIVE per-key tweaks (keep most saved values, "
+                        "change one or two), DO NOT use this socket — wire "
+                        "NV_MaskConfigPatch downstream of the mask_config output instead. "
+                        "(Naming kept as 'override' for backward compatibility; semantics "
+                        "are full replacement per Codex+Gemini debate Q2 verdict.)"
                     ),
                 }),
                 "load_warp_data": ("BOOLEAN", {
@@ -734,19 +739,34 @@ class NV_LoadStitcher_V2:
         if "stitch_params" in metadata:
             stitcher["stitch_params"] = metadata["stitch_params"]
 
-        # --- Resolve mask_config: override > saved > None ------------------
-        saved_mask_config = metadata.get("mask_config")
+        # --- Resolve mask_config: normalize-saved → override-or-saved ------
+        # Step 1: normalize the persisted config against the current schema —
+        # fills missing keys with defaults, preserves canonical key order,
+        # warns on unknown keys (Q6 verdict: active normalization, non-destructive).
+        raw_saved_mask_config = metadata.get("mask_config")
+        saved_mask_config, _unknown_keys = normalize_mask_config(
+            raw_saved_mask_config, report_lines=report_lines
+        )
+
+        # Step 2: choose effective config. Override (when wired) replaces saved.
+        # Deepcopy override defensively — ComfyUI dicts pass by reference (Q5 verdict).
         if mask_config_override is not None:
             if not isinstance(mask_config_override, dict):
                 raise TypeError(
                     f"[NV_LoadStitcher_V2] mask_config_override must be a dict "
                     f"(MASK_PROCESSING_CONFIG), got {type(mask_config_override).__name__}"
                 )
-            mask_config = dict(mask_config_override)  # defensive copy
+            mask_config = copy.deepcopy(mask_config_override)
             if saved_mask_config is not None:
                 report_lines.append(
-                    f"mask_config_override wired — replacing saved config "
+                    f"mask_config_override wired — REPLACING saved config "
                     f"({len(saved_mask_config)} keys) with override ({len(mask_config)} keys)"
+                )
+                # Provenance (Q4 verdict): embed saved config text for human-debug
+                # so a downstream debug consumer can compare original vs effective
+                # via load_report without needing an extra socket.
+                report_lines.append(
+                    f"  saved config (replaced, for provenance): {saved_mask_config}"
                 )
             else:
                 report_lines.append(
