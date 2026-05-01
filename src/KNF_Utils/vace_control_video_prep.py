@@ -15,6 +15,52 @@ This node processes the mask ONCE, then uses that same result for both:
 
 Guarantees perfect pixel-level alignment between grey zone and VACE mask boundary.
 
+# =============================================================================
+# Two-Mask Architecture (2026-05-01)
+# =============================================================================
+# This node emits TWO logically-distinct masks for TWO different jobs. Read this
+# before tweaking — same-named-looking params shape DIFFERENT masks at DIFFERENT
+# pipeline stages with DIFFERENT failure modes.
+#
+#   ┌─────────────────────────────────────────────────────────────────────────┐
+#   │ Job 1: GENERATION MASK  (output: control_masks)                         │
+#   │   Job   : Tells VACE/WAN what region to repaint.                        │
+#   │   Stage : Pre-sampler — encoded into latent conditioning.               │
+#   │   Goal  : Cover BOTH source-subject silhouette AND target-subject       │
+#   │           silhouette (so original doesn't leak through, AND the model   │
+#   │           has room to generate the new shape). NOT too wide — over-     │
+#   │           expansion makes WAN hallucinate in obviously-not-subject      │
+#   │           areas.                                                        │
+#   │   Knobs : erosion_blocks, feather_blocks, vace_input_grow_px,           │
+#   │           vace_halo_px, fill_mode, fill_value.                          │
+#   │           Tooltips for these are tagged [GEN MASK].                     │
+#   │                                                                         │
+#   │ Job 2: STITCH/BLEND MASK  (output: stitch_mask, tight_mask)             │
+#   │   Job   : Tells the compositor what region to alpha-blend.              │
+#   │   Stage : Post-sampler — pure pixel-space alpha composite.              │
+#   │   Goal  : Hide the seam between AI output and original frame. Can be   │
+#   │           tighter than the GEN mask (pure compositing job, no model    │
+#   │           encoding constraints). Soft edges are a feature here.        │
+#   │   Knobs : vace_stitch_source, vace_stitch_erosion_px,                   │
+#   │           vace_stitch_feather_px.                                       │
+#   │           Tooltips for these are tagged [STITCH MASK].                  │
+#   └─────────────────────────────────────────────────────────────────────────┘
+#
+# Other tooltip tag legend:
+#   [SHAPE]    — pre-stage geometry decisions (tight vs bbox, bbox padding)
+#   [CLEANUP]  — applied to raw mask BEFORE the gen/stitch split
+#   [CHUNK]    — multi-chunk continuity (previous_chunk_tail, tail_overlap)
+#   [ADVANCED] — VAE-specific or rarely-tweaked
+#
+# Source verification (multi-AI VACE deep-dive, 2026-05-01): VACE injection at
+# WAN model.py:802 is `x += c_skip * vace_strength[iii]` — additive residual,
+# NOT a hard mask gate. The mask multiplicatively splits control_video into
+# inactive/reactive branches at nodes_wan.py:339-340 BEFORE VAE encoding, then
+# gets a 64-channel 8x8-block decomposition (nodes_wan.py:351-354). This
+# confirms: feather_blocks ≥ 1 matters for clean ENCODING of the boundary
+# (VAE block alignment), not for some abstract "gate cliff." See D-122.
+# =============================================================================
+
 Mask shape modes:
   - "as_is": Use the input mask directly (tight segmentation mask).
   - "bbox": Convert to per-frame bounding boxes with temporal smoothing. Produces
@@ -98,126 +144,215 @@ class NV_VaceControlVideoPrep:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "image": ("IMAGE",),
-                "mask": ("MASK",),
+                "image": ("IMAGE", {
+                    "tooltip": (
+                        "Source video frames [B, H, W, 3]. Will be composited with neutral fill "
+                        "inside the generation mask to produce control_video for WanVaceToVideo."
+                    ),
+                }),
+                "mask": ("MASK", {
+                    "tooltip": (
+                        "Raw input mask [B, H, W]. Goes through CLEANUP → SHAPE → splits into "
+                        "GEN MASK (drives VACE) + STITCH MASK (drives compositing). See module "
+                        "docstring for the two-mask architecture."
+                    ),
+                }),
                 "mask_shape": (["as_is", "bbox"], {
                     "default": "as_is",
-                    "tooltip": "as_is: use input mask directly (tight segmentation). "
-                               "bbox: convert to per-frame bounding boxes with temporal smoothing. "
-                               "Box masks produce cleaner VACE results because boundaries align with "
-                               "VAE 8x8 blocks and match VACE training distribution."
+                    "tooltip": (
+                        "[SHAPE] Pre-stage geometry decision — affects BOTH gen and stitch masks. "
+                        "as_is: use input mask directly (tight segmentation). "
+                        "bbox: convert to per-frame bounding boxes with temporal smoothing. "
+                        "Box masks produce cleaner VACE results because boundaries align with "
+                        "VAE 8x8 blocks and match VACE training distribution."
+                    ),
                 }),
                 "mode": (["auto", "manual"], {
                     "default": "auto",
-                    "tooltip": "auto: analyze mask geometry and derive optimal erosion/feather, "
-                               "using widget values as targets (capped by mask safety limits). "
-                               "manual: use erosion_blocks and feather_blocks directly."
+                    "tooltip": (
+                        "[GEN MASK] How to derive the GENERATION-mask erosion/feather values. "
+                        "auto: analyze mask geometry and pick optimal values (capped by safety "
+                        "limits derived from the mask itself). The widget values below act as "
+                        "TARGETS in this mode. "
+                        "manual: use erosion_blocks and feather_blocks widget values directly."
+                    ),
                 }),
                 "erosion_blocks": ("FLOAT", {
                     "default": 0.5, "min": 0.0, "max": 4.0, "step": 0.25,
-                    "tooltip": "Erode mask inward by this many VAE blocks. "
-                               "In auto mode, this is the target value capped by mask geometry. "
-                               "0.5 blocks = 4px for WAN."
+                    "tooltip": (
+                        "[GEN MASK] Erode the GENERATION mask inward by this many VAE blocks (8px each "
+                        "for WAN). 0.5 blocks = 4px. NEVER set to 0 — sharp 1-pixel edges produce "
+                        "ALIASED encoded conditioning at the VAE-block grid (see D-122). "
+                        "In auto mode this is the target value capped by mask geometry. "
+                        "DOES NOT affect the stitch mask — for that, see vace_stitch_erosion_px."
+                    ),
                 }),
                 "feather_blocks": ("FLOAT", {
                     "default": 1.5, "min": 0.0, "max": 8.0, "step": 0.25,
-                    "tooltip": "Feather mask edge over this many VAE blocks. "
-                               "1.5 blocks = 12px for WAN. "
-                               "In auto mode, this is the target value capped by mask geometry."
+                    "tooltip": (
+                        "[GEN MASK] Feather the GENERATION mask edge over this many VAE blocks. "
+                        "1.5 blocks = 12px for WAN. NEVER set to 0 — feather over >1 VAE block "
+                        "ensures the boundary gradient is captured cleanly in encoded space "
+                        "(VACE encodes the mask via 8x8 block decomposition; sharp pixel-aligned "
+                        "edges produce aliased conditioning). "
+                        "DOES NOT affect the stitch mask — for that, see vace_stitch_feather_px."
+                    ),
                 }),
                 "fill_mode": (["soft", "none"], {
                     "default": "soft",
-                    "tooltip": "soft: alpha-composite fill using feathered mask. Smooth channels, "
-                               "mild double-attenuation in transition zone. "
-                               "none: no fill, real content everywhere. Mathematically ideal "
-                               "inactive channel. Best for LoRA face replacement."
+                    "tooltip": (
+                        "[GEN MASK] How control_video is filled inside the generation mask. "
+                        "soft: alpha-composite fill using feathered mask. Smooth channels, "
+                        "mild double-attenuation in transition zone. "
+                        "none: no fill, real content everywhere. Mathematically ideal "
+                        "inactive channel. Best for LoRA face replacement."
+                    ),
                 }),
             },
             "optional": {
                 "mask_config": ("MASK_PROCESSING_CONFIG", {
-                    "tooltip": "Optional shared config from NV_MaskProcessingConfig. "
-                               "When connected, overrides VACE erosion/feather, stitch, cleanup, "
-                               "input_grow, and halo widgets."
+                    "tooltip": (
+                        "Optional shared config bus from NV_MaskProcessingConfig. When connected, "
+                        "overrides matching widgets across BOTH gen and stitch stages: "
+                        "[GEN] erosion/feather/input_grow/halo; "
+                        "[STITCH] stitch_erosion/stitch_feather; "
+                        "[CLEANUP] fill_holes/remove_noise/smooth. "
+                        "Note: a future v2.1 may split this into separate MASK_GEN_CONFIG and "
+                        "MASK_BLEND_CONFIG buses to make the gen/stitch separation explicit at "
+                        "the bus level."
+                    ),
                 }),
                 "bbox_padding": ("FLOAT", {
                     "default": 0.15, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "BBox padding as fraction of bbox dimensions (0.15 = 15%). "
-                               "Only used when mask_shape='bbox'. VACE training uses 10-20%."
+                    "tooltip": (
+                        "[SHAPE] BBox padding as fraction of bbox dimensions (0.15 = 15%). "
+                        "Only used when mask_shape='bbox'. VACE training uses 10-20%."
+                    ),
                 }),
                 "bbox_smooth_frames": ("INT", {
                     "default": 5, "min": 0, "max": 31, "step": 2,
-                    "tooltip": "Temporal smoothing window for bbox coordinates (odd values recommended). "
-                               "0 = disabled. Only used when mask_shape='bbox'."
+                    "tooltip": (
+                        "[SHAPE] Temporal smoothing window for bbox coordinates (odd values recommended). "
+                        "0 = disabled. Only used when mask_shape='bbox'."
+                    ),
                 }),
                 "fill_value": ("FLOAT", {
                     "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "Fill color for masked area. 0.5 = true VACE neutral. "
-                               "Only used when fill_mode='soft'."
+                    "tooltip": (
+                        "[GEN MASK] Fill color for masked area in control_video. 0.5 = true VACE neutral "
+                        "(WanVaceToVideo centers control_video by -0.5, so 0.5 → 0.0 in the encoded "
+                        "inactive channel). Only used when fill_mode='soft'."
+                    ),
                 }),
                 "threshold": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "Binarize mask at 0.5 before processing."
+                    "tooltip": (
+                        "[CLEANUP] Binarize raw input mask at 0.5 before all downstream processing. "
+                        "Use when input is a soft probability map and you want crisp downstream behavior."
+                    ),
                 }),
                 "vace_input_grow_px": ("INT", {
                     "default": 0, "min": -128, "max": 128, "step": 1,
-                    "tooltip": "Grow (positive) or shrink (negative) the raw input mask before "
-                               "VACE processing. Expands the area VACE regenerates. "
-                               "Use for object insertion where generated content extends beyond mask. "
-                               "0 = mask already covers the right area. (Previously: mask_grow)"
+                    "tooltip": (
+                        "[GEN MASK] Uniform grow (positive) or shrink (negative) of the GENERATION mask "
+                        "BEFORE VACE processing. Use to ensure full coverage of BOTH source-subject "
+                        "silhouette AND target-subject silhouette (e.g., head-swap with size mismatch — "
+                        "original head must be hidden, AND target shape must have room to generate). "
+                        "0 = input mask already covers the right area. "
+                        "DOES NOT affect the stitch mask. (Previously: mask_grow)"
+                    ),
                 }),
                 "cleanup_fill_holes": ("INT", {
                     "default": 0, "min": 0, "max": 128, "step": 1,
-                    "tooltip": "Fill gaps/holes in mask (morphological closing). (Previously: mask_fill_holes)"
+                    "tooltip": (
+                        "[CLEANUP] Fill gaps/holes in raw mask (morphological closing). Applied BEFORE "
+                        "the gen/stitch split — affects both downstream masks. "
+                        "Legacy: prefer NV_MaskBinaryCleanup upstream for true binary fill_holes "
+                        "(scipy.ndimage.binary_fill_holes is strictly more powerful). "
+                        "(Previously: mask_fill_holes)"
+                    ),
                 }),
                 "cleanup_remove_noise": ("INT", {
                     "default": 0, "min": 0, "max": 32, "step": 1,
-                    "tooltip": "Remove isolated pixels (morphological opening). (Previously: mask_remove_noise)"
+                    "tooltip": (
+                        "[CLEANUP] Remove isolated pixels (morphological opening). Applied BEFORE the "
+                        "gen/stitch split. "
+                        "Legacy: prefer NV_MaskBinaryCleanup.min_component_area_px upstream. "
+                        "(Previously: mask_remove_noise)"
+                    ),
                 }),
                 "cleanup_smooth": ("INT", {
                     "default": 0, "min": 0, "max": 127, "step": 1,
-                    "tooltip": "Smooth jagged edges (binarize + blur). (Previously: mask_smooth)"
+                    "tooltip": (
+                        "[CLEANUP] Smooth jagged edges of raw mask (binarize + blur). Applied BEFORE "
+                        "the gen/stitch split. Useful for SAM3 stairstep edges. (Previously: mask_smooth)"
+                    ),
                 }),
                 "vae_stride": ("INT", {
                     "default": 8, "min": 4, "max": 32, "step": 4,
-                    "tooltip": "VAE spatial stride in pixels (8 for WAN)."
+                    "tooltip": (
+                        "[ADVANCED] VAE spatial stride in pixels. WAN VAE = 8. Verified at "
+                        "comfy_extras/nodes_wan.py:348. Don't change unless using a non-WAN model."
+                    ),
                 }),
                 "vace_stitch_source": (["tight", "bbox"], {
                     "default": "tight",
-                    "tooltip": "Source mask for VACE pixel-space stitching. "
-                               "'tight': original input mask (precise boundary). "
-                               "'bbox': VACE bbox mask eroded inward (hides seam artifacts). "
-                               "(Previously: stitch_source)"
+                    "tooltip": (
+                        "[STITCH MASK] Source mask for the pixel-space STITCH/COMPOSITE output. "
+                        "'tight': original input mask (precise subject boundary). "
+                        "'bbox': bbox mask eroded inward (hides VACE generation seams at boundary). "
+                        "DOES NOT affect what VACE generates — only what gets composited back to frame. "
+                        "(Previously: stitch_source)"
+                    ),
                 }),
                 "vace_halo_px": ("INT", {
                     "default": 16, "min": 0, "max": 48, "step": 4,
-                    "tooltip": "Seam-Absorbing Halo: expand VACE conditioning mask OUTWARD. "
-                               "16px = recommended (2 VAE blocks). 0 = disabled. "
-                               "(Previously: halo_pixels)"
+                    "tooltip": (
+                        "[GEN MASK] Seam-Absorbing Halo: expand the GENERATION mask OUTWARD by N px so "
+                        "WAN actually repaints a margin OUTSIDE the eventual stitch boundary. The stitch "
+                        "composite seam then falls INSIDE repainted content rather than on a hard "
+                        "AI/original boundary — major reduction in visible seam. 16px = recommended "
+                        "(2 VAE blocks). 0 = disabled. "
+                        "Despite the name, this shapes the GEN mask, not the stitch mask. "
+                        "(Previously: halo_pixels)"
+                    ),
                 }),
                 "vace_stitch_erosion_px": ("INT", {
                     "default": 0, "min": -32, "max": 32, "step": 1,
-                    "tooltip": "Erode/dilate VACE pixel-space stitch mask. "
-                               "Independent of VACE conditioning erosion. (Previously: stitch_erosion)"
+                    "tooltip": (
+                        "[STITCH MASK] Erode (negative) or dilate (positive) the pixel-space STITCH "
+                        "mask. Tightens or widens the composite boundary; INDEPENDENT of VACE "
+                        "conditioning erosion. Use to fine-tune the visible seam without affecting "
+                        "what WAN generated. (Previously: stitch_erosion)"
+                    ),
                 }),
                 "vace_stitch_feather_px": ("INT", {
                     "default": 8, "min": 0, "max": 64, "step": 1,
-                    "tooltip": "Feather VACE pixel-space stitch mask edges. "
-                               "8-16px = subtle, 0 = hard edge. (Previously: stitch_feather)"
+                    "tooltip": (
+                        "[STITCH MASK] Feather pixel-space STITCH mask edges for soft compositing. "
+                        "8-16px = subtle, 24-32px = visible softening, 0 = hard edge. "
+                        "Soft edges here are FINE — this is pure pixel-space alpha blending, not "
+                        "encoded conditioning. (Previously: stitch_feather)"
+                    ),
                 }),
                 "previous_chunk_tail": ("IMAGE", {
-                    "tooltip": "Last N frames of previous chunk's output (post-CropColorFix, pre-stitch). "
-                               "Prepended to control video with mask=0 (preserve exactly). VACE continues "
-                               "generation from these frames — trained inpainting continuation behavior. "
-                               "No domain mismatch: tail goes through same VAE encode as control video. "
-                               "Leave unconnected for chunk 0."
+                    "tooltip": (
+                        "[CHUNK] Last N frames of previous chunk's output (post-CropColorFix, pre-stitch). "
+                        "Prepended to control video with mask=0 (preserve exactly). VACE continues "
+                        "generation from these frames — trained inpainting continuation behavior. "
+                        "No domain mismatch: tail goes through same VAE encode as control video. "
+                        "Leave unconnected for chunk 0."
+                    ),
                 }),
                 "tail_overlap_frames": ("INT", {
                     "default": 4, "min": 0, "max": 16, "step": 4,
-                    "tooltip": "Number of tail frames to prepend from previous_chunk_tail. "
-                               "0 = disabled. MUST be a multiple of 4 (WAN temporal compression rule: "
-                               "adding 4k frames to a valid 4k+1 count preserves validity). "
-                               "4 = 1 latent frame, 8 = 2 latent frames. "
-                               "Strip tail_trim frames from output after generation."
+                    "tooltip": (
+                        "[CHUNK] Number of tail frames to prepend from previous_chunk_tail. "
+                        "0 = disabled. MUST be a multiple of 4 (WAN temporal compression rule: "
+                        "adding 4k frames to a valid 4k+1 count preserves validity). "
+                        "4 = 1 latent frame, 8 = 2 latent frames. "
+                        "Strip tail_trim frames from output after generation."
+                    ),
                 }),
             },
         }
@@ -227,12 +362,25 @@ class NV_VaceControlVideoPrep:
     FUNCTION = "execute"
     CATEGORY = "NV_Utils/VACE"
     DESCRIPTION = (
-        "Single-node VACE control video + mask preparation with triple-mask output. "
-        "control_masks = VACE conditioning mask (bbox, eroded, feathered). "
-        "stitch_mask = compositing mask (source selectable: 'tight' for precise subject boundary, "
-        "'bbox' for eroded-inward bbox that hides VACE edge seams). "
-        "tight_mask = always the original tight mask with stitch erosion/feather applied (backup). "
-        "Use stitch_mask with NV_VaceVideoStitch for pixel compositing."
+        "Single-node VACE control video + mask preparation with two-mask architecture.\n"
+        "\n"
+        "TWO logically-distinct masks for TWO different jobs (see module docstring):\n"
+        "  • control_masks (GEN MASK)    → tells VACE/WAN what region to repaint.\n"
+        "    Shaped by [GEN MASK] tagged params: erosion_blocks, feather_blocks,\n"
+        "    vace_input_grow_px, vace_halo_px, fill_mode, fill_value.\n"
+        "    Goal: cover the union of source-subject + target-subject silhouettes,\n"
+        "    feathered in VAE-block units for clean encoded conditioning.\n"
+        "  • stitch_mask (BLEND MASK)    → tells the compositor what region to alpha-blend.\n"
+        "    Shaped by [STITCH MASK] tagged params: vace_stitch_source,\n"
+        "    vace_stitch_erosion_px, vace_stitch_feather_px.\n"
+        "    Goal: hide the seam in pixel space; soft edges are a feature here.\n"
+        "  • tight_mask                  → backup output: tight original mask with stitch\n"
+        "    erosion/feather applied. Use when you want a different boundary downstream\n"
+        "    than the bbox-vs-tight choice in vace_stitch_source.\n"
+        "\n"
+        "Pre-stage params [SHAPE] + [CLEANUP] apply to the raw mask BEFORE the gen/stitch split.\n"
+        "Wire control_masks → WanVaceToVideo. Wire stitch_mask → NV_VaceVideoStitch (or any\n"
+        "downstream pixel compositor) for the post-sampler blend."
     )
 
     def execute(self, image, mask, mask_shape, mode, erosion_blocks, feather_blocks, fill_mode,
