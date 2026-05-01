@@ -16,11 +16,9 @@ This node processes the mask ONCE, then uses that same result for both:
 Guarantees perfect pixel-level alignment between grey zone and VACE mask boundary.
 
 # =============================================================================
-# Two-Mask Architecture (2026-05-01)
+# Two-Mask Architecture (2026-05-01, simplified post-research)
 # =============================================================================
-# This node emits TWO logically-distinct masks for TWO different jobs. Read this
-# before tweaking — same-named-looking params shape DIFFERENT masks at DIFFERENT
-# pipeline stages with DIFFERENT failure modes.
+# This node emits TWO logically-distinct masks for TWO different jobs.
 #
 #   ┌─────────────────────────────────────────────────────────────────────────┐
 #   │ Job 1: GENERATION MASK  (output: control_masks)                         │
@@ -31,19 +29,15 @@ Guarantees perfect pixel-level alignment between grey zone and VACE mask boundar
 #   │           has room to generate the new shape). NOT too wide — over-     │
 #   │           expansion makes WAN hallucinate in obviously-not-subject      │
 #   │           areas.                                                        │
-#   │   Knobs : erosion_blocks, feather_blocks, vace_input_grow_px,           │
-#   │           vace_halo_px, fill_mode, fill_value.                          │
-#   │           Tooltips for these are tagged [GEN MASK].                     │
+#   │   Knobs : vace_input_grow_px (the one mask-shape knob), vae_grid_snap   │
+#   │           (optional VAE 8x8 quantization). Tagged [GEN MASK].           │
 #   │                                                                         │
 #   │ Job 2: STITCH/BLEND MASK  (output: stitch_mask, tight_mask)             │
 #   │   Job   : Tells the compositor what region to alpha-blend.              │
 #   │   Stage : Post-sampler — pure pixel-space alpha composite.              │
-#   │   Goal  : Hide the seam between AI output and original frame. Can be   │
-#   │           tighter than the GEN mask (pure compositing job, no model    │
-#   │           encoding constraints). Soft edges are a feature here.        │
+#   │   Goal  : Hide the seam between AI output and original frame.           │
 #   │   Knobs : vace_stitch_source, vace_stitch_erosion_px,                   │
-#   │           vace_stitch_feather_px.                                       │
-#   │           Tooltips for these are tagged [STITCH MASK].                  │
+#   │           vace_stitch_feather_px. Tagged [STITCH MASK].                 │
 #   └─────────────────────────────────────────────────────────────────────────┘
 #
 # Other tooltip tag legend:
@@ -52,13 +46,46 @@ Guarantees perfect pixel-level alignment between grey zone and VACE mask boundar
 #   [CHUNK]    — multi-chunk continuity (previous_chunk_tail, tail_overlap)
 #   [ADVANCED] — VAE-specific or rarely-tweaked
 #
-# Source verification (multi-AI VACE deep-dive, 2026-05-01): VACE injection at
-# WAN model.py:802 is `x += c_skip * vace_strength[iii]` — additive residual,
-# NOT a hard mask gate. The mask multiplicatively splits control_video into
-# inactive/reactive branches at nodes_wan.py:339-340 BEFORE VAE encoding, then
-# gets a 64-channel 8x8-block decomposition (nodes_wan.py:351-354). This
-# confirms: feather_blocks ≥ 1 matters for clean ENCODING of the boundary
-# (VAE block alignment), not for some abstract "gate cliff." See D-122.
+# =============================================================================
+# RETIREMENTS — 2026-05-01 (post research + multi-AI debate)
+# =============================================================================
+# The following GEN-MASK params were retired after research showed VACE was
+# trained on BINARY masks (paper § 3.2; arxiv 2503.07598) and feathered/soft
+# input is OUT OF DISTRIBUTION:
+#
+#   feather_blocks  → REMOVED. Soft GEN masks are OOD per VACE training data.
+#                     Hard cliff: was defaulted to 1.5 ("NEVER 0" lore); the rule
+#                     was retconned project-internal misattribution. See CHANGELOG.
+#   erosion_blocks  → REMOVED. Mathematically equivalent to vace_input_grow_px
+#                     with negative values; the "VAE block alignment" framing did
+#                     NOT survive scrutiny — erosion shifts boundary inward without
+#                     snapping to the 8x8 grid. For real grid alignment use the new
+#                     vae_grid_snap toggle (per-block majority quantization).
+#   vace_halo_px    → REMOVED. Functionally identical to vace_input_grow_px (both
+#                     uniformly expand the GEN mask). The "Seam-Absorbing Halo"
+#                     framing was just labeling for a uniform expansion operation.
+#   fill_mode       → REMOVED. "soft" with gray-127 fill IS the canonical training
+#                     distribution per VACE User Guide. "none" mode was OOD. Hardcoded
+#                     to soft.
+#   fill_value      → REMOVED. Locked to 0.5 by VAE centering math — WanVaceToVideo
+#                     centers control_video by -0.5, so 0.5 maps to 0 in encoded
+#                     inactive channel. Anything else is OOD. Hardcoded to 0.5.
+#   mode (auto/manual) → REMOVED. With erosion/feather retired, nothing is auto-derived.
+#
+# NEW PARAMETER:
+#   vae_grid_snap (BOOLEAN, default False) — quantizes the binary mask boundary
+#                     to multiples of vae_stride via per-block majority voting.
+#                     Genuinely snaps to the VAE encoder grid (unlike erosion which
+#                     just shifted the boundary inward).
+#
+# Source verification (multi-AI VACE deep-dive, 2026-05-01):
+#   - VACE paper § 3.2: "the mask is binary, with 1 and 0 indicating edit vs keep"
+#   - Official User Guide: src_mask = white-generate / black-retain
+#   - Training data: SAM2 instance masks + binary morphological augmentation
+#   - VACE injection at wan/model.py:802 is `x += c_skip * vace_strength[iii]`
+#     (additive residual, not hard gate)
+#   - Mask path at nodes_wan.py:339-354: control video multiplicatively split,
+#     mask gets 64-channel 8x8 block decomposition via nearest-exact interpolate
 # =============================================================================
 
 Mask shape modes:
@@ -83,32 +110,14 @@ subtracting 0.5, so fill=0.5 → centered=0.0 → both inactive and reactive get
 """
 
 import torch
-import numpy as np
-from scipy.ndimage import distance_transform_edt
+# numpy + scipy.distance_transform_edt removed 2026-05-01: were only used by
+# compute_inscribed_radius() which fed the retired auto-mode erosion/feather logic.
 
 from .mask_ops import mask_erode_dilate, mask_blur, mask_fill_holes, mask_remove_noise, mask_smooth
 from .bbox_ops import (
     extract_bboxes, build_bbox_masks,
     gaussian_smooth_1d, median_filter_1d,
 )
-
-
-def compute_inscribed_radius(mask: torch.Tensor) -> tuple[list[float], int]:
-    """Compute inscribed radius per frame via EDT. Returns (radii_list, min_radius_frame_idx)."""
-    if mask.dim() == 2:
-        mask = mask.unsqueeze(0)
-
-    radii = []
-    for b in range(mask.shape[0]):
-        mask_bin = (mask[b] > 0.5).cpu().numpy().astype(np.uint8)
-        if np.any(mask_bin):
-            dist = distance_transform_edt(mask_bin)
-            radii.append(float(np.max(dist)))
-        else:
-            radii.append(0.0)
-
-    min_idx = int(np.argmin(radii)) if radii else 0
-    return radii, min_idx
 
 
 def masks_to_bboxes(mask, padding, smooth_window, vae_stride, info_lines):
@@ -137,6 +146,60 @@ def masks_to_bboxes(mask, padding, smooth_window, vae_stride, info_lines):
                             info_lines=info_lines, vae_stride=vae_stride)
 
 
+def _snap_mask_to_vae_grid(mask, stride=8):
+    """Snap mask boundary to multiples of `stride` via per-block majority quantization.
+
+    For each `stride x stride` block of pixels, count foreground pixels (mask > 0.5).
+    If more than 50% of the block is foreground, the entire block becomes 1.0; otherwise
+    the entire block becomes 0.0. Result: every stride-aligned block has a uniform value,
+    perfectly aligned with the VACE encoder's VAE 8x8 spatial stride.
+
+    This eliminates fractional-block ambiguity that arises when an arbitrary binary
+    boundary falls inside a single VAE block (the encoder sees a partial block which
+    encodes to an in-between latent value). With grid-snapping on, every block is
+    fully foreground or fully background -- the encoded mask becomes crisp.
+
+    Different from erosion: erosion shifts the boundary inward by a fixed offset,
+    leaving its alignment to the grid arbitrary. Grid-snap actually quantizes the
+    boundary onto stride-aligned positions.
+
+    Args:
+        mask: [B, H, W] tensor in [0, 1]. Values >0.5 treated as foreground.
+        stride: VAE spatial stride (8 for WAN).
+
+    Returns:
+        [B, H, W] tensor with grid-quantized boundary; each stride x stride block
+        is uniformly 0.0 or 1.0.
+    """
+    if mask.dim() != 3:
+        raise ValueError(
+            f"_snap_mask_to_vae_grid expects [B,H,W], got shape {tuple(mask.shape)}"
+        )
+    B, H, W = mask.shape
+    pad_h = (stride - H % stride) % stride
+    pad_w = (stride - W % stride) % stride
+    if pad_h or pad_w:
+        # Pad to clean stride multiples for the reshape, snap, then crop back.
+        # Pad value 0 (background) is the safe default — won't introduce false fg.
+        mask_p = torch.nn.functional.pad(mask, (0, pad_w, 0, pad_h), mode="constant", value=0.0)
+    else:
+        mask_p = mask
+    Hp, Wp = mask_p.shape[1], mask_p.shape[2]
+
+    # Per-block majority vote: each (stride x stride) block becomes 1.0 if >50% fg.
+    binary = (mask_p > 0.5).to(mask.dtype)
+    blocks = binary.view(B, Hp // stride, stride, Wp // stride, stride)
+    block_sum = blocks.sum(dim=(2, 4))                       # [B, H/s, W/s]
+    threshold = (stride * stride) / 2.0
+    block_on = (block_sum > threshold).to(mask.dtype)        # [B, H/s, W/s]
+
+    # Expand each block back to full resolution
+    snapped = block_on.unsqueeze(2).unsqueeze(4).expand(
+        B, Hp // stride, stride, Wp // stride, stride
+    ).reshape(B, Hp, Wp)
+    return snapped[:, :H, :W]
+
+
 class NV_VaceControlVideoPrep:
     """Prepare both control_video and control_masks for WanVaceToVideo in a single node."""
 
@@ -158,54 +221,15 @@ class NV_VaceControlVideoPrep:
                     ),
                 }),
                 "mask_shape": (["as_is", "bbox"], {
-                    "default": "as_is",
+                    "default": "bbox",
                     "tooltip": (
                         "[SHAPE] Pre-stage geometry decision — affects BOTH gen and stitch masks. "
-                        "as_is: use input mask directly (tight segmentation). "
-                        "bbox: convert to per-frame bounding boxes with temporal smoothing. "
-                        "Box masks produce cleaner VACE results because boundaries align with "
-                        "VAE 8x8 blocks and match VACE training distribution."
-                    ),
-                }),
-                "mode": (["auto", "manual"], {
-                    "default": "auto",
-                    "tooltip": (
-                        "[GEN MASK] How to derive the GENERATION-mask erosion/feather values. "
-                        "auto: analyze mask geometry and pick optimal values (capped by safety "
-                        "limits derived from the mask itself). The widget values below act as "
-                        "TARGETS in this mode. "
-                        "manual: use erosion_blocks and feather_blocks widget values directly."
-                    ),
-                }),
-                "erosion_blocks": ("FLOAT", {
-                    "default": 0.5, "min": 0.0, "max": 4.0, "step": 0.25,
-                    "tooltip": (
-                        "[GEN MASK] Erode the GENERATION mask inward by this many VAE blocks (8px each "
-                        "for WAN). 0.5 blocks = 4px. NEVER set to 0 — sharp 1-pixel edges produce "
-                        "ALIASED encoded conditioning at the VAE-block grid (see D-122). "
-                        "In auto mode this is the target value capped by mask geometry. "
-                        "DOES NOT affect the stitch mask — for that, see vace_stitch_erosion_px."
-                    ),
-                }),
-                "feather_blocks": ("FLOAT", {
-                    "default": 1.5, "min": 0.0, "max": 8.0, "step": 0.25,
-                    "tooltip": (
-                        "[GEN MASK] Feather the GENERATION mask edge over this many VAE blocks. "
-                        "1.5 blocks = 12px for WAN. NEVER set to 0 — feather over >1 VAE block "
-                        "ensures the boundary gradient is captured cleanly in encoded space "
-                        "(VACE encodes the mask via 8x8 block decomposition; sharp pixel-aligned "
-                        "edges produce aliased conditioning). "
-                        "DOES NOT affect the stitch mask — for that, see vace_stitch_feather_px."
-                    ),
-                }),
-                "fill_mode": (["soft", "none"], {
-                    "default": "soft",
-                    "tooltip": (
-                        "[GEN MASK] How control_video is filled inside the generation mask. "
-                        "soft: alpha-composite fill using feathered mask. Smooth channels, "
-                        "mild double-attenuation in transition zone. "
-                        "none: no fill, real content everywhere. Mathematically ideal "
-                        "inactive channel. Best for LoRA face replacement."
+                        "bbox (DEFAULT): convert to per-frame bounding boxes with temporal smoothing — "
+                        "in-distribution per VACE training (paper § 3.2 + bbox augmentation), "
+                        "naturally 8x8-block-aligned when sized correctly. "
+                        "as_is: use input mask directly (tight segmentation) — out-of-distribution "
+                        "for VACE; only use for tight subject masks at high denoise (>~0.75) where "
+                        "bbox produces visible rectangular pasted-on artifacts."
                     ),
                 }),
             },
@@ -213,13 +237,13 @@ class NV_VaceControlVideoPrep:
                 "mask_config": ("MASK_PROCESSING_CONFIG", {
                     "tooltip": (
                         "Optional shared config bus from NV_MaskProcessingConfig. When connected, "
-                        "overrides matching widgets across BOTH gen and stitch stages: "
-                        "[GEN] erosion/feather/input_grow/halo; "
+                        "overrides matching widgets: "
+                        "[GEN] vace_input_grow_px; "
                         "[STITCH] stitch_erosion/stitch_feather; "
                         "[CLEANUP] fill_holes/remove_noise/smooth. "
-                        "Note: a future v2.1 may split this into separate MASK_GEN_CONFIG and "
-                        "MASK_BLEND_CONFIG buses to make the gen/stitch separation explicit at "
-                        "the bus level."
+                        "Bus keys for RETIRED params (vace_erosion_blocks, vace_feather_blocks, "
+                        "vace_halo_px) are silently ignored — those operations are no longer applied. "
+                        "Future v2.1 may split this into MASK_GEN_CONFIG + MASK_BLEND_CONFIG buses."
                     ),
                 }),
                 "bbox_padding": ("FLOAT", {
@@ -236,12 +260,16 @@ class NV_VaceControlVideoPrep:
                         "0 = disabled. Only used when mask_shape='bbox'."
                     ),
                 }),
-                "fill_value": ("FLOAT", {
-                    "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05,
+                "vae_grid_snap": ("BOOLEAN", {
+                    "default": False,
                     "tooltip": (
-                        "[GEN MASK] Fill color for masked area in control_video. 0.5 = true VACE neutral "
-                        "(WanVaceToVideo centers control_video by -0.5, so 0.5 → 0.0 in the encoded "
-                        "inactive channel). Only used when fill_mode='soft'."
+                        "[GEN MASK] Quantize the binary mask boundary to multiples of vae_stride (8 px) "
+                        "via per-block majority voting. Each 8x8 block becomes uniformly 1.0 or 0.0 — "
+                        "perfectly aligned with VACE's encoder grid, eliminating fractional-block "
+                        "ambiguity at arbitrary boundaries. Different from erosion (retired) — does NOT "
+                        "shift the boundary inward, just snaps it to grid lines. Useful for tight "
+                        "irregular masks where boundary alignment with VAE blocks reduces encoded "
+                        "artifacts. False (default) = pass binary mask as-is; True = snap to grid."
                     ),
                 }),
                 "threshold": ("BOOLEAN", {
@@ -254,12 +282,18 @@ class NV_VaceControlVideoPrep:
                 "vace_input_grow_px": ("INT", {
                     "default": 0, "min": -128, "max": 128, "step": 1,
                     "tooltip": (
-                        "[GEN MASK] Uniform grow (positive) or shrink (negative) of the GENERATION mask "
-                        "BEFORE VACE processing. Use to ensure full coverage of BOTH source-subject "
-                        "silhouette AND target-subject silhouette (e.g., head-swap with size mismatch — "
-                        "original head must be hidden, AND target shape must have room to generate). "
+                        "[GEN MASK] The ONE mask-shape knob for VACE. Uniformly grow (positive) or "
+                        "shrink (negative) the GENERATION mask in pixels. "
+                        "USE POSITIVE TO: cover BOTH source-subject silhouette AND target-subject "
+                        "silhouette (head-swap with size mismatch — original head hidden + target shape "
+                        "has room to generate); add a repaint margin so the eventual stitch seam falls "
+                        "inside repainted content (the old 'Seam-Absorbing Halo' role — now subsumed). "
+                        "USE NEGATIVE TO: shrink the editable region inward (the old 'erosion_blocks' "
+                        "role — now subsumed; both ops were morphological erosion, just expressed in "
+                        "different units). "
                         "0 = input mask already covers the right area. "
-                        "DOES NOT affect the stitch mask. (Previously: mask_grow)"
+                        "Subsumes retired params: vace_halo_px (= positive grow) and erosion_blocks "
+                        "(= negative grow). DOES NOT affect the stitch mask."
                     ),
                 }),
                 "cleanup_fill_holes": ("INT", {
@@ -303,18 +337,6 @@ class NV_VaceControlVideoPrep:
                         "'bbox': bbox mask eroded inward (hides VACE generation seams at boundary). "
                         "DOES NOT affect what VACE generates — only what gets composited back to frame. "
                         "(Previously: stitch_source)"
-                    ),
-                }),
-                "vace_halo_px": ("INT", {
-                    "default": 16, "min": 0, "max": 48, "step": 4,
-                    "tooltip": (
-                        "[GEN MASK] Seam-Absorbing Halo: expand the GENERATION mask OUTWARD by N px so "
-                        "WAN actually repaints a margin OUTSIDE the eventual stitch boundary. The stitch "
-                        "composite seam then falls INSIDE repainted content rather than on a hard "
-                        "AI/original boundary — major reduction in visible seam. 16px = recommended "
-                        "(2 VAE blocks). 0 = disabled. "
-                        "Despite the name, this shapes the GEN mask, not the stitch mask. "
-                        "(Previously: halo_pixels)"
                     ),
                 }),
                 "vace_stitch_erosion_px": ("INT", {
@@ -362,58 +384,58 @@ class NV_VaceControlVideoPrep:
     FUNCTION = "execute"
     CATEGORY = "NV_Utils/VACE"
     DESCRIPTION = (
-        "Single-node VACE control video + mask preparation with two-mask architecture.\n"
+        "Single-node VACE control video + mask preparation. Slim version: research showed "
+        "VACE was trained on BINARY masks (paper § 3.2), so feathering / erosion / soft-fill "
+        "params have been retired as out-of-distribution.\n"
         "\n"
-        "TWO logically-distinct masks for TWO different jobs (see module docstring):\n"
-        "  • control_masks (GEN MASK)    → tells VACE/WAN what region to repaint.\n"
-        "    Shaped by [GEN MASK] tagged params: erosion_blocks, feather_blocks,\n"
-        "    vace_input_grow_px, vace_halo_px, fill_mode, fill_value.\n"
-        "    Goal: cover the union of source-subject + target-subject silhouettes,\n"
-        "    feathered in VAE-block units for clean encoded conditioning.\n"
-        "  • stitch_mask (BLEND MASK)    → tells the compositor what region to alpha-blend.\n"
-        "    Shaped by [STITCH MASK] tagged params: vace_stitch_source,\n"
-        "    vace_stitch_erosion_px, vace_stitch_feather_px.\n"
-        "    Goal: hide the seam in pixel space; soft edges are a feature here.\n"
-        "  • tight_mask                  → backup output: tight original mask with stitch\n"
-        "    erosion/feather applied. Use when you want a different boundary downstream\n"
-        "    than the bbox-vs-tight choice in vace_stitch_source.\n"
+        "GEN MASK (control_masks) → drives WAN regeneration. Binary by default; one knob "
+        "(vace_input_grow_px) for uniform expand/shrink. Optional vae_grid_snap quantizes "
+        "boundaries to the VAE 8x8 grid for tight irregular masks.\n"
         "\n"
-        "Pre-stage params [SHAPE] + [CLEANUP] apply to the raw mask BEFORE the gen/stitch split.\n"
-        "Wire control_masks → WanVaceToVideo. Wire stitch_mask → NV_VaceVideoStitch (or any\n"
-        "downstream pixel compositor) for the post-sampler blend."
+        "STITCH MASK (stitch_mask, tight_mask) → drives post-sampler pixel compositing. "
+        "Soft edges fine here; vace_stitch_* params shape it independently.\n"
+        "\n"
+        "Pre-stage params [SHAPE]/[CLEANUP] apply before the gen/stitch split. Control video "
+        "is always soft-filled with VACE neutral 0.5 (canonical training distribution).\n"
+        "\n"
+        "Wire control_masks → WanVaceToVideo. Wire stitch_mask → NV_VaceVideoStitch / "
+        "NV_InpaintStitch_V2 for post-sampler blend."
     )
 
-    def execute(self, image, mask, mask_shape, mode, erosion_blocks, feather_blocks, fill_mode,
+    def execute(self, image, mask, mask_shape,
                 mask_config=None, bbox_padding=0.15, bbox_smooth_frames=5,
-                fill_value=0.5, threshold=False,
+                vae_grid_snap=False, threshold=False,
                 vace_input_grow_px=0, cleanup_fill_holes=0, cleanup_remove_noise=0,
                 cleanup_smooth=0, vae_stride=8,
-                vace_stitch_source="tight", vace_halo_px=16,
+                vace_stitch_source="tight",
                 vace_stitch_erosion_px=0, vace_stitch_feather_px=8,
                 previous_chunk_tail=None, tail_overlap_frames=4):
 
-        # Apply shared config override if connected
+        # Hardcoded canonical VACE values (per research 2026-05-01):
+        # - Fill mode is always "soft" alpha-composite (VACE training distribution).
+        # - Fill value is locked to 0.5 (gray-127), the VACE neutral. WanVaceToVideo
+        #   centers control_video by -0.5, so 0.5 maps to 0 in the encoded inactive
+        #   channel. Anything else is OOD per the training data + paper.
+        FILL_VALUE = 0.5
+
+        # Apply shared config override if connected. Only references SURVIVING keys.
+        # Bus keys for retired params (vace_erosion_blocks, vace_feather_blocks,
+        # vace_halo_px) are silently ignored.
         from .mask_processing_config import apply_vace_mask_config
         vals = apply_vace_mask_config(mask_config,
             cleanup_fill_holes=cleanup_fill_holes,
             cleanup_remove_noise=cleanup_remove_noise,
             cleanup_smooth=cleanup_smooth,
-            erosion_blocks=erosion_blocks,
-            feather_blocks=feather_blocks,
             vace_stitch_erosion_px=vace_stitch_erosion_px,
             vace_stitch_feather_px=vace_stitch_feather_px,
             vace_input_grow_px=vace_input_grow_px,
-            vace_halo_px=vace_halo_px,
         )
         fill_holes_v = vals["cleanup_fill_holes"]
         remove_noise_v = vals["cleanup_remove_noise"]
         smooth_v = vals["cleanup_smooth"]
-        erosion_blocks = vals["erosion_blocks"]
-        feather_blocks = vals["feather_blocks"]
         stitch_erosion = vals["vace_stitch_erosion_px"]
         stitch_feather = vals["vace_stitch_feather_px"]
         vace_input_grow_px = vals["vace_input_grow_px"]
-        vace_halo_px = vals["vace_halo_px"]
 
         if mask.dim() == 2:
             mask = mask.unsqueeze(0)
@@ -448,8 +470,8 @@ class NV_VaceControlVideoPrep:
                           f"(will prepend to control_video/control_masks after mask processing)")
 
         info_lines = [
-            f"[NV_VaceControlVideoPrep] shape={mask_shape} | mode={mode} | "
-            f"fill={fill_mode} | vae_stride={vae_stride}px"
+            f"[NV_VaceControlVideoPrep v2.1] shape={mask_shape} | grid_snap={vae_grid_snap} | "
+            f"vae_stride={vae_stride}px | fill=soft@0.5 (canonical VACE neutral)"
         ]
 
         # Helper: apply tail prepend to control_video + control_masks for any exit path
@@ -475,8 +497,8 @@ class NV_VaceControlVideoPrep:
             return (cv, cm, mask, mask, info, tail_trim)
 
         if mask_min > 0.99:
-            fill = torch.full_like(image, fill_value) if fill_mode == "soft" else image
-            info_lines.append("  Mask is all ones — full fill applied")
+            fill = torch.full_like(image, FILL_VALUE)
+            info_lines.append("  Mask is all ones — full fill applied (0.5 neutral)")
             cv, cm = _apply_tail(fill, mask)
             if tail_trim > 0:
                 info_lines.append(f"  Tail prepended: {tail_trim} frames (trivial mask path)")
@@ -528,105 +550,36 @@ class NV_VaceControlVideoPrep:
                 print(info)
                 return (cv, cm, mask, mask, info, tail_trim)
 
-        # --- Step 3: Analyze mask geometry ---
-        radii, min_frame = compute_inscribed_radius(result_mask)
-        min_radius = radii[min_frame] if radii else 0.0
-        radius_blocks = min_radius / vae_stride
+        # --- Step 3: Binarize the GEN mask ---
+        # VACE was trained on binary masks (paper § 3.2). Cleanup ops above use
+        # greyscale morphology which can leave soft values; enforce binary at the
+        # boundary between mask processing and VACE consumption. This is the
+        # binary-first principle from the 2026-05-01 research+debate convergence.
+        result_mask = (result_mask > 0.5).to(result_mask.dtype)
+        info_lines.append("  Binarized for VACE (binary-first per training distribution)")
 
-        info_lines.append(
-            f"  Inscribed radius: {min_radius:.1f}px ({radius_blocks:.1f} VAE blocks)"
-            f" — min at frame {min_frame}/{len(radii)}"
-        )
-
-        # --- Step 4: Compute erosion/feather pixel values ---
-        if mode == "auto":
-            # Use widget values as TARGETS, capped by mask geometry safety limits
-            erosion_target = erosion_blocks * vae_stride
-            erosion_max_safe = max(1.0, min_radius / 3.0)
-            erosion_px = int(round(min(erosion_target, erosion_max_safe)))
-
-            feather_target = feather_blocks * vae_stride
-            feather_max_safe = max(float(vae_stride), min_radius / 2.0)
-            feather_px = int(round(min(feather_target, feather_max_safe)))
-
+        # --- Step 4: Optional VAE grid snap ---
+        # Genuinely quantizes the binary boundary onto stride-aligned positions
+        # via per-block majority voting. Different from the retired erosion_blocks
+        # (which just shifted the boundary inward without grid alignment). When
+        # enabled, every 8x8 VAE block is uniformly fully foreground or fully
+        # background — eliminates fractional-block ambiguity at arbitrary boundaries.
+        if vae_grid_snap:
+            result_mask = _snap_mask_to_vae_grid(result_mask, stride=vae_stride)
             info_lines.append(
-                f"  Erosion (auto): {erosion_px}px "
-                f"— target: {erosion_target:.0f}px, max safe: {erosion_max_safe:.0f}px"
-            )
-            info_lines.append(
-                f"  Feather (auto): {feather_px}px "
-                f"— target: {feather_target:.0f}px, max safe: {feather_max_safe:.0f}px"
+                f"  VAE grid snap applied: boundary quantized to {vae_stride}px-aligned blocks "
+                f"via per-block majority vote"
             )
 
-            if min_radius < vae_stride:
-                info_lines.append(
-                    f"  WARNING: Mask thinner than 1 VAE block ({min_radius:.1f}px < {vae_stride}px). "
-                    f"Auto values are heavily constrained."
-                )
-
-        else:  # manual
-            erosion_px = int(round(erosion_blocks * vae_stride))
-            feather_px = int(round(feather_blocks * vae_stride))
-            info_lines.append(
-                f"  Erosion (manual): {erosion_blocks} blocks = {erosion_px}px"
-            )
-            info_lines.append(
-                f"  Feather (manual): {feather_blocks} blocks = {feather_px}px"
-            )
-
-        # --- Step 5: Erode ---
-        if erosion_px > 0:
-            result_mask = mask_erode_dilate(result_mask, -erosion_px)
-
-        # --- Step 5b: Seam-Absorbing Control Halo ---
-        # Expand the BINARY eroded mask outward BEFORE feathering, so the halo gets a
-        # clean uniform expansion. Dilating after feather would distort the gradient profile
-        # (grey morphology expands high-value contours more than low-value).
-        if vace_halo_px > 0:
-            result_mask = mask_erode_dilate(result_mask, vace_halo_px)  # positive = dilate outward
-            info_lines.append(
-                f"  Halo: expanded VACE mask outward by {vace_halo_px}px "
-                f"({vace_halo_px / vae_stride:.1f} VAE blocks) — applied pre-feather"
-            )
-
-        # --- Step 6: Blur (feather) ---
-        if feather_px > 0:
-            result_mask = mask_blur(result_mask, feather_px)
-            effective_kernel = feather_px if feather_px % 2 == 1 else feather_px + 1
-            info_lines.append(f"  Blur kernel: {effective_kernel}px (odd)")
-
-        # --- Step 7: Clamp ---
-        result_mask = result_mask.clamp(0.0, 1.0)
-
-        # --- Step 8: Composite control video ---
-        # Expand mask for broadcasting: [B, H, W] → [B, H, W, 1] for IMAGE [B, H, W, C]
+        # --- Step 5: Composite control video (always soft-fill with VACE neutral 0.5) ---
+        # WanVaceToVideo centers control_video by -0.5 so 0.5 maps to 0 in encoded
+        # inactive channel. This is canonical per the VACE User Guide. The retired
+        # fill_mode='none' path was OOD relative to the training distribution.
         mask_expanded = result_mask.unsqueeze(-1)
-
-        if fill_mode == "soft":
-            # Alpha composite: real * (1 - mask) + fill * mask
-            control_video = image * (1.0 - mask_expanded) + fill_value * mask_expanded
-            info_lines.append(
-                f"  Fill: soft composite with value={fill_value:.2f} "
-                f"(VACE neutral={'yes' if abs(fill_value - 0.5) < 0.01 else 'NO — 0.5 is neutral'})"
-            )
-        else:  # none
-            control_video = image
-            info_lines.append("  Fill: none — real content passed through")
-
-        # Transition summary
-        transition_px = erosion_px + feather_px
-        transition_blocks = transition_px / vae_stride
-        transition_patches = transition_px / (vae_stride * 2)  # VACE patch stride (1,2,2)
+        control_video = image * (1.0 - mask_expanded) + FILL_VALUE * mask_expanded
         info_lines.append(
-            f"  Transition zone: ~{transition_px}px "
-            f"({transition_blocks:.1f} VAE blocks, {transition_patches:.1f} VACE attention patches)"
+            f"  Fill: soft composite with VACE neutral {FILL_VALUE:.2f} (gray-127)"
         )
-
-        if fill_mode == "soft" and feather_px > 0:
-            info_lines.append(
-                "  Note: soft fill + feathered mask creates mild double-attenuation in "
-                "transition zone. Switch to fill_mode='none' for linear attenuation."
-            )
 
         # --- Step 9: Build tight mask (always from original input mask) ---
         tight_mask = mask.clone()
