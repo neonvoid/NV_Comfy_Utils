@@ -434,8 +434,25 @@ class NV_WarpAlignmentCheck:
                         active_in_bbox = int(m_i[y0:y1, x0:x1].sum())
                         if (ch >= _PHASE_MIN_BBOX_DIM and cw >= _PHASE_MIN_BBOX_DIM
                                 and active_in_bbox >= _PHASE_MIN_ACTIVE_PX):
+                            # Crop to mask bbox THEN apply a SOFT-mask weighting that suppresses
+                            # background pixels within the bbox. Subject-only phase correlation.
+                            #
+                            # Why soft and not hard binary: a hard binary mask creates a razor-
+                            # sharp interior edge inside the crop, and the FFT in phaseCorrelate
+                            # treats that edge as a massive high-frequency signal that dominates
+                            # the correlation peak (biases dx/dy toward 0). A Gaussian-blurred
+                            # mask gives smooth falloff at the subject boundary, so phase corr
+                            # locks onto subject content instead of the mask edge.
                             crop_o = a_np[y0:y1, x0:x1]
                             crop_w = b_np[y0:y1, x0:x1]
+                            mask_crop = m_i[y0:y1, x0:x1].astype(np.float32)
+                            # Sigma scales with bbox size: ~5% of min(ch, cw), clamped to [3, 16].
+                            # Smaller crops get a tighter falloff so the soft band doesn't eat
+                            # the whole subject; larger crops get a wider band for clean tapering.
+                            sigma = max(3.0, min(16.0, 0.05 * min(ch, cw)))
+                            soft_mask = cv2.GaussianBlur(mask_crop, (0, 0), sigmaX=sigma)
+                            crop_o = crop_o * soft_mask
+                            crop_w = crop_w * soft_mask
                             dx, dy, status = self._phase_correlate_hann(crop_o, crop_w)
                             phase_status[i] = status
                             phase_dx[i] = None if np.isnan(dx) else round(dx, 3)
