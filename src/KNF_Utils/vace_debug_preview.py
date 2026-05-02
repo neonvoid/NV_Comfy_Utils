@@ -111,9 +111,19 @@ class NV_VaceDebugPreview:
                     "tooltip": "Stitcher from InpaintCrop2. Shows the crop blend mask (yellow) — "
                                "this is what actually controls the pixel-space composite boundary."
                 }),
-                "mask_config": ("MASK_BLEND_CONFIG", {
-                    "tooltip": "BLEND config dict — used to compute cumulative expansion summary "
-                               "for the BLEND-side mask. GEN-side comes via the VACE prep info string."
+                "mask_gen_config": ("MASK_GEN_CONFIG", {
+                    "tooltip": (
+                        "Optional GEN config (NV_MaskGenConfig) — supplies "
+                        "vace_input_grow_px for the cumulative expansion summary."
+                    ),
+                }),
+                "mask_blend_config": ("MASK_BLEND_CONFIG", {
+                    "tooltip": (
+                        "Optional BLEND config (NV_MaskBlendConfig) — supplies "
+                        "crop_expand_px / crop_blend_feather_px / vace_stitch_* for "
+                        "the BLEND-side expansion summary. Both buses can be wired "
+                        "for the full GEN+BLEND debug picture."
+                    ),
                 }),
                 "overlay_alpha": ("FLOAT", {
                     "default": 0.5, "min": 0.1, "max": 0.9, "step": 0.05,
@@ -134,7 +144,22 @@ class NV_VaceDebugPreview:
     )
 
     def execute(self, image, control_video, control_masks, mode="side_by_side",
-                stitch_mask=None, stitcher=None, mask_config=None, overlay_alpha=0.5):
+                stitch_mask=None, stitcher=None,
+                mask_gen_config=None, mask_blend_config=None, overlay_alpha=0.5):
+        # Merge the two buses into a single dict for the legacy summary code below
+        # (lines ~290 read both GEN-only `vace_input_grow_px` and BLEND-only
+        # `crop_*` / `vace_stitch_*` keys — needs both to compute the cumulative
+        # expansion summary). BLEND wins on shared cleanup_* keys (matches
+        # mask_pipeline_viz precedence). Retired keys (vace_halo_px,
+        # vace_erosion_blocks, vace_feather_blocks) are no longer in either bus
+        # but the .get() fallback to 0 handles their absence safely.
+        mask_config = {}
+        if mask_gen_config:
+            mask_config.update(mask_gen_config)
+        if mask_blend_config:
+            mask_config.update(mask_blend_config)
+        if not mask_config:
+            mask_config = None
 
         B = image.shape[0]
         H, W = image.shape[1], image.shape[2]
