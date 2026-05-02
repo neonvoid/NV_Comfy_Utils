@@ -54,9 +54,10 @@ class NV_ImageDiffAnalyzer:
                     "tooltip": "Connect the STITCHER from InpaintCrop2. Extracts the blend mask, crop coords, "
                                "and stitch parameters for analysis. Overrides the 'mask' input if both connected."
                 }),
-                "mask_config": ("MASK_PROCESSING_CONFIG", {
-                    "tooltip": "Connect NV_MaskProcessingConfig to log the mask processing settings "
-                               "used in the pipeline (erode/dilate, blend pixels, etc.)."
+                "mask_config": ("MASK_BLEND_CONFIG", {
+                    "tooltip": "Connect NV_MaskBlendConfig to log the BLEND-side mask processing "
+                               "settings used in the pipeline (cleanup, crop_expand, blend_feather, "
+                               "stitch erosion/feather)."
                 }),
                 "mask_threshold": ("FLOAT", {
                     "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01,

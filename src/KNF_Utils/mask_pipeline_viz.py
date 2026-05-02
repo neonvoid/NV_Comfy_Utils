@@ -239,9 +239,19 @@ class NV_MaskPipelineViz:
                 }),
             },
             "optional": {
-                "mask_config": ("MASK_PROCESSING_CONFIG", {
-                    "tooltip": "Optional shared config from NV_MaskProcessingConfig. "
-                               "When connected, overrides all mask processing widgets on this node."
+                "mask_gen_config": ("MASK_GEN_CONFIG", {
+                    "tooltip": (
+                        "Optional GEN bus from NV_MaskGenConfig. When wired, overrides "
+                        "cleanup_* + vace_input_grow_px on the GEN-side preview."
+                    ),
+                }),
+                "mask_blend_config": ("MASK_BLEND_CONFIG", {
+                    "tooltip": (
+                        "Optional BLEND bus from NV_MaskBlendConfig. When wired, overrides "
+                        "cleanup_* + crop_expand_px + crop_blend_feather_px + vace_stitch_* "
+                        "on the BLEND-side preview. Cleanup keys: blend bus wins over gen "
+                        "when both are wired."
+                    ),
                 }),
                 "bbox_mask": ("MASK", {
                     "tooltip": "Optional bounding box mask from MaskTrackingBBox.",
@@ -274,33 +284,28 @@ class NV_MaskPipelineViz:
                 cleanup_smooth, crop_blend_feather_px,
                 erosion_blocks, feather_blocks, vae_stride,
                 vace_stitch_erosion_px, vace_stitch_feather_px,
-                mask_config=None, bbox_mask=None,
+                mask_gen_config=None, mask_blend_config=None, bbox_mask=None,
                 cropped_image=None, cropped_mask=None):
 
-        # Apply shared config override if connected
-        from .mask_processing_config import apply_mask_config, apply_vace_mask_config
-        vals = apply_mask_config(mask_config,
-            crop_expand_px=crop_expand_px,
-            cleanup_fill_holes=cleanup_fill_holes,
-            cleanup_remove_noise=cleanup_remove_noise,
-            cleanup_smooth=cleanup_smooth,
-            crop_blend_feather_px=crop_blend_feather_px,
-        )
-        crop_expand_px = vals["crop_expand_px"]
-        cleanup_fill_holes = vals["cleanup_fill_holes"]
-        cleanup_remove_noise = vals["cleanup_remove_noise"]
-        cleanup_smooth = vals["cleanup_smooth"]
-        crop_blend_feather_px = vals["crop_blend_feather_px"]
-        vace_vals = apply_vace_mask_config(mask_config,
-            erosion_blocks=erosion_blocks,
-            feather_blocks=feather_blocks,
-            vace_stitch_erosion_px=vace_stitch_erosion_px,
-            vace_stitch_feather_px=vace_stitch_feather_px,
-        )
-        erosion_blocks = vace_vals["erosion_blocks"]
-        feather_blocks = vace_vals["feather_blocks"]
-        vace_stitch_erosion_px = vace_vals["vace_stitch_erosion_px"]
-        vace_stitch_feather_px = vace_vals["vace_stitch_feather_px"]
+        # Resolve from two bus inputs (D-189 bus split). Cleanup keys appear in
+        # both buses: prefer BLEND when both are wired (blend is the more typical
+        # inspection target). vace_input_grow_px is GEN-only; crop_*/vace_stitch_*
+        # are BLEND-only. erosion_blocks/feather_blocks stay LOCAL ONLY — they
+        # were retired keys (D-187) and the new buses don't carry them; the viz
+        # widgets are kept so the user can preview what those operations would
+        # look like, even though no VACE prep node applies them anymore.
+        gen_cfg = mask_gen_config or {}
+        blend_cfg = mask_blend_config or {}
+        cleanup_fill_holes = blend_cfg.get(
+            "cleanup_fill_holes", gen_cfg.get("cleanup_fill_holes", cleanup_fill_holes))
+        cleanup_remove_noise = blend_cfg.get(
+            "cleanup_remove_noise", gen_cfg.get("cleanup_remove_noise", cleanup_remove_noise))
+        cleanup_smooth = blend_cfg.get(
+            "cleanup_smooth", gen_cfg.get("cleanup_smooth", cleanup_smooth))
+        crop_expand_px = blend_cfg.get("crop_expand_px", crop_expand_px)
+        crop_blend_feather_px = blend_cfg.get("crop_blend_feather_px", crop_blend_feather_px)
+        vace_stitch_erosion_px = blend_cfg.get("vace_stitch_erosion_px", vace_stitch_erosion_px)
+        vace_stitch_feather_px = blend_cfg.get("vace_stitch_feather_px", vace_stitch_feather_px)
 
         # Common mask processing kwargs
         mask_kwargs = dict(

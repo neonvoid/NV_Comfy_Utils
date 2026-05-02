@@ -295,16 +295,15 @@ class NV_VaceControlVideoPrep_V2:
                 }),
             },
             "optional": {
-                "mask_config": ("MASK_PROCESSING_CONFIG", {
+                "mask_config": ("MASK_GEN_CONFIG", {
                     "tooltip": (
-                        "Optional shared config bus from NV_MaskProcessingConfig. When connected, "
-                        "overrides matching widgets: "
-                        "[GEN] vace_input_grow_px; "
-                        "[STITCH] stitch_erosion/stitch_feather; "
-                        "[CLEANUP] fill_holes/remove_noise/smooth. "
-                        "Bus keys for RETIRED params (vace_erosion_blocks, vace_feather_blocks, "
-                        "vace_halo_px) are silently ignored — those operations are no longer applied. "
-                        "Future v2.1 may split this into MASK_GEN_CONFIG + MASK_BLEND_CONFIG buses."
+                        "Optional GEN config bus from NV_MaskGenConfig. When connected, "
+                        "overrides matching widgets: cleanup_fill_holes, cleanup_remove_noise, "
+                        "cleanup_smooth, vace_input_grow_px. "
+                        "vace_stitch_* widgets are NOT bus-driven — they shape the local "
+                        "stitch_mask output and stay as local-only widgets. The bus is "
+                        "GEN-side only (D-189 head-swap principle: GEN mask covers UNION of "
+                        "source + target silhouettes; BLEND mask is a separate concern)."
                     ),
                 }),
                 "bbox_padding": ("FLOAT", {
@@ -479,24 +478,17 @@ class NV_VaceControlVideoPrep_V2:
         #   channel. Anything else is OOD per the training data + paper.
         FILL_VALUE = 0.5
 
-        # Apply shared config override if connected. Only references SURVIVING keys.
-        # Bus keys for retired params (vace_erosion_blocks, vace_feather_blocks,
-        # vace_halo_px) are silently ignored.
-        from .mask_processing_config import apply_vace_mask_config
-        vals = apply_vace_mask_config(mask_config,
-            cleanup_fill_holes=cleanup_fill_holes,
-            cleanup_remove_noise=cleanup_remove_noise,
-            cleanup_smooth=cleanup_smooth,
-            vace_stitch_erosion_px=vace_stitch_erosion_px,
-            vace_stitch_feather_px=vace_stitch_feather_px,
-            vace_input_grow_px=vace_input_grow_px,
-        )
-        fill_holes_v = vals["cleanup_fill_holes"]
-        remove_noise_v = vals["cleanup_remove_noise"]
-        smooth_v = vals["cleanup_smooth"]
-        stitch_erosion = vals["vace_stitch_erosion_px"]
-        stitch_feather = vals["vace_stitch_feather_px"]
-        vace_input_grow_px = vals["vace_input_grow_px"]
+        # Resolve GEN-bus values over local widgets (bus wins when present).
+        # MASK_GEN_CONFIG carries only GEN-side keys: cleanup_* + vace_input_grow_px.
+        # vace_stitch_* are local-only widgets (they shape the stitch_mask output —
+        # a downstream BLEND-pipeline concern, not a GEN-pipeline concern).
+        gen_cfg = mask_config or {}
+        fill_holes_v = gen_cfg.get("cleanup_fill_holes", cleanup_fill_holes)
+        remove_noise_v = gen_cfg.get("cleanup_remove_noise", cleanup_remove_noise)
+        smooth_v = gen_cfg.get("cleanup_smooth", cleanup_smooth)
+        vace_input_grow_px = gen_cfg.get("vace_input_grow_px", vace_input_grow_px)
+        stitch_erosion = vace_stitch_erosion_px
+        stitch_feather = vace_stitch_feather_px
 
         if mask.dim() == 2:
             mask = mask.unsqueeze(0)

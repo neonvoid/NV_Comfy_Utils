@@ -157,13 +157,14 @@ class NV_RebuildBlendMask:
                 }),
             },
             "optional": {
-                "mask_config": ("MASK_PROCESSING_CONFIG", {
+                "mask_config": ("MASK_BLEND_CONFIG", {
                     "tooltip": (
-                        "Optional MASK_PROCESSING_CONFIG override bus. When wired, its keys "
-                        "(cleanup_*, crop_expand_px, crop_blend_feather_px) are applied where "
-                        "the corresponding widget is at its sentinel. Resolution priority: "
-                        "widget value > mask_config value > stitcher.crop_params > fallback default. "
-                        "Useful for sharing settings across multiple consumers."
+                        "Optional MASK_BLEND_CONFIG override bus from NV_MaskBlendConfig. "
+                        "When wired, its keys (cleanup_*, crop_expand_px, crop_blend_feather_px) "
+                        "are applied where the corresponding widget is at its sentinel. "
+                        "Resolution priority: widget value > mask_config value > stitcher.crop_params "
+                        "> fallback default. NV_RebuildBlendMask is a BLEND-pipeline node "
+                        "(D-189) — operates on the BLEND mask, distinct from the GEN mask."
                     ),
                 }),
             },
@@ -205,7 +206,7 @@ class NV_RebuildBlendMask:
 
         if mask_config is not None and not isinstance(mask_config, dict):
             raise TypeError(
-                f"[NV_RebuildBlendMask] mask_config must be a dict (MASK_PROCESSING_CONFIG), "
+                f"[NV_RebuildBlendMask] mask_config must be a dict (MASK_BLEND_CONFIG), "
                 f"got {type(mask_config).__name__}"
             )
 

@@ -321,7 +321,9 @@ from .inpaint_stitch import (
     NODE_DISPLAY_NAME_MAPPINGS as INPAINT_STITCH_DISPLAY_NAME_MAPPINGS
 )
 
-# Import mask processing config (shared config bus for mask parameters)
+# Import bifurcated GEN/BLEND mask config buses (D-189 / D-190 v2.1 PR1).
+# Old NV_MaskProcessingConfig + NV_MaskConfigPatch were retired 2026-05-01:
+# replaced by NV_MaskGenConfig + NV_MaskBlendConfig + NV_MaskBlendConfigPatch.
 from .mask_processing_config import (
     NODE_CLASS_MAPPINGS as MASK_PROCESSING_CONFIG_CLASS_MAPPINGS,
     NODE_DISPLAY_NAME_MAPPINGS as MASK_PROCESSING_CONFIG_DISPLAY_NAME_MAPPINGS

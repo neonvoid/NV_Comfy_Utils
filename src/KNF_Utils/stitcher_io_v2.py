@@ -45,7 +45,10 @@ import numpy as np
 import torch
 from PIL import Image
 
-from .mask_processing_config import normalize_mask_config
+from .mask_processing_config import (
+    normalize_blend_config,
+    migrate_v1_to_split_configs,
+)
 
 
 SCHEMA_VERSION = "2.0"
@@ -412,13 +415,15 @@ class NV_SaveStitcher_V2:
                 }),
             },
             "optional": {
-                "mask_config": ("MASK_PROCESSING_CONFIG", {
+                "mask_config": ("MASK_BLEND_CONFIG", {
                     "tooltip": (
-                        "Optional MASK_PROCESSING_CONFIG to persist alongside the stitcher. "
-                        "When wired, the config dict (cleanup_*, crop_*, vace_* params) "
-                        "is saved into metadata.json so a downstream NV_LoadStitcher_V2 "
-                        "can re-emit it. Useful for capturing the exact mask settings "
-                        "that produced this stitcher in a sweep workflow."
+                        "Optional MASK_BLEND_CONFIG to persist alongside the stitcher. "
+                        "Stitcher is a BLEND-pipeline data structure (D-189) — only the "
+                        "BLEND bus belongs here. GEN-side params are persisted separately "
+                        "if needed via the GEN producer node in the consuming workflow. "
+                        "When wired, the config dict (cleanup_*, crop_*, stitch_*) is "
+                        "saved into metadata.json so a downstream NV_LoadStitcher_V2 "
+                        "can re-emit it."
                     ),
                 }),
                 "save_canvas_images": ("BOOLEAN", {
@@ -506,15 +511,19 @@ class NV_SaveStitcher_V2:
         if "stitch_params" in stitcher:
             metadata["stitch_params"] = stitcher["stitch_params"]
 
-        # --- Optional: persist the mask_config bus --------------------------
+        # --- Optional: persist the BLEND mask_config bus --------------------
+        # Stitcher is BLEND-side only (D-189). The metadata key is renamed to
+        # `mask_blend_config` to make the bus identity explicit on disk; the
+        # legacy `mask_config` key is still recognized on load via the v1
+        # migration path in NV_LoadStitcher_V2.
         if mask_config is not None:
             if not isinstance(mask_config, dict):
                 raise TypeError(
-                    f"[NV_SaveStitcher_V2] mask_config must be a dict (the MASK_PROCESSING_CONFIG "
-                    f"dict emitted by NV_MaskProcessingConfig), got {type(mask_config).__name__}"
+                    f"[NV_SaveStitcher_V2] mask_config must be a dict (the MASK_BLEND_CONFIG "
+                    f"dict emitted by NV_MaskBlendConfig), got {type(mask_config).__name__}"
                 )
-            metadata["mask_config"] = dict(mask_config)
-            report_lines.append(f"Persisted mask_config ({len(mask_config)} keys)")
+            metadata["mask_blend_config"] = dict(mask_config)
+            report_lines.append(f"Persisted mask_blend_config ({len(mask_config)} keys)")
 
         # --- Frame counts header -------------------------------------------
         n_canvas = len(stitcher["canvas_image"])
@@ -635,16 +644,15 @@ class NV_LoadStitcher_V2:
                 }),
             },
             "optional": {
-                "mask_config_override": ("MASK_PROCESSING_CONFIG", {
+                "mask_config_override": ("MASK_BLEND_CONFIG", {
                     "tooltip": (
-                        "FULL REPLACEMENT (NOT a merge) — when wired, this REPLACES "
-                        "the saved mask_config entirely. The saved config is logged in "
-                        "load_report for human-debug provenance but discarded from the "
-                        "dataflow. For SELECTIVE per-key tweaks (keep most saved values, "
-                        "change one or two), DO NOT use this socket — wire "
-                        "NV_MaskConfigPatch downstream of the mask_config output instead. "
-                        "(Naming kept as 'override' for backward compatibility; semantics "
-                        "are full replacement per Codex+Gemini debate Q2 verdict.)"
+                        "FULL REPLACEMENT (NOT a merge) — when wired, REPLACES the "
+                        "saved BLEND config entirely. Saved config logged in load_report "
+                        "for provenance but discarded from the dataflow. For per-key "
+                        "tweaks (keep most saved values, change one or two), wire "
+                        "NV_MaskBlendConfigPatch downstream of the mask_config output "
+                        "instead. (Type was MASK_PROCESSING_CONFIG pre-bus-split; "
+                        "stitcher is BLEND-side only per D-189.)"
                     ),
                 }),
                 "load_warp_data": ("BOOLEAN", {
@@ -661,15 +669,19 @@ class NV_LoadStitcher_V2:
             },
         }
 
-    # 3-output: stitcher, mask_config (override > saved > None), report
-    RETURN_TYPES = ("STITCHER", "MASK_PROCESSING_CONFIG", "STRING")
+    # 3-output: stitcher, mask_blend_config (override > saved > None), report
+    RETURN_TYPES = ("STITCHER", "MASK_BLEND_CONFIG", "STRING")
     RETURN_NAMES = ("stitcher", "mask_config", "load_report")
     FUNCTION = "load_stitcher"
     CATEGORY = "NV_Utils/Stitcher"
     DESCRIPTION = (
         "Load a STITCHER saved with NV_SaveStitcher_V2 (full V2 schema). "
-        "Returns the persisted MASK_PROCESSING_CONFIG (or mask_config_override "
-        "if wired, or None if neither). Refuses v1 saves with a migration message."
+        "Returns the persisted MASK_BLEND_CONFIG (or mask_config_override "
+        "if wired, or None if neither). Auto-migrates pre-bus-split saves "
+        "with the legacy `mask_config` key — splits, drops retired keys "
+        "with diagnostic warning, returns BLEND half. GEN-side keys from v1 "
+        "saves are reported in load_report but NOT emitted (stitcher is "
+        "BLEND-only per D-189; wire NV_MaskGenConfig separately)."
     )
 
     def load_stitcher(self, input_path, mask_config_override=None,
@@ -739,45 +751,71 @@ class NV_LoadStitcher_V2:
         if "stitch_params" in metadata:
             stitcher["stitch_params"] = metadata["stitch_params"]
 
-        # --- Resolve mask_config: normalize-saved → override-or-saved ------
-        # Step 1: normalize the persisted config against the current schema —
-        # fills missing keys with defaults, preserves canonical key order,
-        # warns on unknown keys (Q6 verdict: active normalization, non-destructive).
-        raw_saved_mask_config = metadata.get("mask_config")
-        saved_mask_config, _unknown_keys = normalize_mask_config(
-            raw_saved_mask_config, report_lines=report_lines
-        )
+        # --- Resolve mask_blend_config: detect schema, normalize, override ---
+        # Step 1a: Check for the new bus-split key first (`mask_blend_config`).
+        # Step 1b: Fall back to the legacy `mask_config` key from pre-bus-split
+        # saves and auto-migrate via migrate_v1_to_split_configs — drops the
+        # 3 retired keys (vace_erosion_blocks/feather_blocks/halo_px) and the
+        # GEN-side keys with diagnostic warnings. The GEN half is logged but
+        # NOT emitted (stitcher is BLEND-only per D-189; user wires NV_Mask
+        # GenConfig separately if they want GEN params back).
+        raw_saved_blend_config = metadata.get("mask_blend_config")
+        if raw_saved_blend_config is not None:
+            saved_mask_config, _unknown = normalize_blend_config(
+                raw_saved_blend_config, report_lines=report_lines
+            )
+        else:
+            raw_saved_v1_config = metadata.get("mask_config")
+            if raw_saved_v1_config is not None:
+                report_lines.append(
+                    "Detected pre-bus-split save (legacy `mask_config` key). "
+                    "Auto-migrating to MASK_BLEND_CONFIG via migrate_v1_to_split_configs..."
+                )
+                _gen_dict, blend_dict, _dropped = migrate_v1_to_split_configs(
+                    raw_saved_v1_config, report_lines=report_lines
+                )
+                saved_mask_config, _unknown = normalize_blend_config(
+                    blend_dict, report_lines=report_lines
+                )
+                # Only log GEN-side intent when the v1 save had a NON-DEFAULT
+                # vace_input_grow_px (the only GEN-specific knob — cleanup_*
+                # are shared, so their presence in v1 doesn't imply GEN intent).
+                # _gen_dict is always populated with defaults by the migration,
+                # so `if _gen_dict:` would log on every legacy load. (Codex
+                # impl-review 2026-05-01.)
+                v1_grow = raw_saved_v1_config.get("vace_input_grow_px")
+                if v1_grow is not None and v1_grow != 0:
+                    report_lines.append(
+                        f"  v1 GEN-side intent detected (vace_input_grow_px="
+                        f"{v1_grow}). NOT emitted by this loader — stitcher is "
+                        f"BLEND-only per D-189. Wire NV_MaskGenConfig separately "
+                        f"if you want to preserve this GEN knob."
+                    )
+            else:
+                saved_mask_config = None
 
         # Step 2: choose effective config. Override (when wired) replaces saved.
-        # We normalize the override against the current schema TOO — defends
-        # against an old upstream config emitted before a schema append: that
-        # would otherwise flow through here verbatim and arrive at consumers
-        # missing the new key, who'd silently fall back to their widget defaults.
-        # normalize_mask_config() also deepcopies internally, so this satisfies
-        # the Q5 deepcopy verdict in one step.
-        # (Codex impl-review 2026-05-01, override-not-normalized gap.)
+        # Normalize the override too (Codex impl-review 2026-05-01,
+        # override-not-normalized gap). normalize_blend_config also deepcopies
+        # internally — satisfies the Q5 deepcopy verdict.
         if mask_config_override is not None:
             if not isinstance(mask_config_override, dict):
                 raise TypeError(
                     f"[NV_LoadStitcher_V2] mask_config_override must be a dict "
-                    f"(MASK_PROCESSING_CONFIG), got {type(mask_config_override).__name__}"
+                    f"(MASK_BLEND_CONFIG), got {type(mask_config_override).__name__}"
                 )
             override_report_lines = []
-            mask_config, _override_unknown = normalize_mask_config(
+            mask_config, _override_unknown = normalize_blend_config(
                 mask_config_override, report_lines=override_report_lines
             )
             if override_report_lines:
-                # Tag normalize messages so they don't conflate with saved-config diagnostics
                 for line in override_report_lines:
-                    report_lines.append(line.replace("normalize_mask_config:", "normalize_mask_config (override):"))
+                    report_lines.append(line.replace("normalize_blend_config:", "normalize_blend_config (override):"))
             if saved_mask_config is not None:
                 report_lines.append(
                     f"mask_config_override wired — REPLACING saved config "
                     f"({len(saved_mask_config)} keys) with override ({len(mask_config)} keys)"
                 )
-                # Provenance (Q4 verdict): embed saved config text for human-debug
-                # so a downstream debug consumer can compare original vs effective
-                # via load_report without needing an extra socket.
                 report_lines.append(
                     f"  saved config (replaced, for provenance): {saved_mask_config}"
                 )
@@ -788,7 +826,7 @@ class NV_LoadStitcher_V2:
         else:
             mask_config = saved_mask_config
             if mask_config is not None:
-                report_lines.append(f"Restored saved mask_config ({len(mask_config)} keys)")
+                report_lines.append(f"Restored saved mask_blend_config ({len(mask_config)} keys)")
 
         # --- Load canvas images (strict — no silent skips) -----------------
         d = metadata.get("canvas_images_dir")

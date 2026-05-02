@@ -195,8 +195,10 @@ class NV_ShotRecord:
                 "stitcher": ("STITCHER", {
                     "tooltip": "Optional fallback if no manifest_in — extracts bbox trajectory directly."
                 }),
-                "mask_config": ("MASK_PROCESSING_CONFIG", {
-                    "tooltip": "Optional fallback if no manifest_in — extracts mask processing params."
+                "mask_config": ("MASK_BLEND_CONFIG", {
+                    "tooltip": "Optional fallback if no manifest_in — extracts BLEND-side mask "
+                               "processing params. GEN-side params come via the consuming node's "
+                               "info string."
                 }),
                 "render_status": (["completed", "failed", "oom", "aborted"], {
                     "default": "completed",

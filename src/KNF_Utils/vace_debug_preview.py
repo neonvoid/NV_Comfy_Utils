@@ -111,8 +111,9 @@ class NV_VaceDebugPreview:
                     "tooltip": "Stitcher from InpaintCrop2. Shows the crop blend mask (yellow) — "
                                "this is what actually controls the pixel-space composite boundary."
                 }),
-                "mask_config": ("MASK_PROCESSING_CONFIG", {
-                    "tooltip": "Config dict — used to compute cumulative expansion summary."
+                "mask_config": ("MASK_BLEND_CONFIG", {
+                    "tooltip": "BLEND config dict — used to compute cumulative expansion summary "
+                               "for the BLEND-side mask. GEN-side comes via the VACE prep info string."
                 }),
                 "overlay_alpha": ("FLOAT", {
                     "default": 0.5, "min": 0.1, "max": 0.9, "step": 0.05,

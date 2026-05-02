@@ -299,9 +299,12 @@ class NV_InpaintCrop:
                 }),
             },
             "optional": {
-                "mask_config": ("MASK_PROCESSING_CONFIG", {
-                    "tooltip": "Optional shared config from NV_MaskProcessingConfig. "
-                               "When connected, overrides cleanup, crop_expand, and blend_feather widgets."
+                "mask_config": ("MASK_BLEND_CONFIG", {
+                    "tooltip": "Optional BLEND config bus from NV_MaskBlendConfig. "
+                               "When connected, overrides cleanup_*, crop_expand_px, "
+                               "crop_blend_feather_px widgets. NV_InpaintCrop2 is a BLEND-pipeline "
+                               "consumer (D-189): the cleanup/crop knobs here shape the mask used "
+                               "for compositing, distinct from the GEN mask going to VACE."
                 }),
                 "bounding_box_mask": ("MASK", {
                     "tooltip": "Optional mask defining minimum crop area. Crop region will encompass this entire mask. "
@@ -388,20 +391,16 @@ class NV_InpaintCrop:
             resize_algorithm = _overridden["resize_algorithm"]
             anomaly_threshold = _overridden["anomaly_threshold"]
 
-        # Apply shared config override if connected
-        from .mask_processing_config import apply_mask_config
-        vals = apply_mask_config(mask_config,
-            crop_expand_px=crop_expand_px,
-            cleanup_fill_holes=cleanup_fill_holes,
-            cleanup_remove_noise=cleanup_remove_noise,
-            cleanup_smooth=cleanup_smooth,
-            crop_blend_feather_px=crop_blend_feather_px,
-        )
-        erode_dilate_v = vals["crop_expand_px"]
-        fill_holes_v = vals["cleanup_fill_holes"]
-        remove_noise_v = vals["cleanup_remove_noise"]
-        smooth_v = vals["cleanup_smooth"]
-        blend_pixels_v = vals["crop_blend_feather_px"]
+        # Resolve BLEND-bus values over local widgets (bus wins when present).
+        # MASK_BLEND_CONFIG carries BLEND-side keys: cleanup_* + crop_expand_px +
+        # crop_blend_feather_px + vace_stitch_*. Only the keys this node uses are
+        # resolved here.
+        blend_cfg = mask_config or {}
+        erode_dilate_v = blend_cfg.get("crop_expand_px", crop_expand_px)
+        fill_holes_v = blend_cfg.get("cleanup_fill_holes", cleanup_fill_holes)
+        remove_noise_v = blend_cfg.get("cleanup_remove_noise", cleanup_remove_noise)
+        smooth_v = blend_cfg.get("cleanup_smooth", cleanup_smooth)
+        blend_pixels_v = blend_cfg.get("crop_blend_feather_px", crop_blend_feather_px)
 
         padding_multiple = int(padding_multiple)
         device = comfy.model_management.get_torch_device()

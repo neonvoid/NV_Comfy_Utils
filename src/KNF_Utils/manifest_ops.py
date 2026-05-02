@@ -58,16 +58,27 @@ def summarize_stitcher(stitcher):
 
 
 def summarize_mask_config(mask_config):
-    """Extract dict summary of NV_MaskProcessingConfig override values."""
+    """Extract dict summary of MASK_GEN_CONFIG or MASK_BLEND_CONFIG override values.
+
+    Recognizes keys from both new bus schemas (D-189 bus split). Retired keys
+    (vace_erosion_blocks, vace_feather_blocks, vace_halo_px) are still in the
+    extraction list for backward-compat with old saves, but are no longer
+    emitted by current producer nodes.
+    """
     if mask_config is None:
         return None
     if not isinstance(mask_config, dict):
         return {"raw": str(type(mask_config))}
     keys = [
+        # Shared cleanup keys (in both GEN and BLEND schemas)
         'cleanup_fill_holes', 'cleanup_remove_noise', 'cleanup_smooth',
+        # GEN-only
+        'vace_input_grow_px',
+        # BLEND-only
         'crop_expand_px', 'crop_blend_feather_px',
-        'vace_input_grow_px', 'vace_erosion_blocks', 'vace_feather_blocks',
-        'vace_halo_px', 'vace_stitch_erosion_px', 'vace_stitch_feather_px',
+        'vace_stitch_erosion_px', 'vace_stitch_feather_px',
+        # Legacy/retired (only present in pre-split saves)
+        'vace_erosion_blocks', 'vace_feather_blocks', 'vace_halo_px',
     ]
     out = {}
     for k in keys:

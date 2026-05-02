@@ -76,8 +76,10 @@ class NV_RenderManifest:
                     "tooltip": "Stitcher dict from NV_InpaintCrop2 / NV_CoTrackerBridge. Auto-extracts "
                                "bbox extents per frame, canvas dims, content_warp_mode, etc."
                 }),
-                "mask_config": ("MASK_PROCESSING_CONFIG", {
-                    "tooltip": "NV_MaskProcessingConfig output. Auto-extracts erosion/feather/halo overrides."
+                "mask_config": ("MASK_BLEND_CONFIG", {
+                    "tooltip": "NV_MaskBlendConfig output. Auto-extracts BLEND-side mask processing "
+                               "overrides (cleanup, crop_expand, blend_feather, stitch erosion/feather). "
+                               "GEN-side params are recorded via the consuming node's info string instead."
                 }),
                 # Info STRING inputs (from each node's info output)
                 "static_vace_mask_info": ("STRING", {"forceInput": True, "tooltip": "info from NV_StaticVaceMask"}),
